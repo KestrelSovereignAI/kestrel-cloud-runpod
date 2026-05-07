@@ -10,6 +10,7 @@ from kestrel_cloud_runpod.manager import RunPodManager
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_sdk.llm.types import BackendType
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +53,32 @@ class RunPodFeature(Feature):
         ttl_seconds: str = "",
         pod_type: str = "",
         lines: str = "100",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         if getattr(self, 'disabled', False):
-            return {
-                "action": action,
-                "error": "RunPod feature is disabled",
-                "reason": getattr(self, 'disabled_reason', 'RUNPOD_API_KEY not set'),
-            }
+            return ToolResult.failed(
+                "RunPod feature is disabled",
+                data={
+                    "action": action,
+                    "reason": getattr(
+                        self, "disabled_reason", "RUNPOD_API_KEY not set"
+                    ),
+                },
+            )
         action_normalized = (action or "status").lower()
 
         if action_normalized in {"status"}:
             return await self._status()
         if action_normalized in {"logs", "log"}:
-            num_lines = self._coerce_optional_int(lines) or 100
+            # Pre-flight coerce ``lines`` so a non-numeric value lands
+            # in the ToolResult envelope, not as a raised ValueError
+            # (#1042 layer 4b honesty contract).
+            try:
+                num_lines = self._coerce_optional_int(lines) or 100
+            except ValueError:
+                return ToolResult.failed(
+                    f"Invalid lines '{lines}'. Expected a non-negative integer.",
+                    data={"argument": "lines", "received": lines},
+                )
             return await self._logs(lines=num_lines)
         if action_normalized in {"off", "stop"}:
             return await self._stop()
@@ -75,7 +89,12 @@ class RunPodFeature(Feature):
                 ttl_seconds=ttl_seconds,
                 pod_type=pod_type,
             )
-        raise ValueError("Unsupported GPU action. Use on, off, or status.")
+        return ToolResult.failed(
+            f"Unsupported GPU action: {action}. Use on, off, status, or logs.",
+            data={
+                "available_actions": ["status", "on", "off", "logs"],
+            },
+        )
 
     # NOTE: !dream command removed
     # generate_image_on_runpod() exists below but NOTHING CALLS IT
@@ -87,15 +106,15 @@ class RunPodFeature(Feature):
         prompt: str,
         model_name: Optional[str] = None,
         ttl_seconds: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
-        Internal method for generating images on RunPod GPU.
+        Generate an image on a RunPod GPU.
 
-        STATUS: NOT USED - Nothing calls this method.
-        
-
-        This method exists for future RunPod integration but is dead code.
-        Automatically starts pod, generates image, and stops pod.
+        Currently has no @tool decorator (no command surface) but is
+        exercised by the integration test suite, so it's migrated to
+        the ToolResult envelope alongside the rest of the feature.
+        Automatically starts a pod, generates the image, and stops
+        the pod.
 
         Args:
             prompt: Image generation prompt
@@ -103,41 +122,70 @@ class RunPodFeature(Feature):
             ttl_seconds: Optional TTL (default: min of default_ttl or 900)
 
         Returns:
-            Dict with image result and session info
+            ``ToolResult.ok(confirmation, data={result, session, teardown, ...})``
+            on success; ``ToolResult.failed(error, data=...)`` on
+            validation or manager error. Pod is always stopped before
+            returning, even on the failure paths, so cost runaway
+            cannot persist.
         """
         prompt = prompt.strip()
         if not prompt:
-            raise ValueError("Prompt is required for image generation")
+            return ToolResult.failed(
+                "Prompt is required for image generation",
+                data={"argument": "prompt"},
+            )
 
         ttl = ttl_seconds or min(self.manager.default_ttl_seconds, 900)
 
-        image_status = await self.manager.start_session(
-            task_profile="image",
-            model_name=model_name,
-            ttl_seconds=ttl,
-        )
+        try:
+            image_status = await self.manager.start_session(
+                task_profile="image",
+                model_name=model_name,
+                ttl_seconds=ttl,
+            )
+        except RunPodManagerError as e:
+            return ToolResult.failed(str(e))
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")
         if not endpoint:
-            await self.manager.stop_session()
-            raise RunPodManagerError("Image endpoint not provided by pod")
+            # Always stop the pod before returning to prevent cost
+            # runaway. We swallow stop errors here — the primary
+            # failure (missing endpoint) is what the caller needs.
+            try:
+                await self.manager.stop_session()
+            except RunPodManagerError as stop_err:
+                logger.warning(f"stop_session also failed: {stop_err}")
+            return ToolResult.failed(
+                "Image endpoint not provided by pod",
+                data={"session": image_status},
+            )
 
         payload = {"prompt": prompt, "model": model_name or image_status.get("model_name")}
         image_result = await asyncio.to_thread(self._post_json, endpoint, payload)
 
         # CRITICAL: Always stop the pod after use to avoid cost runaway
-        teardown = await self.manager.stop_session()
+        try:
+            teardown = await self.manager.stop_session()
+        except RunPodManagerError as e:
+            # Pod may have stopped on its own (TTL expiry); log but
+            # don't fail the user's image-generation request, since
+            # the image itself succeeded.
+            logger.warning(f"stop_session after image gen failed: {e}")
+            teardown = {"warning": str(e)}
         self._detach_gpu_backend("image generation completed")
 
-        logger.info(f"✅ RunPod image generation complete, pod stopped")
+        logger.info("✅ RunPod image generation complete, pod stopped")
 
-        return {
-            "action": "generate_image",
-            "prompt": prompt,
-            "result": image_result,
-            "session": image_status,
-            "teardown": teardown,
-        }
+        return ToolResult.ok(
+            confirmation=f"Generated image for prompt: {prompt[:60]}",
+            data={
+                "action": "generate_image",
+                "prompt": prompt,
+                "result": image_result,
+                "session": image_status,
+                "teardown": teardown,
+            },
+        )
 
     async def _start(
         self,
@@ -146,14 +194,25 @@ class RunPodFeature(Feature):
         task_profile: str,
         ttl_seconds: str,
         pod_type: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         profile_key = (task_profile or "llm").lower()
         if profile_key not in self.manager.profiles:
-            raise RunPodManagerError(
-                f"Unknown task_profile '{task_profile}'. Available: {', '.join(self.manager.profiles.keys())}"
+            # Validation failure → ToolResult.failed (NOT an exception).
+            # See #1042 layer 4b honesty contract.
+            available = list(self.manager.profiles.keys())
+            return ToolResult.failed(
+                f"Unknown task_profile '{task_profile}'. "
+                f"Available: {', '.join(available)}",
+                data={"available_profiles": available},
             )
 
-        ttl = self._coerce_optional_int(ttl_seconds)
+        try:
+            ttl = self._coerce_optional_int(ttl_seconds)
+        except ValueError:
+            return ToolResult.failed(
+                f"Invalid ttl_seconds '{ttl_seconds}'. Expected a non-negative integer.",
+                data={"argument": "ttl_seconds", "received": ttl_seconds},
+            )
         target_model = model_name or None
         env_overrides = {
             "KESTREL_PROFILE": profile_key,
@@ -167,48 +226,86 @@ class RunPodFeature(Feature):
             "pod_type": pod_type or None,
         }
 
-        status = await self.manager.start_session(
-            task_profile=profile_key,
-            model_name=target_model,
-            ttl_seconds=ttl,
-            pod_type=pod_type or None,
-            metadata=metadata,
-        )
+        try:
+            status = await self.manager.start_session(
+                task_profile=profile_key,
+                model_name=target_model,
+                ttl_seconds=ttl,
+                pod_type=pod_type or None,
+                metadata=metadata,
+            )
+        except RunPodManagerError as e:
+            return ToolResult.failed(str(e))
 
         if profile_key == "llm":
             self._attach_gpu_backend(status)
 
-        return {
-            "action": "start",
-            "session": status,
-            "router": self._router_status(),
-        }
+        return ToolResult.ok(
+            confirmation=f"Started RunPod session (profile: {profile_key})",
+            data={
+                "action": "start",
+                "session": status,
+                "router": self._router_status(),
+            },
+        )
 
-    async def _stop(self) -> Dict[str, Any]:
-        status = await self.manager.stop_session()
+    async def _stop(self) -> ToolResult:
+        """Stop the current pod.
+
+        Branch the confirmation between actual-stop and no-op so the
+        LLM doesn't narrate "Stopped" when there was nothing to
+        stop (#1042 honesty contract). The manager returns a status
+        like ``terminating`` or ``terminated`` when there was a pod
+        and ``offline`` when the call was a no-op.
+        """
+        try:
+            status = await self.manager.stop_session()
+        except RunPodManagerError as e:
+            return ToolResult.failed(str(e))
         self._detach_gpu_backend("Requested via !gpu off")
-        return {
-            "action": "stop",
-            "session": status,
-            "router": self._router_status(),
-        }
+        was_no_op = status.get("status") == "offline" and not status.get("active")
+        confirmation = (
+            "No active RunPod session to stop (no-op)"
+            if was_no_op
+            else "Stopped RunPod session"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "action": "stop",
+                "session": status,
+                "router": self._router_status(),
+            },
+        )
 
-    async def _status(self) -> Dict[str, Any]:
-        status = await self.manager.get_status()
-        return {
-            "action": "status",
-            "session": status,
-            "router": self._router_status(),
-        }
+    async def _status(self) -> ToolResult:
+        try:
+            status = await self.manager.get_status()
+        except RunPodManagerError as e:
+            return ToolResult.failed(str(e))
+        return ToolResult.ok(
+            confirmation=f"RunPod session status: {status.get('status', 'unknown')}",
+            data={
+                "action": "status",
+                "session": status,
+                "router": self._router_status(),
+            },
+        )
 
-    async def _logs(self, lines: int) -> Dict[str, Any]:
-        logs = await self.manager.get_logs(lines=lines)
-        return {
-            "action": "logs",
-            "lines": lines,
-            "logs": logs,
-            "router": self._router_status(),
-        }
+    async def _logs(self, lines: int) -> ToolResult:
+        try:
+            logs = await self.manager.get_logs(lines=lines)
+        except RunPodManagerError as e:
+            return ToolResult.failed(str(e))
+        return ToolResult.ok(
+            confirmation=f"Retrieved {lines} log line(s) from RunPod",
+            data={
+                "action": "logs",
+                "lines": lines,
+                "logs": logs,
+                "router": self._router_status(),
+            },
+        )
 
     def _attach_gpu_backend(self, session_status: Dict[str, Any]) -> None:
         if not self.llm_service:

@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_cloud_runpod.feature import RunPodFeature
+from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_sdk.llm import BackendType
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 
 class FakeRunPodManager:
@@ -103,12 +105,16 @@ async def test_manage_gpu_start_and_stop(runpod_feature):
         pod_type="h100-single",
     )
 
+    assert isinstance(start_result, ToolResult)
+    assert start_result.status is ToolResultStatus.OK
     assert manager.started is True
     assert llm_service.switch_calls
-    assert start_result["session"]["status"] == "ready"
+    assert start_result.data["session"]["status"] == "ready"
 
     stop_result = await feature.manage_gpu(action="off")
-    assert stop_result["session"]["status"] == "terminating"
+    assert isinstance(stop_result, ToolResult)
+    assert stop_result.status is ToolResultStatus.OK
+    assert stop_result.data["session"]["status"] == "terminating"
     assert manager.started is False
     assert llm_service.deactivate_reasons[-1] == "Requested via !gpu off"
 
@@ -124,7 +130,174 @@ async def test_image_generation_tears_down_session(runpod_feature):
     # Use the internal method (dream_image was removed, see feature.py lines 65-68)
     image_result = await feature.generate_image_on_runpod(prompt="sunset beach in watercolor")
 
-    assert "result" in image_result
+    assert isinstance(image_result, ToolResult)
+    assert image_result.status is ToolResultStatus.OK
+    assert "result" in image_result.data
     assert manager.started is False
     assert llm_service.deactivate_reasons[-1] == "image generation completed"
     assert llm_service.last_backend == BackendType.CLOUD
+
+
+# ---------------------------------------------------------------------------
+# Pre-emptive #1042 honesty checklist (failure paths land in ToolResult)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_manage_gpu_unknown_action_returns_failed(runpod_feature):
+    """Unknown action lands in ToolResult.failed, NOT a raised
+    ValueError that escapes the envelope."""
+    feature, _manager, _ = runpod_feature
+
+    result = await feature.manage_gpu(action="dance")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Unsupported GPU action" in result.error
+    assert result.data["available_actions"] == ["status", "on", "off", "logs"]
+
+
+@pytest.mark.asyncio
+async def test_start_unknown_profile_returns_failed(runpod_feature):
+    """Unknown profile lands in ToolResult.failed (pre-flight check),
+    not a raised RunPodManagerError that escapes the envelope."""
+    feature, manager, _ = runpod_feature
+
+    result = await feature._start(
+        model_name="",
+        task_profile="not-a-real-profile",
+        ttl_seconds="",
+        pod_type="",
+    )
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "not-a-real-profile" in result.error
+    # Manager.start_session should NOT have been called.
+    assert manager.started is False
+
+
+@pytest.mark.asyncio
+async def test_start_invalid_ttl_returns_failed(runpod_feature):
+    """Non-numeric ttl_seconds lands in ToolResult.failed, not a
+    raised ValueError out of _coerce_optional_int."""
+    feature, manager, _ = runpod_feature
+
+    result = await feature._start(
+        model_name="",
+        task_profile="llm",
+        ttl_seconds="abc",
+        pod_type="",
+    )
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Invalid ttl_seconds" in result.error
+    assert result.data["argument"] == "ttl_seconds"
+    assert manager.started is False
+
+
+@pytest.mark.asyncio
+async def test_logs_invalid_lines_returns_failed(runpod_feature):
+    """Non-numeric ``lines`` argument lands in ToolResult.failed,
+    not a raised ValueError out of _coerce_optional_int."""
+    feature, manager, _ = runpod_feature
+
+    result = await feature.manage_gpu(action="logs", lines="abc")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Invalid lines" in result.error
+    assert result.data["argument"] == "lines"
+
+
+@pytest.mark.asyncio
+async def test_disabled_feature_returns_failed(monkeypatch):
+    """A feature whose manager couldn't be constructed (e.g. missing
+    RUNPOD_API_KEY) lands in ToolResult.failed, not a legacy dict."""
+
+    def _raise(*_, **__):
+        raise RunPodManagerError("RUNPOD_API_KEY not set")
+
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", _raise
+    )
+
+    feature = RunPodFeature(SimpleNamespace())
+    await feature.initialize()
+    assert feature.disabled is True
+
+    result = await feature.manage_gpu(action="status")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "disabled" in result.error.lower()
+    assert "RUNPOD_API_KEY" in result.data["reason"]
+
+
+@pytest.mark.asyncio
+async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatch):
+    """When ``!gpu off`` runs with no active session and the manager
+    returns ``{active: False, status: "offline"}``, the confirmation
+    must say "no-op" — saying "Stopped RunPod session" would be the
+    #1042 confident-lie failure mode."""
+
+    class _NoSessionManager(FakeRunPodManager):
+        async def stop_session(self):
+            return {"active": False, "status": "offline"}
+
+    fake_manager = _NoSessionManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="off")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert "no-op" in result.confirmation.lower()
+    assert "Stopped RunPod session" not in result.confirmation, (
+        "regression of #1042 honesty fix: confirmation claims an "
+        "action happened when there was nothing to stop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_helper_wraps_manager_error_in_tool_result(monkeypatch):
+    """Every helper that calls into RunPodManager catches
+    RunPodManagerError and converts to ToolResult.failed."""
+
+    class _ErroringManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            raise RunPodManagerError("boom-status")
+
+        async def get_logs(self, **_):
+            raise RunPodManagerError("boom-logs")
+
+        async def stop_session(self):
+            raise RunPodManagerError("boom-stop")
+
+        async def start_session(self, **_):
+            raise RunPodManagerError("boom-start")
+
+    fake_manager = _ErroringManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    for action, kwargs, expected in [
+        ("status", {}, "boom-status"),
+        ("logs", {"lines": "10"}, "boom-logs"),
+        ("off", {}, "boom-stop"),
+        ("on", {"task_profile": "llm"}, "boom-start"),
+    ]:
+        result = await feature.manage_gpu(action=action, **kwargs)
+        assert isinstance(result, ToolResult), action
+        assert result.status is ToolResultStatus.ERROR, action
+        assert expected in result.error, f"action {action}: {result.error!r}"
