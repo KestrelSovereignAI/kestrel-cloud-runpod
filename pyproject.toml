@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-runpod"
-version = "0.1.0"
+version = "0.2.0"
 description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -31,7 +31,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.2,<1",
+    "kestrel-sovereign-sdk>=0.4,<1",
     # Framework runtime dep: feature uses kestrel_sovereign.config.load_config
     # to honor the unified-kestrel.toml [runpod] section. Same shape as
     # kestrel-cloud-gcp + kestrel-cloud-vastai.
