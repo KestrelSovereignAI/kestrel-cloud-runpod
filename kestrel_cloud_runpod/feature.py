@@ -137,6 +137,35 @@ class RunPodFeature(Feature):
 
         ttl = ttl_seconds or min(self.manager.default_ttl_seconds, 900)
 
+        # Capture whether a session was already active before we
+        # touched the manager. This is the load-bearing signal for
+        # whether a teardown after a failed ``start_session`` would
+        # tear down OUR orphaned pod (safe) or someone else's
+        # active session (catastrophic).
+        #
+        # If a session was active before we started:
+        #   - The manager will refuse to overwrite ("already active"
+        #     and other pre-creation validations).
+        #   - That session is NOT ours — never call stop_session.
+        #
+        # If no session was active before:
+        #   - Any session state we leave behind on a raise is OUR
+        #     doing (readiness-timeout post-creation, etc.).
+        #   - stop_session is safe to call: either it cleans up our
+        #     orphaned pod, or it's a no-op when nothing was created
+        #     (TTL-too-high / missing-default-model and other pre-
+        #     creation validation failures).
+        try:
+            pre_status = await self.manager.get_status()
+        except RunPodManagerError:
+            # If we can't even read status, default to "assume
+            # something was active" — fail safe by not touching it.
+            pre_was_active = True
+        else:
+            pre_was_active = bool(pre_status.get("active")) or (
+                pre_status.get("status") not in {"offline", "terminated", None}
+            )
+
         try:
             image_status = await self.manager.start_session(
                 task_profile="image",
@@ -144,36 +173,18 @@ class RunPodFeature(Feature):
                 ttl_seconds=ttl,
             )
         except RunPodManagerError as e:
-            err_msg = str(e)
-            # ``start_session`` raises in two distinct conditions and
-            # we MUST handle them differently:
-            #
-            # (1) Pre-creation: another session is already active.
-            #     The manager refuses to overwrite. NO new pod was
-            #     started; the active session belongs to someone
-            #     else (e.g., an LLM pod). We must NOT call
-            #     ``stop_session()`` — that would tear down the
-            #     unrelated active session.
-            #
-            # (2) Post-creation: ``provider.start_pod`` already ran,
-            #     a pod is billing, and ``_wait_until_ready`` (or
-            #     similar) raised. We MUST best-effort
-            #     ``stop_session()`` to avoid cost runaway.
-            #
-            # The manager flags case (1) with a specific error
-            # message ("A RunPod session is already active"). For
-            # any other RunPodManagerError, assume we created a pod
-            # and clean up.
-            pre_creation = "already active" in err_msg.lower()
-            if not pre_creation:
+            # Only attempt teardown if there was nothing active
+            # before we tried — anything we created in the failed
+            # start_session is fair game; anything that was already
+            # there isn't ours to stop.
+            if not pre_was_active:
                 try:
                     await self.manager.stop_session()
                 except Exception as stop_err:
                     logger.warning(
-                        f"stop_session after failed start also failed "
-                        f"(may be pre-pod state): {stop_err}"
+                        f"stop_session after failed start also failed: {stop_err}"
                     )
-            return ToolResult.failed(err_msg)
+            return ToolResult.failed(str(e))
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")
         if not endpoint:

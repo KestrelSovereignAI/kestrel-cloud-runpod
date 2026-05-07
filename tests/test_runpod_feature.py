@@ -265,23 +265,57 @@ async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatc
     )
 
 
+@pytest.mark.parametrize(
+    "raise_message",
+    [
+        "A RunPod session is already active",
+        "ttl_seconds 99999 exceeds profile max 3600",
+        "image profile has no default_model configured",
+        "Some other validation we haven't seen yet",
+    ],
+    ids=[
+        "already-active",
+        "ttl-too-high",
+        "no-default-model",
+        "unknown-pre-creation-validation",
+    ],
+)
 @pytest.mark.asyncio
-async def test_image_generation_does_not_stop_unrelated_active_session(monkeypatch):
+async def test_image_generation_does_not_stop_unrelated_active_session(
+    monkeypatch, raise_message,
+):
     """When ``generate_image_on_runpod`` is called while another
-    session (e.g., an LLM pod) is already active,
-    ``manager.start_session`` raises ``"A RunPod session is already
-    active"`` BEFORE creating an image pod. Our catch block must
-    NOT call ``stop_session()`` — that would tear down the
-    unrelated, perfectly-fine LLM session.
+    session (e.g., an LLM pod) is already active, ANY pre-creation
+    raise from ``manager.start_session`` (already-active conflict,
+    TTL validation, no-default-model, …) MUST NOT trigger
+    ``stop_session()`` — that would tear down the unrelated,
+    perfectly-fine LLM session.
 
-    This is exactly the regression codex round 3 caught: the
-    teardown-on-failure logic for readiness-timeout MUST NOT trip
-    on the pre-creation conflict case.
+    Codex iterations on this PR escalated through three layers of
+    this same root issue: round 1 missed cleanup on inference
+    failure, round 2 missed cleanup on post-creation start failure,
+    round 3 introduced over-aggressive cleanup that tore down
+    pre-existing sessions on the "already active" sentinel. Round 4
+    surfaced that other pre-creation validations (TTL,
+    default_model) had the same regression. The fix uses a
+    pre/post session-active check rather than message matching —
+    parameterising this test across multiple pre-creation messages
+    pins the contract that ALL of them get the same correct
+    treatment, not just the one we happen to know about today.
     """
 
     class _AlreadyActiveManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            # An unrelated LLM session was already running before
+            # generate_image_on_runpod was called.
+            return {
+                "active": True,
+                "status": "ready",
+                "task_profile": "llm",
+            }
+
         async def start_session(self, **_):
-            raise RunPodManagerError("A RunPod session is already active")
+            raise RunPodManagerError(raise_message)
 
     fake_manager = _AlreadyActiveManager()
     monkeypatch.setattr(
@@ -295,13 +329,57 @@ async def test_image_generation_does_not_stop_unrelated_active_session(monkeypat
 
     assert isinstance(result, ToolResult)
     assert result.status is ToolResultStatus.ERROR
-    assert "already active" in result.error.lower()
-    # The unrelated active session MUST NOT have been touched.
+    assert raise_message in result.error
+    # The unrelated active session MUST NOT have been touched —
+    # regardless of which pre-creation validation raised.
     assert fake_manager.stop_calls == 0, (
-        "regression of codex round 3: image-gen helper called "
-        "stop_session on a pre-existing unrelated session that "
-        "happened to be active when image generation was attempted"
+        f"regression: pre-creation raise '{raise_message}' "
+        "triggered stop_session on an unrelated active session "
+        "(should only stop sessions we actually created)"
     )
+
+
+@pytest.mark.asyncio
+async def test_image_generation_pre_creation_validation_no_existing_session(monkeypatch):
+    """Pre-creation validation failure (e.g., TTL too high) when NO
+    pre-existing session is active. The teardown decision logic
+    will call ``stop_session()`` (which is safely a no-op since no
+    pod was created), and the user gets the ToolResult.failed."""
+
+    class _PreValidationManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            return {"active": False, "status": "offline"}
+
+        async def start_session(self, **_):
+            raise RunPodManagerError(
+                "ttl_seconds 99999 exceeds profile max 3600"
+            )
+
+        async def stop_session(self):
+            # Tracks calls so the test can verify behaviour, but
+            # returns a no-op success shape consistent with what the
+            # real manager does when nothing is running.
+            self.stop_calls += 1
+            return {"active": False, "status": "offline"}
+
+    fake_manager = _PreValidationManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "exceeds profile max" in result.error
+    # stop_session WAS called (because nothing was active before, so
+    # cleanup is safe) but it's a no-op at the manager level.
+    # This is acceptable: a small wasted call vs a complex
+    # introspect-what-the-manager-actually-created path.
+    assert fake_manager.stop_calls == 1
 
 
 @pytest.mark.asyncio
@@ -319,6 +397,14 @@ async def test_image_generation_startup_failure_still_stops_pod(monkeypatch):
         def __init__(self):
             super().__init__()
             self.start_session_calls = 0
+
+        async def get_status(self, **_):
+            # Realistic pre-call state for this scenario: no session
+            # was active before generate_image_on_runpod was invoked.
+            # The teardown decision logic uses this to know that
+            # anything we leave behind during start_session is OUR
+            # doing (not an unrelated LLM session).
+            return {"active": False, "status": "offline"}
 
         async def start_session(self, **_):
             self.start_session_calls += 1
