@@ -1304,3 +1304,115 @@ async def test_image_gen_failure_with_failed_teardown_warns_about_billing(
     assert result.status is ToolResultStatus.ERROR
     assert "Image generation request failed" in result.error
     assert "still be billing" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_surfaces_session_before_stop(monkeypatch):
+    """Codex round 11: when manager.stop_session raises, production
+    has already cleared _session before the provider.stop_pod call
+    that failed. The pod may still be billing and the manager has
+    lost the handle. _stop must pre-capture session info and surface
+    it so the user can stop the pod manually."""
+
+    class _LostHandleManager(FakeRunPodManager):
+        def __init__(self):
+            super().__init__()
+            self._stop_attempted = False
+
+        async def get_status(self, **_):
+            # Pre-stop snapshot: an active session.
+            return {
+                "active": True,
+                "status": "ready",
+                "pod_id": "pod-orphan-42",
+                "task_profile": "llm",
+                "model_name": "llama-3",
+                "remaining_ttl_seconds": 1500,
+            }
+
+        async def stop_session(self):
+            # Production behavior: clears _session BEFORE provider
+            # call, then raises. Manager has lost the handle.
+            raise RuntimeError("provider 504 on stop_pod")
+
+    fake_manager = _LostHandleManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="off")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "provider 504" in result.error
+    # CRITICAL: pod_id and warning must be in the data so the user
+    # can clean up out-of-band.
+    assert "session_before_stop" in result.data, (
+        "stop failure didn't surface the captured session; the "
+        "manager lost the pod handle and the user has no way to "
+        "find the orphan"
+    )
+    assert result.data["session_before_stop"]["pod_id"] == "pod-orphan-42"
+    assert "warning" in result.data
+    assert "still be billing" in result.data["warning"].lower()
+    assert "manually" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_with_no_active_session_no_orphan_warning(monkeypatch):
+    """Codex round 11 negative case: when stop_session fails AND no
+    session was active pre-stop, there's no orphan to warn about.
+    Don't add the warning in that case (would confuse the user)."""
+
+    class _NoSessionRaiseManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            return {"active": False, "status": "offline"}
+
+        async def stop_session(self):
+            raise RuntimeError("transient HTTP 503")
+
+    fake_manager = _NoSessionRaiseManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="off")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "transient HTTP 503" in result.error
+    # No active pre-stop session → no orphan possible → no warning.
+    assert "session_before_stop" not in result.data
+    assert "warning" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_disabled_feature_image_gen_returns_failed_not_attribute_error(
+    monkeypatch,
+):
+    """Codex round 11: generate_image_on_runpod must check the
+    disabled flag before dereferencing self.manager.default_ttl_seconds.
+    Previously raised AttributeError (escaping the @tool envelope)
+    on a disabled feature."""
+
+    def _raise_init():
+        raise RunPodManagerError("RUNPOD_API_KEY not set")
+
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", _raise_init
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+    assert feature.disabled is True
+    assert feature.manager is None
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "disabled" in result.error.lower()
+    assert result.data["reason"] == "RUNPOD_API_KEY not set"

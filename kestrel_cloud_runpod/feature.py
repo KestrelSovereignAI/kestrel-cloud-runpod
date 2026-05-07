@@ -139,6 +139,23 @@ class RunPodFeature(Feature):
             returning, even on the failure paths, so cost runaway
             cannot persist.
         """
+        # Disabled-feature guard (codex round 11). When initialize()
+        # caught a missing RUNPOD_API_KEY it set ``self.manager =
+        # None`` and ``self.disabled = True``. ``manage_gpu`` checks
+        # this; ``generate_image_on_runpod`` previously did not, so
+        # calling it on a disabled feature dereferenced None and
+        # raised AttributeError instead of returning ToolResult.
+        if getattr(self, "disabled", False) or self.manager is None:
+            return ToolResult.failed(
+                "RunPod feature is disabled",
+                data={
+                    "action": "generate_image",
+                    "reason": getattr(
+                        self, "disabled_reason", "RUNPOD_API_KEY not set"
+                    ),
+                },
+            )
+
         prompt = prompt.strip()
         if not prompt:
             return ToolResult.failed(
@@ -516,6 +533,23 @@ class RunPodFeature(Feature):
         chose to stop.
         """
         async with self._start_lock:
+            # Pre-capture session info BEFORE stop_session
+            # (codex round 11). Production stop_session clears
+            # ``_session`` before calling provider.stop_pod, so if
+            # provider.stop_pod fails the manager has lost the pod
+            # handle for any retry. The user must be told both
+            # "stop failed" AND "pod may still be billing — here's
+            # the pod_id we tried to stop" so they can clean up
+            # out-of-band. Catch broadly here too — pre-capture
+            # itself can fail.
+            session_before_stop: Optional[Dict[str, Any]] = None
+            try:
+                session_before_stop = await self.manager.get_status()
+            except Exception as pre_err:
+                logger.warning(
+                    f"Pre-stop get_status failed; cannot capture pod "
+                    f"handle for orphan-warning: {pre_err}"
+                )
             # Catch broadly: provider/SDK calls inside stop_session
             # can raise raw HTTPError/Timeout that aren't
             # RunPodManagerError; those would otherwise escape the
@@ -523,7 +557,24 @@ class RunPodFeature(Feature):
             try:
                 status = await self.manager.stop_session()
             except Exception as e:
-                return ToolResult.failed(str(e))
+                fail_data: Dict[str, Any] = {"action": "stop"}
+                # If a session was active pre-stop, the manager has
+                # already cleared its handle by the time
+                # provider.stop_pod raised. Surface the captured
+                # session so the user can stop the pod manually.
+                if (
+                    session_before_stop is not None
+                    and self._status_was_active(session_before_stop)
+                ):
+                    fail_data["session_before_stop"] = session_before_stop
+                    fail_data["warning"] = (
+                        "stop_session failed AFTER the manager cleared "
+                        "its session handle; the pod may still be "
+                        "billing. session_before_stop preserves the "
+                        "pod_id so you can stop it manually via the "
+                        "RunPod console."
+                    )
+                return ToolResult.failed(str(e), data=fail_data)
             # Wrap router detach (codex round 9). If the LLM service
             # raises during detach (broken adapter, etc.), the pod IS
             # stopped — return partial with the teardown caveat.
