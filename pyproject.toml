@@ -1,0 +1,70 @@
+[project]
+name = "kestrel-cloud-runpod"
+version = "0.1.0"
+description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "kestrel",
+    "runpod",
+    "gpu",
+    "lora",
+    "training",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "kestrel-sovereign-sdk>=0.2,<1",
+    # Framework runtime dep: feature uses kestrel_sovereign.config.load_config
+    # to honor the unified-kestrel.toml [runpod] section. Same shape as
+    # kestrel-cloud-gcp + kestrel-cloud-vastai.
+    "kestrel-sovereign>=0.7,<1",
+    "runpod>=1.8.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-cloud-runpod"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues"
+
+[project.entry-points."kestrel_sovereign.features"]
+RunPodFeature = "kestrel_cloud_runpod.feature:RunPodFeature"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_cloud_runpod"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_cloud_runpod/**/*", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "cloud_resource: tests that touch real cloud (RunPod creds required)",
+]
