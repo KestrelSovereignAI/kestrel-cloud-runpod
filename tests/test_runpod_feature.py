@@ -1156,3 +1156,151 @@ async def test_stop_serializes_with_in_flight_start(monkeypatch):
     # The serialization order is: start completed first (lock held),
     # then stop saw the started session and stopped it.
     assert fake_manager.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_image_gen_failed_start_with_failed_teardown_surfaces_orphan_warning(
+    monkeypatch,
+):
+    """Codex round 10: generate_image_on_runpod must surface
+    teardown_error in the same way as _start. If start_session
+    raises AND teardown also fails, the user has an invisible orphan
+    pod that's still billing."""
+    fake_manager = FakeRunPodManager()
+
+    async def _raise_start(**_):
+        raise RuntimeError("readiness post-creation timeout")
+
+    async def _raise_stop():
+        raise RuntimeError("provider 503 during teardown")
+
+    async def _inactive_status(**_):
+        return {"active": False, "status": "offline"}
+
+    fake_manager.start_session = _raise_start
+    fake_manager.stop_session = _raise_stop
+    fake_manager.get_status = _inactive_status
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+    feature._post_json = lambda url, payload: {"unused": True}
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "readiness post-creation timeout" in result.error
+    assert result.data["teardown_error"] == "provider 503 during teardown"
+    assert "orphan" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_image_gen_missing_endpoint_with_failed_teardown_surfaces_warning(
+    monkeypatch,
+):
+    """Codex round 10: missing-endpoint path must also surface the
+    teardown_error. Without it, a pod that produced no endpoint AND
+    failed to stop is invisible to the user — GPU billing
+    continues, no warning."""
+
+    class _NoEndpointManager(FakeRunPodManager):
+        async def start_session(self, **kwargs):
+            self.started = True
+            # No image_endpoint, no inference_url.
+            return {
+                "pod_id": "pod-broken",
+                "task_profile": kwargs["task_profile"],
+                "model_name": "llama-3",
+                "status": "ready",
+                "remaining_ttl_seconds": 1800,
+            }
+
+        async def stop_session(self):
+            raise RuntimeError("provider 504 on stop_pod")
+
+    fake_manager = _NoEndpointManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Image endpoint not provided" in result.error
+    assert result.data["teardown_error"] == "provider 504 on stop_pod"
+    assert "still be billing" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_image_gen_success_with_failed_teardown_returns_partial(monkeypatch):
+    """Codex round 10: image gen produced an image, but stop_session
+    failed. The GPU may still be billing — saying 'pod stopped' in
+    a clean OK is the #1042 confident-lie failure mode. Result must
+    be PARTIAL with the teardown caveat in confirmation + error."""
+    fake_manager = FakeRunPodManager()
+
+    async def _raise_stop():
+        raise RuntimeError("provider 502 on stop_pod")
+
+    fake_manager.stop_session = _raise_stop
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+    feature._post_json = lambda url, payload: {"image_b64": "fake"}
+
+    result = await feature.generate_image_on_runpod(prompt="a sunset")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL, (
+        "image succeeded + teardown failed = PARTIAL, not OK; saying "
+        "'pod stopped' when it's still billing is a confident lie"
+    )
+    assert "Generated image" in result.confirmation
+    assert "teardown failed" in result.confirmation.lower()
+    assert "still be billing" in result.confirmation.lower()
+    assert "provider 502" in result.error
+    # Image result still surfaces in data.
+    assert result.data["result"] == {"image_b64": "fake"}
+
+
+@pytest.mark.asyncio
+async def test_image_gen_failure_with_failed_teardown_warns_about_billing(
+    monkeypatch,
+):
+    """Codex round 10: when image generation FAILS and teardown also
+    fails, surface the warning. Two problems: image didn't render,
+    AND there's an orphan pod billing."""
+    fake_manager = FakeRunPodManager()
+
+    async def _raise_stop():
+        raise RuntimeError("provider 502 on stop_pod")
+
+    fake_manager.stop_session = _raise_stop
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    def _raise_post(url, payload):
+        raise RuntimeError("HTTP 500 from image endpoint")
+
+    feature._post_json = _raise_post
+
+    result = await feature.generate_image_on_runpod(prompt="a sunset")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Image generation request failed" in result.error
+    assert "still be billing" in result.data["warning"].lower()

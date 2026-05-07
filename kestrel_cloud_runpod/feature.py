@@ -212,29 +212,59 @@ class RunPodFeature(Feature):
                 # before we tried — anything we created in the failed
                 # start_session is fair game; anything that was
                 # already there isn't ours to stop.
+                # Surface teardown errors (codex round 10): same
+                # invisibility issue as _start. The manager's
+                # stop_session clears _session before provider.stop_pod,
+                # so a failed stop leaves the orphan invisible.
+                teardown_error: Optional[str] = None
                 if not pre_was_active:
                     try:
                         await self.manager.stop_session()
                     except Exception as stop_err:
+                        teardown_error = str(stop_err)
                         logger.warning(
                             f"stop_session after failed start also failed: {stop_err}"
                         )
-                return ToolResult.failed(str(e))
+                fail_data: Dict[str, Any] = {
+                    "action": "generate_image",
+                    "prompt": prompt,
+                }
+                if teardown_error is not None:
+                    fail_data["teardown_error"] = teardown_error
+                    fail_data["warning"] = (
+                        "best-effort teardown after failed image-pod start "
+                        "also failed; the manager has lost the pod handle. "
+                        "Inspect the RunPod console for orphan pods."
+                    )
+                return ToolResult.failed(str(e), data=fail_data)
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")
         if not endpoint:
             # Always stop the pod before returning to prevent cost
-            # runaway. We swallow stop errors here — the primary
-            # failure (missing endpoint) is what the caller needs.
-            # Catch broadly: provider exceptions in stop_session can
-            # also be non-RunPodManagerError (codex round 6).
+            # runaway. Surface teardown failures (codex round 10):
+            # if no endpoint AND stop_session also fails, the user
+            # has TWO problems (no endpoint, possible orphan), not
+            # one.
+            no_endpoint_teardown_err: Optional[str] = None
             try:
                 await self.manager.stop_session()
             except Exception as stop_err:
+                no_endpoint_teardown_err = str(stop_err)
                 logger.warning(f"stop_session also failed: {stop_err}")
+            no_endpoint_data: Dict[str, Any] = {
+                "action": "generate_image",
+                "prompt": prompt,
+                "session": image_status,
+            }
+            if no_endpoint_teardown_err is not None:
+                no_endpoint_data["teardown_error"] = no_endpoint_teardown_err
+                no_endpoint_data["warning"] = (
+                    "image pod produced no endpoint AND teardown failed; "
+                    "GPU may still be billing. Check provider directly."
+                )
             return ToolResult.failed(
                 "Image endpoint not provided by pod",
-                data={"session": image_status},
+                data=no_endpoint_data,
             )
 
         payload = {"prompt": prompt, "model": model_name or image_status.get("model_name")}
@@ -256,14 +286,17 @@ class RunPodFeature(Feature):
 
         # CRITICAL: stop the pod whether image generation succeeded
         # or the request raised. ``stop_session`` errors during
-        # teardown are logged but don't override the primary result.
-        # Catch broadly: provider exceptions in stop_session can also
-        # be non-RunPodManagerError (codex round 6).
+        # teardown are now BOTH logged AND surfaced into the
+        # ToolResult — saying "Generated image, pod stopped" when
+        # the pod is still billing is the #1042 confident-lie
+        # failure mode (codex round 10).
+        teardown_failed = False
         try:
             teardown = await self.manager.stop_session()
         except Exception as e:
+            teardown_failed = True
             logger.warning(f"stop_session after image gen failed: {e}")
-            teardown = {"warning": str(e)}
+            teardown = {"warning": str(e), "teardown_failed": True}
         # Wrap detach in try/except (codex round 9): the LLM service
         # could raise, and image-gen has already done its work — we
         # don't want a router cleanup failure to hide the result.
@@ -276,27 +309,47 @@ class RunPodFeature(Feature):
             logger.warning(f"router detach after image gen failed: {detach_err}")
 
         if image_error is not None:
+            err_data = {
+                "action": "generate_image",
+                "prompt": prompt,
+                "session": image_status,
+                "teardown": teardown,
+            }
+            if teardown_failed:
+                err_data["warning"] = (
+                    "image generation failed AND pod teardown failed; "
+                    "GPU may still be billing. Check provider directly."
+                )
             return ToolResult.failed(
                 f"Image generation request failed: {image_error}",
-                data={
-                    "action": "generate_image",
-                    "prompt": prompt,
-                    "session": image_status,
-                    "teardown": teardown,
-                },
+                data=err_data,
+            )
+
+        # Image generation succeeded. If teardown ALSO succeeded,
+        # this is a clean OK. If teardown failed, it's PARTIAL —
+        # the user got their image, but there's a billing-active
+        # orphan they need to know about.
+        ok_data = {
+            "action": "generate_image",
+            "prompt": prompt,
+            "result": image_result,
+            "session": image_status,
+            "teardown": teardown,
+        }
+        if teardown_failed:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Generated image for prompt: {prompt[:60]}; "
+                    "pod teardown failed (GPU may still be billing)"
+                ),
+                error=f"teardown error: {teardown.get('warning')}",
+                data=ok_data,
             )
 
         logger.info("✅ RunPod image generation complete, pod stopped")
-
         return ToolResult.ok(
             confirmation=f"Generated image for prompt: {prompt[:60]}",
-            data={
-                "action": "generate_image",
-                "prompt": prompt,
-                "result": image_result,
-                "session": image_status,
-                "teardown": teardown,
-            },
+            data=ok_data,
         )
 
     async def _start(
@@ -518,6 +571,16 @@ class RunPodFeature(Feature):
         # raise raw HTTPError/Timeout that aren't RunPodManagerError;
         # those would otherwise escape the @tool envelope (codex round
         # 6 catch).
+        #
+        # Known limitation (codex round 10): _status does NOT take
+        # ``_start_lock``. Manager.stop_session clears ``_session``
+        # before calling provider.stop_pod, so a concurrent !gpu
+        # status during a slow stop will return ``offline`` while
+        # the provider tear-down is still in flight. Acquiring the
+        # lock would block frequent UI status polls for the full
+        # duration of provider.stop_pod (often 10-30s). Accepted as
+        # a transient honesty gap; the deeper fix is in the manager
+        # (refresh from provider before returning offline).
         try:
             status = await self.manager.get_status()
         except Exception as e:
