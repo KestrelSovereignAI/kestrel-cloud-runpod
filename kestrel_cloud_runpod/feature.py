@@ -144,6 +144,19 @@ class RunPodFeature(Feature):
                 ttl_seconds=ttl,
             )
         except RunPodManagerError as e:
+            # ``start_session`` calls ``provider.start_pod`` and then
+            # waits for readiness. If the wait times out (or any
+            # other ``RunPodManagerError`` raises after the pod was
+            # created), the manager's internal ``_session`` field is
+            # already set and the pod is billing. Best-effort
+            # teardown before returning so we don't leak GPU cost.
+            try:
+                await self.manager.stop_session()
+            except Exception as stop_err:
+                logger.warning(
+                    f"stop_session after failed start also failed "
+                    f"(may be pre-pod state): {stop_err}"
+                )
             return ToolResult.failed(str(e))
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")

@@ -266,6 +266,50 @@ async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_image_generation_startup_failure_still_stops_pod(monkeypatch):
+    """When ``manager.start_session`` raises (e.g., ``_wait_until_ready``
+    times out after ``provider.start_pod`` already created the
+    pod), the helper MUST attempt teardown before returning
+    ``ToolResult.failed``. Otherwise the pod billing leaks.
+
+    Modeled after a real RunPod failure mode codex flagged: the pod
+    is created, billing starts, then readiness polling times out.
+    """
+
+    class _StartupTimeoutManager(FakeRunPodManager):
+        def __init__(self):
+            super().__init__()
+            self.start_session_calls = 0
+
+        async def start_session(self, **_):
+            self.start_session_calls += 1
+            # Pod was created (start_pod ran), then readiness wait
+            # raised — the manager's ``_session`` is already set
+            # and the pod is billing.
+            raise RunPodManagerError("timed out waiting for pod readiness")
+
+    fake_manager = _StartupTimeoutManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "timed out waiting for pod readiness" in result.error
+    # Best-effort teardown must have been attempted regardless of
+    # the start-session failure — pod billing must not leak.
+    assert fake_manager.stop_calls == 1, (
+        "regression: start_session raised after pod creation but "
+        "stop_session was never called → pod billing leak"
+    )
+
+
+@pytest.mark.asyncio
 async def test_image_generation_inference_failure_still_stops_pod(runpod_feature):
     """When the image-endpoint POST raises (HTTP 500, timeout,
     connection error, …), the pod MUST still be torn down — the
