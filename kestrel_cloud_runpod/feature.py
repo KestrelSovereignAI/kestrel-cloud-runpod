@@ -175,9 +175,7 @@ class RunPodFeature(Feature):
             )
             pre_was_active = True
         else:
-            pre_was_active = bool(pre_status.get("active")) or (
-                pre_status.get("status") not in {"offline", "terminated", None}
-            )
+            pre_was_active = self._status_was_active(pre_status)
 
         # Catch broadly: start_session can raise raw provider/SDK
         # exceptions AFTER creating a pod (during readiness wait or
@@ -331,9 +329,7 @@ class RunPodFeature(Feature):
             )
             pre_was_active = True
         else:
-            pre_was_active = bool(pre_status.get("active")) or (
-                pre_status.get("status") not in {"offline", "terminated", None}
-            )
+            pre_was_active = self._status_was_active(pre_status)
 
         # Catch broadly: start_session can raise raw provider/SDK
         # exceptions (HTTPError, TimeoutError, etc.) AFTER creating a
@@ -435,8 +431,13 @@ class RunPodFeature(Feature):
             logs = await self.manager.get_logs(tail=lines)
         except Exception as e:
             return ToolResult.failed(str(e))
+        # ``lines`` is the tail REQUEST, not the count returned. The
+        # pod may have fewer lines, or the manager may truncate.
+        # Saying "Retrieved N log line(s)" overstates the result if
+        # fewer were available (#1042 honesty contract). Phrase the
+        # confirmation as the request itself.
         return ToolResult.ok(
-            confirmation=f"Retrieved {lines} log line(s) from RunPod",
+            confirmation=f"Retrieved RunPod logs (tail: {lines})",
             data={
                 "action": "logs",
                 "lines": lines,
@@ -480,6 +481,40 @@ class RunPodFeature(Feature):
         if not self.llm_service:
             return None
         return self.llm_service.get_backend_status()
+
+    @staticmethod
+    def _status_was_active(pre_status: Dict[str, Any]) -> bool:
+        """Was a manager session active before we touched it?
+
+        This is the load-bearing predicate for orphan-pod cleanup. If
+        we get it wrong:
+        - True when the manager would actually accept a new
+          start_session: we skip teardown on a failed start, leaking
+          OUR orphan pod (the one we just created).
+        - False when there really IS an unrelated active session: we
+          tear it down on a failed start, destroying user state.
+
+        Production manager (RunPodManager.get_status) returns the
+        ``active`` key explicitly, computed from
+        ``RunPodSession.is_active`` — which is False for OFFLINE,
+        TERMINATING, and ERROR. Trust ``active`` when present.
+
+        For test fakes / older code paths that don't set ``active``,
+        fall back to the inactive-states allowlist that matches
+        ``is_active``: include TERMINATING and ERROR (not just
+        OFFLINE/TERMINATED) so a manager in a non-active terminal
+        state isn't treated as "session in progress".
+        """
+        active_value = pre_status.get("active")
+        if active_value is not None:
+            return bool(active_value)
+        return pre_status.get("status") not in {
+            "offline",
+            "terminating",
+            "terminated",
+            "error",
+            None,
+        }
 
     @staticmethod
     def _coerce_optional_int(value: Any) -> Optional[int]:

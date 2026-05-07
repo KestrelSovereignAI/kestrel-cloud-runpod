@@ -757,3 +757,105 @@ async def test_image_generation_raw_provider_exception_does_not_escape(monkeypat
         "image-gen acquire-use-release: orphan pod must be torn down "
         "when start_session raises after creation"
     )
+
+
+@pytest.mark.parametrize(
+    "pre_status,expected",
+    [
+        # Manager-canonical 'active' key — trust it directly.
+        ({"active": True, "status": "ready"}, True),
+        ({"active": False, "status": "offline"}, False),
+        # Codex round 7 catch: terminating/error are NOT active in
+        # production (RunPodSession.is_active gates them out), even
+        # though their status string isn't 'offline'.
+        ({"active": False, "status": "terminating"}, False),
+        ({"active": False, "status": "error"}, False),
+        # Conflicting state — trust the explicit 'active' key over
+        # the status string. Production sets active from is_active.
+        ({"active": False, "status": "ready"}, False),
+        # Test-fake / legacy shapes that omit 'active' → fall back
+        # to status-string allowlist that matches is_active semantics.
+        ({"status": "ready"}, True),
+        ({"status": "provisioning"}, True),
+        ({"status": "loading"}, True),
+        ({"status": "offline"}, False),
+        ({"status": "terminated"}, False),
+        ({"status": "terminating"}, False),
+        ({"status": "error"}, False),
+        # Empty / missing.
+        ({}, False),
+        ({"status": None}, False),
+    ],
+)
+def test_status_was_active_aligns_with_manager_is_active(pre_status, expected):
+    """Codex round 7 catch: ``pre_was_active`` must agree with
+    ``RunPodSession.is_active``. If we mis-classify a TERMINATING or
+    ERROR session as active, a failed start_session leaks our orphan
+    pod (we skip teardown). If we mis-classify a real active session
+    as inactive, we tear it down on a failed start. Pin the
+    semantics."""
+    assert RunPodFeature._status_was_active(pre_status) is expected
+
+
+@pytest.mark.asyncio
+async def test_start_with_terminating_pre_state_tears_down_orphan(monkeypatch):
+    """Codex round 7 regression: when preflight returns
+    ``{"active": False, "status": "terminating"}``, that's NOT a
+    pre-existing active session. If start_session then raises after
+    creating a new pod, we MUST tear down our orphan, not skip."""
+    stop_called = []
+
+    class _TerminatingThenRaiseManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            # Old session is still in TERMINATING wind-down — manager
+            # treats this as inactive and is willing to start fresh.
+            return {"active": False, "status": "terminating"}
+
+        async def start_session(self, **_):
+            raise RuntimeError("readiness timeout post-creation")
+
+        async def stop_session(self):
+            stop_called.append(True)
+            return await FakeRunPodManager.stop_session(self)
+
+    fake_manager = _TerminatingThenRaiseManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="on", task_profile="llm")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert stop_called == [True], (
+        "TERMINATING is not pre-active per RunPodSession.is_active; "
+        "failed start MUST tear down our orphan pod"
+    )
+
+
+@pytest.mark.asyncio
+async def test_logs_confirmation_phrases_tail_not_count(runpod_feature):
+    """Codex round 7 catch: ``Retrieved N log line(s)`` lies when
+    fewer than N lines actually came back. The confirmation must
+    phrase the request, not claim a count."""
+    feature, manager, _ = runpod_feature
+
+    async def _short_logs(*, tail):
+        # Pod has 2 lines; user requested 100.
+        return "line A\nline B\n"
+
+    manager.get_logs = _short_logs
+
+    result = await feature.manage_gpu(action="logs", lines="100")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert "100" in result.confirmation
+    assert "tail" in result.confirmation.lower(), (
+        "confirmation must phrase ``lines`` as the tail REQUEST, not a "
+        "count of lines actually retrieved (#1042 honesty contract)"
+    )
+    # Should NOT claim "Retrieved 100 log line(s)" — that overstates.
+    assert "Retrieved 100 log line" not in result.confirmation
