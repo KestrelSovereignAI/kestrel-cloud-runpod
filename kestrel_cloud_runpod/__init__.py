@@ -30,6 +30,8 @@ Usage:
     feature = RunPodFeature(agent)
 """
 
+from importlib.metadata import PackageNotFoundError, version as _version
+
 from .feature import RunPodFeature
 from .manager import RunPodManager
 from .models import (
@@ -39,6 +41,11 @@ from .models import (
     RunPodSession,
 )
 
+try:
+    __version__ = _version("kestrel-cloud-runpod")
+except PackageNotFoundError:
+    __version__ = "0.0.0+local"
+
 __all__ = [
     "RunPodFeature",
     "RunPodManager",
@@ -46,4 +53,5 @@ __all__ = [
     "RunPodSession",
     "PodStatus",
     "GPUProfile",
+    "__version__",
 ]
