@@ -179,13 +179,17 @@ class RunPodFeature(Feature):
                 pre_status.get("status") not in {"offline", "terminated", None}
             )
 
+        # Catch broadly: start_session can raise raw provider/SDK
+        # exceptions AFTER creating a pod (during readiness wait or
+        # status refresh). Catching only RunPodManagerError would let
+        # those escape and leak a billing-active pod (codex round 6).
         try:
             image_status = await self.manager.start_session(
                 task_profile="image",
                 model_name=model_name,
                 ttl_seconds=ttl,
             )
-        except RunPodManagerError as e:
+        except Exception as e:
             # Only attempt teardown if there was nothing active
             # before we tried — anything we created in the failed
             # start_session is fair game; anything that was already
@@ -204,9 +208,11 @@ class RunPodFeature(Feature):
             # Always stop the pod before returning to prevent cost
             # runaway. We swallow stop errors here — the primary
             # failure (missing endpoint) is what the caller needs.
+            # Catch broadly: provider exceptions in stop_session can
+            # also be non-RunPodManagerError (codex round 6).
             try:
                 await self.manager.stop_session()
-            except RunPodManagerError as stop_err:
+            except Exception as stop_err:
                 logger.warning(f"stop_session also failed: {stop_err}")
             return ToolResult.failed(
                 "Image endpoint not provided by pod",
@@ -233,9 +239,11 @@ class RunPodFeature(Feature):
         # CRITICAL: stop the pod whether image generation succeeded
         # or the request raised. ``stop_session`` errors during
         # teardown are logged but don't override the primary result.
+        # Catch broadly: provider exceptions in stop_session can also
+        # be non-RunPodManagerError (codex round 6).
         try:
             teardown = await self.manager.stop_session()
-        except RunPodManagerError as e:
+        except Exception as e:
             logger.warning(f"stop_session after image gen failed: {e}")
             teardown = {"warning": str(e)}
         self._detach_gpu_backend(
@@ -306,6 +314,32 @@ class RunPodFeature(Feature):
             "pod_type": pod_type or None,
         }
 
+        # Pre-flight: was a session already active before we touched
+        # the manager? Same load-bearing signal as
+        # generate_image_on_runpod — discriminates orphaned-pod cleanup
+        # (safe) from tearing down an unrelated active session
+        # (catastrophic). Catch broadly: get_status itself can raise
+        # raw provider exceptions; fail safe by assuming a session was
+        # active so we never auto-teardown on unreadable state.
+        try:
+            pre_status = await self.manager.get_status()
+        except Exception as e:
+            logger.warning(
+                f"Pre-flight get_status before start failed; "
+                f"assuming a session may be active and skipping any "
+                f"teardown on subsequent start_session failure: {e}"
+            )
+            pre_was_active = True
+        else:
+            pre_was_active = bool(pre_status.get("active")) or (
+                pre_status.get("status") not in {"offline", "terminated", None}
+            )
+
+        # Catch broadly: start_session can raise raw provider/SDK
+        # exceptions (HTTPError, TimeoutError, etc.) AFTER creating a
+        # pod, during the readiness wait or status refresh. Those
+        # would otherwise escape the @tool envelope and leave a
+        # billing-active pod the user can't see (codex round 6).
         try:
             status = await self.manager.start_session(
                 task_profile=profile_key,
@@ -314,7 +348,18 @@ class RunPodFeature(Feature):
                 pod_type=pod_type or None,
                 metadata=metadata,
             )
-        except RunPodManagerError as e:
+        except Exception as e:
+            # Best-effort teardown only when there was nothing active
+            # before — any session state we leave behind is OUR doing
+            # (post-creation readiness raise, etc.). If a session was
+            # already active, it's not ours to stop.
+            if not pre_was_active:
+                try:
+                    await self.manager.stop_session()
+                except Exception as stop_err:
+                    logger.warning(
+                        f"stop_session after failed start also failed: {stop_err}"
+                    )
             return ToolResult.failed(str(e))
 
         if profile_key == "llm":
@@ -338,9 +383,13 @@ class RunPodFeature(Feature):
         like ``terminating`` or ``terminated`` when there was a pod
         and ``offline`` when the call was a no-op.
         """
+        # Catch broadly: provider/SDK calls inside stop_session can
+        # raise raw HTTPError/Timeout that aren't RunPodManagerError;
+        # those would otherwise escape the @tool envelope (codex round
+        # 6 catch).
         try:
             status = await self.manager.stop_session()
-        except RunPodManagerError as e:
+        except Exception as e:
             return ToolResult.failed(str(e))
         self._detach_gpu_backend("Requested via !gpu off")
         was_no_op = status.get("status") == "offline" and not status.get("active")
@@ -359,9 +408,13 @@ class RunPodFeature(Feature):
         )
 
     async def _status(self) -> ToolResult:
+        # Catch broadly: provider/SDK calls inside get_status can
+        # raise raw HTTPError/Timeout that aren't RunPodManagerError;
+        # those would otherwise escape the @tool envelope (codex round
+        # 6 catch).
         try:
             status = await self.manager.get_status()
-        except RunPodManagerError as e:
+        except Exception as e:
             return ToolResult.failed(str(e))
         return ToolResult.ok(
             confirmation=f"RunPod session status: {status.get('status', 'unknown')}",
@@ -373,9 +426,14 @@ class RunPodFeature(Feature):
         )
 
     async def _logs(self, lines: int) -> ToolResult:
+        # ``RunPodManager.get_logs`` takes ``tail=``, not ``lines=``.
+        # Also catch broadly: provider/SDK calls inside get_logs can
+        # raise raw HTTPError/Timeout that aren't RunPodManagerError;
+        # those would otherwise escape the @tool envelope (codex round
+        # 6 catch).
         try:
-            logs = await self.manager.get_logs(lines=lines)
-        except RunPodManagerError as e:
+            logs = await self.manager.get_logs(tail=lines)
+        except Exception as e:
             return ToolResult.failed(str(e))
         return ToolResult.ok(
             confirmation=f"Retrieved {lines} log line(s) from RunPod",

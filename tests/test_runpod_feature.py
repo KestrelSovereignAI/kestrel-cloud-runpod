@@ -550,3 +550,210 @@ async def test_helper_wraps_manager_error_in_tool_result(monkeypatch):
         assert isinstance(result, ToolResult), action
         assert result.status is ToolResultStatus.ERROR, action
         assert expected in result.error, f"action {action}: {result.error!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised",
+    [
+        RuntimeError("HTTPError 503: bad gateway"),
+        TimeoutError("provider timed out"),
+    ],
+)
+async def test_helper_wraps_raw_provider_exception_in_tool_result(
+    monkeypatch, raised
+):
+    """Codex round 6: every helper that calls into RunPodManager must
+    catch broader than RunPodManagerError. The underlying provider/SDK
+    can raise raw HTTPError/Timeout/etc. which would otherwise escape
+    the @tool envelope. This test pins the broad-catch contract for
+    every action surface."""
+
+    class _RawErroringManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            raise raised
+
+        async def get_logs(self, **_):
+            raise raised
+
+        async def stop_session(self):
+            raise raised
+
+        async def start_session(self, **_):
+            raise raised
+
+    fake_manager = _RawErroringManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    for action, kwargs in [
+        ("status", {}),
+        ("logs", {"lines": "10"}),
+        ("off", {}),
+        ("on", {"task_profile": "llm"}),
+    ]:
+        result = await feature.manage_gpu(action=action, **kwargs)
+        assert isinstance(result, ToolResult), action
+        assert result.status is ToolResultStatus.ERROR, action
+        assert str(raised) in result.error, (
+            f"action {action}: expected {raised!r} in error, got {result.error!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_logs_passes_tail_kwarg_to_manager(monkeypatch):
+    """Codex round 6: ``RunPodManager.get_logs`` takes ``tail=``, not
+    ``lines=``. A previous version of _logs sent ``lines=`` which
+    would TypeError against the real signature; the FakeRunPodManager's
+    ``**_`` swallowed it silently. Pin the call kwarg explicitly."""
+    captured = {}
+
+    class _LogsCapturingManager(FakeRunPodManager):
+        async def get_logs(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return "log line 1\nlog line 2\n"
+
+    fake_manager = _LogsCapturingManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="logs", lines="42")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    # The contract: get_logs is called with ``tail=`` (real signature),
+    # NOT ``lines=`` (which would fail against the production manager).
+    assert captured["args"] == ()
+    assert captured["kwargs"] == {"tail": 42}, (
+        f"feature called manager.get_logs with {captured['kwargs']!r}; "
+        "must use tail= to match RunPodManager.get_logs signature"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_raw_provider_exception_attempts_teardown(monkeypatch):
+    """Codex round 6: when ``_start`` calls ``start_session`` and a raw
+    (non-RunPodManagerError) provider exception escapes after the pod
+    is created, ``_start`` must (a) return ToolResult.failed instead of
+    letting the exception escape the envelope, and (b) attempt
+    best-effort teardown so the orphan pod doesn't leak (provided no
+    pre-existing session was active)."""
+    stop_called = []
+
+    class _RawRaisingManager(FakeRunPodManager):
+        async def start_session(self, **kwargs):
+            raise RuntimeError("HTTPError 502: pod created, then readiness wait failed")
+
+        async def stop_session(self):
+            stop_called.append(True)
+            return await FakeRunPodManager.stop_session(self)
+
+        async def get_status(self, **_):
+            # No session active before _start ran.
+            return {"active": False, "status": "offline"}
+
+    fake_manager = _RawRaisingManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="on", task_profile="llm")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "HTTPError 502" in result.error
+    # No pre-existing session → best-effort teardown of the orphan pod.
+    assert stop_called == [True], (
+        "raw exception after start_session must trigger best-effort teardown "
+        "when no session was pre-active"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_raw_exception_with_preexisting_session_skips_teardown(
+    monkeypatch,
+):
+    """Codex round 6 + round 4 honesty contract: when start_session
+    raises AND a session was already active before, we must NOT call
+    stop_session — that would tear down an unrelated user session."""
+    stop_called = []
+
+    class _PreActiveRaisingManager(FakeRunPodManager):
+        async def start_session(self, **kwargs):
+            raise RuntimeError("HTTPError 503: provider degraded")
+
+        async def stop_session(self):
+            stop_called.append(True)
+            return await FakeRunPodManager.stop_session(self)
+
+        async def get_status(self, **_):
+            # Pre-existing active session — NOT ours to tear down.
+            return {
+                "active": True,
+                "status": "ready",
+                "pod_id": "pod-someone-elses",
+            }
+
+    fake_manager = _PreActiveRaisingManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="on", task_profile="llm")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "HTTPError 503" in result.error
+    assert stop_called == [], (
+        "session was pre-active; tearing it down on a failed start "
+        "would destroy unrelated user state"
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_generation_raw_provider_exception_does_not_escape(monkeypatch):
+    """Codex round 6: generate_image_on_runpod must catch broader than
+    RunPodManagerError around start_session, since the provider can
+    raise raw exceptions after creating the pod. Pin the broad-catch
+    contract."""
+    stop_called = []
+
+    class _RawRaisingImageManager(FakeRunPodManager):
+        async def start_session(self, **kwargs):
+            raise RuntimeError("HTTPError 504: image pod readiness timeout")
+
+        async def stop_session(self):
+            stop_called.append(True)
+            return await FakeRunPodManager.stop_session(self)
+
+        async def get_status(self, **_):
+            return {"active": False, "status": "offline"}
+
+    fake_manager = _RawRaisingImageManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.generate_image_on_runpod(prompt="a sunset")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "HTTPError 504" in result.error
+    assert stop_called == [True], (
+        "image-gen acquire-use-release: orphan pod must be torn down "
+        "when start_session raises after creation"
+    )
