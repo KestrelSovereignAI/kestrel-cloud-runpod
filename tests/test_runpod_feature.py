@@ -266,6 +266,36 @@ async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_image_generation_inference_failure_still_stops_pod(runpod_feature):
+    """When the image-endpoint POST raises (HTTP 500, timeout,
+    connection error, …), the pod MUST still be torn down — the
+    user's exception path can't bill them indefinitely. The error
+    must also land in ToolResult.failed so the audit hook can see
+    it (instead of escaping the envelope as a raised exception)."""
+    feature, manager, llm_service = runpod_feature
+
+    def _failing_post(_url, _payload):
+        raise RuntimeError("HTTP 500: model OOM")
+
+    feature._post_json = _failing_post
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "HTTP 500: model OOM" in result.error
+    # Pod was torn down despite the inference failure.
+    assert manager.stop_calls == 1
+    assert manager.started is False
+    # Backend was detached with the failure-specific reason (honest
+    # narration — not "completed").
+    assert llm_service.deactivate_reasons[-1] == "image generation failed"
+    # Teardown info still surfaces in data so the caller can confirm
+    # the cleanup happened.
+    assert "teardown" in result.data
+
+
+@pytest.mark.asyncio
 async def test_helper_wraps_manager_error_in_tool_result(monkeypatch):
     """Every helper that calls into RunPodManager catches
     RunPodManagerError and converts to ToolResult.failed."""

@@ -161,18 +161,45 @@ class RunPodFeature(Feature):
             )
 
         payload = {"prompt": prompt, "model": model_name or image_status.get("model_name")}
-        image_result = await asyncio.to_thread(self._post_json, endpoint, payload)
 
-        # CRITICAL: Always stop the pod after use to avoid cost runaway
+        # ``_post_json`` can raise from requests (HTTPError, Timeout,
+        # ConnectionError) when the pod is up but the inference call
+        # fails. We MUST tear down the pod on every exit path,
+        # successful or not — otherwise an HTTP 500 from the image
+        # endpoint leaves an idle GPU billing until TTL expiry. The
+        # exception is also captured into the ToolResult.failed
+        # envelope (#1042 layer 4b) instead of escaping the @tool.
+        image_result: Optional[Dict[str, Any]] = None
+        image_error: Optional[Exception] = None
+        try:
+            image_result = await asyncio.to_thread(self._post_json, endpoint, payload)
+        except Exception as e:
+            image_error = e
+            logger.error(f"Image generation request failed: {e}")
+
+        # CRITICAL: stop the pod whether image generation succeeded
+        # or the request raised. ``stop_session`` errors during
+        # teardown are logged but don't override the primary result.
         try:
             teardown = await self.manager.stop_session()
         except RunPodManagerError as e:
-            # Pod may have stopped on its own (TTL expiry); log but
-            # don't fail the user's image-generation request, since
-            # the image itself succeeded.
             logger.warning(f"stop_session after image gen failed: {e}")
             teardown = {"warning": str(e)}
-        self._detach_gpu_backend("image generation completed")
+        self._detach_gpu_backend(
+            "image generation failed" if image_error is not None
+            else "image generation completed"
+        )
+
+        if image_error is not None:
+            return ToolResult.failed(
+                f"Image generation request failed: {image_error}",
+                data={
+                    "action": "generate_image",
+                    "prompt": prompt,
+                    "session": image_status,
+                    "teardown": teardown,
+                },
+            )
 
         logger.info("✅ RunPod image generation complete, pod stopped")
 
