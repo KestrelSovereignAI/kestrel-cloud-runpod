@@ -340,6 +340,56 @@ async def test_image_generation_does_not_stop_unrelated_active_session(
 
 
 @pytest.mark.asyncio
+async def test_image_generation_preflight_status_failure_does_not_escape_envelope(
+    monkeypatch,
+):
+    """When the preflight ``get_status`` call itself raises a
+    provider-level exception (HTTP 5xx, timeout, etc), the failure
+    MUST land in ToolResult.failed via the start_session path —
+    NOT escape the @tool method.
+
+    Codex round 5 catch: ``get_status`` can perform a provider
+    refresh that raises ``requests.exceptions.HTTPError`` / etc.
+    Catching only ``RunPodManagerError`` in the preflight let those
+    escape. The fix catches broadly and fails safe (treat as
+    "session was active" → skip teardown).
+    """
+
+    class _FlakyStatusManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            # Generic provider exception, not a RunPodManagerError.
+            raise RuntimeError("HTTPError 503 Service Unavailable")
+
+        async def start_session(self, **_):
+            # If we get here at all, return a normal-looking session
+            # so we can verify it WASN'T torn down.
+            return {
+                "active": True,
+                "status": "ready",
+                "image_endpoint": "http://gpu/invoke",
+                "model_name": "stable-diffusion",
+            }
+
+    fake_manager = _FlakyStatusManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+    feature._post_json = lambda url, payload: {"image": "base64..."}
+
+    # The call should NOT raise — it should land in a ToolResult.
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    # The actual generate_image flow continued normally and succeeded
+    # because get_status only gates the teardown decision, not the
+    # whole call.
+    assert result.status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
 async def test_image_generation_pre_creation_validation_no_existing_session(monkeypatch):
     """Pre-creation validation failure (e.g., TTL too high) when NO
     pre-existing session is active. The teardown decision logic

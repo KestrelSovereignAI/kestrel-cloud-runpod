@@ -155,11 +155,24 @@ class RunPodFeature(Feature):
         #     orphaned pod, or it's a no-op when nothing was created
         #     (TTL-too-high / missing-default-model and other pre-
         #     creation validation failures).
+        # Catch BROADLY here, not just RunPodManagerError. The
+        # ``get_status`` call can perform a provider refresh that
+        # raises requests.exceptions.HTTPError, TimeoutError, etc.
+        # when the RunPod/managed API is degraded. Those raw
+        # exceptions would otherwise escape generate_image_on_runpod
+        # before it can return ToolResult.failed. Failing safe by
+        # assuming a session was active (skip teardown) is the
+        # right call when status is unreadable: if we can't tell
+        # whether we'd be tearing down our own pod or someone
+        # else's, we err on the side of touching nothing.
         try:
             pre_status = await self.manager.get_status()
-        except RunPodManagerError:
-            # If we can't even read status, default to "assume
-            # something was active" — fail safe by not touching it.
+        except Exception as e:
+            logger.warning(
+                f"Pre-flight get_status failed; "
+                f"assuming a session may be active and skipping any "
+                f"teardown on subsequent start_session failure: {e}"
+            )
             pre_was_active = True
         else:
             pre_was_active = bool(pre_status.get("active")) or (
