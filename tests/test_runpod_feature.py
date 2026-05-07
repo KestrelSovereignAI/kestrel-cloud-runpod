@@ -859,3 +859,98 @@ async def test_logs_confirmation_phrases_tail_not_count(runpod_feature):
     )
     # Should NOT claim "Retrieved 100 log line(s)" — that overstates.
     assert "Retrieved 100 log line" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_concurrent_start_does_not_tear_down_winners_pod(monkeypatch):
+    """Codex round 8 catch: two concurrent ``!gpu on`` calls each run
+    preflight, see inactive, race into start_session. Without
+    feature-level serialization, the loser observes the winner's
+    session, raises ``"already active"`` from the manager, computes
+    ``pre_was_active=False`` from its stale snapshot, and tears down
+    the winner's pod.
+
+    This test pins the contract that the feature-level lock
+    serializes preflight + start_session, so the loser's preflight
+    runs AFTER the winner's session is established and observes
+    active=True (correctly skipping teardown)."""
+    import asyncio as _asyncio
+
+    class _RaceManager(FakeRunPodManager):
+        """Mimics production manager: start_session is serialized by
+        an internal lock, but get_status is NOT (it's a snapshot
+        read). This is the exact shape that creates the TOCTOU race
+        the feature-level lock fixes."""
+
+        def __init__(self):
+            super().__init__()
+            self._active = False
+            self._inner_lock = _asyncio.Lock()
+            self._start_calls = 0
+            self.stop_calls = 0
+
+        async def get_status(self, **_):
+            # No lock — fast snapshot read, like production.
+            return {
+                "active": self._active,
+                "status": "ready" if self._active else "offline",
+            }
+
+        async def start_session(self, **kwargs):
+            # Serialized by an internal lock, like the production
+            # manager's ``async with self._lock`` in core.py.
+            async with self._inner_lock:
+                if self._active:
+                    raise RunPodManagerError(
+                        "A RunPod session is already active"
+                    )
+                # Provider call delay — long enough for the loser's
+                # preflight to interleave when the feature lock is
+                # absent.
+                await _asyncio.sleep(0.02)
+                self._start_calls += 1
+                self._active = True
+                return {
+                    "active": True,
+                    "status": "ready",
+                    "pod_id": f"pod-{self._start_calls}",
+                    "task_profile": kwargs["task_profile"],
+                    "model_name": "llama-3",
+                    "remaining_ttl_seconds": 1800,
+                    "inference_url": "http://gpu:8000/v1",
+                }
+
+        async def stop_session(self):
+            async with self._inner_lock:
+                self.stop_calls += 1
+                self._active = False
+                return {"active": False, "status": "terminating"}
+
+    fake_manager = _RaceManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    # Two concurrent !gpu on calls. With the feature-level lock, the
+    # loser's preflight observes the winner's active session and
+    # skips teardown. Without the lock, the loser tears down the
+    # winner's pod.
+    results = await _asyncio.gather(
+        feature.manage_gpu(action="on", task_profile="llm"),
+        feature.manage_gpu(action="on", task_profile="llm"),
+        return_exceptions=True,
+    )
+
+    statuses = [r.status for r in results if isinstance(r, ToolResult)]
+    # Exactly one OK, one ERROR (the loser saw "already active").
+    assert statuses.count(ToolResultStatus.OK) == 1, statuses
+    assert statuses.count(ToolResultStatus.ERROR) == 1, statuses
+    # CRITICAL: the loser must NOT have torn down the winner's pod.
+    assert fake_manager.stop_calls == 0, (
+        f"loser tore down winner's pod (stop_calls={fake_manager.stop_calls}); "
+        "feature-level lock must serialize preflight + start_session"
+    )
+    # Winner's session is still active.
+    assert fake_manager._active is True

@@ -35,6 +35,17 @@ class RunPodFeature(Feature):
             self.disabled_reason = str(e)
             return
         self.disabled = False
+        # Feature-level serialization for "preflight get_status +
+        # start_session + best-effort teardown on failure". The
+        # manager's own lock only protects each method internally; it
+        # does NOT cover the read-then-create-then-cleanup decision
+        # the feature makes across two manager calls. Without this
+        # lock, two concurrent !gpu on calls can both observe inactive
+        # state (TOCTOU), one creates a pod, the other gets "already
+        # active", computes ``pre_was_active=False`` from its stale
+        # snapshot, and tears down the first call's pod (codex
+        # round 8 catch).
+        self._start_lock = asyncio.Lock()
         self.llm_service = getattr(self.agent, "llm_service", None)
         if not self.llm_service:
             logger.warning("LLMService not available; GPU routing disabled")
@@ -165,41 +176,50 @@ class RunPodFeature(Feature):
         # right call when status is unreadable: if we can't tell
         # whether we'd be tearing down our own pod or someone
         # else's, we err on the side of touching nothing.
-        try:
-            pre_status = await self.manager.get_status()
-        except Exception as e:
-            logger.warning(
-                f"Pre-flight get_status failed; "
-                f"assuming a session may be active and skipping any "
-                f"teardown on subsequent start_session failure: {e}"
-            )
-            pre_was_active = True
-        else:
-            pre_was_active = self._status_was_active(pre_status)
+        # Serialize the preflight + start + teardown sequence against
+        # other concurrent acquire-style callers — same shared lock
+        # used by ``_start`` (codex round 8). Two concurrent !gpu on
+        # / image-gen calls observed inactive in their preflight, both
+        # raced into start_session, the loser tore down the winner's
+        # pod. The manager's own lock doesn't span this multi-call
+        # sequence.
+        async with self._start_lock:
+            try:
+                pre_status = await self.manager.get_status()
+            except Exception as e:
+                logger.warning(
+                    f"Pre-flight get_status failed; "
+                    f"assuming a session may be active and skipping any "
+                    f"teardown on subsequent start_session failure: {e}"
+                )
+                pre_was_active = True
+            else:
+                pre_was_active = self._status_was_active(pre_status)
 
-        # Catch broadly: start_session can raise raw provider/SDK
-        # exceptions AFTER creating a pod (during readiness wait or
-        # status refresh). Catching only RunPodManagerError would let
-        # those escape and leak a billing-active pod (codex round 6).
-        try:
-            image_status = await self.manager.start_session(
-                task_profile="image",
-                model_name=model_name,
-                ttl_seconds=ttl,
-            )
-        except Exception as e:
-            # Only attempt teardown if there was nothing active
-            # before we tried — anything we created in the failed
-            # start_session is fair game; anything that was already
-            # there isn't ours to stop.
-            if not pre_was_active:
-                try:
-                    await self.manager.stop_session()
-                except Exception as stop_err:
-                    logger.warning(
-                        f"stop_session after failed start also failed: {stop_err}"
-                    )
-            return ToolResult.failed(str(e))
+            # Catch broadly: start_session can raise raw provider/SDK
+            # exceptions AFTER creating a pod (during readiness wait
+            # or status refresh). Catching only RunPodManagerError
+            # would let those escape and leak a billing-active pod
+            # (codex round 6).
+            try:
+                image_status = await self.manager.start_session(
+                    task_profile="image",
+                    model_name=model_name,
+                    ttl_seconds=ttl,
+                )
+            except Exception as e:
+                # Only attempt teardown if there was nothing active
+                # before we tried — anything we created in the failed
+                # start_session is fair game; anything that was
+                # already there isn't ours to stop.
+                if not pre_was_active:
+                    try:
+                        await self.manager.stop_session()
+                    except Exception as stop_err:
+                        logger.warning(
+                            f"stop_session after failed start also failed: {stop_err}"
+                        )
+                return ToolResult.failed(str(e))
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")
         if not endpoint:
@@ -312,51 +332,57 @@ class RunPodFeature(Feature):
             "pod_type": pod_type or None,
         }
 
-        # Pre-flight: was a session already active before we touched
-        # the manager? Same load-bearing signal as
-        # generate_image_on_runpod — discriminates orphaned-pod cleanup
-        # (safe) from tearing down an unrelated active session
-        # (catastrophic). Catch broadly: get_status itself can raise
-        # raw provider exceptions; fail safe by assuming a session was
-        # active so we never auto-teardown on unreadable state.
-        try:
-            pre_status = await self.manager.get_status()
-        except Exception as e:
-            logger.warning(
-                f"Pre-flight get_status before start failed; "
-                f"assuming a session may be active and skipping any "
-                f"teardown on subsequent start_session failure: {e}"
-            )
-            pre_was_active = True
-        else:
-            pre_was_active = self._status_was_active(pre_status)
+        # Serialize the preflight + start + cleanup decision against
+        # other concurrent acquire-style callers (codex round 8). The
+        # manager's lock only covers each method body; it doesn't span
+        # our read-then-attempt-then-discriminate sequence.
+        async with self._start_lock:
+            # Pre-flight: was a session already active before we
+            # touched the manager? Discriminates orphaned-pod cleanup
+            # (safe) from tearing down an unrelated active session
+            # (catastrophic). Catch broadly: get_status itself can
+            # raise raw provider exceptions; fail safe by assuming a
+            # session was active so we never auto-teardown on
+            # unreadable state.
+            try:
+                pre_status = await self.manager.get_status()
+            except Exception as e:
+                logger.warning(
+                    f"Pre-flight get_status before start failed; "
+                    f"assuming a session may be active and skipping any "
+                    f"teardown on subsequent start_session failure: {e}"
+                )
+                pre_was_active = True
+            else:
+                pre_was_active = self._status_was_active(pre_status)
 
-        # Catch broadly: start_session can raise raw provider/SDK
-        # exceptions (HTTPError, TimeoutError, etc.) AFTER creating a
-        # pod, during the readiness wait or status refresh. Those
-        # would otherwise escape the @tool envelope and leave a
-        # billing-active pod the user can't see (codex round 6).
-        try:
-            status = await self.manager.start_session(
-                task_profile=profile_key,
-                model_name=target_model,
-                ttl_seconds=ttl,
-                pod_type=pod_type or None,
-                metadata=metadata,
-            )
-        except Exception as e:
-            # Best-effort teardown only when there was nothing active
-            # before — any session state we leave behind is OUR doing
-            # (post-creation readiness raise, etc.). If a session was
-            # already active, it's not ours to stop.
-            if not pre_was_active:
-                try:
-                    await self.manager.stop_session()
-                except Exception as stop_err:
-                    logger.warning(
-                        f"stop_session after failed start also failed: {stop_err}"
-                    )
-            return ToolResult.failed(str(e))
+            # Catch broadly: start_session can raise raw provider/SDK
+            # exceptions (HTTPError, TimeoutError, etc.) AFTER
+            # creating a pod, during the readiness wait or status
+            # refresh. Those would otherwise escape the @tool envelope
+            # and leave a billing-active pod the user can't see
+            # (codex round 6).
+            try:
+                status = await self.manager.start_session(
+                    task_profile=profile_key,
+                    model_name=target_model,
+                    ttl_seconds=ttl,
+                    pod_type=pod_type or None,
+                    metadata=metadata,
+                )
+            except Exception as e:
+                # Best-effort teardown only when there was nothing
+                # active before — any session state we leave behind is
+                # OUR doing (post-creation readiness raise, etc.). If
+                # a session was already active, it's not ours to stop.
+                if not pre_was_active:
+                    try:
+                        await self.manager.stop_session()
+                    except Exception as stop_err:
+                        logger.warning(
+                            f"stop_session after failed start also failed: {stop_err}"
+                        )
+                return ToolResult.failed(str(e))
 
         if profile_key == "llm":
             self._attach_gpu_backend(status)
