@@ -954,3 +954,205 @@ async def test_concurrent_start_does_not_tear_down_winners_pod(monkeypatch):
     )
     # Winner's session is still active.
     assert fake_manager._active is True
+
+
+@pytest.mark.asyncio
+async def test_start_router_attach_failure_returns_partial(monkeypatch):
+    """Codex round 9: ``llm_service.switch_backend`` and
+    ``get_backend_status`` were called outside the ToolResult
+    envelope. If they raise, the pod is up but the @tool escapes
+    with an exception. Pod-up + router-failed should be
+    ToolResult.partial — that's exactly the partial-success case."""
+
+    class _BrokenSwitchService(DummyLLMService):
+        def switch_backend(self, backend, *, config):
+            raise RuntimeError("router adapter broken")
+
+    fake_manager = FakeRunPodManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=_BrokenSwitchService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="on", task_profile="llm")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL, (
+        f"expected PARTIAL (pod up, router failed); got {result.status}"
+    )
+    assert "Started RunPod session" in result.confirmation
+    assert "router attach failed" in result.confirmation.lower()
+    assert "router adapter broken" in result.error
+    assert result.data["session"]["pod_id"] == "pod-123"
+    # Pod is still up — confirm the manager actually started it.
+    assert fake_manager.started is True
+
+
+@pytest.mark.asyncio
+async def test_stop_router_detach_failure_returns_partial(monkeypatch):
+    """Codex round 9: ``_detach_gpu_backend`` was called outside the
+    ToolResult envelope in _stop. A broken detach should produce
+    ToolResult.partial, not escape as exception. The pod IS stopped
+    either way; partial surfaces the router caveat."""
+
+    class _BrokenDetachService(DummyLLMService):
+        def _deactivate_remote_backend(self, reason=None):
+            raise RuntimeError("router detach broken")
+
+    fake_manager = FakeRunPodManager()
+    fake_manager.started = True  # Pretend something is running.
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=_BrokenDetachService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="off")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "Stopped RunPod session" in result.confirmation
+    assert "router detach failed" in result.confirmation.lower()
+    assert "router detach broken" in result.error
+    # Pod was actually stopped.
+    assert fake_manager.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_status_router_failure_degrades_to_warning(monkeypatch):
+    """Codex round 9: for inspection-only commands (status, logs), a
+    broken router should NOT fail the whole tool. The user wants the
+    manager session info even if the router can't be inspected.
+    Surface the router error inside the data payload."""
+
+    class _BrokenRouterService(DummyLLMService):
+        def get_backend_status(self):
+            raise RuntimeError("router status broken")
+
+    fake_manager = FakeRunPodManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=_BrokenRouterService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="status")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK, (
+        "router failure on a read-only status command should NOT fail "
+        "the whole tool — degrade gracefully with a warning payload"
+    )
+    assert "router status broken" in str(result.data["router"])
+
+
+@pytest.mark.asyncio
+async def test_failed_start_surfaces_teardown_error_in_data(monkeypatch):
+    """Codex round 9: when start_session raises AND the best-effort
+    teardown also fails, the previous code only logged the teardown
+    error. Production stop_session clears _session BEFORE
+    provider.stop_pod, so a failed stop_pod leaves the manager with
+    no handle for retry. The orphan is invisible to the user.
+    Surface teardown_error + warning in the ToolResult.failed data."""
+    import asyncio as _asyncio
+
+    class _DoubleFailManager(FakeRunPodManager):
+        async def get_status(self, **_):
+            return {"active": False, "status": "offline"}
+
+        async def start_session(self, **_):
+            raise RuntimeError("readiness timeout post-creation")
+
+        async def stop_session(self):
+            raise RuntimeError("provider 503 on stop_pod")
+
+    fake_manager = _DoubleFailManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.manage_gpu(action="on", task_profile="llm")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "readiness timeout" in result.error
+    # CRITICAL: teardown failure must be surfaced so the user knows
+    # there's an orphan they need to clean up out of band.
+    assert "teardown_error" in result.data, (
+        "failed teardown after failed start was silently logged; the "
+        "orphan pod is invisible to the user"
+    )
+    assert "provider 503 on stop_pod" in result.data["teardown_error"]
+    assert "warning" in result.data
+    assert "orphan" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_serializes_with_in_flight_start(monkeypatch):
+    """Codex round 9: _stop must take _start_lock to prevent
+    stop-during-start races. Production start_session sets _session,
+    releases the manager's lock, then runs readiness wait. A
+    concurrent !gpu off can clear _session mid-readiness, producing
+    a spurious 'start failed' message after the user already chose
+    to stop."""
+    import asyncio as _asyncio
+
+    start_release = _asyncio.Event()
+    stop_observed_lock_held = _asyncio.Event()
+
+    class _SlowStartManager(FakeRunPodManager):
+        async def start_session(self, **kwargs):
+            # Block inside start_session so we know stop arrives
+            # while start is in flight.
+            await start_release.wait()
+            self.started = True
+            return {
+                "active": True,
+                "status": "ready",
+                "pod_id": "pod-1",
+                "task_profile": kwargs["task_profile"],
+                "model_name": "llama-3",
+                "remaining_ttl_seconds": 1800,
+                "inference_url": "http://gpu:8000/v1",
+            }
+
+    fake_manager = _SlowStartManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    # Kick off a start that blocks inside start_session.
+    start_task = _asyncio.create_task(
+        feature.manage_gpu(action="on", task_profile="llm")
+    )
+    # Give start time to acquire _start_lock and enter start_session.
+    await _asyncio.sleep(0.05)
+
+    # Kick off a stop. With the round-9 fix, this must wait for
+    # start to finish (lock held). Without the fix, stop would
+    # proceed immediately.
+    stop_task = _asyncio.create_task(feature.manage_gpu(action="off"))
+    # Give stop a chance to attempt the lock.
+    await _asyncio.sleep(0.05)
+
+    assert not stop_task.done(), (
+        "_stop must block on _start_lock while a start is in flight"
+    )
+
+    # Release start; stop should now proceed.
+    start_release.set()
+
+    start_result, stop_result = await _asyncio.gather(start_task, stop_task)
+
+    assert isinstance(start_result, ToolResult)
+    assert isinstance(stop_result, ToolResult)
+    assert start_result.status is ToolResultStatus.OK
+    assert stop_result.status is ToolResultStatus.OK
+    # The serialization order is: start completed first (lock held),
+    # then stop saw the started session and stopped it.
+    assert fake_manager.stop_calls == 1

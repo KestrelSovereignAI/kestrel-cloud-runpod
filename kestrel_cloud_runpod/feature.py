@@ -264,10 +264,16 @@ class RunPodFeature(Feature):
         except Exception as e:
             logger.warning(f"stop_session after image gen failed: {e}")
             teardown = {"warning": str(e)}
-        self._detach_gpu_backend(
-            "image generation failed" if image_error is not None
-            else "image generation completed"
-        )
+        # Wrap detach in try/except (codex round 9): the LLM service
+        # could raise, and image-gen has already done its work — we
+        # don't want a router cleanup failure to hide the result.
+        try:
+            self._detach_gpu_backend(
+                "image generation failed" if image_error is not None
+                else "image generation completed"
+            )
+        except Exception as detach_err:
+            logger.warning(f"router detach after image gen failed: {detach_err}")
 
         if image_error is not None:
             return ToolResult.failed(
@@ -375,24 +381,66 @@ class RunPodFeature(Feature):
                 # active before — any session state we leave behind is
                 # OUR doing (post-creation readiness raise, etc.). If
                 # a session was already active, it's not ours to stop.
+                # Surface teardown errors in the ToolResult data
+                # (codex round 9): production stop_session clears
+                # ``_session`` BEFORE provider.stop_pod, so a failed
+                # stop_pod leaves the manager with no handle for a
+                # later retry. The orphan is invisible to the user
+                # unless we tell them.
+                teardown_error: Optional[str] = None
                 if not pre_was_active:
                     try:
                         await self.manager.stop_session()
                     except Exception as stop_err:
+                        teardown_error = str(stop_err)
                         logger.warning(
                             f"stop_session after failed start also failed: {stop_err}"
                         )
-                return ToolResult.failed(str(e))
+                fail_data: Dict[str, Any] = {"action": "start"}
+                if teardown_error is not None:
+                    fail_data["teardown_error"] = teardown_error
+                    fail_data["warning"] = (
+                        "best-effort teardown after failed start_session "
+                        "also failed; manager may have lost the pod handle "
+                        "(stop_session clears _session before provider.stop_pod). "
+                        "Inspect the RunPod console directly for orphan pods."
+                    )
+                return ToolResult.failed(str(e), data=fail_data)
 
-        if profile_key == "llm":
-            self._attach_gpu_backend(status)
+        # Wrap router/attach in try/except (codex round 9): if
+        # ``llm_service.switch_backend`` or ``get_backend_status``
+        # raises (broken adapter, unexpected backend state, etc.),
+        # the pod is up but the @tool would still escape with an
+        # exception. Pod started + router failed = ToolResult.partial,
+        # which is exactly the partial-success case the envelope was
+        # designed for.
+        try:
+            if profile_key == "llm":
+                self._attach_gpu_backend(status)
+            router_payload = self._router_status()
+        except Exception as router_err:
+            logger.error(
+                f"Router/attach failed after successful pod start: {router_err}"
+            )
+            return ToolResult.partial(
+                confirmation=(
+                    f"Started RunPod session (profile: {profile_key}); "
+                    "LLM router attach failed"
+                ),
+                error=f"router attach error: {router_err}",
+                data={
+                    "action": "start",
+                    "session": status,
+                    "router_error": str(router_err),
+                },
+            )
 
         return ToolResult.ok(
             confirmation=f"Started RunPod session (profile: {profile_key})",
             data={
                 "action": "start",
                 "session": status,
-                "router": self._router_status(),
+                "router": router_payload,
             },
         )
 
@@ -404,16 +452,52 @@ class RunPodFeature(Feature):
         stop (#1042 honesty contract). The manager returns a status
         like ``terminating`` or ``terminated`` when there was a pod
         and ``offline`` when the call was a no-op.
+
+        Acquires the same ``_start_lock`` used by ``_start`` to
+        prevent stop-vs-start races (codex round 9): if a !gpu on
+        is in its readiness wait, the manager has already returned
+        from start_session but the feature is still inside its
+        guarded section. Without this lock, a concurrent !gpu off
+        could clear ``_session`` while readiness polls, producing
+        a spurious "start failed" message after the user already
+        chose to stop.
         """
-        # Catch broadly: provider/SDK calls inside stop_session can
-        # raise raw HTTPError/Timeout that aren't RunPodManagerError;
-        # those would otherwise escape the @tool envelope (codex round
-        # 6 catch).
-        try:
-            status = await self.manager.stop_session()
-        except Exception as e:
-            return ToolResult.failed(str(e))
-        self._detach_gpu_backend("Requested via !gpu off")
+        async with self._start_lock:
+            # Catch broadly: provider/SDK calls inside stop_session
+            # can raise raw HTTPError/Timeout that aren't
+            # RunPodManagerError; those would otherwise escape the
+            # @tool envelope (codex round 6 catch).
+            try:
+                status = await self.manager.stop_session()
+            except Exception as e:
+                return ToolResult.failed(str(e))
+            # Wrap router detach (codex round 9). If the LLM service
+            # raises during detach (broken adapter, etc.), the pod IS
+            # stopped — return partial with the teardown caveat.
+            try:
+                self._detach_gpu_backend("Requested via !gpu off")
+                router_payload = self._router_status()
+            except Exception as router_err:
+                logger.error(
+                    f"Router detach failed after successful pod stop: {router_err}"
+                )
+                was_no_op = (
+                    status.get("status") == "offline" and not status.get("active")
+                )
+                base_confirmation = (
+                    "No active RunPod session to stop (no-op)"
+                    if was_no_op
+                    else "Stopped RunPod session"
+                )
+                return ToolResult.partial(
+                    confirmation=f"{base_confirmation}; LLM router detach failed",
+                    error=f"router detach error: {router_err}",
+                    data={
+                        "action": "stop",
+                        "session": status,
+                        "router_error": str(router_err),
+                    },
+                )
         was_no_op = status.get("status") == "offline" and not status.get("active")
         confirmation = (
             "No active RunPod session to stop (no-op)"
@@ -425,7 +509,7 @@ class RunPodFeature(Feature):
             data={
                 "action": "stop",
                 "session": status,
-                "router": self._router_status(),
+                "router": router_payload,
             },
         )
 
@@ -443,7 +527,7 @@ class RunPodFeature(Feature):
             data={
                 "action": "status",
                 "session": status,
-                "router": self._router_status(),
+                "router": self._safe_router_status(),
             },
         )
 
@@ -468,7 +552,7 @@ class RunPodFeature(Feature):
                 "action": "logs",
                 "lines": lines,
                 "logs": logs,
-                "router": self._router_status(),
+                "router": self._safe_router_status(),
             },
         )
 
@@ -507,6 +591,20 @@ class RunPodFeature(Feature):
         if not self.llm_service:
             return None
         return self.llm_service.get_backend_status()
+
+    def _safe_router_status(self) -> Optional[Dict[str, Any]]:
+        """Read-only router-status fetch that degrades to a warning
+        payload if the LLM service raises. Used by ``_status`` and
+        ``_logs`` (codex round 9): for inspection-only commands, a
+        broken router shouldn't fail the whole tool — surface the
+        error in the data payload instead so the user sees both the
+        manager session info and the router caveat.
+        """
+        try:
+            return self._router_status()
+        except Exception as e:
+            logger.warning(f"router_status read failed: {e}")
+            return {"warning": f"router_status unavailable: {e}"}
 
     @staticmethod
     def _status_was_active(pre_status: Dict[str, Any]) -> bool:
