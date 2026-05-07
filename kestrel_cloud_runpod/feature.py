@@ -144,20 +144,36 @@ class RunPodFeature(Feature):
                 ttl_seconds=ttl,
             )
         except RunPodManagerError as e:
-            # ``start_session`` calls ``provider.start_pod`` and then
-            # waits for readiness. If the wait times out (or any
-            # other ``RunPodManagerError`` raises after the pod was
-            # created), the manager's internal ``_session`` field is
-            # already set and the pod is billing. Best-effort
-            # teardown before returning so we don't leak GPU cost.
-            try:
-                await self.manager.stop_session()
-            except Exception as stop_err:
-                logger.warning(
-                    f"stop_session after failed start also failed "
-                    f"(may be pre-pod state): {stop_err}"
-                )
-            return ToolResult.failed(str(e))
+            err_msg = str(e)
+            # ``start_session`` raises in two distinct conditions and
+            # we MUST handle them differently:
+            #
+            # (1) Pre-creation: another session is already active.
+            #     The manager refuses to overwrite. NO new pod was
+            #     started; the active session belongs to someone
+            #     else (e.g., an LLM pod). We must NOT call
+            #     ``stop_session()`` — that would tear down the
+            #     unrelated active session.
+            #
+            # (2) Post-creation: ``provider.start_pod`` already ran,
+            #     a pod is billing, and ``_wait_until_ready`` (or
+            #     similar) raised. We MUST best-effort
+            #     ``stop_session()`` to avoid cost runaway.
+            #
+            # The manager flags case (1) with a specific error
+            # message ("A RunPod session is already active"). For
+            # any other RunPodManagerError, assume we created a pod
+            # and clean up.
+            pre_creation = "already active" in err_msg.lower()
+            if not pre_creation:
+                try:
+                    await self.manager.stop_session()
+                except Exception as stop_err:
+                    logger.warning(
+                        f"stop_session after failed start also failed "
+                        f"(may be pre-pod state): {stop_err}"
+                    )
+            return ToolResult.failed(err_msg)
 
         endpoint = image_status.get("image_endpoint") or image_status.get("inference_url")
         if not endpoint:

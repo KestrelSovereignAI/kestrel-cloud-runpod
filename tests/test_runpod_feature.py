@@ -266,6 +266,45 @@ async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_image_generation_does_not_stop_unrelated_active_session(monkeypatch):
+    """When ``generate_image_on_runpod`` is called while another
+    session (e.g., an LLM pod) is already active,
+    ``manager.start_session`` raises ``"A RunPod session is already
+    active"`` BEFORE creating an image pod. Our catch block must
+    NOT call ``stop_session()`` — that would tear down the
+    unrelated, perfectly-fine LLM session.
+
+    This is exactly the regression codex round 3 caught: the
+    teardown-on-failure logic for readiness-timeout MUST NOT trip
+    on the pre-creation conflict case.
+    """
+
+    class _AlreadyActiveManager(FakeRunPodManager):
+        async def start_session(self, **_):
+            raise RunPodManagerError("A RunPod session is already active")
+
+    fake_manager = _AlreadyActiveManager()
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
+
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    await feature.initialize()
+
+    result = await feature.generate_image_on_runpod(prompt="anything")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "already active" in result.error.lower()
+    # The unrelated active session MUST NOT have been touched.
+    assert fake_manager.stop_calls == 0, (
+        "regression of codex round 3: image-gen helper called "
+        "stop_session on a pre-existing unrelated session that "
+        "happened to be active when image generation was attempted"
+    )
+
+
+@pytest.mark.asyncio
 async def test_image_generation_startup_failure_still_stops_pod(monkeypatch):
     """When ``manager.start_session`` raises (e.g., ``_wait_until_ready``
     times out after ``provider.start_pod`` already created the
