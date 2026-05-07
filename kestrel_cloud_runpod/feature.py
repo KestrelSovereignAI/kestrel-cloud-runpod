@@ -65,15 +65,17 @@ class RunPodFeature(Feature):
         pod_type: str = "",
         lines: str = "100",
     ) -> ToolResult:
-        if getattr(self, 'disabled', False):
+        # Single guard for both disabled AND pre-initialized states
+        # (codex round 12). Without this, calling manage_gpu before
+        # initialize() runs raises AttributeError for ``manager`` /
+        # ``_start_lock``, escaping the @tool envelope through the
+        # legacy ``{success: False}`` shape that the audit hook
+        # can't read.
+        not_ready_reason = self._not_ready_reason()
+        if not_ready_reason is not None:
             return ToolResult.failed(
-                "RunPod feature is disabled",
-                data={
-                    "action": action,
-                    "reason": getattr(
-                        self, "disabled_reason", "RUNPOD_API_KEY not set"
-                    ),
-                },
+                f"RunPod feature is unavailable: {not_ready_reason}",
+                data={"action": action, "reason": not_ready_reason},
             )
         action_normalized = (action or "status").lower()
 
@@ -139,21 +141,16 @@ class RunPodFeature(Feature):
             returning, even on the failure paths, so cost runaway
             cannot persist.
         """
-        # Disabled-feature guard (codex round 11). When initialize()
-        # caught a missing RUNPOD_API_KEY it set ``self.manager =
-        # None`` and ``self.disabled = True``. ``manage_gpu`` checks
-        # this; ``generate_image_on_runpod`` previously did not, so
-        # calling it on a disabled feature dereferenced None and
-        # raised AttributeError instead of returning ToolResult.
-        if getattr(self, "disabled", False) or self.manager is None:
+        # Disabled / pre-initialized guard (codex rounds 11 + 12).
+        # ``self.manager = None`` after a failed init; missing
+        # ``manager`` attribute entirely if initialize() never ran.
+        # Either way, we MUST return ToolResult.failed instead of
+        # AttributeError-ing on the next manager dereference.
+        not_ready_reason = self._not_ready_reason()
+        if not_ready_reason is not None:
             return ToolResult.failed(
-                "RunPod feature is disabled",
-                data={
-                    "action": "generate_image",
-                    "reason": getattr(
-                        self, "disabled_reason", "RUNPOD_API_KEY not set"
-                    ),
-                },
+                f"RunPod feature is unavailable: {not_ready_reason}",
+                data={"action": "generate_image", "reason": not_ready_reason},
             )
 
         prompt = prompt.strip()
@@ -719,6 +716,27 @@ class RunPodFeature(Feature):
         except Exception as e:
             logger.warning(f"router_status read failed: {e}")
             return {"warning": f"router_status unavailable: {e}"}
+
+    def _not_ready_reason(self) -> Optional[str]:
+        """Return a human-readable reason if the feature isn't ready
+        to serve commands, or None if it is. Covers both:
+
+        - Disabled (initialize ran but the manager wouldn't construct
+          — e.g. missing RUNPOD_API_KEY → ``self.disabled = True``).
+        - Pre-initialized (initialize never ran, so ``manager`` /
+          ``_start_lock`` attributes don't exist yet).
+
+        Without this guard, the second case would AttributeError on
+        the first manager dereference and escape the @tool envelope
+        as the legacy ``{success: False}`` shape (codex round 12).
+        """
+        if getattr(self, "disabled", False):
+            return getattr(self, "disabled_reason", "RUNPOD_API_KEY not set")
+        if not hasattr(self, "manager") or self.manager is None:
+            return "feature not initialized (initialize() has not been called)"
+        if not hasattr(self, "_start_lock"):
+            return "feature not initialized (initialize() has not been called)"
+        return None
 
     @staticmethod
     def _status_was_active(pre_status: Dict[str, Any]) -> bool:

@@ -231,7 +231,7 @@ async def test_disabled_feature_returns_failed(monkeypatch):
 
     assert isinstance(result, ToolResult)
     assert result.status is ToolResultStatus.ERROR
-    assert "disabled" in result.error.lower()
+    assert "unavailable" in result.error.lower()
     assert "RUNPOD_API_KEY" in result.data["reason"]
 
 
@@ -1414,5 +1414,30 @@ async def test_disabled_feature_image_gen_returns_failed_not_attribute_error(
 
     assert isinstance(result, ToolResult)
     assert result.status is ToolResultStatus.ERROR
-    assert "disabled" in result.error.lower()
+    assert "unavailable" in result.error.lower()
     assert result.data["reason"] == "RUNPOD_API_KEY not set"
+
+
+@pytest.mark.asyncio
+async def test_pre_initialize_returns_failed_not_attribute_error():
+    """Codex round 12: if manage_gpu / generate_image_on_runpod is
+    invoked before initialize() runs (e.g. test misconfig, framework
+    bug), the previous code AttributeError-ed on the manager
+    dereference. Now both paths must return ToolResult.failed instead
+    of escaping the @tool envelope as the legacy {success: False}
+    shape."""
+    feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
+    # Deliberately do NOT call await feature.initialize().
+    assert not hasattr(feature, "manager") or feature.manager is None
+
+    for action in ("status", "on", "off", "logs"):
+        result = await feature.manage_gpu(action=action)
+        assert isinstance(result, ToolResult), action
+        assert result.status is ToolResultStatus.ERROR, action
+        assert "unavailable" in result.error.lower(), action
+        assert "not initialized" in result.data["reason"], action
+
+    image_result = await feature.generate_image_on_runpod(prompt="anything")
+    assert isinstance(image_result, ToolResult)
+    assert image_result.status is ToolResultStatus.ERROR
+    assert "not initialized" in image_result.data["reason"]
