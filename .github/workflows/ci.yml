@@ -7,13 +7,14 @@ on:
       - 'feat/*'
       - 'fix/*'
       - 'extract/*'
+      - 'codex/*'
   pull_request:
     branches: [main]
   workflow_dispatch:
   workflow_call:
 
 env:
-  PYTHON_VERSION: "3.13"
+  PYTHON_VERSION: "3.14"
 
 jobs:
   lint-and-imports:
@@ -86,7 +87,7 @@ jobs:
     needs: build-check
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install uv

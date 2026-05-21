@@ -5,6 +5,16 @@ from kestrel_cloud_runpod.manager import RunPodManager
 from kestrel_cloud_runpod.providers import DirectRunPodProvider
 from kestrel_cloud_runpod.models import RunPodManagerError, PodStatus, RunPodSession
 
+MINIMAL_RUNPOD_CONFIG = {
+    "profiles": {
+        "llm": {
+            "name": "Test LLM",
+            "gpu_type_id": "NVIDIA RTX A5000",
+            "image_name": "runpod/pytorch:latest",
+        }
+    }
+}
+
 @pytest.fixture
 def mock_runpod():
     with patch("kestrel_cloud_runpod.providers.runpod") as mock:
@@ -58,7 +68,7 @@ class TestRunPodLogs:
         mock_provider.exec_command.return_value = "log line 1\nlog line 2"
         
         with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
-            manager = RunPodManager()
+            manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
         
         # Setup active session
         session = RunPodSession(
@@ -89,7 +99,7 @@ class TestRunPodLogs:
     async def test_get_logs_no_session(self):
         mock_provider = MagicMock(spec=DirectRunPodProvider)
         with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
-            manager = RunPodManager()
+            manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
         manager._session = None
         
         with pytest.raises(RunPodManagerError, match="No active session"):
