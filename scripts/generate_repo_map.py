@@ -41,6 +41,7 @@ EXCLUDE_DIRS = {
     "playwright-report",
 }
 EXCLUDE_SUFFIXES = {".pyc", ".lock"}
+EXCLUDE_BASENAMES = {"package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml"}
 
 # Top-level docs listed first, in this order, within the root section.
 ROOT_DOCS_PRIORITY = [
@@ -92,7 +93,8 @@ def is_excluded(path: str) -> bool:
     parts = Path(path).parts
     if any(p in EXCLUDE_DIRS for p in parts):
         return True
-    return Path(path).suffix in EXCLUDE_SUFFIXES
+    p = Path(path)
+    return p.suffix in EXCLUDE_SUFFIXES or p.name in EXCLUDE_BASENAMES
 
 
 def first_sentence(text: str, max_chars: int = 200) -> str:
