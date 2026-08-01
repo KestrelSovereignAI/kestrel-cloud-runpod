@@ -1,0 +1,421 @@
+"""Runpod v2 capacity, readiness, and teardown adapter for Ollama leases."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from .clients import RunpodControlPlaneClient
+from .models import (
+    ComputeProduct,
+    EndpointCreateRequest,
+    FlashBoot,
+    GPUProfile,
+    PlacementDecision,
+    PodCreateRequest,
+    RunPodAPIError,
+    RunPodManagerError,
+)
+from .ollama_contracts import (
+    OllamaLeaseMode,
+    OllamaLeaseRequest,
+    OllamaPlacementPlan,
+    OllamaReadinessObservation,
+    OllamaResourceType,
+    ProvisionedOllamaResource,
+    select_ollama_plan,
+)
+from .placement import select_gpu
+from .providers import _resolve_env_vars
+
+RUNPOD_SERVERLESS_MAX_IDLE_TIMEOUT_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class RunpodOllamaDeployment:
+    """Explicit runtime settings; image and region policy remain profile-owned."""
+
+    profile: GPUProfile
+    serverless_workers_max: int
+    serverless_request_count: int
+    serverless_execution_timeout_ms: int
+    serverless_flashboot: FlashBoot
+    http_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.serverless_workers_max < 1 or self.serverless_request_count < 1:
+            raise ValueError(
+                "Runpod Ollama Serverless worker settings must be positive"
+            )
+        if self.serverless_execution_timeout_ms < 1 or self.http_timeout_seconds <= 0:
+            raise ValueError("Runpod Ollama endpoint timeouts must be positive")
+
+
+class RunpodOllamaCapacityProvider:
+    """Provision only v2 load-balanced Serverless endpoints or dedicated Pods."""
+
+    def __init__(
+        self,
+        *,
+        client: RunpodControlPlaneClient,
+        deployment: RunpodOllamaDeployment,
+        serverless_api_key: str | None,
+        pod_bearer_token: str | None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if not serverless_api_key and not pod_bearer_token:
+            raise RunPodManagerError(
+                "A restricted Serverless key or Pod inference token is required"
+            )
+        self.client = client
+        self.deployment = deployment
+        self._serverless_api_key = serverless_api_key
+        self._pod_bearer_token = pod_bearer_token
+        self._http_transport = http_transport
+
+    async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
+        products = (
+            (ComputeProduct.SERVERLESS,)
+            if request.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+            else (ComputeProduct.POD,)
+            if request.mode is OllamaLeaseMode.DEDICATED_POD
+            else (ComputeProduct.SERVERLESS, ComputeProduct.POD)
+        )
+        decisions: dict[ComputeProduct, PlacementDecision] = {}
+        failures: list[str] = []
+        for product in products:
+            if product is ComputeProduct.SERVERLESS and not self._serverless_api_key:
+                failures.append(
+                    "SERVERLESS: RUNPOD_SERVERLESS_API_KEY is not configured"
+                )
+                continue
+            if product is ComputeProduct.POD and not self._pod_bearer_token:
+                failures.append("POD: RUNPOD_OLLAMA_BEARER_TOKEN is not configured")
+                continue
+            if (
+                product is ComputeProduct.SERVERLESS
+                and request.idle_timeout_seconds
+                > RUNPOD_SERVERLESS_MAX_IDLE_TIMEOUT_SECONDS
+            ):
+                failures.append(
+                    "SERVERLESS: idle timeout exceeds the v2 endpoint maximum"
+                )
+                continue
+            requirements = request.constraints.requirements(product)
+            try:
+                offers = await asyncio.to_thread(
+                    self.client.list_gpus,
+                    products=(product,),
+                    count=requirements.gpu_count,
+                    cloud=requirements.cloud,
+                    min_cuda_version=requirements.min_cuda_version,
+                )
+                if product is ComputeProduct.SERVERLESS:
+                    offers = tuple(offer for offer in offers if offer.pool)
+                decisions[product] = select_gpu(offers, requirements)
+            except RunPodManagerError as exc:
+                failures.append(f"{product.value}: {exc}")
+        return select_ollama_plan(request, decisions, failures=failures)
+
+    async def provision(
+        self,
+        *,
+        request: OllamaLeaseRequest,
+        plan: OllamaPlacementPlan,
+        resource_name: str,
+    ) -> ProvisionedOllamaResource:
+        profile = self.deployment.profile
+        image = _resolve_env_vars({"image": profile.image_name})["image"]
+        env = _resolve_env_vars(profile.env)
+        # Request fields are data, not configuration templates. Append them only
+        # after trusted profile environment references have been expanded.
+        env["OLLAMA_MODELS_PULL"] = request.model
+        env["HEALTH_CHECK_PATH"] = "/api/tags"
+        if plan.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            if not self._serverless_api_key:
+                raise RunPodManagerError(
+                    "RUNPOD_SERVERLESS_API_KEY is required for Serverless Ollama"
+                )
+            pool = plan.placement.gpu_pool
+            if not pool:
+                raise RunPodManagerError("Selected Serverless GPU has no pool ID")
+            endpoint = await asyncio.to_thread(
+                self.client.create_endpoint,
+                EndpointCreateRequest(
+                    name=resource_name,
+                    image=image,
+                    gpu_pools=(pool,),
+                    endpoint_type="LOAD_BALANCER",
+                    scaling={
+                        "type": "REQUEST_COUNT",
+                        "requestCount": self.deployment.serverless_request_count,
+                    },
+                    gpu_count=plan.placement.gpu_count,
+                    workers_min=0,
+                    workers_max=self.deployment.serverless_workers_max,
+                    idle_timeout_seconds=request.idle_timeout_seconds,
+                    disk_gb=profile.container_disk_gb,
+                    ports=tuple(profile.ports),
+                    env=env,
+                    registry_id=profile.registry_id,
+                    data_center_ids=request.constraints.allowed_data_center_ids,
+                    network_volume_ids=(
+                        (profile.network_volume_id,)
+                        if profile.network_volume_id
+                        else ()
+                    ),
+                    execution_timeout_ms=(
+                        self.deployment.serverless_execution_timeout_ms
+                    ),
+                    flashboot=self.deployment.serverless_flashboot,
+                ),
+            )
+            return ProvisionedOllamaResource(
+                resource_type=plan.resource_type,
+                provider_resource_id=endpoint.id,
+                resource_name=resource_name,
+            )
+        if not self._pod_bearer_token:
+            raise RunPodManagerError(
+                "RUNPOD_OLLAMA_BEARER_TOKEN is required for dedicated Ollama Pods"
+            )
+        env["KESTREL_OLLAMA_BEARER_TOKEN"] = self._pod_bearer_token
+        mounts: Mapping[str, Any] | None = None
+        if profile.network_volume_id:
+            mounts = {
+                "network": [
+                    {
+                        "volumeId": profile.network_volume_id,
+                        "path": profile.volume_mount_path or "/runpod-volume",
+                    }
+                ]
+            }
+        elif profile.volume_gb:
+            mounts = {
+                "persistent": {
+                    "size": profile.volume_gb,
+                    "path": profile.volume_mount_path or "/workspace",
+                }
+            }
+        pod = await asyncio.to_thread(
+            self.client.create_pod,
+            PodCreateRequest(
+                name=resource_name,
+                image=image,
+                gpu_id=plan.placement.gpu_id,
+                gpu_count=plan.placement.gpu_count,
+                cloud=request.constraints.cloud,
+                disk_gb=profile.container_disk_gb,
+                ports=tuple(profile.ports),
+                env=env,
+                registry_id=profile.registry_id,
+                data_center_ids=request.constraints.allowed_data_center_ids,
+                mounts=mounts,
+            ),
+        )
+        return ProvisionedOllamaResource(
+            resource_type=plan.resource_type,
+            provider_resource_id=pod.id,
+            resource_name=resource_name,
+        )
+
+    async def find_resource(
+        self, *, resource_type: OllamaResourceType, resource_name: str
+    ) -> ProvisionedOllamaResource | None:
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            resources = await asyncio.to_thread(self.client.list_endpoints)
+            matches = [item for item in resources if item.name == resource_name]
+        else:
+            resources = await asyncio.to_thread(self.client.list_pods)
+            matches = [item for item in resources if item.name == resource_name]
+        if len(matches) > 1:
+            raise RunPodManagerError(
+                f"Multiple Runpod resources match durable name '{resource_name}'"
+            )
+        if not matches:
+            return None
+        return ProvisionedOllamaResource(
+            resource_type=resource_type,
+            provider_resource_id=matches[0].id,
+            resource_name=resource_name,
+        )
+
+    async def observe(
+        self, resource: ProvisionedOllamaResource
+    ) -> OllamaReadinessObservation:
+        if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            endpoint = await asyncio.to_thread(
+                self.client.get_endpoint, resource.provider_resource_id
+            )
+            base_url = endpoint.request_urls.get("base")
+            health_url = endpoint.request_urls.get("health")
+            provider_ready = bool(
+                health_url
+                and await self._healthy(
+                    health_url, bearer_token=self._serverless_api_key
+                )
+            )
+            models = (
+                await self._models(base_url, bearer_token=self._serverless_api_key)
+                if base_url
+                else ()
+            )
+        else:
+            pod = await asyncio.to_thread(
+                self.client.get_pod, resource.provider_resource_id
+            )
+            base_url = _pod_base_url(
+                resource.provider_resource_id,
+                pod.raw,
+                self.deployment.profile.inference_port,
+                self.deployment.profile.inference_protocol,
+            )
+            health_url = None
+            private_route = bool(
+                base_url and await self._rejects_anonymous_requests(base_url)
+            )
+            provider_ready = pod.status.upper() == "RUNNING" and private_route
+            models = (
+                await self._models(base_url, bearer_token=self._pod_bearer_token)
+                if base_url and private_route
+                else ()
+            )
+        return OllamaReadinessObservation(
+            provider_ready=provider_ready,
+            route_url=base_url,
+            provider_health_url=health_url,
+            model_names=models,
+        )
+
+    async def pull_model(
+        self, resource: ProvisionedOllamaResource, route_url: str, model: str
+    ) -> None:
+        bearer_token = (
+            self._serverless_api_key
+            if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+            else self._pod_bearer_token
+        )
+        if not bearer_token:
+            raise RunPodManagerError(
+                "Ollama model pull has no scoped data-plane credential"
+            )
+        try:
+            async with self._http_client(bearer_token=bearer_token) as client:
+                response = await client.post(
+                    f"{route_url.rstrip('/')}/api/pull",
+                    json={"name": model, "stream": False},
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RunPodManagerError(
+                f"Ollama model pull failed: {type(exc).__name__}"
+            ) from exc
+
+    async def teardown(self, resource: ProvisionedOllamaResource) -> None:
+        try:
+            if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+                await asyncio.to_thread(
+                    self.client.delete_endpoint, resource.provider_resource_id
+                )
+            else:
+                await asyncio.to_thread(
+                    self.client.pod_action, resource.provider_resource_id, "terminate"
+                )
+        except RunPodAPIError as exc:
+            if exc.status_code != 404:
+                raise
+
+    async def _healthy(self, url: str, *, bearer_token: str | None) -> bool:
+        try:
+            async with self._http_client(bearer_token=bearer_token) as client:
+                response = await client.get(url)
+                return 200 <= response.status_code < 300
+        except httpx.HTTPError:
+            return False
+
+    async def _rejects_anonymous_requests(self, base_url: str) -> bool:
+        try:
+            async with self._http_client(bearer_token=None) as client:
+                response = await client.get(f"{base_url.rstrip('/')}/api/tags")
+                return response.status_code in {401, 403}
+        except httpx.HTTPError:
+            return False
+
+    async def _models(
+        self, base_url: str, *, bearer_token: str | None
+    ) -> tuple[str, ...]:
+        try:
+            async with self._http_client(bearer_token=bearer_token) as client:
+                response = await client.get(f"{base_url.rstrip('/')}/api/tags")
+                if response.status_code < 200 or response.status_code >= 300:
+                    return ()
+                payload: object = response.json()
+        except (httpx.HTTPError, ValueError):
+            return ()
+        if not isinstance(payload, Mapping):
+            return ()
+        models = payload.get("models")
+        if not isinstance(models, Sequence) or isinstance(models, (str, bytes)):
+            return ()
+        names: list[str] = []
+        for item in models:
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("name") or item.get("model")
+            if isinstance(name, str) and name:
+                names.append(name)
+        return tuple(names)
+
+    def _http_client(self, *, bearer_token: str | None) -> httpx.AsyncClient:
+        headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else None
+        return httpx.AsyncClient(
+            headers=headers,
+            timeout=self.deployment.http_timeout_seconds,
+            transport=self._http_transport,
+        )
+
+
+def _pod_base_url(
+    pod_id: str,
+    payload: Mapping[str, Any],
+    inference_port: int,
+    protocol: str,
+) -> str | None:
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return None
+    ports = runtime.get("ports")
+    if not isinstance(ports, Sequence) or isinstance(ports, (str, bytes)):
+        return None
+    for item in ports:
+        if not isinstance(item, Mapping):
+            continue
+        private = item.get("private") or item.get("privatePort")
+        try:
+            matches = (
+                isinstance(private, (str, int))
+                and not isinstance(private, bool)
+                and int(private) == inference_port
+            )
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            continue
+        port_type = str(item.get("type", "")).lower()
+        if port_type == "http":
+            return f"https://{pod_id}-{inference_port}.proxy.runpod.net"
+        if protocol.strip().lower() != "https":
+            return None
+        ip = item.get("ip")
+        public = item.get("public") or item.get("publicPort")
+        if (
+            isinstance(ip, str)
+            and isinstance(public, (str, int))
+            and not isinstance(public, bool)
+        ):
+            return f"https://{ip}:{int(public)}"
+    return None

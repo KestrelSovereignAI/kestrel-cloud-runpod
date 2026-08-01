@@ -5,7 +5,7 @@ Combines all RunPod functionality from the mixin classes
 into a single manager class.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .core import RunPodManagerCore
 from .ollama import RunPodOllamaMixin
@@ -23,7 +23,7 @@ class RunPodManager(
     Combines:
     - RunPodManagerCore: SDK operations, profile loading, session management
     - RunPodTrainingMixin: LoRA training methods
-    - RunPodOllamaMixin: Ollama cloud server methods
+    - RunPodOllamaMixin: durable private-Ollama capacity leases
 
     Usage:
         manager = RunPodManager()
@@ -34,15 +34,10 @@ class RunPodManager(
         status = await manager.poll_training_status(session, job_id)
         lora_data = await manager.download_lora(session, job_id)
 
-        # Ollama Cloud
-        session = await manager.start_ollama_pod(["phi4"])
-        base_url = await manager.get_ollama_base_url()
-        # Use base_url with OllamaAdapter
-
-        # Cleanup
-        await manager.terminate_session(session)
+        # Ollama leases use acquire_ollama_lease(request), then explicitly
+        # touch_ollama_lease(...) and release_ollama_lease(...).
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, mode: Optional[str] = None):
+    def __init__(self, config: dict[str, Any] | None = None, mode: str | None = None):
         """Initialize the RunPod manager."""
         super().__init__(config, mode)

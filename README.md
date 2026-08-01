@@ -2,6 +2,8 @@
 
 Runpod GPU cloud provider for Kestrel Sovereign agents. Provision Pods, run LoRA training, manage Pod lifecycle, and submit queue-based Serverless jobs without using Runpod's v1 or GraphQL infrastructure APIs.
 
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Installation
 
 ```bash
@@ -15,8 +17,12 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 | Variable | Description |
 |----------|-------------|
 | `RUNPOD_API_KEY` | RunPod API key (required) |
+| `RUNPOD_SERVERLESS_API_KEY` | Restricted Serverless invocation key for Ollama endpoint probes and model pulls |
+| `RUNPOD_OLLAMA_BEARER_TOKEN` | Workload-scoped token enforced by the reviewed Ollama Pod image |
 | `RUNPOD_CONTROL_PLANE_BASE_URL` | Optional beta/dev override; must end in `/v2` |
 | `RUNPOD_USER_AGENT` | Optional non-empty application User-Agent override |
+| `RUNPOD_OLLAMA_IMAGE` | Reviewed private Ollama Pod/Serverless image |
+| `RUNPOD_OLLAMA_LEASE_DB` | Optional absolute override for the durable SQLite lease store |
 
 Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
 
@@ -26,7 +32,7 @@ Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
 - Standalone API: `RunPodManager` for direct programmatic use
 - `RunpodControlPlaneClient` — typed v2 catalog, Pod, Serverless endpoint, worker/log, and billing client
 - `RunpodServerlessClient` — typed queue job run/status/cancel/retry/health client
-- RunPod-backed Ollama integration (when running large models on rented GPUs)
+- Durable RunPod-backed private Ollama leases with readiness and cost gates
 
 ## Architecture
 
@@ -55,9 +61,13 @@ job = jobs.run("endpoint-id", {"prompt": "hello"})
 status = jobs.status("endpoint-id", job.id)
 ```
 
-Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. The compatibility manager preserves that type, and its LoRA/Ollama helpers halt instead of trying a replacement profile. A production caller must persist its attempt/fingerprint and reconcile by listing or status lookup before authorizing another create.
+Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 
-This package supplies the v2 vendor boundary; it does not turn the legacy in-memory manager TTL into a durable lease. Durable Serverless dispatch belongs to [frinz#688](https://github.com/KestrelSovereignAI/frinz/issues/688), and durable private-inference ownership/reaping belongs to [kestrel-cloud-runpod#9](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/9). Until those consumers land, process-local expiry is not a billing-safety guarantee.
+Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload IDs, the exact model, placement constraints, expected warm utilization, an idle timeout, hard deadline, and maximum spend. The service compares current Pod and Serverless catalog offers. Bursty traffic can use native load-balanced Serverless; sustained sessions can use a dedicated Pod. Queue Serverless is not selected for interactive streaming. `lease.public_route_url` remains `None` until both Runpod health and Ollama `/api/tags` prove the requested model is ready. An external scheduler must run `RunPodManager.reconcile_ollama_leases()` periodically so expiry and teardown retries survive requester crashes. The `kestrel-runpod-reconcile-ollama` command performs one fail-fast pass and is suitable for a timer or job runner.
+
+Control-plane, Serverless data-plane, and Pod workload credentials are separate. This package does not ship the runtime image: `RUNPOD_OLLAMA_IMAGE` must identify a separately built and reviewed image that enforces `Authorization: Bearer $KESTREL_OLLAMA_BEARER_TOKEN`. The provider injects that value from `RUNPOD_OLLAMA_BEARER_TOKEN` and refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. The token is never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
+
+`accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection estimate still compares the expected Serverless initialization, active, and idle-tail window against the expected Pod session.
 
 ### Configuration migration from 0.2
 
