@@ -1,197 +1,260 @@
-"""
-RunPod GPU Providers.
+"""Provider adapters backed by the Runpod v2 REST control plane."""
 
-Contains provider abstractions for direct RunPod API and managed proxy.
-"""
+from __future__ import annotations
 
 import logging
+import os
+import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
+from kestrel_sdk.config.constants import HTTP_TIMEOUT_DEFAULT, HTTP_TIMEOUT_QUICK
 
-try:
-    import paramiko
-except ImportError:
-    paramiko = None  # type: ignore[assignment]
-
-try:
-    import runpod
-    from runpod.cli.utils.rp_info import get_pod_ssh_ip_port
-    from runpod.cli.utils.rp_userspace import find_ssh_key_file
-except ImportError:
-    runpod = None  # type: ignore[assignment]
-    get_pod_ssh_ip_port = None  # type: ignore[assignment]
-    find_ssh_key_file = None  # type: ignore[assignment]
-
-from kestrel_sdk.config.constants import (
-    HTTP_TIMEOUT_DEFAULT,
-    HTTP_TIMEOUT_QUICK,
+from .clients import RunpodControlPlaneClient
+from .models import (
+    CloudType,
+    ComputeProduct,
+    GPUProfile,
+    PlacementRequirements,
+    PodCreateRequest,
+    RunPodManagerError,
 )
-from .models import RunPodManagerError
+from .placement import select_gpu
 
 logger = logging.getLogger(__name__)
+_ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
 
-def _sanitize_env_vars(env_vars: Dict[str, Any]) -> Dict[str, str]:
-    """Drop unset environment values before sending pod env to RunPod."""
-    return {
-        key: str(value)
-        for key, value in env_vars.items()
-        if value is not None
-    }
+def _resolve_env_vars(env_vars: Dict[str, Any]) -> Dict[str, str]:
+    """Resolve required environment references immediately before provisioning."""
+
+    resolved: Dict[str, str] = {}
+    for key, raw_value in env_vars.items():
+        if raw_value is None:
+            continue
+        value = str(raw_value)
+
+        def replace_var(match: re.Match[str], env_key: str = key) -> str:
+            var_name = match.group(1)
+            if var_name not in os.environ:
+                raise RunPodManagerError(
+                    f"Pod env '{env_key}' references unset environment variable "
+                    f"'{var_name}'"
+                )
+            return os.environ[var_name]
+
+        resolved[key] = _ENV_VAR_RE.sub(replace_var, value)
+    return resolved
 
 
 class GPUProvider(ABC):
-    """Abstract provider that knows how to manage pods."""
+    """Abstract provider that knows how to manage Pods."""
 
     @abstractmethod
-    def start_pod(self, profile, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Start a new GPU pod with the given profile and metadata."""
-        ...
+    def start_pod(
+        self, profile: GPUProfile, metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Start a new GPU Pod with the given workload profile."""
 
     @abstractmethod
     def get_status(self, pod_id: str) -> Dict[str, Any]:
-        """Get the current status of a pod."""
-        ...
+        """Get the current status of a Pod."""
 
     @abstractmethod
     def stop_pod(self, pod_id: str) -> Dict[str, Any]:
-        """Stop a running pod."""
-        ...
+        """Stop a running Pod without deleting it."""
 
 
 class DirectRunPodProvider(GPUProvider):
-    """Provider that talks to RunPod directly using the runpod SDK."""
+    """Compatibility provider implemented exclusively on Runpod REST v2."""
 
-    def __init__(self, api_key: str, cloud_type: str = "COMMUNITY"):
-        if runpod is None:
-            raise ImportError(
-                "runpod package is required for DirectRunPodProvider. "
-                "Install it with: pip install kestrel-sovereign[cloud]"
-            )
-        if not api_key:
+    def __init__(
+        self,
+        api_key: str,
+        cloud_type: str = "SECURE",
+        *,
+        client: Optional[RunpodControlPlaneClient] = None,
+        control_plane_base_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
+        if not api_key and client is None:
             raise RunPodManagerError("RUNPOD_API_KEY is required for direct mode")
-        self.api_key = api_key
-        self.cloud_type = cloud_type
-        runpod.api_key = api_key
+        try:
+            self.cloud = CloudType(cloud_type.upper())
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "RUNPOD_CLOUD_TYPE must be SECURE or COMMUNITY"
+            ) from exc
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if control_plane_base_url:
+            client_kwargs["base_url"] = control_plane_base_url
+        if user_agent:
+            client_kwargs["user_agent"] = user_agent
+        self.client = client or RunpodControlPlaneClient(**client_kwargs)
 
-    def start_pod(self, profile, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        pod_config = {
-            "name": metadata.get("name", f"kestrel-{profile.id}"),
-            "image_name": profile.image_name,
-            "gpu_type_id": profile.gpu_type_id,
-            "cloud_type": metadata.get("cloud_type", self.cloud_type),
-            "container_disk_in_gb": profile.container_disk_gb,
-            "ports": ",".join(profile.ports),
-            "env": _sanitize_env_vars({**profile.env, **metadata.get("env_overrides", {})}),
-        }
+    def start_pod(
+        self, profile: GPUProfile, metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        pod_env = _resolve_env_vars(
+            {**profile.env, **metadata.get("env_overrides", {})}
+        )
+        cloud_value = metadata.get("cloud_type", profile.cloud.value)
+        try:
+            cloud = CloudType(str(cloud_value).upper())
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "Pod cloud_type must be SECURE or COMMUNITY"
+            ) from exc
+        requirements = PlacementRequirements(
+            product=ComputeProduct.POD,
+            min_vram_gb=profile.min_vram_gb,
+            gpu_count=profile.gpu_count,
+            cloud=cloud,
+            min_cuda_version=profile.min_cuda_version,
+            max_cost_per_hr=profile.max_cost_per_hr,
+            allowed_gpu_ids=profile.allowed_gpu_ids,
+            allowed_data_center_ids=profile.allowed_data_center_ids,
+            benchmark_id=profile.task_type,
+        )
+        offers = self.client.list_gpus(
+            products=(ComputeProduct.POD,),
+            count=requirements.gpu_count,
+            cloud=requirements.cloud,
+            min_cuda_version=requirements.min_cuda_version,
+        )
+        placement = select_gpu(offers, requirements)
 
-        # Use network volume if specified (persistent storage, survives pod restart)
+        mounts: Optional[Dict[str, Any]] = None
         if profile.network_volume_id:
-            pod_config["network_volume_id"] = profile.network_volume_id
-            # volume_mount_path defaults to /runpod-volume if not specified
-            if profile.volume_mount_path:
-                pod_config["volume_mount_path"] = profile.volume_mount_path
-            logger.info("Using network volume %s mounted at %s",
-                        profile.network_volume_id,
-                        profile.volume_mount_path or "/runpod-volume")
-        else:
-            # Fall back to ephemeral volume (lost on pod termination)
-            pod_config["volume_in_gb"] = profile.volume_gb
+            mounts = {
+                "network": [
+                    {
+                        "volumeId": profile.network_volume_id,
+                        "path": profile.volume_mount_path or "/runpod-volume",
+                    }
+                ]
+            }
+        elif profile.volume_gb:
+            mounts = {
+                "persistent": {
+                    "size": profile.volume_gb,
+                    "path": profile.volume_mount_path or "/workspace",
+                }
+            }
 
-        docker_args = metadata.get("docker_args")
-        if docker_args:
-            pod_config["docker_args"] = docker_args
-        # Use template_id if available (for private registry auth)
-        if profile.template_id:
-            pod_config["template_id"] = profile.template_id
-            logger.info("Using RunPod template %s for registry auth", profile.template_id)
-        logger.info("Creating RunPod pod with config: %s", pod_config["name"])
-        return runpod.create_pod(**pod_config)
-
-    def get_status(self, pod_id: str) -> Dict[str, Any]:
-        result = runpod.get_pod(pod_id)
-        # runpod SDK can return None right after pod creation
-        if result is None:
-            return {"id": pod_id, "status": "PROVISIONING", "desiredStatus": "RUNNING"}
+        pod = self.client.create_pod(
+            PodCreateRequest(
+                name=metadata.get("name", f"kestrel-{profile.id}"),
+                image=profile.image_name,
+                gpu_id=placement.gpu_id,
+                gpu_count=placement.gpu_count,
+                cloud=placement.cloud,
+                disk_gb=profile.container_disk_gb,
+                ports=tuple(profile.ports),
+                env=pod_env,
+                args=metadata.get("docker_args"),
+                registry_id=profile.registry_id,
+                data_center_ids=profile.allowed_data_center_ids,
+                mounts=mounts,
+            )
+        )
+        result = dict(pod.raw)
+        result["_kestrel_placement"] = placement
         return result
 
+    def get_status(self, pod_id: str) -> Dict[str, Any]:
+        return dict(self.client.get_pod(pod_id).raw)
+
     def stop_pod(self, pod_id: str) -> Dict[str, Any]:
-        return runpod.stop_pod(pod_id)
+        pod = self.client.pod_action(pod_id, "stop")
+        return dict(pod.raw) if pod is not None else {"id": pod_id, "status": "EXITED"}
 
     def resume_pod(self, pod_id: str, gpu_count: int = 1) -> Dict[str, Any]:
-        """Resume a stopped pod. Much faster than creating new (~10-30s vs 2-5min)."""
-        return runpod.resume_pod(pod_id, gpu_count)
+        """Start a stopped Pod; v2 chooses currently available compute."""
+
+        if gpu_count != 1:
+            logger.debug("Runpod v2 start action uses the Pod's configured GPU count")
+        pod = self.client.pod_action(pod_id, "start")
+        return (
+            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "STARTING"}
+        )
 
     def terminate_pod(self, pod_id: str) -> Dict[str, Any]:
-        """Permanently destroy a pod. Use stop_pod to pause instead."""
-        return runpod.terminate_pod(pod_id)
+        """Permanently terminate a Pod through the v2 action contract."""
+
+        pod = self.client.pod_action(pod_id, "terminate")
+        return (
+            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "TERMINATED"}
+        )
 
     def list_pods(self) -> List[Dict[str, Any]]:
-        """List all pods for this account."""
-        return runpod.get_pods()
+        return [dict(pod.raw) for pod in self.client.list_pods()]
+
+    def get_logs(self, pod_id: str, tail: int = 100) -> str:
+        """Collect the requested Pod log backfill from the v2 SSE endpoint."""
+
+        if tail < 1 or tail > 5000:
+            raise ValueError("tail must be between 1 and 5000")
+        lines: list[str] = []
+        for event in self.client.iter_pod_logs(
+            pod_id, tail=tail, stream_window_seconds=2.0
+        ):
+            line = event.get("line")
+            if isinstance(line, str):
+                lines.append(line)
+            if len(lines) >= tail:
+                break
+        return "\n".join(lines)
 
     def exec_command(self, pod_id: str, command: str) -> str:
-        """Executes a command on the pod via SSH and returns the output."""
-        try:
-            pod = runpod.get_pod(pod_id)
-            if not pod:
-                raise RunPodManagerError(f"Pod {pod_id} not found")
+        """Reject the removed private-CLI SSH path with migration guidance."""
 
-            ip, port = get_pod_ssh_ip_port(pod)
-            if not ip or not port:
-                raise RunPodManagerError(f"Could not determine SSH IP/port for pod {pod_id}")
-
-            key_file = find_ssh_key_file()
-            if not key_file:
-                raise RunPodManagerError("No SSH key file found")
-
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, port=port, username="root", key_filename=key_file)
-
-            stdin, stdout, stderr = ssh.exec_command(command)
-            output = stdout.read().decode("utf-8")
-            error = stderr.read().decode("utf-8")
-            ssh.close()
-
-            if error:
-                logger.warning("SSH command stderr: %s", error)
-            return output
-        except Exception as e:
-            logger.error("Failed to execute command on pod %s: %s", pod_id, e)
-            raise RunPodManagerError(f"SSH command failed: {e}") from e
+        raise RunPodManagerError(
+            "Arbitrary SSH execution is not available through Runpod REST v2. "
+            "Expose a scoped workload HTTP operation or use the v2 Pod log stream."
+        )
 
 
 class ManagedRunPodProvider(GPUProvider):
-    """Provider proxying through a managed platform API."""
+    """Provider proxying through a managed Kestrel platform API."""
 
     def __init__(self, api_base: str, api_key: str):
         if not api_base or not api_key:
-            raise RunPodManagerError("Managed provider requires KESTREL_API_BASE and KESTREL_API_KEY")
+            raise RunPodManagerError(
+                "Managed provider requires KESTREL_API_BASE and KESTREL_API_KEY"
+            )
         self.api_base = api_base.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+        )
 
-    def start_pod(self, profile, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        payload = {
-            "profile": profile.id,
-            "metadata": metadata,
-        }
-        response = self.session.post(f"{self.api_base}/runpod/pods", json=payload, timeout=HTTP_TIMEOUT_DEFAULT)
+    def start_pod(
+        self, profile: GPUProfile, metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = {"profile": profile.id, "metadata": metadata}
+        response = self.session.post(
+            f"{self.api_base}/runpod/pods",
+            json=payload,
+            timeout=HTTP_TIMEOUT_DEFAULT,
+        )
         response.raise_for_status()
         return response.json()
 
     def get_status(self, pod_id: str) -> Dict[str, Any]:
-        response = self.session.get(f"{self.api_base}/runpod/pods/{pod_id}", timeout=HTTP_TIMEOUT_QUICK)
+        response = self.session.get(
+            f"{self.api_base}/runpod/pods/{pod_id}", timeout=HTTP_TIMEOUT_QUICK
+        )
         response.raise_for_status()
         return response.json()
 
     def stop_pod(self, pod_id: str) -> Dict[str, Any]:
-        response = self.session.post(f"{self.api_base}/runpod/pods/{pod_id}/stop", timeout=HTTP_TIMEOUT_QUICK)
+        response = self.session.post(
+            f"{self.api_base}/runpod/pods/{pod_id}/stop", timeout=HTTP_TIMEOUT_QUICK
+        )
         response.raise_for_status()
         return response.json()

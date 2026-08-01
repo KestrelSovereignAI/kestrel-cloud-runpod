@@ -6,12 +6,13 @@ default_ttl_seconds = 1800
 max_ttl_seconds = 3600
 poll_interval_seconds = 10
 readiness_timeout_seconds = 600
-cloud_type = "COMMUNITY"
+cloud_type = "SECURE"
+# control_plane_base_url = "https://v2-rest.runpod.io/v2" # Override only for beta/dev smoke tests.
+# user_agent = "your-app/runpod-integration"               # Must be a non-empty application UA.
 
 [profiles.llm]
-name = "H100 Single - LLM"
+name = "Large-memory LLM"
 task_type = "llm"
-gpu_type_id = "NVIDIA_H100"
 image_name = "runpod/kestrel-llm:latest"
 container_disk_gb = 40
 volume_gb = 0
@@ -21,10 +22,12 @@ inference_protocol = "http"
 inference_base_path = "/v1"
 image_invoke_path = "/v1/completions"
 default_model = "llama-3-70b-instruct"
-pod_type = "h100-single"
+pod_type = "dedicated-llm"
 max_context_window = 32768
-vram_gb = 80
-cost_per_hr = 4.75
+min_vram_gb = 80
+min_cuda_version = "12.8"
+max_cost_per_hr = 5.00
+gpu_count = 1
 readiness_timeout_seconds = 900
 
 [profiles.llm.env]
@@ -32,9 +35,8 @@ readiness_timeout_seconds = 900
   KESTREL_PROFILE = "llm"
 
 [profiles.image]
-name = "A100 - Image"
+name = "Large-memory image generation"
 task_type = "image"
-gpu_type_id = "NVIDIA_A100"
 image_name = "runpod/kestrel-flux:latest"
 container_disk_gb = 80
 volume_gb = 0
@@ -44,10 +46,12 @@ inference_protocol = "http"
 inference_base_path = "/invoke"
 image_invoke_path = "/invoke"
 default_model = "flux-dev"
-pod_type = "a100-single"
+pod_type = "dedicated-image"
 max_context_window = 4096
-vram_gb = 40
-cost_per_hr = 2.8
+min_vram_gb = 40
+min_cuda_version = "12.8"
+max_cost_per_hr = 3.00
+gpu_count = 1
 
 [profiles.image.env]
   KESTREL_PROFILE = "image"

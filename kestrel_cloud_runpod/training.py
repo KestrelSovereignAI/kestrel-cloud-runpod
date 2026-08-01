@@ -11,16 +11,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.config.constants import (
+    BACKEND_URL_TIMEOUT,
+    BACKEND_URL_TIMEOUT_SHORT,
     HTTP_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_DOWNLOAD,
     HTTP_TIMEOUT_UPLOAD,
     POD_READY_TIMEOUT,
-    BACKEND_URL_TIMEOUT,
-    BACKEND_URL_TIMEOUT_SHORT,
     RUNPOD_STATUS_POLL_INTERVAL,
 )
-from .models import GPUProfile, PodStatus, RunPodManagerError, RunPodSession
-from .providers import DirectRunPodProvider
+
+from .models import (
+    GPUProfile,
+    RunPodAmbiguousResultError,
+    RunPodManagerError,
+    RunPodSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +41,7 @@ class RunPodTrainingMixin:
         self,
         session: RunPodSession,
         timeout: int = 600,  # 10 minutes default (model loading can take 5-10 min)
-        poll_interval: int = 15
+        poll_interval: int = 15,
     ) -> None:
         """
         Wait for training pod's /ready endpoint to return 200.
@@ -63,7 +68,11 @@ class RunPodTrainingMixin:
         ready_url = f"{session.backend_base_url}/ready"
         deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
 
-        logger.info(f"Waiting for training model to load at {ready_url} (may take 5-10 min on first run)...")
+        logger.info(
+            "Waiting for training model to load at %s "
+            "(may take 5-10 min on first run)...",
+            ready_url,
+        )
 
         attempts = 0
         last_status = None
@@ -94,34 +103,50 @@ class RunPodTrainingMixin:
                         if "Training in progress" in str(detail):
                             # Extract the job ID from the message
                             # Format: "Training in progress: {job_id}"
-                            existing_job = str(detail).split(":")[-1].strip() if ":" in str(detail) else "unknown"
+                            existing_job = (
+                                str(detail).split(":")[-1].strip()
+                                if ":" in str(detail)
+                                else "unknown"
+                            )
                             raise RunPodManagerError(
-                                f"Cannot start training - another job is already running on this pod: {existing_job}. "
-                                f"Wait for it to complete or cancel it first."
+                                "Cannot start training - another job is already "
+                                f"running on this pod: {existing_job}. Wait for it "
+                                "to complete or cancel it first."
                             )
 
                         if detail != last_detail:
-                            logger.info(f"Training pod not ready (attempt {attempts}): {detail}")
+                            logger.info(
+                                f"Training pod not ready (attempt {attempts}): {detail}"
+                            )
                             last_detail = detail
 
                     elif response.status_code == 404:
-                        # /ready endpoint doesn't exist - SimpleTuner loads model on-demand
+                        # SimpleTuner loads on demand when /ready is unavailable.
                         # Skip the wait and proceed directly to training
-                        logger.info("Training pod has no /ready endpoint - SimpleTuner loads model on-demand, proceeding...")
+                        logger.info(
+                            "Training Pod has no /ready endpoint; proceeding with "
+                            "SimpleTuner's on-demand model load"
+                        )
                         return
 
                     else:
                         # Unexpected status
-                        logger.warning(f"Unexpected /ready response: {response.status_code}")
+                        logger.warning(
+                            f"Unexpected /ready response: {response.status_code}"
+                        )
 
                 except httpx.ConnectError:
                     if last_status != "connect_error":
-                        logger.info(f"Training pod not yet reachable (attempt {attempts})")
+                        logger.info(
+                            f"Training pod not yet reachable (attempt {attempts})"
+                        )
                         last_status = "connect_error"
 
                 except httpx.TimeoutException:
                     if last_status != "timeout":
-                        logger.warning(f"Training pod /ready timed out (attempt {attempts})")
+                        logger.warning(
+                            f"Training pod /ready timed out (attempt {attempts})"
+                        )
                         last_status = "timeout"
 
                 await asyncio.sleep(poll_interval)
@@ -137,7 +162,7 @@ class RunPodTrainingMixin:
         Start a pod for LoRA training using the training profile.
 
         If persistent_pod_id is configured:
-        - Resume the existing pod if stopped (~10-30s)
+        - Ask v2 to start the existing pod if stopped
         - Use the existing pod if already running (instant)
         - After training, pod should be stopped (paused) not terminated
 
@@ -158,21 +183,24 @@ class RunPodTrainingMixin:
         # Check if training profile has a persistent pod configured
         if "training" in self.profiles:
             profile = self.profiles["training"]
-            # Expand env var at RUNTIME (not at load time) so server doesn't need restart
+            # Expand at runtime so a server restart is unnecessary.
             persistent_pod_id = self._expand_single_env_var(profile.persistent_pod_id)
             if persistent_pod_id:
                 logger.info(f"Using persistent training pod: {persistent_pod_id}")
-                return await self._use_persistent_pod(persistent_pod_id, profile, ttl_seconds)
+                return await self._use_persistent_pod(
+                    persistent_pod_id, profile, ttl_seconds
+                )
 
-        # Try to resume a stopped training pod first (much faster)
+        # Reuse an explicitly stopped Pod when the workload's storage policy permits it.
         stopped_pod = await self.find_stopped_pod("lora_training", "training")
         if stopped_pod:
             try:
                 profile = self._select_profile("training")
-                logger.info("Resuming stopped training pod (10-30s vs 2-5min for new)")
+                logger.info("Starting existing stopped training Pod through Runpod v2")
                 return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
             except RunPodManagerError as e:
                 logger.warning(f"Failed to resume stopped pod: {e}")
+                raise
 
         # Try each profile in order
         last_error = None
@@ -182,15 +210,15 @@ class RunPodTrainingMixin:
 
             try:
                 logger.info(f"Trying training profile: {profile_name}")
-                result = await self.start_session(
+                await self.start_session(
                     task_profile=profile_name,
                     model_name="flux-lora-trainer",
                     ttl_seconds=ttl_seconds,
                     metadata={
                         "name": f"kestrel-lora-{companion_id[:8]}",
                         "companion_id": companion_id,
-                        "purpose": "lora_training"
-                    }
+                        "purpose": "lora_training",
+                    },
                 )
 
                 async with self._lock:
@@ -198,17 +226,28 @@ class RunPodTrainingMixin:
                     if session:
                         # Verify backend URL is available (required for training)
                         if not session.backend_base_url:
-                            logger.error(f"Pod started but no backend URL after ready - check RunPod pod ports")
+                            logger.error(
+                                "Pod started but has no backend URL after readiness; "
+                                "check Runpod Pod ports"
+                            )
                             # Try to stop the pod that has no URL
-                            try:
-                                await self.stop_session()
-                            except Exception:
-                                pass
-                            last_error = RunPodManagerError(f"Pod {session.pod_id} has no backend URL - ports not assigned")
+                            await self.stop_session()
+                            last_error = RunPodManagerError(
+                                f"Pod {session.pod_id} has no backend URL; ports "
+                                "were not assigned"
+                            )
                             continue
-                        logger.info(f"Training pod started with profile {profile_name}, URL: {session.backend_base_url}")
+                        logger.info(
+                            "Training Pod started with profile %s, URL: %s",
+                            profile_name,
+                            session.backend_base_url,
+                        )
                         return session
 
+            except RunPodAmbiguousResultError:
+                # A timed-out create may already be billable. Never try the
+                # next profile until an external reconciler resolves it.
+                raise
             except RunPodManagerError as e:
                 logger.warning(f"Profile {profile_name} failed: {e}")
                 last_error = e
@@ -220,14 +259,13 @@ class RunPodTrainingMixin:
             logger.error(f"All training profiles failed. Last error: {last_error}")
         return None
 
-    async def _use_persistent_pod(self, pod_id: str, profile: GPUProfile, ttl_seconds: int) -> Optional[RunPodSession]:
+    async def _use_persistent_pod(
+        self, pod_id: str, profile: GPUProfile, ttl_seconds: int
+    ) -> Optional[RunPodSession]:
         """
         Use an existing persistent pod - resume if stopped, connect if running.
 
-        This is the preferred mode for training pods:
-        - No startup delay if already running
-        - ~10-30s resume time if stopped
-        - Models stay cached on network volume
+        Readiness time is measured rather than inferred from whether the Pod existed.
         """
         try:
             # Get current pod status
@@ -255,16 +293,24 @@ class RunPodTrainingMixin:
 
             # Resume if stopped/exited
             if status in ("EXITED", "exited", "STOPPED", "stopped"):
-                logger.info(f"Resuming stopped persistent pod {pod_id} (status={status})")
+                logger.info(
+                    f"Resuming stopped persistent pod {pod_id} (status={status})"
+                )
                 gpu_count = 1
                 try:
-                    result = await asyncio.to_thread(self.provider.resume_pod, pod_id, gpu_count)
+                    result = await asyncio.to_thread(
+                        self.provider.resume_pod, pod_id, gpu_count
+                    )
                     logger.info(f"Resume API call returned: {result}")
                 except Exception as resume_err:
                     logger.error(f"Failed to resume pod {pod_id}: {resume_err}")
                     raise
                 # Wait for it to be ready
-                logger.info(f"Waiting for pod {pod_id} to become ready (up to {POD_READY_TIMEOUT}s)...")
+                logger.info(
+                    "Waiting for Pod %s to become ready (up to %ss)...",
+                    pod_id,
+                    POD_READY_TIMEOUT,
+                )
                 await self._wait_for_pod_ready(session, timeout=POD_READY_TIMEOUT)
                 logger.info(f"Pod {pod_id} is now ready")
 
@@ -275,7 +321,9 @@ class RunPodTrainingMixin:
                 self._update_session_from_runtime(session, pod_info)
                 # If no backend URL yet, wait for it
                 if not session.backend_base_url:
-                    await self._wait_for_backend_url(session, timeout=BACKEND_URL_TIMEOUT_SHORT)
+                    await self._wait_for_backend_url(
+                        session, timeout=BACKEND_URL_TIMEOUT_SHORT
+                    )
 
             else:
                 logger.warning(f"Persistent pod {pod_id} in unexpected state: {status}")
@@ -289,14 +337,18 @@ class RunPodTrainingMixin:
                 logger.error(f"Persistent pod {pod_id} has no backend URL")
                 return None
 
-            logger.info(f"Using persistent pod {pod_id}, URL: {session.backend_base_url}")
+            logger.info(
+                f"Using persistent pod {pod_id}, URL: {session.backend_base_url}"
+            )
             return session
 
         except Exception as e:
             logger.error(f"Failed to use persistent pod {pod_id}: {e}")
             return None
 
-    async def _wait_for_pod_ready(self, session: RunPodSession, timeout: int = 300) -> None:
+    async def _wait_for_pod_ready(
+        self, session: RunPodSession, timeout: int = 300
+    ) -> None:
         """Wait for a pod to reach RUNNING status."""
         deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
         while datetime.now(timezone.utc) < deadline:
@@ -314,9 +366,13 @@ class RunPodTrainingMixin:
             logger.debug(f"Pod {session.pod_id} status: {status}, waiting...")
             await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL)
 
-        raise RunPodManagerError(f"Pod {session.pod_id} did not become ready within {timeout}s")
+        raise RunPodManagerError(
+            f"Pod {session.pod_id} did not become ready within {timeout}s"
+        )
 
-    async def _wait_for_backend_url(self, session: RunPodSession, timeout: int = 120) -> None:
+    async def _wait_for_backend_url(
+        self, session: RunPodSession, timeout: int = 120
+    ) -> None:
         """Wait for backend URL to be populated (ports assigned)."""
         deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
         while datetime.now(timezone.utc) < deadline:
@@ -340,7 +396,7 @@ class RunPodTrainingMixin:
         """
         Start a pod for LoRA-based image generation.
 
-        Tries to resume a stopped pod first (~10-30s) before creating new (~2-5min).
+        Reuses an eligible stopped Pod before creating a new one.
 
         Args:
             companion_id: Companion for tracking
@@ -355,24 +411,26 @@ class RunPodTrainingMixin:
             # Try to resume a stopped inference pod first (much faster)
             stopped_pod = await self.find_stopped_pod("lora_inference", "image")
             if stopped_pod:
-                logger.info(f"Resuming stopped inference pod (10-30s vs 2-5min for new)")
+                logger.info("Starting existing stopped inference Pod through Runpod v2")
                 return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
 
             # No stopped pod found, create new one
-            result = await self.start_session(
+            await self.start_session(
                 task_profile="image",
                 model_name="flux-with-lora",
                 ttl_seconds=ttl_seconds,
                 metadata={
                     "name": f"kestrel-selfie-{companion_id[:8]}",
                     "companion_id": companion_id,
-                    "purpose": "lora_inference"
-                }
+                    "purpose": "lora_inference",
+                },
             )
 
             async with self._lock:
                 return self._session
 
+        except RunPodAmbiguousResultError:
+            raise
         except RunPodManagerError as e:
             logger.error(f"Failed to start inference pod for {companion_id}: {e}")
             return None
@@ -383,7 +441,7 @@ class RunPodTrainingMixin:
         avatar_data: bytes,
         companion_id: str,
         callback_url: Optional[str] = None,
-        wait_for_model_ready: bool = True
+        wait_for_model_ready: bool = True,
     ) -> str:
         """
         Submit training job to pod's /train endpoint.
@@ -418,10 +476,13 @@ class RunPodTrainingMixin:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_UPLOAD) as client:
             try:
                 # Use avatar bytes directly from sovereign storage
-                logger.info(f"Using avatar data from sovereign storage: {len(avatar_data)} bytes")
+                logger.info(
+                    "Using avatar data from sovereign storage: %s bytes",
+                    len(avatar_data),
+                )
 
                 # Detect content type from magic bytes
-                if avatar_data[:8] == b'\x89PNG\r\n\x1a\n':
+                if avatar_data[:8] == b"\x89PNG\r\n\x1a\n":
                     content_type = "image/png"
                     filename = "avatar.png"
                 else:
@@ -440,12 +501,18 @@ class RunPodTrainingMixin:
                 response.raise_for_status()
                 result = response.json()
             except httpx.ConnectError as e:
-                raise RunPodManagerError(f"Cannot connect to training pod at {train_url}: {e}") from e
+                raise RunPodManagerError(
+                    f"Cannot connect to training pod at {train_url}: {e}"
+                ) from e
             except httpx.HTTPStatusError as e:
                 error_body = e.response.text[:500] if e.response else "No response body"
-                raise RunPodManagerError(f"Training pod returned HTTP {e.response.status_code}: {error_body}") from e
+                raise RunPodManagerError(
+                    f"Training pod returned HTTP {e.response.status_code}: {error_body}"
+                ) from e
             except httpx.TimeoutException as e:
-                raise RunPodManagerError(f"Timeout connecting to training pod at {train_url}") from e
+                raise RunPodManagerError(
+                    f"Timeout connecting to training pod at {train_url}"
+                ) from e
 
         job_id = result.get("job_id")
         if not job_id:
@@ -485,7 +552,9 @@ class RunPodTrainingMixin:
             except httpx.HTTPStatusError:
                 return None
 
-    async def cancel_training_job(self, session: RunPodSession, job_id: str) -> Dict[str, Any]:
+    async def cancel_training_job(
+        self, session: RunPodSession, job_id: str
+    ) -> Dict[str, Any]:
         """
         Cancel a training job.
 
@@ -538,7 +607,9 @@ class RunPodTrainingMixin:
             logger.warning(f"Force-cleared job lock on pod: {result}")
             return result
 
-    async def poll_training_status(self, session: RunPodSession, job_id: str) -> Dict[str, Any]:
+    async def poll_training_status(
+        self, session: RunPodSession, job_id: str
+    ) -> Dict[str, Any]:
         """
         Get training job status from pod.
 
@@ -586,11 +657,7 @@ class RunPodTrainingMixin:
             return response.content
 
     async def generate_with_lora(
-        self,
-        session: RunPodSession,
-        prompt: str,
-        lora_path: str,
-        num_outputs: int = 1
+        self, session: RunPodSession, prompt: str, lora_path: str, num_outputs: int = 1
     ) -> Dict[str, Any]:
         """
         Generate images using loaded LoRA model.
@@ -621,8 +688,8 @@ class RunPodTrainingMixin:
                     "lora_path": lora_path,
                     "num_outputs": num_outputs,
                     "aspect_ratio": "1:1",
-                    "output_format": "jpg"
-                }
+                    "output_format": "jpg",
+                },
             )
             response.raise_for_status()
             return response.json()

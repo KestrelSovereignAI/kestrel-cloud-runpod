@@ -30,13 +30,19 @@ Usage:
     feature = RunPodFeature(agent)
 """
 
-from importlib.metadata import PackageNotFoundError, version as _version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
 
+from .clients import RunpodControlPlaneClient, RunpodServerlessClient
 from .feature import RunPodFeature
 from .manager import RunPodManager
 from .models import (
+    FlashBoot,
     GPUProfile,
+    PlacementRequirements,
     PodStatus,
+    RunPodAmbiguousResultError,
+    RunPodAPIError,
     RunPodManagerError,
     RunPodSession,
 )
@@ -53,5 +59,11 @@ __all__ = [
     "RunPodSession",
     "PodStatus",
     "GPUProfile",
+    "FlashBoot",
+    "PlacementRequirements",
+    "RunPodAPIError",
+    "RunPodAmbiguousResultError",
+    "RunpodControlPlaneClient",
+    "RunpodServerlessClient",
     "__version__",
 ]
