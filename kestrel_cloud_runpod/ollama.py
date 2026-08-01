@@ -9,10 +9,11 @@ import logging
 from typing import List, Optional
 
 from kestrel_sdk.config.constants import (
-    HTTP_TIMEOUT_QUICK,
     HTTP_TIMEOUT_DOWNLOAD,
+    HTTP_TIMEOUT_QUICK,
 )
-from .models import RunPodSession
+
+from .models import RunPodAmbiguousResultError, RunPodSession
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,14 @@ class RunPodOllamaMixin:
     Requires RunPodManagerCore as base class.
     """
 
-    async def start_ollama_pod(self, models_to_pull: Optional[List[str]] = None) -> Optional[RunPodSession]:
+    async def start_ollama_pod(
+        self, models_to_pull: Optional[List[str]] = None
+    ) -> Optional[RunPodSession]:
         """
         Start an Ollama server pod on RunPod for users without local GPU.
 
         Uses existing switch_backend() mechanism in LLMService to route requests.
-        Tries to resume a stopped pod first (~10-30s) before creating new (~2-5min).
+        Reuses an eligible stopped Pod before creating a new one.
 
         Args:
             models_to_pull: Optional list of models to pre-pull on startup.
@@ -50,24 +53,26 @@ class RunPodOllamaMixin:
             # Try to resume a stopped Ollama pod first (much faster)
             stopped_pod = await self.find_stopped_pod("ollama_server", "ollama")
             if stopped_pod:
-                logger.info("Resuming stopped Ollama pod (10-30s vs 2-5min for new)")
+                logger.info("Starting existing stopped Ollama Pod through Runpod v2")
                 return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
 
             # No stopped pod found, create new one
-            result = await self.start_session(
+            await self.start_session(
                 task_profile="ollama",
                 model_name=profile.default_model,
                 ttl_seconds=ttl_seconds,
                 metadata={
                     "name": "kestrel-ollama",
                     "purpose": "ollama_server",
-                    "env_overrides": env_overrides
-                }
+                    "env_overrides": env_overrides,
+                },
             )
 
             async with self._lock:
                 return self._session
 
+        except RunPodAmbiguousResultError:
+            raise
         except Exception as e:
             logger.error(f"Failed to start Ollama pod: {e}")
             return None
@@ -146,10 +151,11 @@ class RunPodOllamaMixin:
             return False
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DOWNLOAD) as client:  # Long timeout for large models
+            async with httpx.AsyncClient(
+                timeout=HTTP_TIMEOUT_DOWNLOAD
+            ) as client:  # Long timeout for large models
                 response = await client.post(
-                    f"{base_url}/api/pull",
-                    json={"name": model_name, "stream": False}
+                    f"{base_url}/api/pull", json={"name": model_name, "stream": False}
                 )
                 return response.status_code == 200
         except Exception as e:

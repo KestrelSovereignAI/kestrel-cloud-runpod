@@ -42,6 +42,10 @@ jobs:
           print('kestrel_cloud_runpod imports OK; RunPodFeature class:', RunPodFeature.__name__)
           "
         timeout-minutes: 3
+      - name: Validate pinned Runpod v2 OpenAPI contract
+        run: |
+          . .venv/bin/activate
+          python scripts/check_runpod_openapi.py --check-pin
 
   build-check:
     runs-on: ubuntu-latest
@@ -129,5 +133,5 @@ jobs:
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
           . .venv/bin/activate
           uv pip install -e '.[test]'
-          uv run --no-sync pytest tests/ -v --tb=short
+          uv run --no-sync pytest tests/ -v --tb=short -m "not cloud_resource"
         timeout-minutes: 5
