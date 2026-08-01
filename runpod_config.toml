@@ -10,6 +10,35 @@ cloud_type = "SECURE"
 # control_plane_base_url = "https://v2-rest.runpod.io/v2" # Override only for beta/dev smoke tests.
 # user_agent = "your-app/runpod-integration"               # Must be a non-empty application UA.
 
+[ollama_leases]
+database_path = "${KESTREL_HOME}/state/runpod-ollama-leases.sqlite3"
+poll_interval_seconds = 5
+serverless_workers_max = 1
+serverless_request_count = 1
+serverless_execution_timeout_ms = 300000
+serverless_flashboot = "FLASHBOOT"
+http_timeout_seconds = 300
+
+[profiles.ollama]
+name = "Private Ollama"
+task_type = "ollama"
+image_name = "${RUNPOD_OLLAMA_IMAGE}"
+container_disk_gb = 40
+volume_gb = 0
+ports = ["11434/http"]
+inference_port = 11434
+inference_protocol = "http"
+inference_base_path = "/"
+pod_type = "private-ollama"
+min_vram_gb = 24
+min_cuda_version = "12.8"
+gpu_count = 1
+
+[profiles.ollama.env]
+  OLLAMA_HOST = "0.0.0.0:11434"
+  # The provider injects KESTREL_OLLAMA_BEARER_TOKEN from the untracked
+  # RUNPOD_OLLAMA_BEARER_TOKEN environment variable.
+
 [profiles.llm]
 name = "Large-memory LLM"
 task_type = "llm"

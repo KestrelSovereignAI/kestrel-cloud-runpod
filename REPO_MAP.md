@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 35 tracked files (20 `.py`, 4 `.md`, 11 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 49 tracked files (33 `.py`, 5 `.md`, 11 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -19,6 +19,7 @@ Repo entry points and standard project files.
 - **AGENTS.md** — kestrel-cloud-runpod — Agent Instructions — See [README.md](README.md) for package overview.
 - **LICENSE** — —
 - **.gitignore** — —
+- **CHANGELOG.md** — Changelog — All notable changes to `kestrel-cloud-runpod` are documented here.
 - **REPO_MAP.md** — kestrel-cloud-runpod — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **pyproject.toml** — (configuration)
 - **runpod_config.toml** — (configuration)
@@ -48,8 +49,18 @@ Repo entry points and standard project files.
   - `class RunPodManager`
 - **kestrel_cloud_runpod/models.py** — Typed contracts for the Runpod v2 control and data planes.
   - `class RunPodManagerError`; `class RateLimit`; `class RunPodAPIError`; `class RunPodAmbiguousResultError`; `class CloudType`; `class ComputeProduct`; `class Availability`; `class FlashBoot`; `…`
-- **kestrel_cloud_runpod/ollama.py** — RunPod Ollama Cloud Server Methods.
+- **kestrel_cloud_runpod/ollama.py** — Runpod private-Ollama lease integration for :class:`RunPodManager`.
   - `class RunPodOllamaMixin`
+- **kestrel_cloud_runpod/ollama_contracts.py** — Typed contracts and cost policy for durable private-Ollama leases.
+  - `class OllamaLeaseMode`; `class OllamaResourceType`; `class OllamaLeaseState`; `class OllamaTeardownState`; `class OllamaLeaseConflictError`; `class OllamaLeaseAuthorizationError`; `class OllamaLeaseReadinessError`; `class OllamaLeaseTeardownError`; `…`
+- **kestrel_cloud_runpod/ollama_provider.py** — Runpod v2 capacity, readiness, and teardown adapter for Ollama leases.
+  - `class RunpodOllamaDeployment`; `class RunpodOllamaCapacityProvider`
+- **kestrel_cloud_runpod/ollama_reconciler.py** — One-shot entry point for externally scheduled Ollama lease reconciliation.
+  - `async def reconcile_once(manager_factory)`; `def main()`
+- **kestrel_cloud_runpod/ollama_repository.py** — Transactional SQLite persistence for private-Ollama leases.
+  - `class SQLiteOllamaLeaseRepository`; `def lease_database_path(config)`; `def request_from_lease(lease)`
+- **kestrel_cloud_runpod/ollama_service.py** — Restart-safe lifecycle orchestration for private-Ollama leases.
+  - `class OllamaLeaseService`
 - **kestrel_cloud_runpod/placement.py** — Deterministic GPU placement from live Runpod v2 catalog offers.
   - `def select_gpu(offers, requirements)`
 - **kestrel_cloud_runpod/providers.py** — Provider adapters backed by the Runpod v2 REST control plane.
@@ -68,12 +79,28 @@ Repo entry points and standard project files.
 
 - **tests/conftest.py** — Test configuration for kestrel-cloud-runpod.
   - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`
+- **tests/ollama_test_support.py** — Shared deterministic fixtures for Ollama lease tests.
+  - `class MutableClock`; `def make_request(clock)`; `def make_decision(product)`; `class FakeOllamaProvider`; `def serverless_plan(rate)`
+- **tests/test_ollama_contracts.py** — Cost selection and public-route contracts for Ollama leases.
+  - `def test_bursty_session_selects_lower_effective_serverless_cost()`; `def test_sustained_session_selects_pod_at_live_rates()`; `def test_forced_mode_and_cost_cap_fail_closed()`; `def test_request_fingerprint_changes_with_billing_policy()`; `def test_model_tags_normalize_implicit_latest()`; `def test_request_rejects_non_finite_or_non_positive_cost(invalid_cost)`; `def test_request_rejects_fractional_duration()`; `def test_provider_error_is_redacted_before_durable_state()`
+- **tests/test_ollama_mixin.py** — Manager integration tests for the durable Ollama lease surface.
+  - `async def test_mixin_delegates_only_to_injected_durable_service()`; `def test_mixin_has_no_in_memory_or_managed_provider_fallback()`; `def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch)`
+- **tests/test_ollama_provider.py** — Runpod v2 adapter tests with in-memory HTTP/control-plane doubles.
+  - `async def test_plan_uses_product_specific_live_catalog_prices(monkeypatch)`; `async def test_serverless_provision_is_load_balanced_and_configuration_owned(monkeypatch)`; `async def test_observe_requires_provider_health_and_reads_exact_model()`; `async def test_pod_observation_uses_v2_status_and_runtime_route()`; `async def test_pod_observation_fails_closed_when_route_allows_anonymous_access()`; `def test_tcp_pod_route_requires_tls_before_bearer_token_can_be_sent()`; `async def test_model_pull_is_bounded_nonstreaming_request()`; `async def test_teardown_uses_delete_for_endpoint_and_terminate_for_pod()`; `…`
+- **tests/test_ollama_reconciler.py** — External one-shot reconciler entry point tests.
+  - `async def test_reconcile_once_constructs_manager_and_runs_single_pass()`
+- **tests/test_ollama_repository.py** — Persistence, idempotency, and restart tests for Ollama leases.
+  - `def test_insert_is_idempotent_and_survives_repository_restart(tmp_path)`; `def test_reused_lease_id_with_changed_request_is_rejected(tmp_path)`; `def test_compare_and_set_rejects_stale_revision(tmp_path)`; `def test_request_recovery_rejects_corrupt_constraints(tmp_path, constraints_json)`; `def test_request_recovery_rejects_non_requested_state(tmp_path)`; `def test_database_path_requires_absolute_explicit_configuration(monkeypatch)`; `def test_database_environment_expansion_fails_when_missing(monkeypatch)`
+- **tests/test_ollama_service.py** — Lifecycle, crash recovery, readiness, cost, and teardown tests.
+  - `async def test_acquire_pulls_missing_model_and_only_returns_ready_route(tmp_path)`; `async def test_duplicate_acquire_does_not_create_second_resource(tmp_path)`; `async def test_reconciler_recovers_crash_after_requested_insert(tmp_path)`; `async def test_concurrent_duplicate_acquire_cannot_double_provision(tmp_path)`; `async def test_release_is_idempotent(tmp_path)`; `async def test_teardown_failure_keeps_provider_id_and_reconciler_retries(tmp_path)`; `async def test_restart_reconciles_resource_created_before_id_was_persisted(tmp_path)`; `async def test_release_does_not_orphan_late_ambiguous_creation(tmp_path)`; `…`
+- **tests/test_release_metadata.py** — Release metadata alignment tests.
+  - `def test_project_version_has_matching_release_notes()`
 - **tests/test_runpod_clients.py** — HTTP and request-shape contracts for both Runpod v2 services.
   - `def test_control_client_auth_user_agent_catalog_query_and_timeouts()`; `def test_default_user_agent_is_explicit_and_non_generic()`; `def test_catalog_availability_requires_one_product_context()`; `def test_rfc9457_problem_is_typed_and_does_not_expose_body()`; `def test_safe_get_retries_using_retry_after_and_records_rate_limit()`; `def test_safe_get_uses_rate_limit_reset_when_retry_after_is_absent()`; `def test_create_is_not_retried_after_ambiguous_server_error()`; `def test_create_timeout_is_ambiguous_and_not_retried()`; `…`
 - **tests/test_runpod_feature.py** — —
   - `class FakeRunPodManager`; `class DummyLLMService`; `async def runpod_feature(monkeypatch)`; `async def test_manage_gpu_start_and_stop(runpod_feature)`; `async def test_image_generation_tears_down_session(runpod_feature)`; `async def test_manage_gpu_unknown_action_returns_failed(runpod_feature)`; `async def test_start_unknown_profile_returns_failed(runpod_feature)`; `async def test_start_invalid_ttl_returns_failed(runpod_feature)`; `…`
 - **tests/test_runpod_model_contracts.py** — Contracts for RunPod profile-owned model defaults.
-  - `async def test_resume_stopped_pod_requires_profile_default_model()`; `async def test_start_ollama_pod_uses_profile_default_model_without_hidden_fallback()`; `async def test_start_ollama_pod_resumes_existing_pod_without_new_model_override()`
+  - `async def test_resume_stopped_pod_requires_profile_default_model()`
 - **tests/test_runpod_openapi_contract.py** — Parity tests between Kestrel's typed calls and the pinned beta schema.
   - `def test_pin_checksum_and_validator_script()`; `def test_all_consumed_control_plane_operations_match_pin()`; `def test_consumed_request_and_response_shapes_match_pin()`; `def test_typed_create_and_update_payloads_validate_against_pin()`; `def test_runtime_base_url_is_explicit_despite_beta_schema_server_discrepancy()`; `def test_semantic_diff_reports_breaking_and_additive_changes()`; `def test_production_package_contains_no_v1_graphql_or_legacy_sdk_calls()`
 - **tests/test_runpod_placement.py** — Live-catalog placement policy tests.

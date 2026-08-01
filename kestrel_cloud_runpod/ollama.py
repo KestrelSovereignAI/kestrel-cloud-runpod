@@ -1,163 +1,155 @@
-"""
-RunPod Ollama Cloud Server Methods.
+"""Runpod private-Ollama lease integration for :class:`RunPodManager`."""
 
-Contains methods for running Ollama LLM servers on RunPod
-for users without local GPU access.
-"""
+from __future__ import annotations
 
-import logging
-from typing import List, Optional
+import os
+from collections.abc import Mapping
+from typing import Any, Protocol, cast
 
-from kestrel_sdk.config.constants import (
-    HTTP_TIMEOUT_DOWNLOAD,
-    HTTP_TIMEOUT_QUICK,
+from .models import FlashBoot, GPUProfile, RunPodManagerError
+from .ollama_contracts import (
+    OllamaLease,
+    OllamaLeaseRequest,
 )
+from .ollama_provider import (
+    RunpodOllamaCapacityProvider,
+    RunpodOllamaDeployment,
+)
+from .ollama_repository import (
+    SQLiteOllamaLeaseRepository,
+    lease_database_path,
+)
+from .ollama_service import OllamaLeaseService
+from .providers import DirectRunPodProvider, GPUProvider
 
-from .models import RunPodAmbiguousResultError, RunPodSession
 
-logger = logging.getLogger(__name__)
+class _OllamaManagerHost(Protocol):
+    provider: GPUProvider
+    config: Mapping[str, Any]
+
+    def _select_profile(self, task_profile: str) -> GPUProfile: ...
 
 
 class RunPodOllamaMixin:
+    """Expose durable, ownership-scoped Ollama leases through the manager.
+
+    The previous singleton session helpers were intentionally removed: they lost
+    billing ownership and TTL state on process exit.  Callers now supply a stable
+    lease/owner/workload identity and an explicit deadline/cost policy.
     """
-    Mixin for Ollama cloud server operations on RunPod.
 
-    Requires RunPodManagerCore as base class.
-    """
+    _ollama_lease_service: OllamaLeaseService | None = None
 
-    async def start_ollama_pod(
-        self, models_to_pull: Optional[List[str]] = None
-    ) -> Optional[RunPodSession]:
-        """
-        Start an Ollama server pod on RunPod for users without local GPU.
+    def set_ollama_lease_service(self, service: OllamaLeaseService) -> None:
+        """Inject the durable service (primarily for managed hosting and tests)."""
 
-        Uses existing switch_backend() mechanism in LLMService to route requests.
-        Reuses an eligible stopped Pod before creating a new one.
+        self._ollama_lease_service = service
 
-        Args:
-            models_to_pull: Optional list of models to pre-pull on startup.
-                          Overrides OLLAMA_MODELS_PULL in profile env.
+    async def acquire_ollama_lease(self, request: OllamaLeaseRequest) -> OllamaLease:
+        return await self._get_ollama_lease_service().acquire(request)
 
-        Returns:
-            RunPodSession with backend_base_url like http://pod-ip:11434
-        """
-        try:
-            profile = self._select_profile("ollama")
-            ttl_seconds = 3600  # 1 hour default for chat sessions
+    async def get_ollama_lease(
+        self, lease_id: str, *, owner_id: str, workload_id: str
+    ) -> OllamaLease:
+        return await self._get_ollama_lease_service().get(
+            lease_id, owner_id=owner_id, workload_id=workload_id
+        )
 
-            # Build env overrides for model pre-pulling
-            env_overrides = {}
-            if models_to_pull:
-                env_overrides["OLLAMA_MODELS_PULL"] = ",".join(models_to_pull)
+    async def touch_ollama_lease(
+        self, lease_id: str, *, owner_id: str, workload_id: str
+    ) -> OllamaLease:
+        return await self._get_ollama_lease_service().touch(
+            lease_id, owner_id=owner_id, workload_id=workload_id
+        )
 
-            # Try to resume a stopped Ollama pod first (much faster)
-            stopped_pod = await self.find_stopped_pod("ollama_server", "ollama")
-            if stopped_pod:
-                logger.info("Starting existing stopped Ollama Pod through Runpod v2")
-                return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
+    async def release_ollama_lease(
+        self, lease_id: str, *, owner_id: str, workload_id: str
+    ) -> OllamaLease:
+        return await self._get_ollama_lease_service().release(
+            lease_id, owner_id=owner_id, workload_id=workload_id
+        )
 
-            # No stopped pod found, create new one
-            await self.start_session(
-                task_profile="ollama",
-                model_name=profile.default_model,
-                ttl_seconds=ttl_seconds,
-                metadata={
-                    "name": "kestrel-ollama",
-                    "purpose": "ollama_server",
-                    "env_overrides": env_overrides,
-                },
+    async def reconcile_ollama_leases(self) -> tuple[OllamaLease, ...]:
+        """Run one restart-safe reconciliation pass from an external scheduler."""
+
+        return await self._get_ollama_lease_service().reconcile()
+
+    def _get_ollama_lease_service(self) -> OllamaLeaseService:
+        existing = self._ollama_lease_service
+        if existing is not None:
+            return existing
+        host = cast(_OllamaManagerHost, self)
+        if not isinstance(host.provider, DirectRunPodProvider):
+            raise RunPodManagerError(
+                "Durable Ollama leases require the direct Runpod v2 provider or an "
+                "explicitly injected OllamaLeaseService"
             )
-
-            async with self._lock:
-                return self._session
-
-        except RunPodAmbiguousResultError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to start Ollama pod: {e}")
-            return None
-
-    async def get_ollama_base_url(self) -> Optional[str]:
-        """
-        Get the base URL for the Ollama API on the running pod.
-
-        Returns URL like http://pod-ip:11434 for use with OllamaAdapter.
-        """
-        async with self._lock:
-            session = self._session
-
-        if not session or session.task_profile != "ollama":
-            return None
-
-        if not session.is_active:
-            return None
-
-        return session.backend_base_url
-
-    async def check_ollama_health(self, timeout: float = HTTP_TIMEOUT_QUICK) -> bool:
-        """
-        Check if the Ollama pod is healthy and responding.
-
-        Returns True if Ollama API is responding, False otherwise.
-        """
-        import httpx
-
-        base_url = await self.get_ollama_base_url()
-        if not base_url:
-            return False
-
+        raw_settings = host.config.get("ollama_leases")
+        if not isinstance(raw_settings, Mapping):
+            raise RunPodManagerError(
+                "Configure the ollama_leases section before acquiring capacity"
+            )
+        serverless_api_key = os.getenv("RUNPOD_SERVERLESS_API_KEY")
+        pod_bearer_token = os.getenv("RUNPOD_OLLAMA_BEARER_TOKEN")
+        if not serverless_api_key and not pod_bearer_token:
+            raise RunPodManagerError(
+                "Configure RUNPOD_SERVERLESS_API_KEY, "
+                "RUNPOD_OLLAMA_BEARER_TOKEN, or both for Runpod Ollama"
+            )
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(f"{base_url}/api/tags")
-                return response.status_code == 200
-        except Exception:
-            return False
+            flashboot = FlashBoot(
+                _required_string(raw_settings, "serverless_flashboot")
+            )
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "ollama_leases.serverless_flashboot is invalid"
+            ) from exc
+        deployment = RunpodOllamaDeployment(
+            profile=host._select_profile("ollama"),
+            serverless_workers_max=_required_int(
+                raw_settings, "serverless_workers_max"
+            ),
+            serverless_request_count=_required_int(
+                raw_settings, "serverless_request_count"
+            ),
+            serverless_execution_timeout_ms=_required_int(
+                raw_settings, "serverless_execution_timeout_ms"
+            ),
+            serverless_flashboot=flashboot,
+            http_timeout_seconds=_required_float(raw_settings, "http_timeout_seconds"),
+        )
+        service = OllamaLeaseService(
+            repository=SQLiteOllamaLeaseRepository(lease_database_path(raw_settings)),
+            provider=RunpodOllamaCapacityProvider(
+                client=host.provider.client,
+                deployment=deployment,
+                serverless_api_key=serverless_api_key,
+                pod_bearer_token=pod_bearer_token,
+            ),
+            poll_interval_seconds=_required_float(
+                raw_settings, "poll_interval_seconds"
+            ),
+        )
+        self._ollama_lease_service = service
+        return service
 
-    async def list_ollama_models(self) -> List[str]:
-        """
-        List available models on the running Ollama pod.
 
-        Returns list of model names.
-        """
-        import httpx
+def _required_string(settings: Mapping[str, Any], name: str) -> str:
+    value = settings.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise RunPodManagerError(f"ollama_leases.{name} must be configured")
+    return value
 
-        base_url = await self.get_ollama_base_url()
-        if not base_url:
-            return []
 
-        try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_QUICK) as client:
-                response = await client.get(f"{base_url}/api/tags")
-                response.raise_for_status()
-                data = response.json()
-                return [m["name"] for m in data.get("models", [])]
-        except Exception as e:
-            logger.error(f"Failed to list Ollama models: {e}")
-            return []
+def _required_int(settings: Mapping[str, Any], name: str) -> int:
+    value = settings.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise RunPodManagerError(f"ollama_leases.{name} must be a positive integer")
+    return value
 
-    async def pull_ollama_model(self, model_name: str) -> bool:
-        """
-        Pull a model to the running Ollama pod.
 
-        Args:
-            model_name: Model to pull (e.g., "qwen2.5:7b")
-
-        Returns True if pull started successfully.
-        """
-        import httpx
-
-        base_url = await self.get_ollama_base_url()
-        if not base_url:
-            return False
-
-        try:
-            async with httpx.AsyncClient(
-                timeout=HTTP_TIMEOUT_DOWNLOAD
-            ) as client:  # Long timeout for large models
-                response = await client.post(
-                    f"{base_url}/api/pull", json={"name": model_name, "stream": False}
-                )
-                return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Failed to pull Ollama model {model_name}: {e}")
-            return False
+def _required_float(settings: Mapping[str, Any], name: str) -> float:
+    value = settings.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise RunPodManagerError(f"ollama_leases.{name} must be a positive number")
+    return float(value)

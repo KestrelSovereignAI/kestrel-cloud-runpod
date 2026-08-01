@@ -17,7 +17,12 @@ kestrel-cloud-runpod/
 │   ├── manager.py                 # pod lifecycle management
 │   ├── providers.py               # provider wiring
 │   ├── models.py                  # typed models/contracts
-│   ├── ollama.py                  # Ollama-on-RunPod serving
+│   ├── ollama.py                  # manager integration for durable Ollama leases
+│   ├── ollama_contracts.py        # lease types and live-cost selection policy
+│   ├── ollama_repository.py       # SQLite WAL/revision-CAS lease state
+│   ├── ollama_provider.py         # Runpod v2 LB/Pod capacity adapter
+│   ├── ollama_service.py          # acquire/readiness/release/reconciliation state machine
+│   ├── ollama_reconciler.py       # one-shot external scheduler entry point
 │   └── training.py                # training-job orchestration
 └── tests/
 ```

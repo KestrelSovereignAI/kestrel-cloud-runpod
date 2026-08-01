@@ -6,7 +6,7 @@ Modular structure for the RunPod GPU instance manager:
 - providers.py: GPU provider abstractions (direct, managed proxy)
 - core.py: Core SDK operations, profile loading, session management
 - training.py: LoRA training methods (HTTP API)
-- ollama.py: Ollama cloud server methods
+- ollama.py: durable private-Ollama lease integration
 - manager.py: Combined RunPodManager class
 - feature.py: Kestrel feature integration
 
@@ -22,9 +22,9 @@ Usage:
     status = await manager.poll_training_status(session, job_id)
     lora_data = await manager.download_lora(session, job_id)
 
-    # Ollama Cloud workflow
-    session = await manager.start_ollama_pod(["phi4"])
-    base_url = await manager.get_ollama_base_url()
+    # Private Ollama uses an explicit OllamaLeaseRequest:
+    lease = await manager.acquire_ollama_lease(request)
+    route = lease.public_route_url
 
     # Or as a Kestrel feature
     feature = RunPodFeature(agent)
@@ -46,6 +46,20 @@ from .models import (
     RunPodManagerError,
     RunPodSession,
 )
+from .ollama_contracts import (
+    OllamaLease,
+    OllamaLeaseAuthorizationError,
+    OllamaLeaseConflictError,
+    OllamaLeaseMode,
+    OllamaLeaseReadinessError,
+    OllamaLeaseRequest,
+    OllamaLeaseState,
+    OllamaLeaseTeardownError,
+    OllamaResourceConstraints,
+    OllamaResourceType,
+    OllamaTeardownState,
+)
+from .ollama_service import OllamaLeaseService
 
 try:
     __version__ = _version("kestrel-cloud-runpod")
@@ -53,16 +67,28 @@ except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
 __all__ = [
+    "FlashBoot",
+    "GPUProfile",
+    "OllamaLease",
+    "OllamaLeaseAuthorizationError",
+    "OllamaLeaseConflictError",
+    "OllamaLeaseMode",
+    "OllamaLeaseReadinessError",
+    "OllamaLeaseRequest",
+    "OllamaLeaseService",
+    "OllamaLeaseState",
+    "OllamaLeaseTeardownError",
+    "OllamaResourceConstraints",
+    "OllamaResourceType",
+    "OllamaTeardownState",
+    "PlacementRequirements",
+    "PodStatus",
+    "RunPodAPIError",
+    "RunPodAmbiguousResultError",
     "RunPodFeature",
     "RunPodManager",
     "RunPodManagerError",
     "RunPodSession",
-    "PodStatus",
-    "GPUProfile",
-    "FlashBoot",
-    "PlacementRequirements",
-    "RunPodAPIError",
-    "RunPodAmbiguousResultError",
     "RunpodControlPlaneClient",
     "RunpodServerlessClient",
     "__version__",
