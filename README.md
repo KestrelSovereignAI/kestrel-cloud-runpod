@@ -24,6 +24,10 @@ Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
 - Standalone API: `RunPodManager` for direct programmatic use
 - RunPod-backed Ollama integration (when running large models on rented GPUs)
 
+## Architecture
+
+- [Runpod v2 execution platform](docs/architecture/RUNPOD_V2_EXECUTION_PLATFORM.md) — the accepted control-plane, Serverless, catalog inference, and private Ollama design. New infrastructure work is v2-only; existing v1 REST and legacy GraphQL calls are migration targets, not foundations for new development.
+
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.2,<1` — base `Feature`, `tool`, `ToolCategory`, `BackendType`
