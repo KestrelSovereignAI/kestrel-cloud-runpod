@@ -13,6 +13,7 @@ import httpx
 
 from .clients import RunpodControlPlaneClient
 from .models import (
+    Availability,
     ComputeProduct,
     EndpointCreateRequest,
     FlashBoot,
@@ -158,7 +159,18 @@ class RunpodOllamaCapacityProvider:
                     min_cuda_version=requirements.min_cuda_version,
                 )
                 if product is ComputeProduct.SERVERLESS:
+                    poolless_available = any(
+                        offer.pool is None
+                        and offer.availability not in {None, Availability.NONE}
+                        for offer in offers
+                    )
                     offers = tuple(offer for offer in offers if offer.pool)
+                    if poolless_available and not offers:
+                        raise RunPodManagerError(
+                            "Runpod v2 advertised Serverless GPU availability "
+                            "without the canonical pool ID required by endpoint "
+                            "creation; refusing to guess a billable placement"
+                        )
                 decisions[product] = select_gpu(offers, requirements)
             except RunPodManagerError as exc:
                 failures.append(f"{product.value}: {exc}")

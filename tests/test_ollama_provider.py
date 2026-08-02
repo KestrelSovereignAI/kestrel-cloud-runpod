@@ -214,6 +214,85 @@ async def test_plan_uses_product_specific_live_catalog_prices(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_poolless_serverless_availability_fails_clearly_without_create(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+
+    def poolless_mig(*, products, **kwargs):
+        del kwargs
+        assert products == (ComputeProduct.SERVERLESS,)
+        return (
+            replace(
+                _offer(ComputeProduct.SERVERLESS),
+                id=(
+                    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"
+                ),
+                pool=None,
+                secure=False,
+                community=False,
+                secure_max_count=0,
+                community_max_count=0,
+                availability=Availability.HIGH,
+            ),
+        )
+
+    client.list_gpus = poolless_mig
+    provider = _provider(client=client)
+    request = make_request(
+        MutableClock(), mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+
+    with pytest.raises(
+        RunPodManagerError,
+        match="without the canonical pool ID.*refusing to guess",
+    ):
+        await provider.plan(request)
+
+    assert client.endpoint_request is None
+    assert client.pod_request is None
+
+
+@pytest.mark.asyncio
+async def test_pooled_serverless_offer_survives_unrelated_poolless_offer(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+
+    def mixed_serverless(*, products, **kwargs):
+        del kwargs
+        assert products == (ComputeProduct.SERVERLESS,)
+        pooled = _offer(ComputeProduct.SERVERLESS)
+        return (
+            replace(
+                pooled,
+                id=(
+                    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"
+                ),
+                pool=None,
+                availability=Availability.HIGH,
+            ),
+            pooled,
+        )
+
+    client.list_gpus = mixed_serverless
+    provider = _provider(client=client)
+
+    plan = await provider.plan(
+        make_request(
+            MutableClock(), mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        )
+    )
+
+    assert plan.placement.gpu_id == "gpu-serverless"
+    assert plan.placement.gpu_pool == "pool-24"
+    assert client.endpoint_request is None
+    assert client.pod_request is None
+
+
+@pytest.mark.asyncio
 async def test_serverless_provision_is_load_balanced_and_configuration_owned(
     monkeypatch,
 ):
