@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 71 tracked files (47 `.py`, 6 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 73 tracked files (49 `.py`, 6 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -46,6 +46,8 @@ Repo entry points and standard project files.
   - `class RunPodManagerCore`
 - **kestrel_cloud_runpod/feature.py** — —
   - `class RunPodFeature`
+- **kestrel_cloud_runpod/inference_provider.py** — SDK inference-lease adapter backed by durable Runpod Ollama capacity.
+  - `class RunpodInferenceLeaseProvider`
 - **kestrel_cloud_runpod/manager.py** — RunPod Manager - Combined Class.
   - `class RunPodManager`
 - **kestrel_cloud_runpod/models.py** — Typed contracts for the Runpod v2 control and data planes.
@@ -61,7 +63,7 @@ Repo entry points and standard project files.
 - **kestrel_cloud_runpod/ollama_repository.py** — Transactional SQLite persistence for private-Ollama leases.
   - `class SQLiteOllamaLeaseRepository`; `def lease_database_path(config)`; `def request_from_lease(lease)`
 - **kestrel_cloud_runpod/ollama_runtime.py** — Canonical configuration contract for the authenticated Ollama workload.
-  - `def require_immutable_ollama_image(image)`; `def build_ollama_runtime_environment(profile_environment)`
+  - `def require_immutable_ollama_image(image)`; `def build_ollama_runtime_environment(profile_environment)`; `def parse_ollama_model_allowlist(raw)`
 - **kestrel_cloud_runpod/ollama_service.py** — Restart-safe lifecycle orchestration for private-Ollama leases.
   - `class OllamaLeaseService`
 - **kestrel_cloud_runpod/placement.py** — Deterministic GPU placement from live Runpod v2 catalog offers.
@@ -104,6 +106,8 @@ Repo entry points and standard project files.
   - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`
 - **tests/ollama_test_support.py** — Shared deterministic fixtures for Ollama lease tests.
   - `class MutableClock`; `def make_request(clock)`; `def make_decision(product)`; `class FakeOllamaProvider`; `def serverless_plan(rate)`
+- **tests/test_inference_provider.py** — SDK provider boundary tests for durable private Runpod inference.
+  - `def test_dedicated_entry_point_loads_sdk_provider_contract()`; `def test_capabilities_are_deterministic_and_policy_scoped(tmp_path)`; `async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path)`; `async def test_quote_expires_before_estimated_cold_start_window_closes(tmp_path)`; `async def test_catalog_refresh_cannot_consume_remaining_cold_start_window(tmp_path)`; `async def test_status_returns_only_exact_authenticated_ready_route(tmp_path)`; `async def test_restart_reconciles_same_lease_without_duplicate_capacity(tmp_path)`; `async def test_owner_isolation_precedes_status_or_release_mutation(tmp_path)`; `…`
 - **tests/test_ollama_contracts.py** — Cost selection and public-route contracts for Ollama leases.
   - `def test_bursty_session_selects_lower_effective_serverless_cost()`; `def test_sustained_session_selects_pod_at_live_rates()`; `def test_forced_mode_and_cost_cap_fail_closed()`; `def test_request_fingerprint_changes_with_billing_policy()`; `def test_model_tags_normalize_implicit_latest()`; `def test_request_rejects_non_finite_or_non_positive_cost(invalid_cost)`; `def test_request_rejects_fractional_duration()`; `def test_provider_error_is_redacted_before_durable_state()`
 - **tests/test_ollama_mixin.py** — Manager integration tests for the durable Ollama lease surface.

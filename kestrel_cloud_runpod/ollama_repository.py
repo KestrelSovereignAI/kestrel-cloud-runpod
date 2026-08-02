@@ -63,6 +63,7 @@ class SQLiteOllamaLeaseRepository:
             "selected_gpu_name",
             "catalog_observed_at",
             "last_provider_error",
+            "termination_reason",
             "teardown_attempts",
         }
     )
@@ -131,6 +132,7 @@ class SQLiteOllamaLeaseRepository:
                     selected_gpu_name TEXT,
                     catalog_observed_at TEXT,
                     last_provider_error TEXT,
+                    termination_reason TEXT,
                     teardown_attempts INTEGER NOT NULL DEFAULT 0,
                     revision INTEGER NOT NULL DEFAULT 0
                 )
@@ -142,10 +144,31 @@ class SQLiteOllamaLeaseRepository:
                 ON ollama_leases(state, idle_deadline, hard_deadline)
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(ollama_leases)"
+                ).fetchall()
+            }
+            if "termination_reason" not in columns:
+                connection.execute(
+                    "ALTER TABLE ollama_leases ADD COLUMN termination_reason TEXT"
+                )
+            # Routes are re-observed from Runpod and exist only in the host
+            # process.  Clear values written by releases before the SDK
+            # inference boundary made addressable endpoints host-only.
+            connection.execute(
+                """
+                UPDATE ollama_leases
+                SET route_url = NULL, provider_health_url = NULL
+                WHERE route_url IS NOT NULL OR provider_health_url IS NOT NULL
+                """
+            )
 
     def insert_request(
         self, request: OllamaLeaseRequest, *, now: datetime
     ) -> tuple[OllamaLease, bool]:
+        request_started_at = request.requested_at or now
         constraints = asdict(request.constraints)
         constraints["cloud"] = request.constraints.cloud.value
         values = (
@@ -170,7 +193,8 @@ class SQLiteOllamaLeaseRepository:
             iso_datetime(request.hard_deadline),
             iso_datetime(
                 min(
-                    now + timedelta(seconds=request.readiness_timeout_seconds),
+                    request_started_at
+                    + timedelta(seconds=request.readiness_timeout_seconds),
                     request.hard_deadline,
                 )
             ),
@@ -380,6 +404,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         selected_gpu_name=row["selected_gpu_name"],
         catalog_observed_at=_optional_datetime(row["catalog_observed_at"]),
         last_provider_error=row["last_provider_error"],
+        termination_reason=row["termination_reason"],
         teardown_attempts=row["teardown_attempts"],
         revision=row["revision"],
     )
