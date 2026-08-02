@@ -81,7 +81,9 @@ class DummyLLMService:
 @pytest.fixture
 async def runpod_feature(monkeypatch):
     fake_manager = FakeRunPodManager()
-    monkeypatch.setattr("kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager)
+    monkeypatch.setattr(
+        "kestrel_cloud_runpod.feature.RunPodManager", lambda: fake_manager
+    )
 
     llm_service = DummyLLMService()
     agent = SimpleNamespace(llm_service=llm_service)
@@ -108,7 +110,8 @@ async def test_manage_gpu_start_and_stop(runpod_feature):
     assert isinstance(start_result, ToolResult)
     assert start_result.status is ToolResultStatus.OK
     assert manager.started is True
-    assert llm_service.switch_calls
+    assert llm_service.switch_calls == []
+    assert "router" not in start_result.data
     assert start_result.data["session"]["status"] == "ready"
 
     stop_result = await feature.manage_gpu(action="off")
@@ -116,7 +119,8 @@ async def test_manage_gpu_start_and_stop(runpod_feature):
     assert stop_result.status is ToolResultStatus.OK
     assert stop_result.data["session"]["status"] == "terminating"
     assert manager.started is False
-    assert llm_service.deactivate_reasons[-1] == "Requested via !gpu off"
+    assert llm_service.deactivate_reasons == []
+    assert "router" not in stop_result.data
 
 
 @pytest.mark.asyncio
@@ -128,13 +132,15 @@ async def test_image_generation_tears_down_session(runpod_feature):
     feature, manager, llm_service = runpod_feature
 
     # Use the internal method (dream_image was removed, see feature.py lines 65-68)
-    image_result = await feature.generate_image_on_runpod(prompt="sunset beach in watercolor")
+    image_result = await feature.generate_image_on_runpod(
+        prompt="sunset beach in watercolor"
+    )
 
     assert isinstance(image_result, ToolResult)
     assert image_result.status is ToolResultStatus.OK
     assert "result" in image_result.data
     assert manager.started is False
-    assert llm_service.deactivate_reasons[-1] == "image generation completed"
+    assert llm_service.deactivate_reasons == []
     assert llm_service.last_backend == BackendType.CLOUD
 
 
@@ -219,9 +225,7 @@ async def test_disabled_feature_returns_failed(monkeypatch):
     def _raise(*_, **__):
         raise RunPodManagerError("RUNPOD_API_KEY not set")
 
-    monkeypatch.setattr(
-        "kestrel_cloud_runpod.feature.RunPodManager", _raise
-    )
+    monkeypatch.setattr("kestrel_cloud_runpod.feature.RunPodManager", _raise)
 
     feature = RunPodFeature(SimpleNamespace())
     await feature.initialize()
@@ -282,7 +286,8 @@ async def test_stop_with_no_active_session_returns_no_op_confirmation(monkeypatc
 )
 @pytest.mark.asyncio
 async def test_image_generation_does_not_stop_unrelated_active_session(
-    monkeypatch, raise_message,
+    monkeypatch,
+    raise_message,
 ):
     """When ``generate_image_on_runpod`` is called while another
     session (e.g., an LLM pod) is already active, ANY pre-creation
@@ -390,7 +395,9 @@ async def test_image_generation_preflight_status_failure_does_not_escape_envelop
 
 
 @pytest.mark.asyncio
-async def test_image_generation_pre_creation_validation_no_existing_session(monkeypatch):
+async def test_image_generation_pre_creation_validation_no_existing_session(
+    monkeypatch,
+):
     """Pre-creation validation failure (e.g., TTL too high) when NO
     pre-existing session is active. The teardown decision logic
     will call ``stop_session()`` (which is safely a no-op since no
@@ -401,9 +408,7 @@ async def test_image_generation_pre_creation_validation_no_existing_session(monk
             return {"active": False, "status": "offline"}
 
         async def start_session(self, **_):
-            raise RunPodManagerError(
-                "ttl_seconds 99999 exceeds profile max 3600"
-            )
+            raise RunPodManagerError("ttl_seconds 99999 exceeds profile max 3600")
 
         async def stop_session(self):
             # Tracks calls so the test can verify behaviour, but
@@ -506,9 +511,8 @@ async def test_image_generation_inference_failure_still_stops_pod(runpod_feature
     # Pod was torn down despite the inference failure.
     assert manager.stop_calls == 1
     assert manager.started is False
-    # Backend was detached with the failure-specific reason (honest
-    # narration — not "completed").
-    assert llm_service.deactivate_reasons[-1] == "image generation failed"
+    # Operator image controls never mutate the provider-neutral LLM route.
+    assert llm_service.deactivate_reasons == []
     # Teardown info still surfaces in data so the caller can confirm
     # the cleanup happened.
     assert "teardown" in result.data
@@ -560,9 +564,7 @@ async def test_helper_wraps_manager_error_in_tool_result(monkeypatch):
         TimeoutError("provider timed out"),
     ],
 )
-async def test_helper_wraps_raw_provider_exception_in_tool_result(
-    monkeypatch, raised
-):
+async def test_helper_wraps_raw_provider_exception_in_tool_result(monkeypatch, raised):
     """Codex round 6: every helper that calls into RunPodManager must
     catch broader than RunPodManagerError. The underlying provider/SDK
     can raise raw HTTPError/Timeout/etc. which would otherwise escape
@@ -901,9 +903,7 @@ async def test_concurrent_start_does_not_tear_down_winners_pod(monkeypatch):
             # manager's ``async with self._lock`` in core.py.
             async with self._inner_lock:
                 if self._active:
-                    raise RunPodManagerError(
-                        "A RunPod session is already active"
-                    )
+                    raise RunPodManagerError("A RunPod session is already active")
                 # Provider call delay — long enough for the loser's
                 # preflight to interleave when the feature lock is
                 # absent.
@@ -957,12 +957,8 @@ async def test_concurrent_start_does_not_tear_down_winners_pod(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_router_attach_failure_returns_partial(monkeypatch):
-    """Codex round 9: ``llm_service.switch_backend`` and
-    ``get_backend_status`` were called outside the ToolResult
-    envelope. If they raise, the pod is up but the @tool escapes
-    with an exception. Pod-up + router-failed should be
-    ToolResult.partial — that's exactly the partial-success case."""
+async def test_start_operator_control_never_calls_llm_router(monkeypatch):
+    """Provider-neutral leases exclusively own LLM route activation."""
 
     class _BrokenSwitchService(DummyLLMService):
         def switch_backend(self, backend, *, config):
@@ -978,23 +974,17 @@ async def test_start_router_attach_failure_returns_partial(monkeypatch):
     result = await feature.manage_gpu(action="on", task_profile="llm")
 
     assert isinstance(result, ToolResult)
-    assert result.status is ToolResultStatus.PARTIAL, (
-        f"expected PARTIAL (pod up, router failed); got {result.status}"
-    )
+    assert result.status is ToolResultStatus.OK
     assert "Started RunPod session" in result.confirmation
-    assert "router attach failed" in result.confirmation.lower()
-    assert "router adapter broken" in result.error
     assert result.data["session"]["pod_id"] == "pod-123"
+    assert "router" not in result.data
     # Pod is still up — confirm the manager actually started it.
     assert fake_manager.started is True
 
 
 @pytest.mark.asyncio
-async def test_stop_router_detach_failure_returns_partial(monkeypatch):
-    """Codex round 9: ``_detach_gpu_backend`` was called outside the
-    ToolResult envelope in _stop. A broken detach should produce
-    ToolResult.partial, not escape as exception. The pod IS stopped
-    either way; partial surfaces the router caveat."""
+async def test_stop_operator_control_never_calls_llm_router(monkeypatch):
+    """Stopping an operator pod does not own the active inference lease."""
 
     class _BrokenDetachService(DummyLLMService):
         def _deactivate_remote_backend(self, reason=None):
@@ -1011,20 +1001,16 @@ async def test_stop_router_detach_failure_returns_partial(monkeypatch):
     result = await feature.manage_gpu(action="off")
 
     assert isinstance(result, ToolResult)
-    assert result.status is ToolResultStatus.PARTIAL
+    assert result.status is ToolResultStatus.OK
     assert "Stopped RunPod session" in result.confirmation
-    assert "router detach failed" in result.confirmation.lower()
-    assert "router detach broken" in result.error
+    assert "router" not in result.data
     # Pod was actually stopped.
     assert fake_manager.stop_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_status_router_failure_degrades_to_warning(monkeypatch):
-    """Codex round 9: for inspection-only commands (status, logs), a
-    broken router should NOT fail the whole tool. The user wants the
-    manager session info even if the router can't be inspected.
-    Surface the router error inside the data payload."""
+async def test_status_operator_control_never_reads_llm_router(monkeypatch):
+    """Infrastructure status has no second LLM route/session view."""
 
     class _BrokenRouterService(DummyLLMService):
         def get_backend_status(self):
@@ -1040,11 +1026,8 @@ async def test_status_router_failure_degrades_to_warning(monkeypatch):
     result = await feature.manage_gpu(action="status")
 
     assert isinstance(result, ToolResult)
-    assert result.status is ToolResultStatus.OK, (
-        "router failure on a read-only status command should NOT fail "
-        "the whole tool — degrade gracefully with a warning payload"
-    )
-    assert "router status broken" in str(result.data["router"])
+    assert result.status is ToolResultStatus.OK
+    assert "router" not in result.data
 
 
 @pytest.mark.asyncio
@@ -1402,9 +1385,7 @@ async def test_disabled_feature_image_gen_returns_failed_not_attribute_error(
     def _raise_init():
         raise RunPodManagerError("RUNPOD_API_KEY not set")
 
-    monkeypatch.setattr(
-        "kestrel_cloud_runpod.feature.RunPodManager", _raise_init
-    )
+    monkeypatch.setattr("kestrel_cloud_runpod.feature.RunPodManager", _raise_init)
     feature = RunPodFeature(SimpleNamespace(llm_service=DummyLLMService()))
     await feature.initialize()
     assert feature.disabled is True

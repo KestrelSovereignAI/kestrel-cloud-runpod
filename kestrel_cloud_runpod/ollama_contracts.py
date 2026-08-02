@@ -140,6 +140,7 @@ class OllamaLeaseRequest:
     hard_deadline: datetime
     max_authorized_cost: float
     mode: OllamaLeaseMode = OllamaLeaseMode.AUTO
+    requested_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, OllamaLeaseMode):
@@ -148,6 +149,10 @@ class OllamaLeaseRequest:
             raise TypeError("Ollama constraints must be OllamaResourceConstraints")
         if not isinstance(self.hard_deadline, datetime):
             raise TypeError("Ollama hard_deadline must be a datetime")
+        if self.requested_at is not None and not isinstance(
+            self.requested_at, datetime
+        ):
+            raise TypeError("Ollama requested_at must be a datetime when provided")
         for name, value in (
             ("lease_id", self.lease_id),
             ("owner_id", self.owner_id),
@@ -188,6 +193,10 @@ class OllamaLeaseRequest:
         ):
             raise ValueError("max_authorized_cost must be positive")
         require_aware(self.hard_deadline, "hard_deadline")
+        if self.requested_at is not None:
+            require_aware(self.requested_at, "requested_at")
+            if self.requested_at >= self.hard_deadline:
+                raise ValueError("Ollama requested_at must precede hard_deadline")
 
     @property
     def fingerprint(self) -> str:
@@ -209,6 +218,9 @@ class OllamaLeaseRequest:
             "hard_deadline": iso_datetime(self.hard_deadline),
             "max_authorized_cost": self.max_authorized_cost,
             "mode": self.mode.value,
+            "requested_at": (
+                iso_datetime(self.requested_at) if self.requested_at else None
+            ),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
@@ -288,6 +300,7 @@ class OllamaLease:
     selected_gpu_name: str | None
     catalog_observed_at: datetime | None
     last_provider_error: str | None
+    termination_reason: str | None
     teardown_attempts: int
     revision: int
 
@@ -308,7 +321,6 @@ class OllamaLease:
             "provider_resource_id": self.provider_resource_id,
             "provision_attempt_id": self.provision_attempt_id,
             "creation_uncertain": self.creation_uncertain,
-            "route_url": self.public_route_url,
             "state": self.state.value,
             "teardown_state": self.teardown_state.value,
             "created_at": iso_datetime(self.created_at),
@@ -342,6 +354,7 @@ class OllamaLease:
             "selected_gpu_name": self.selected_gpu_name,
             "catalog_observed_at": optional_iso_datetime(self.catalog_observed_at),
             "last_provider_error": self.last_provider_error,
+            "termination_reason": self.termination_reason,
         }
 
 

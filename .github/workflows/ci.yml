@@ -78,6 +78,7 @@ jobs:
               'kestrel_cloud_runpod/feature.py',
               'kestrel_cloud_runpod/manager.py',
               'kestrel_cloud_runpod/core.py',
+              'kestrel_cloud_runpod/inference_provider.py',
           ]
           missing = [m for m in required if m not in names]
           if missing:
@@ -114,6 +115,11 @@ jobs:
           eps = md.entry_points(group='kestrel_sovereign.features')
           names = [e.name for e in eps]
           assert 'RunPodFeature' in names, f'Entry-point not registered: {names}'
+          inference = md.entry_points(group='kestrel_sovereign.inference_lease_providers')
+          providers = [e.name for e in inference]
+          assert 'runpod' in providers, f'Inference entry-point not registered: {providers}'
+          adapter = next(e for e in inference if e.name == 'runpod').load()()
+          assert adapter.provider_name == 'runpod'
           print(f'kestrel-cloud-runpod installs + entry-point OK on Python ${{ matrix.python-version }}')
           "
 

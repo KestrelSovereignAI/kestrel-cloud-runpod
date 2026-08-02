@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-runpod"
-version = "0.5.0"
+version = "0.6.0"
 description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.14.1,<1",
+    "kestrel-sovereign-sdk>=0.34.0,<1",
     # Framework runtime dep: feature uses kestrel_sovereign.config.load_config
     # to honor the unified-kestrel.toml [runpod] section. Same shape as
     # kestrel-cloud-gcp + kestrel-cloud-vastai.
@@ -56,6 +56,9 @@ Issues = "https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues"
 
 [project.entry-points."kestrel_sovereign.features"]
 RunPodFeature = "kestrel_cloud_runpod.feature:RunPodFeature"
+
+[project.entry-points."kestrel_sovereign.inference_lease_providers"]
+runpod = "kestrel_cloud_runpod.inference_provider:RunpodInferenceLeaseProvider"
 
 [project.scripts]
 kestrel-runpod-reconcile-ollama = "kestrel_cloud_runpod.ollama_reconciler:main"

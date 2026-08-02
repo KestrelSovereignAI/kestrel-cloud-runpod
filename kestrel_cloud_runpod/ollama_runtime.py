@@ -96,7 +96,7 @@ def build_ollama_runtime_environment(
             "profiles.ollama.env.KESTREL_OLLAMA_ALLOWED_MODELS must configure "
             + "digest-pinned operator policy"
         )
-    allowed = _parse_model_allowlist(allowed_raw)
+    allowed = parse_ollama_model_allowlist(allowed_raw)
     if requested_model not in allowed:
         raise RunPodManagerError(
             f"Ollama model '{requested_model}' is not in the operator allowlist"
@@ -118,7 +118,9 @@ def build_ollama_runtime_environment(
     return environment
 
 
-def _parse_model_allowlist(raw: str) -> dict[str, str]:
+def parse_ollama_model_allowlist(raw: str) -> dict[str, str]:
+    """Parse the operator's digest-pinned model policy without provisioning."""
+
     allowed: dict[str, str] = {}
     for item in raw.split(","):
         spec = item.strip()

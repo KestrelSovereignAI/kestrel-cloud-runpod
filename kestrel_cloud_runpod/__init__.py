@@ -35,6 +35,7 @@ from importlib.metadata import version as _version
 
 from .clients import RunpodControlPlaneClient, RunpodServerlessClient
 from .feature import RunPodFeature
+from .inference_provider import RunpodInferenceLeaseProvider
 from .manager import RunPodManager
 from .models import (
     FlashBoot,
@@ -102,6 +103,7 @@ __all__ = [
     "RunPodManagerError",
     "RunPodSession",
     "RunpodControlPlaneClient",
+    "RunpodInferenceLeaseProvider",
     "RunpodServerlessClient",
     "TrainingPodCleanupError",
     "TrainingPodCleanupState",
