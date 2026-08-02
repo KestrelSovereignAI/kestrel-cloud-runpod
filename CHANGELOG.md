@@ -20,6 +20,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - `manage_gpu` is now strictly an infrastructure/operator surface. The
   provider-neutral inference coordinator is the sole owner of LLM routing.
 - Raised the minimum `kestrel-sovereign-sdk` version to 0.34.0.
+- Poolless beta-v2 Serverless availability now fails with a specific no-create
+  error instead of being silently discarded; no GPU-pool identifier is guessed.
 
 ## [0.5.0] - 2026-08-01
 

@@ -90,6 +90,13 @@ v2 create request to the quoted region. A shared model network volume reduces
 download time, but can narrow placement availability and Serverless requires a
 single writer.
 
+Runpod's beta v2 catalog currently reports the PRO 6000 MIG 1g.24gb and
+2g.48gb products as available for Serverless while returning `pool = null`.
+The same v2 create contract requires a canonical GPU pool ID. Kestrel therefore
+rejects those offers before creation and never guesses a pool from a marketing
+name or GPU ID; see [#21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21).
+A separately valid Pod offer may still be quoted explicitly as Pod capacity.
+
 The route endpoint and bearer are reconstructed from a fresh authenticated
 provider observation and live only in the SDK `InferenceRoute`. They are never
 written to provider lease rows or public metadata. On process restart,

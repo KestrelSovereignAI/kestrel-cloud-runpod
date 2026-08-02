@@ -108,6 +108,15 @@ The client queries `/catalog/gpus` with the availability expansion and product c
 
 Marketing SKU names are useful benchmark labels, not durable API identifiers. The initial benchmark matrix includes PRO 6000 MIG 1g.24gb, PRO 6000 MIG 2g.48gb, RTX PRO 4500, and RTX PRO 4000 Blackwell, but production configuration will use identifiers/pools returned by v2 and validated by the pinned schema.
 
+As of 2026-08-02, the live beta catalog returns `availability=HIGH` but
+`pool=null` for both PRO 6000 MIG Serverless products. The current v2
+`CreateEndpointRequest` requires at least one catalog-provided pool ID, so this
+is availability evidence but not actionable placement authority. The selector
+fails clearly before any create call and does not derive or hardcode a pool
+from the SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)
+tracks the vendor-contract gap; a Serverless benchmark remains blocked until
+the catalog supplies a canonical pool or the endpoint-create schema changes.
+
 Estimates use the live placement rate. Actual spend is reconciled from `/billing/serverless` or `/billing/pods` and attributed back to the catalog job or inference lease. A price change therefore affects a new placement decision without requiring a code release, while existing decisions remain auditable.
 
 ## Choosing an execution mode
