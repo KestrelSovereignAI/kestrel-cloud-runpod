@@ -13,6 +13,7 @@ import httpx
 
 from .clients import RunpodControlPlaneClient
 from .models import (
+    Availability,
     ComputeProduct,
     EndpointCreateRequest,
     FlashBoot,
@@ -106,6 +107,20 @@ class RunpodOllamaCapacityProvider:
         self._http_transport = http_transport
         self._clock = clock
 
+    def bearer_token_for(self, resource_type: OllamaResourceType) -> str:
+        """Return the host-only workload credential for an acquired route."""
+
+        token = (
+            self._serverless_api_key
+            if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+            else self._pod_bearer_token
+        )
+        if not token:
+            raise RunPodManagerError(
+                f"No workload credential is configured for {resource_type.value}"
+            )
+        return token
+
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         products = (
             (ComputeProduct.SERVERLESS,)
@@ -144,11 +159,35 @@ class RunpodOllamaCapacityProvider:
                     min_cuda_version=requirements.min_cuda_version,
                 )
                 if product is ComputeProduct.SERVERLESS:
+                    poolless_available = any(
+                        offer.pool is None
+                        and offer.availability not in {None, Availability.NONE}
+                        for offer in offers
+                    )
                     offers = tuple(offer for offer in offers if offer.pool)
+                    if poolless_available and not offers:
+                        raise RunPodManagerError(
+                            "Runpod v2 advertised Serverless GPU availability "
+                            "without the canonical pool ID required by endpoint "
+                            "creation; refusing to guess a billable placement"
+                        )
                 decisions[product] = select_gpu(offers, requirements)
             except RunPodManagerError as exc:
                 failures.append(f"{product.value}: {exc}")
         return select_ollama_plan(request, decisions, failures=failures)
+
+    def validate_runtime_request(self, request: OllamaLeaseRequest) -> None:
+        """Validate workload image, model, and credential before catalog access."""
+
+        if request.mode is OllamaLeaseMode.AUTO:
+            raise RunPodManagerError(
+                "Runtime preflight requires a concrete Ollama execution mode"
+            )
+        self._runtime_environment(
+            request=request,
+            mode=request.mode,
+            provision_requested_at=self._clock(),
+        )
 
     async def provision(
         self,
@@ -163,27 +202,9 @@ class RunpodOllamaCapacityProvider:
         )
         provision_requested_at = self._clock()
         if plan.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
-            if not self._serverless_api_key:
-                raise RunPodManagerError(
-                    "RUNPOD_SERVERLESS_API_KEY is required for Serverless Ollama"
-                )
-            if (
-                profile.network_volume_id
-                and self.deployment.serverless_workers_max != 1
-            ):
-                raise RunPodManagerError(
-                    "A shared Ollama network-volume cache requires exactly one "
-                    "Serverless worker to prevent concurrent mutation"
-                )
-            env = build_ollama_runtime_environment(
-                _resolve_env_vars(profile.env),
-                requested_model=request.model,
-                bearer_token=self._serverless_api_key,
-                bearer_token_expires_at=request.hard_deadline,
+            env = self._runtime_environment(
+                request=request,
                 mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-                model_storage_path=(
-                    "/runpod-volume/ollama" if profile.network_volume_id else "/models"
-                ),
                 provision_requested_at=provision_requested_at,
             )
             pool = plan.placement.gpu_pool
@@ -225,21 +246,9 @@ class RunpodOllamaCapacityProvider:
                 provider_resource_id=endpoint.id,
                 resource_name=resource_name,
             )
-        if not self._pod_bearer_token:
-            raise RunPodManagerError(
-                "RUNPOD_OLLAMA_BEARER_TOKEN is required for dedicated Ollama Pods"
-            )
-        env = build_ollama_runtime_environment(
-            _resolve_env_vars(profile.env),
-            requested_model=request.model,
-            bearer_token=self._pod_bearer_token,
-            bearer_token_expires_at=request.hard_deadline,
+        env = self._runtime_environment(
+            request=request,
             mode=OllamaLeaseMode.DEDICATED_POD,
-            model_storage_path=(
-                f"{(profile.volume_mount_path or '/workspace').rstrip('/')}/ollama"
-                if profile.network_volume_id or profile.volume_gb
-                else "/models"
-            ),
             provision_requested_at=provision_requested_at,
         )
         mounts: Mapping[str, Any] | None = None
@@ -428,6 +437,51 @@ class RunpodOllamaCapacityProvider:
             headers=headers,
             timeout=self.deployment.http_timeout_seconds,
             transport=self._http_transport,
+        )
+
+    def _runtime_environment(
+        self,
+        *,
+        request: OllamaLeaseRequest,
+        mode: OllamaLeaseMode,
+        provision_requested_at: datetime,
+    ) -> dict[str, str]:
+        profile = self.deployment.profile
+        require_immutable_ollama_image(
+            _resolve_env_vars({"image": profile.image_name})["image"]
+        )
+        resource_type = (
+            OllamaResourceType.SERVERLESS_ENDPOINT
+            if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+            else OllamaResourceType.POD
+        )
+        token = self.bearer_token_for(resource_type)
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER:
+            if (
+                profile.network_volume_id
+                and self.deployment.serverless_workers_max != 1
+            ):
+                raise RunPodManagerError(
+                    "A shared Ollama network-volume cache requires exactly one "
+                    "Serverless worker to prevent concurrent mutation"
+                )
+            storage_path = (
+                "/runpod-volume/ollama" if profile.network_volume_id else "/models"
+            )
+        else:
+            storage_path = (
+                f"{(profile.volume_mount_path or '/workspace').rstrip('/')}/ollama"
+                if profile.network_volume_id or profile.volume_gb
+                else "/models"
+            )
+        return build_ollama_runtime_environment(
+            _resolve_env_vars(profile.env),
+            requested_model=request.model,
+            bearer_token=token,
+            bearer_token_expires_at=request.hard_deadline,
+            mode=mode,
+            model_storage_path=storage_path,
+            provision_requested_at=provision_requested_at,
         )
 
 

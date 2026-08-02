@@ -108,6 +108,15 @@ The client queries `/catalog/gpus` with the availability expansion and product c
 
 Marketing SKU names are useful benchmark labels, not durable API identifiers. The initial benchmark matrix includes PRO 6000 MIG 1g.24gb, PRO 6000 MIG 2g.48gb, RTX PRO 4500, and RTX PRO 4000 Blackwell, but production configuration will use identifiers/pools returned by v2 and validated by the pinned schema.
 
+As of 2026-08-02, the live beta catalog returns `availability=HIGH` but
+`pool=null` for both PRO 6000 MIG Serverless products. The current v2
+`CreateEndpointRequest` requires at least one catalog-provided pool ID, so this
+is availability evidence but not actionable placement authority. The selector
+fails clearly before any create call and does not derive or hardcode a pool
+from the SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)
+tracks the vendor-contract gap; a Serverless benchmark remains blocked until
+the catalog supplies a canonical pool or the endpoint-create schema changes.
+
 Estimates use the live placement rate. Actual spend is reconciled from `/billing/serverless` or `/billing/pods` and attributed back to the catalog job or inference lease. A price change therefore affects a new placement decision without requiring a code release, while existing decisions remain auditable.
 
 ## Choosing an execution mode
@@ -179,6 +188,33 @@ Private Ollama is a separate workload contract from the catalog worker.
 
 The model feature selects a model. A provider-neutral inference-lease service acquires private capacity and returns a bounded route only after readiness. `kestrel-cloud-runpod` implements that provider contract without exposing Runpod concepts in Kestrel core.
 
+The package registers `runpod` in the SDK's dedicated inference-provider entry
+point group. Capability matching is deterministic (`ollama`, authenticated
+endpoint, OpenAI chat/completions/embeddings/streaming/tools, one expected
+concurrent request, and explicitly configured Runpod data-center IDs). The
+runtime requires the exact digest-pinned model to report Ollama `completion`
+and `tools` capabilities before readiness, so the default full-agent route
+never degrades to a tool-free lane. This matches Ollama's documented
+[OpenAI-compatible tools support](https://docs.ollama.com/api/openai-compatibility)
+and [Qwen3 tool-calling contract](https://docs.ollama.com/capabilities/tool-calling).
+A quote is a
+read-only v2 catalog operation. The selected mode, observed price, configured
+cold-start estimate, full expected session, and Serverless idle tail must fit
+the caller's hourly, total, region, privacy, and readiness limits before the
+first create request.
+
+Acquisition returns `PENDING`; later status calls drive the durable provider
+state. `READY` is emitted only after an authenticated observation proves both
+runtime health and the exact requested model. The OpenAI `/v1` endpoint and
+workload bearer exist only in the host's SDK route object. SQLite retains the
+resource identity and cost/expiry policy, never the addressable endpoint or
+credential. A restarted adapter re-observes that same deterministic resource,
+so it can reconstruct the route without provisioning a duplicate.
+
+Legacy `manage_gpu` commands are operator-only Pod controls. They do not mutate
+or report LLM routing; the provider-neutral coordinator owns the sole active
+route and drains it before provider release.
+
 For bursty interactive sessions, the default candidate is load-balanced Serverless because Ollama's native HTTP and streaming contract requires direct routing. The endpoint must report healthy and `/api/tags` must show the requested model before Kestrel switches `LLMService` to the route. The caller handles load-balancer no-worker/initialization responses with bounded retry and never treats them as queued work. Runpod provides separate examples for [Ollama on Serverless](https://docs.runpod.io/tutorials/serverless/run-ollama-inference) and [Ollama on a Pod](https://docs.runpod.io/tutorials/pods/run-ollama).
 
 For long or continuously active sessions, a dedicated Pod is considered using live catalog data. The decision compares expected utilization against both alternatives:
@@ -239,7 +275,7 @@ Work is staged so each repository changes only the behavior it owns:
 4. [frinz#688](https://github.com/KestrelSovereignAI/frinz/issues/688) — add durable Serverless dispatch, webhook verification-by-refetch, reconciliation, cancellation, and artifact publication.
 5. [frinz-catalog#88](https://github.com/KestrelSovereignAI/frinz-catalog/issues/88) — benchmark cold start, VRAM, quality, reliability, and actual cost before cutover.
 6. [kestrel-sovereign#2844](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2844) — define the provider-neutral remote inference lease and readiness-gated route integration.
-7. [kestrel-cloud-runpod#9](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/9) — implement that contract with durable private Ollama leases and Serverless-versus-Pod selection.
+7. [kestrel-cloud-runpod#17](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/17) — implement that contract with durable private Ollama leases and Serverless-versus-Pod selection.
 8. [kestrel-feature-lora#4](https://github.com/KestrelSovereignAI/kestrel-feature-lora/issues/4) — migrate the LoRA package's stale adapter onto the canonical v2 provider without duplicating lifecycle code.
 9. [kestrel-cloud-runpod#14](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/14) — persist ownership before training Pod create/resume, reconcile cleanup after crashes, and preserve provider IDs through workload failures.
 
@@ -251,7 +287,7 @@ flowchart TD
     Extract["frinz-catalog #76\nexecutor boundary"] --> CUDA
     CUDA --> Dispatch["frinz #688\ndurable dispatch"]
     Dispatch --> Bench["frinz-catalog #88\nlaunch gate"]
-    V2 --> Ollama["cloud-runpod #9\nOllama leases"]
+    V2 --> Ollama["cloud-runpod #17\nOllama leases"]
     LeaseAPI["kestrel-sovereign #2844\nprovider-neutral lease"] --> Ollama
     V2 --> Cleanup["kestrel-feature-lora #4\nprovider consolidation"]
     LeaseAPI --> Cleanup
@@ -266,11 +302,14 @@ The platform is not production-ready until all applicable gates pass:
 - no production infrastructure call uses v1 or GraphQL;
 - pinned-schema contract and drift tests pass;
 - every billable resource is attributable and externally reclaimable after process failure;
+- pre/post live-run v2 inventories account for Pods, Serverless endpoints, and
+  network volumes, with no unexpected resource remaining after cleanup;
 - ambiguous create, duplicate callback, webhook loss, cancellation, late completion, and teardown failure paths are tested;
 - catalog artifacts publish exactly once and workers have no database credential;
 - private Ollama routes activate only after the requested model is ready;
 - restricted credentials and privacy/cost constraints are verified;
-- cold-start p50/p95, execution p50/p95, VRAM, success rate, quality, and cost are inside approved thresholds; and
+- cold-start p50/p95, execution p50/p95, peak VRAM, peak host RAM, success
+  rate, quality, and cost are inside predeclared approved thresholds; and
 - actual v2 billing reconciles with estimates closely enough to enforce budget limits.
 
 ## Consequences

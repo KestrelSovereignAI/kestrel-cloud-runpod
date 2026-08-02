@@ -32,6 +32,7 @@ REQUIRED_OPERATIONS = {
     ("/v2/pods/{id}", "delete"): "deletePod",
     ("/v2/pods/{id}/action", "post"): "podAction",
     ("/v2/pods/{id}/logs", "get"): "getPodLogs",
+    ("/v2/network-volumes", "get"): "listNetworkVolumes",
     ("/v2/serverless", "get"): "listEndpoints",
     ("/v2/serverless", "post"): "createEndpoint",
     ("/v2/serverless/{id}", "get"): "getEndpoint",
@@ -80,6 +81,14 @@ def test_consumed_request_and_response_shapes_match_pin():
     assert schemas["ListGpuTypesResponse"]["required"] == ["gpus"]
     assert schemas["ListPodsResponse"]["required"] == ["pods"]
     assert schemas["ListEndpointsResponse"]["required"] == ["endpoints"]
+    assert schemas["ListNetworkVolumesResponse"]["required"] == ["networkVolumes"]
+    assert set(schemas["NetworkVolume"]["required"]) == {
+        "id",
+        "name",
+        "size",
+        "dataCenter",
+        "type",
+    }
     assert schemas["ListEndpointWorkersResponse"]["required"] == [
         "workers",
         "summary",
