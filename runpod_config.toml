@@ -40,9 +40,10 @@ min_cuda_version = "12.8"
 gpu_count = 1
 
 [profiles.ollama.env]
-  OLLAMA_HOST = "0.0.0.0:11434"
-  # The provider injects KESTREL_OLLAMA_BEARER_TOKEN from the untracked
-  # RUNPOD_OLLAMA_BEARER_TOKEN environment variable.
+  # Comma-separated name:tag@sha256:<64 lowercase hex> entries. This trusted
+  # operator policy is required and request data cannot expand or override it.
+  KESTREL_OLLAMA_ALLOWED_MODELS = "${RUNPOD_OLLAMA_ALLOWED_MODELS}"
+  # The provider owns PORT, health, requested-model, bearer, expiry, and mode.
 
 [profiles.llm]
 name = "Large-memory LLM"

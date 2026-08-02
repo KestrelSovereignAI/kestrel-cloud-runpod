@@ -125,6 +125,7 @@ class RunPodOllamaMixin:
                 deployment=deployment,
                 serverless_api_key=serverless_api_key,
                 pod_bearer_token=pod_bearer_token,
+                control_plane_api_key=os.getenv("RUNPOD_API_KEY"),
             ),
             poll_interval_seconds=_required_float(
                 raw_settings, "poll_interval_seconds"

@@ -1,0 +1,213 @@
+name: Ollama runtime
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ollama-runtime.yml'
+      - 'kestrel_cloud_runpod/ollama.py'
+      - 'kestrel_cloud_runpod/ollama_provider.py'
+      - 'kestrel_cloud_runpod/ollama_runtime.py'
+      - 'runpod_config.toml'
+      - 'runpod_config.toml.example'
+      - 'runtime/ollama-runtime/**'
+      - 'tests/test_ollama_provider.py'
+      - 'tests/test_ollama_runtime.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ollama-runtime.yml'
+      - 'kestrel_cloud_runpod/ollama.py'
+      - 'kestrel_cloud_runpod/ollama_provider.py'
+      - 'kestrel_cloud_runpod/ollama_runtime.py'
+      - 'runpod_config.toml'
+      - 'runpod_config.toml.example'
+      - 'runtime/ollama-runtime/**'
+      - 'tests/test_ollama_provider.py'
+      - 'tests/test_ollama_runtime.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ollama-runtime-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime
+  RUNTIME_VERSION: 1.0.0
+
+jobs:
+  proxy-contract:
+    name: Proxy and template contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: runtime/ollama-runtime/go.mod
+          cache-dependency-path: runtime/ollama-runtime/go.mod
+      - name: Race, unit, and static checks
+        working-directory: runtime/ollama-runtime
+        run: |
+          go test -race ./...
+          go vet ./...
+          test -z "$(gofmt -l .)"
+      - name: Validate Runpod template JSON
+        run: python -m json.tool runtime/ollama-runtime/runpod-template.json >/dev/null
+
+  image-security:
+    name: Image, SBOM, and vulnerability gate
+    needs: proxy-contract
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write # Publish GitHub provenance for the reviewed image digest.
+      artifact-metadata: write # Link the immutable GHCR artifact to attestations.
+      contents: read
+      id-token: write # Sign the provenance attestation with GitHub OIDC.
+      packages: write # Push the post-scan image to this repository's GHCR package.
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build reviewed linux/amd64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: runtime/ollama-runtime
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ env.RUNTIME_VERSION }}
+          provenance: false
+      - name: Select local scan subject
+        run: echo "RUNTIME_IMAGE_REF=${IMAGE_REPOSITORY}:${RUNTIME_VERSION}" >> "$GITHUB_ENV"
+      - name: Verify nonroot and secret-free image metadata
+        run: |
+          test "$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{.Config.User}}')" = "0:0"
+          docker run --rm --entrypoint /usr/bin/cmp "$RUNTIME_IMAGE_REF" \
+            /bin/ollama /usr/bin/ollama
+          docker image inspect "$RUNTIME_IMAGE_REF" --format '{{json .Config.Env}}' > /tmp/runtime-env.json
+          if grep -Eiq '(api[_-]?key|authorization|bearer|password|secret|token)' /tmp/runtime-env.json; then
+            echo 'runtime image metadata contains a secret-shaped environment name' >&2
+            exit 1
+          fi
+      - name: Verify fresh-volume initialization drops all runtime privilege
+        run: |
+          set -euo pipefail
+          CONTAINER="ollama-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          VOLUME="ollama-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TOKEN="runtime-integration-0123456789abcdef0123456789abcdef"
+          EXPIRES_AT="$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')"
+          cleanup() {
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$VOLUME" >/dev/null
+          docker run --detach --name "$CONTAINER" \
+            --volume "$VOLUME:/workspace" \
+            --env "KESTREL_OLLAMA_BEARER_TOKEN=$TOKEN" \
+            --env "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT=$EXPIRES_AT" \
+            --env "KESTREL_OLLAMA_ALLOWED_MODELS=registry.invalid/model:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+            --env "KESTREL_OLLAMA_REQUIRED_MODEL=registry.invalid/model:v1" \
+            --env "KESTREL_OLLAMA_MODE=dedicated_pod" \
+            --env "KESTREL_OLLAMA_MODEL_STORAGE_PATH=/workspace/ollama" \
+            "$RUNTIME_IMAGE_REF" >/dev/null
+          PROVED=false
+          for _ in $(seq 1 100); do
+            PROCESS_TABLE="$(docker top "$CONTAINER" -eo pid,uid,gid,comm 2>/dev/null || true)"
+            if test "$(printf '%s\n' "$PROCESS_TABLE" | tail -n +2 | wc -l)" -ge 2 && \
+               printf '%s\n' "$PROCESS_TABLE" | tail -n +2 | \
+                 awk '{if ($2 != "10001" || $3 != "10001") exit 1}'; then
+              PROVED=true
+              break
+            fi
+            sleep 0.1
+          done
+          test "$PROVED" = true
+          test "$(docker run --rm --volume "$VOLUME:/workspace" --entrypoint stat \
+            "$RUNTIME_IMAGE_REF" -c '%u:%g' /workspace/ollama)" = "10001:10001"
+          if docker logs "$CONTAINER" 2>&1 | grep -F "$TOKEN"; then
+            echo 'runtime logs exposed the workload capability' >&2
+            exit 1
+          fi
+          if docker history --no-trunc "$RUNTIME_IMAGE_REF" | grep -Eiq '(api[_-]?key|authorization|bearer|password|secret|token)'; then
+            echo 'runtime image history contains secret-shaped material' >&2
+            exit 1
+          fi
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.RUNTIME_IMAGE_REF }}
+          format: spdx-json
+          artifact-name: ollama-runtime-${{ github.sha }}.spdx.json
+          output-file: ollama-runtime.spdx.json
+          syft-version: v1.50.0
+      - name: Verify SBOM contains no credential surface
+        run: |
+          if grep -Eq 'RUNPOD_API_KEY|RUNPOD_CONTROL_PLANE_API_KEY|KESTREL_OLLAMA_BEARER_TOKEN' ollama-runtime.spdx.json; then
+            echo 'runtime SBOM contains a credential surface' >&2
+            exit 1
+          fi
+      - name: Fail on fixed high or critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.RUNTIME_IMAGE_REF }}
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+          version: v0.72.0
+      - name: Log in to GHCR after security gates
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the exact scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: publish
+        run: |
+          set -euo pipefail
+          COMMIT_REF="${IMAGE_REPOSITORY}:sha-${GITHUB_SHA}"
+          docker tag "$RUNTIME_IMAGE_REF" "$COMMIT_REF"
+          VERSION_OUTPUT="$(docker push "$RUNTIME_IMAGE_REF")"
+          printf '%s\n' "$VERSION_OUTPUT"
+          COMMIT_OUTPUT="$(docker push "$COMMIT_REF")"
+          printf '%s\n' "$COMMIT_OUTPUT"
+          VERSION_DIGEST="$(sed -nE 's/.*digest: (sha256:[a-f0-9]{64}).*/\1/p' <<<"$VERSION_OUTPUT" | tail -1)"
+          COMMIT_DIGEST="$(sed -nE 's/.*digest: (sha256:[a-f0-9]{64}).*/\1/p' <<<"$COMMIT_OUTPUT" | tail -1)"
+          test -n "$VERSION_DIGEST"
+          test "$VERSION_DIGEST" = "$COMMIT_DIGEST"
+          LOCAL_ID="$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{.Id}}')"
+          docker pull "${IMAGE_REPOSITORY}@${VERSION_DIGEST}" >/dev/null
+          REMOTE_ID="$(docker image inspect "${IMAGE_REPOSITORY}@${VERSION_DIGEST}" --format '{{.Id}}')"
+          test "$LOCAL_ID" = "$REMOTE_ID"
+          echo "digest=$VERSION_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "reference=${IMAGE_REPOSITORY}@${VERSION_DIGEST}" >> "$GITHUB_OUTPUT"
+      - name: Attest exact published image provenance
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # actions/attest v4 defaults to SLSA provenance when no predicate or
+        # sbom-path is supplied.
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+      - name: Attest exact published image SBOM
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # actions/attest v4 selects its native SBOM mode when sbom-path is set.
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: ollama-runtime.spdx.json
+          push-to-registry: true
