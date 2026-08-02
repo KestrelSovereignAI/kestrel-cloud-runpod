@@ -10,6 +10,11 @@ cloud_type = "SECURE"
 # control_plane_base_url = "https://v2-rest.runpod.io/v2" # Override only for beta/dev smoke tests.
 # user_agent = "your-app/runpod-integration"               # Must be a non-empty application UA.
 
+[training_pods]
+database_path = "${KESTREL_HOME}/state/runpod-training-pods.sqlite3"
+poll_interval_seconds = 10
+orphan_timeout_seconds = 90
+
 [ollama_leases]
 database_path = "${KESTREL_HOME}/state/runpod-ollama-leases.sqlite3"
 poll_interval_seconds = 5

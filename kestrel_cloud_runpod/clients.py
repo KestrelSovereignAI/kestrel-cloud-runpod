@@ -424,6 +424,7 @@ class RunpodControlPlaneClient:
             f"/pods/{_segment(pod_id)}/action",
             json_body={"action": action},
             expected_statuses=(200, 204),
+            ambiguous_on_failure=True,
         )
         return PodResource.from_dict(payload) if payload is not None else None
 

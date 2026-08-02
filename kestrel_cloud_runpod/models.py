@@ -666,6 +666,7 @@ class RunPodSession:
     # Metering context (optional, for usage billing)
     companion_id: Optional[str] = None
     user_id: Optional[str] = None
+    training_cleanup_token: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -683,6 +684,7 @@ class RunPodSession:
             "cost_per_hr": self.cost_per_hr,
             "vram_gb": self.placement.memory_gb if self.placement else None,
             "runtime": self.runtime,
+            "training_cleanup_token": self.training_cleanup_token,
         }
 
     @property

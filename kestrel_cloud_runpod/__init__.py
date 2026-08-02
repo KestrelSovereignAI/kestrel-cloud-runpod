@@ -60,6 +60,18 @@ from .ollama_contracts import (
     OllamaTeardownState,
 )
 from .ollama_service import OllamaLeaseService
+from .training_contracts import (
+    TrainingPodCleanupError,
+    TrainingPodCleanupState,
+    TrainingPodConflictError,
+    TrainingPodLease,
+    TrainingPodLifecycleError,
+    TrainingPodOwnership,
+    TrainingPodRequest,
+    TrainingPodSource,
+    TrainingPodState,
+)
+from .training_service import TrainingPodLeaseService
 
 try:
     __version__ = _version("kestrel-cloud-runpod")
@@ -91,5 +103,15 @@ __all__ = [
     "RunPodSession",
     "RunpodControlPlaneClient",
     "RunpodServerlessClient",
+    "TrainingPodCleanupError",
+    "TrainingPodCleanupState",
+    "TrainingPodConflictError",
+    "TrainingPodLease",
+    "TrainingPodLeaseService",
+    "TrainingPodLifecycleError",
+    "TrainingPodOwnership",
+    "TrainingPodRequest",
+    "TrainingPodSource",
+    "TrainingPodState",
     "__version__",
 ]

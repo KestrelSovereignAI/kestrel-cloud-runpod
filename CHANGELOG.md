@@ -2,6 +2,18 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.5.0] - 2026-08-01
+
+### Added
+
+- Durable SQLite/CAS ownership records for persistent, reused, and newly created LoRA training Pods, persisted before the first billable mutation.
+- Explicit cleanup tokens, ownership-aware stop semantics, ambiguous create/start recovery, workload job/result state, and the externally scheduled `kestrel-runpod-reconcile-training` command.
+- Cancellation, crash, readiness/route, submission, status, result, teardown, and concurrent-acquisition coverage that retains every owned provider Pod ID until v2 confirms it stopped.
+
+### Changed
+
+- Runpod v2 Pod actions now surface transport/5xx outcomes as ambiguous instead of implying the mutation failed.
+
 ## [0.4.0] - 2026-08-01
 
 ### Added
@@ -21,5 +33,6 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 - Migrated the Runpod integration to the beta v2 REST control plane with typed clients, live catalog placement, and pinned OpenAPI validation.
 
+[0.5.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/releases/tag/v0.3.0
