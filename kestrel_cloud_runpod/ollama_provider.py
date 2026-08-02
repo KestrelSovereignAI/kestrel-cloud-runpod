@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import hmac
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -28,6 +30,10 @@ from .ollama_contracts import (
     OllamaResourceType,
     ProvisionedOllamaResource,
     select_ollama_plan,
+)
+from .ollama_runtime import (
+    build_ollama_runtime_environment,
+    require_immutable_ollama_image,
 )
 from .placement import select_gpu
 from .providers import _resolve_env_vars
@@ -65,17 +71,40 @@ class RunpodOllamaCapacityProvider:
         deployment: RunpodOllamaDeployment,
         serverless_api_key: str | None,
         pod_bearer_token: str | None,
+        control_plane_api_key: str | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not serverless_api_key and not pod_bearer_token:
             raise RunPodManagerError(
                 "A restricted Serverless key or Pod inference token is required"
+            )
+        workload_credentials = tuple(
+            credential
+            for credential in (serverless_api_key, pod_bearer_token)
+            if credential
+        )
+        if control_plane_api_key and any(
+            hmac.compare_digest(control_plane_api_key, credential)
+            for credential in workload_credentials
+        ):
+            raise RunPodManagerError(
+                "Ollama workload credentials must differ from RUNPOD_API_KEY"
+            )
+        if (
+            serverless_api_key
+            and pod_bearer_token
+            and hmac.compare_digest(serverless_api_key, pod_bearer_token)
+        ):
+            raise RunPodManagerError(
+                "Serverless and Pod Ollama credentials must be distinct"
             )
         self.client = client
         self.deployment = deployment
         self._serverless_api_key = serverless_api_key
         self._pod_bearer_token = pod_bearer_token
         self._http_transport = http_transport
+        self._clock = clock
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         products = (
@@ -129,17 +158,34 @@ class RunpodOllamaCapacityProvider:
         resource_name: str,
     ) -> ProvisionedOllamaResource:
         profile = self.deployment.profile
-        image = _resolve_env_vars({"image": profile.image_name})["image"]
-        env = _resolve_env_vars(profile.env)
-        # Request fields are data, not configuration templates. Append them only
-        # after trusted profile environment references have been expanded.
-        env["OLLAMA_MODELS_PULL"] = request.model
-        env["HEALTH_CHECK_PATH"] = "/api/tags"
+        image = require_immutable_ollama_image(
+            _resolve_env_vars({"image": profile.image_name})["image"]
+        )
+        provision_requested_at = self._clock()
         if plan.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
             if not self._serverless_api_key:
                 raise RunPodManagerError(
                     "RUNPOD_SERVERLESS_API_KEY is required for Serverless Ollama"
                 )
+            if (
+                profile.network_volume_id
+                and self.deployment.serverless_workers_max != 1
+            ):
+                raise RunPodManagerError(
+                    "A shared Ollama network-volume cache requires exactly one "
+                    "Serverless worker to prevent concurrent mutation"
+                )
+            env = build_ollama_runtime_environment(
+                _resolve_env_vars(profile.env),
+                requested_model=request.model,
+                bearer_token=self._serverless_api_key,
+                bearer_token_expires_at=request.hard_deadline,
+                mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+                model_storage_path=(
+                    "/runpod-volume/ollama" if profile.network_volume_id else "/models"
+                ),
+                provision_requested_at=provision_requested_at,
+            )
             pool = plan.placement.gpu_pool
             if not pool:
                 raise RunPodManagerError("Selected Serverless GPU has no pool ID")
@@ -183,14 +229,26 @@ class RunpodOllamaCapacityProvider:
             raise RunPodManagerError(
                 "RUNPOD_OLLAMA_BEARER_TOKEN is required for dedicated Ollama Pods"
             )
-        env["KESTREL_OLLAMA_BEARER_TOKEN"] = self._pod_bearer_token
+        env = build_ollama_runtime_environment(
+            _resolve_env_vars(profile.env),
+            requested_model=request.model,
+            bearer_token=self._pod_bearer_token,
+            bearer_token_expires_at=request.hard_deadline,
+            mode=OllamaLeaseMode.DEDICATED_POD,
+            model_storage_path=(
+                f"{(profile.volume_mount_path or '/workspace').rstrip('/')}/ollama"
+                if profile.network_volume_id or profile.volume_gb
+                else "/models"
+            ),
+            provision_requested_at=provision_requested_at,
+        )
         mounts: Mapping[str, Any] | None = None
         if profile.network_volume_id:
             mounts = {
                 "network": [
                     {
                         "volumeId": profile.network_volume_id,
-                        "path": profile.volume_mount_path or "/runpod-volume",
+                        "path": profile.volume_mount_path or "/workspace",
                     }
                 ]
             }
@@ -278,10 +336,20 @@ class RunpodOllamaCapacityProvider:
             private_route = bool(
                 base_url and await self._rejects_anonymous_requests(base_url)
             )
-            provider_ready = pod.status.upper() == "RUNNING" and private_route
+            runtime_ready = bool(
+                base_url
+                and private_route
+                and await self._healthy(
+                    f"{base_url.rstrip('/')}/ping",
+                    bearer_token=self._pod_bearer_token,
+                )
+            )
+            provider_ready = (
+                pod.status.upper() == "RUNNING" and private_route and runtime_ready
+            )
             models = (
                 await self._models(base_url, bearer_token=self._pod_bearer_token)
-                if base_url and private_route
+                if base_url and provider_ready
                 else ()
             )
         return OllamaReadinessObservation(
@@ -294,26 +362,10 @@ class RunpodOllamaCapacityProvider:
     async def pull_model(
         self, resource: ProvisionedOllamaResource, route_url: str, model: str
     ) -> None:
-        bearer_token = (
-            self._serverless_api_key
-            if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
-            else self._pod_bearer_token
+        del resource, route_url, model
+        raise RunPodManagerError(
+            "The reviewed Ollama runtime owns model pulls and digest verification"
         )
-        if not bearer_token:
-            raise RunPodManagerError(
-                "Ollama model pull has no scoped data-plane credential"
-            )
-        try:
-            async with self._http_client(bearer_token=bearer_token) as client:
-                response = await client.post(
-                    f"{route_url.rstrip('/')}/api/pull",
-                    json={"name": model, "stream": False},
-                )
-                response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise RunPodManagerError(
-                f"Ollama model pull failed: {type(exc).__name__}"
-            ) from exc
 
     async def teardown(self, resource: ProvisionedOllamaResource) -> None:
         try:
@@ -333,7 +385,7 @@ class RunpodOllamaCapacityProvider:
         try:
             async with self._http_client(bearer_token=bearer_token) as client:
                 response = await client.get(url)
-                return 200 <= response.status_code < 300
+                return response.status_code == 200
         except httpx.HTTPError:
             return False
 

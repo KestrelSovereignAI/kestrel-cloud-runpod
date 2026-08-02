@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "contract": "ollama-runtime/v1",
+  "runtime_version": "1.0.0",
+  "image": {
+    "repository": "ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime",
+    "require_digest": true,
+    "platform": "linux/amd64"
+  },
+  "process": {
+    "uid": 10001,
+    "gid": 10001,
+    "root_init": "cache ownership only; privilege dropped before network listeners",
+    "read_only_root_compatible": false
+  },
+  "ports": [
+    {
+      "container_port": 11434,
+      "protocol": "http",
+      "runpod_mapping": "11434/http",
+      "purpose": "authenticated Ollama API and public health checks"
+    }
+  ],
+  "health": {
+    "liveness_path": "/health/live",
+    "readiness_path": "/ping",
+    "initializing_status": 204,
+    "ready_status": 200
+  },
+  "environment": {
+    "required": [
+      "KESTREL_OLLAMA_ALLOWED_MODELS",
+      "KESTREL_OLLAMA_BEARER_TOKEN",
+      "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT",
+      "KESTREL_OLLAMA_MODE",
+      "KESTREL_OLLAMA_MODEL_STORAGE_PATH",
+      "KESTREL_OLLAMA_REQUIRED_MODEL"
+    ],
+    "optional": [
+      "KESTREL_OLLAMA_POLL_INTERVAL_MS",
+      "KESTREL_OLLAMA_PRELOAD_MODEL",
+      "KESTREL_OLLAMA_PROVISION_REQUESTED_AT",
+      "KESTREL_OLLAMA_STARTUP_TIMEOUT_SECONDS",
+      "PORT",
+      "PORT_HEALTH"
+    ],
+    "forbidden": [
+      "RUNPOD_API_KEY",
+      "RUNPOD_CONTROL_PLANE_API_KEY"
+    ]
+  },
+  "models": {
+    "allowlist_format": "name:tag@sha256:<64 lowercase hex>",
+    "container_cache_path": "/models",
+    "pod_volume_cache_path": "/workspace/ollama",
+    "serverless_network_cache_path": "/runpod-volume/ollama",
+    "cache_data_class": "public model weights only",
+    "arbitrary_pull": false
+  },
+  "modes": {
+    "dedicated_pod": {
+      "port": "11434/http",
+      "supports_empty_cache": true,
+      "supports_persistent_volume": true,
+      "supports_network_volume": true
+    },
+    "serverless_load_balancer": {
+      "endpoint_type": "LOAD_BALANCER",
+      "port_env": "11434",
+      "health_port_env": "11434",
+      "health_path": "/ping",
+      "supports_empty_cache": true,
+      "supports_network_volume": true
+    }
+  }
+}
