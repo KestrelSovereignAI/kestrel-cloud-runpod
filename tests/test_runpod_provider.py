@@ -19,6 +19,10 @@ from kestrel_cloud_runpod.models import (
     RunPodSession,
 )
 from kestrel_cloud_runpod.providers import DirectRunPodProvider
+from kestrel_cloud_runpod.training_contracts import (
+    TrainingPodCleanupError,
+    TrainingPodCleanupState,
+)
 
 MINIMAL_RUNPOD_CONFIG = {
     "manager": {"cloud_type": "SECURE"},
@@ -327,7 +331,7 @@ async def test_manager_preserves_ambiguous_create_for_reconciliation():
 
 
 @pytest.mark.asyncio
-async def test_training_does_not_try_fallback_profile_after_ambiguous_create():
+async def test_training_does_not_try_fallback_profile_after_ambiguous_create(tmp_path):
     ambiguous = RunPodAmbiguousResultError(
         title="Runpod transport failed",
         detail="ReadTimeout",
@@ -336,6 +340,7 @@ async def test_training_does_not_try_fallback_profile_after_ambiguous_create():
     )
     mock_provider = MagicMock(spec=DirectRunPodProvider)
     mock_provider.start_pod.side_effect = ambiguous
+    mock_provider.list_pods.return_value = []
     training_profile = {
         "name": "Training",
         "image_name": "registry/training:sha",
@@ -344,6 +349,11 @@ async def test_training_does_not_try_fallback_profile_after_ambiguous_create():
     }
     config = {
         "manager": {"cloud_type": "SECURE", "max_ttl_seconds": 3600},
+        "training_pods": {
+            "database_path": str(tmp_path / "training.sqlite3"),
+            "poll_interval_seconds": 1,
+            "orphan_timeout_seconds": 30,
+        },
         "profiles": {
             "training": training_profile,
             "training-h100": {**training_profile, "name": "Training fallback"},
@@ -352,10 +362,62 @@ async def test_training_does_not_try_fallback_profile_after_ambiguous_create():
     with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
         manager = RunPodManager(config=config)
 
-    with pytest.raises(RunPodAmbiguousResultError):
+    with pytest.raises(TrainingPodCleanupError) as raised:
         await manager.start_training_pod("companion-123")
 
+    assert raised.value.pod_id is None
+    assert raised.value.billing_risk is True
     mock_provider.start_pod.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_training_uses_distinct_cleanup_token_for_safe_profile_fallback(tmp_path):
+    mock_provider = MagicMock(spec=DirectRunPodProvider)
+    mock_provider.start_pod.side_effect = [
+        RunPodManagerError("profile unavailable"),
+        {"id": "pod-fallback"},
+    ]
+    mock_provider.get_status.return_value = {
+        "id": "pod-fallback",
+        "status": "RUNNING",
+        "runtime": {"ports": [{"private": 8888, "type": "http"}]},
+    }
+    training_profile = {
+        "name": "Training",
+        "image_name": "registry/training:sha",
+        "min_vram_gb": 48,
+        "default_model": "flux-lora-trainer",
+        "ports": ["8888/http"],
+        "inference_port": 8888,
+    }
+    config = {
+        "manager": {"cloud_type": "SECURE", "max_ttl_seconds": 3600},
+        "training_pods": {
+            "database_path": str(tmp_path / "training.sqlite3"),
+            "poll_interval_seconds": 1,
+            "orphan_timeout_seconds": 30,
+        },
+        "profiles": {
+            "training": training_profile,
+            "training-h100": {**training_profile, "name": "Training fallback"},
+        },
+    }
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        manager = RunPodManager(config=config)
+
+    session = await manager.start_training_pod(
+        "companion-123", cleanup_token="training:stable-request-0001"
+    )
+
+    assert session.training_cleanup_token != "training:stable-request-0001"
+    assert session.training_cleanup_token.startswith("training:")
+    first = manager.get_training_pod_lease("training:stable-request-0001")
+    assert first.state.value == "released"
+    assert first.cleanup_state is TrainingPodCleanupState.COMPLETE
+    fallback = manager.get_training_pod_lease(session.training_cleanup_token)
+    assert fallback.profile_id == "training-h100"
+    assert fallback.state.value == "ready"
+    assert mock_provider.start_pod.call_count == 2
 
 
 @pytest.mark.asyncio

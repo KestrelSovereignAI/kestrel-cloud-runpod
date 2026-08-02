@@ -5,19 +5,22 @@ Contains SSH-based and HTTP-based training methods for
 LoRA training on RunPod GPU instances.
 """
 
+# This mixin intentionally declares its manager host contract in the class
+# docstring; attributes and lifecycle methods are supplied by RunPodManagerCore.
+# pyright: reportAttributeAccessIssue=false, reportUninitializedInstanceVariable=false
+
 import asyncio
 import logging
+import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.config.constants import (
-    BACKEND_URL_TIMEOUT,
-    BACKEND_URL_TIMEOUT_SHORT,
     HTTP_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_DOWNLOAD,
     HTTP_TIMEOUT_UPLOAD,
     POD_READY_TIMEOUT,
-    RUNPOD_STATUS_POLL_INTERVAL,
 )
 
 from .models import (
@@ -26,8 +29,31 @@ from .models import (
     RunPodManagerError,
     RunPodSession,
 )
+from .providers import DirectRunPodProvider
+from .training_contracts import (
+    TrainingPodCleanupError,
+    TrainingPodCleanupState,
+    TrainingPodLease,
+    TrainingPodLifecycleError,
+    TrainingPodRequest,
+    TrainingPodSource,
+    durable_training_name,
+)
+from .training_provider import RunpodTrainingPodProvider
+from .training_repository import SQLiteTrainingPodRepository, training_database_path
+from .training_service import TrainingPodLeaseService
 
 logger = logging.getLogger(__name__)
+
+
+def _fallback_training_cleanup_token(cleanup_token: str, profile_name: str) -> str:
+    """Derive a bounded, deterministic identity for a fallback GPU attempt."""
+
+    attempt_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"kestrel-runpod-training\0{cleanup_token}\0{profile_name}",
+    )
+    return f"training:{attempt_id}"
 
 
 class RunPodTrainingMixin:
@@ -36,6 +62,103 @@ class RunPodTrainingMixin:
 
     Requires RunPodManagerCore as base class.
     """
+
+    _training_pod_lease_service: TrainingPodLeaseService | None = None
+    _training_admission_lock: asyncio.Lock | None = None
+
+    def set_training_pod_lease_service(self, service: TrainingPodLeaseService) -> None:
+        """Inject the durable training lifecycle service for hosting or tests."""
+
+        self._training_pod_lease_service = service
+
+    def _get_training_pod_lease_service(self) -> TrainingPodLeaseService:
+        existing = self._training_pod_lease_service
+        if existing is not None:
+            return existing
+        if not isinstance(self.provider, DirectRunPodProvider):
+            raise RunPodManagerError(
+                "Durable training Pods require the direct Runpod v2 provider or an "
+                "explicitly injected TrainingPodLeaseService"
+            )
+        settings = self.config.get("training_pods")
+        if not isinstance(settings, Mapping):
+            raise RunPodManagerError(
+                "Configure the training_pods section before acquiring training capacity"
+            )
+        service = TrainingPodLeaseService(
+            repository=SQLiteTrainingPodRepository(training_database_path(settings)),
+            provider=RunpodTrainingPodProvider(self.provider),
+            profiles=self.profiles,
+            poll_interval_seconds=_required_positive_number(
+                settings, "poll_interval_seconds"
+            ),
+            orphan_timeout_seconds=_required_positive_number(
+                settings, "orphan_timeout_seconds"
+            ),
+            workload_status_observer=self._reconcile_training_workload_status,
+        )
+        self._training_pod_lease_service = service
+        return service
+
+    def get_training_pod_lease(self, cleanup_token: str) -> TrainingPodLease:
+        """Return durable operational state for an authorized cleanup token."""
+
+        lease = self._get_training_pod_lease_service().repository.get(cleanup_token)
+        if lease is None:
+            raise RunPodManagerError(
+                f"Training cleanup token '{cleanup_token}' was not found"
+            )
+        return lease
+
+    async def release_training_pod(
+        self, cleanup_token: str, *, reason: str = "caller release"
+    ) -> TrainingPodLease:
+        """Stop owned training capacity or keep a retryable cleanup record."""
+
+        lease = await self._get_training_pod_lease_service().release(
+            cleanup_token, reason=reason
+        )
+        async with self._lock:
+            if (
+                self._session is not None
+                and self._session.training_cleanup_token == cleanup_token
+            ):
+                self._session.status = self._map_status("EXITED")
+                self._session = None
+        return lease
+
+    async def reconcile_training_pods(self) -> tuple[TrainingPodLease, ...]:
+        """Run one restart-safe cleanup pass from an external scheduler."""
+
+        return await self._get_training_pod_lease_service().reconcile()
+
+    async def _reconcile_training_workload_status(
+        self, lease: TrainingPodLease
+    ) -> str | None:
+        """Recover webhook/poller loss without publishing or downloading output."""
+
+        import httpx
+
+        if not lease.backend_base_url or not lease.provider_job_id:
+            return None
+        url = f"{lease.backend_base_url}/status/{lease.provider_job_id}"
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                payload: object = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RunPodManagerError(
+                f"Training reconciliation status failed ({type(exc).__name__})"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise RunPodManagerError(
+                "Training reconciliation status returned a non-object"
+            )
+        status = payload.get("status") or payload.get("state")
+        if not isinstance(status, str) or not status:
+            raise RunPodManagerError("Training reconciliation status omitted status")
+        return status
 
     async def _wait_for_training_ready(
         self,
@@ -64,6 +187,8 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
 
         ready_url = f"{session.backend_base_url}/ready"
         deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
@@ -81,6 +206,7 @@ class RunPodTrainingMixin:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
             while datetime.now(timezone.utc) < deadline:
                 attempts += 1
+                service.heartbeat(cleanup_token)
                 try:
                     response = await client.get(ready_url)
 
@@ -136,6 +262,9 @@ class RunPodTrainingMixin:
                         )
 
                 except httpx.ConnectError:
+                    service.record_operation_error(
+                        cleanup_token, httpx.ConnectError("training readiness")
+                    )
                     if last_status != "connect_error":
                         logger.info(
                             f"Training pod not yet reachable (attempt {attempts})"
@@ -143,6 +272,9 @@ class RunPodTrainingMixin:
                         last_status = "connect_error"
 
                 except httpx.TimeoutException:
+                    service.record_operation_error(
+                        cleanup_token, httpx.TimeoutException("training readiness")
+                    )
                     if last_status != "timeout":
                         logger.warning(
                             f"Training pod /ready timed out (attempt {attempts})"
@@ -157,7 +289,9 @@ class RunPodTrainingMixin:
             f"The FLUX model may still be downloading. Check pod logs."
         )
 
-    async def start_training_pod(self, companion_id: str) -> Optional[RunPodSession]:
+    async def start_training_pod(
+        self, companion_id: str, *, cleanup_token: str | None = None
+    ) -> RunPodSession:
         """
         Start a pod for LoRA training using the training profile.
 
@@ -175,20 +309,28 @@ class RunPodTrainingMixin:
             companion_id: Companion being trained (for naming/tracking)
 
         Returns:
-            RunPodSession if started successfully, None otherwise
+            A route-ready session carrying its durable cleanup token.
         """
-        ttl_seconds = 3600  # 1 hour max for training
+        ttl_seconds = self._validate_ttl(3600)  # 1 hour requested training cap
         profiles_to_try = ["training", "training-h100", "training-flex"]
 
-        # Check if training profile has a persistent pod configured
+        service = self._get_training_pod_lease_service()
+
+        # Check if training profile has a persistent pod configured.
         if "training" in self.profiles:
             profile = self.profiles["training"]
             # Expand at runtime so a server restart is unnecessary.
             persistent_pod_id = self._expand_single_env_var(profile.persistent_pod_id)
             if persistent_pod_id:
                 logger.info(f"Using persistent training pod: {persistent_pod_id}")
-                return await self._use_persistent_pod(
-                    persistent_pod_id, profile, ttl_seconds
+                return await self._acquire_training_session(
+                    service=service,
+                    companion_id=companion_id,
+                    profile=profile,
+                    ttl_seconds=ttl_seconds,
+                    source=TrainingPodSource.CONFIGURED_PERSISTENT,
+                    provider_pod_id=persistent_pod_id,
+                    cleanup_token=cleanup_token,
                 )
 
         # Reuse an explicitly stopped Pod when the workload's storage policy permits it.
@@ -196,201 +338,123 @@ class RunPodTrainingMixin:
         if stopped_pod:
             try:
                 profile = self._select_profile("training")
+                pod_id = stopped_pod.get("id")
+                if not isinstance(pod_id, str) or not pod_id:
+                    raise RunPodManagerError("Stopped training Pod omitted its v2 ID")
                 logger.info("Starting existing stopped training Pod through Runpod v2")
-                return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
+                return await self._acquire_training_session(
+                    service=service,
+                    companion_id=companion_id,
+                    profile=profile,
+                    ttl_seconds=ttl_seconds,
+                    source=TrainingPodSource.STOPPED_REUSE,
+                    provider_pod_id=pod_id,
+                    cleanup_token=cleanup_token,
+                )
             except RunPodManagerError as e:
                 logger.warning(f"Failed to resume stopped pod: {e}")
                 raise
 
         # Try each profile in order
         last_error = None
+        attempted_profiles = 0
         for profile_name in profiles_to_try:
             if profile_name not in self.profiles:
                 continue
 
+            profile_cleanup_token = cleanup_token
+            if cleanup_token is not None and attempted_profiles > 0:
+                # One logical request may make several confirmed-safe capacity
+                # attempts.  Each attempt needs its own durable primary key so
+                # a released first profile cannot collide with the fallback,
+                # while the first attempt retains the caller's stable token.
+                profile_cleanup_token = _fallback_training_cleanup_token(
+                    cleanup_token, profile_name
+                )
+            attempted_profiles += 1
             try:
                 logger.info(f"Trying training profile: {profile_name}")
-                await self.start_session(
-                    task_profile=profile_name,
-                    model_name="flux-lora-trainer",
+                return await self._acquire_training_session(
+                    service=service,
+                    companion_id=companion_id,
+                    profile=self.profiles[profile_name],
                     ttl_seconds=ttl_seconds,
-                    metadata={
-                        "name": f"kestrel-lora-{companion_id[:8]}",
-                        "companion_id": companion_id,
-                        "purpose": "lora_training",
-                    },
+                    source=TrainingPodSource.CREATED,
+                    provider_pod_id=None,
+                    cleanup_token=profile_cleanup_token,
                 )
-
-                async with self._lock:
-                    session = self._session
-                    if session:
-                        # Verify backend URL is available (required for training)
-                        if not session.backend_base_url:
-                            logger.error(
-                                "Pod started but has no backend URL after readiness; "
-                                "check Runpod Pod ports"
-                            )
-                            # Try to stop the pod that has no URL
-                            await self.stop_session()
-                            last_error = RunPodManagerError(
-                                f"Pod {session.pod_id} has no backend URL; ports "
-                                "were not assigned"
-                            )
-                            continue
-                        logger.info(
-                            "Training Pod started with profile %s, URL: %s",
-                            profile_name,
-                            session.backend_base_url,
-                        )
-                        return session
-
-            except RunPodAmbiguousResultError:
-                # A timed-out create may already be billable. Never try the
-                # next profile until an external reconciler resolves it.
-                raise
-            except RunPodManagerError as e:
+            except TrainingPodLifecycleError as e:
                 logger.warning(f"Profile {profile_name} failed: {e}")
                 last_error = e
-                # Continue to next profile
+                if e.billing_risk or e.cleanup_state not in {
+                    TrainingPodCleanupState.COMPLETE,
+                    TrainingPodCleanupState.NOT_OWNED,
+                }:
+                    raise
+                # A known create rejection with confirmed no capacity can try
+                # the next configured profile. Reuse/resume never reaches here.
                 continue
 
         # All profiles failed
         if last_error:
             logger.error(f"All training profiles failed. Last error: {last_error}")
-        return None
+            raise last_error
+        raise RunPodManagerError("No training profile is configured")
 
-    async def _use_persistent_pod(
-        self, pod_id: str, profile: GPUProfile, ttl_seconds: int
-    ) -> Optional[RunPodSession]:
-        """
-        Use an existing persistent pod - resume if stopped, connect if running.
-
-        Readiness time is measured rather than inferred from whether the Pod existed.
-        """
-        try:
-            # Get current pod status
-            pod_info = await asyncio.to_thread(self.provider.get_status, pod_id)
-            if not pod_info:
-                logger.error(f"Persistent pod {pod_id} not found")
-                return None
-
-            status = pod_info.get("desiredStatus") or pod_info.get("status")
-            logger.info(f"Persistent pod {pod_id} status: {status}")
-
-            # Create session object
+    async def _acquire_training_session(
+        self,
+        *,
+        service: TrainingPodLeaseService,
+        companion_id: str,
+        profile: GPUProfile,
+        ttl_seconds: int,
+        source: TrainingPodSource,
+        provider_pod_id: str | None,
+        cleanup_token: str | None,
+    ) -> RunPodSession:
+        if self._training_admission_lock is None:
+            self._training_admission_lock = asyncio.Lock()
+        async with self._training_admission_lock:
+            async with self._lock:
+                if self._session and self._session.is_active:
+                    raise RunPodManagerError("A RunPod session is already active")
             now = datetime.now(timezone.utc)
+            token = cleanup_token or f"training:{uuid.uuid4()}"
+            readiness_seconds = profile.readiness_timeout_seconds or POD_READY_TIMEOUT
+            readiness_seconds = min(readiness_seconds, ttl_seconds - 1)
+            request = TrainingPodRequest(
+                cleanup_token=token,
+                companion_id=companion_id,
+                profile_id=profile.id,
+                source=source,
+                resource_name=durable_training_name(token),
+                provider_pod_id=provider_pod_id,
+                created_at=now,
+                readiness_deadline=now + timedelta(seconds=readiness_seconds),
+                hard_deadline=now + timedelta(seconds=ttl_seconds),
+            )
+            lease = await service.acquire(request)
+            if not lease.provider_pod_id or not lease.backend_base_url:
+                raise RunPodManagerError(
+                    "Durable training acquisition returned no route"
+                )
             session = RunPodSession(
-                pod_id=pod_id,
+                pod_id=lease.provider_pod_id,
                 profile=profile,
                 task_profile="training",
                 model_name="flux-lora-trainer",
                 pod_type=profile.pod_type,
-                status=self._map_status(status),
+                status=self._map_status("RUNNING"),
                 ttl_seconds=ttl_seconds,
-                started_at=now,
-                expires_at=now + timedelta(seconds=ttl_seconds),
+                started_at=lease.created_at,
+                expires_at=lease.hard_deadline,
+                backend_base_url=lease.backend_base_url,
+                companion_id=companion_id,
+                training_cleanup_token=lease.cleanup_token,
             )
-
-            # Resume if stopped/exited
-            if status in ("EXITED", "exited", "STOPPED", "stopped"):
-                logger.info(
-                    f"Resuming stopped persistent pod {pod_id} (status={status})"
-                )
-                gpu_count = 1
-                try:
-                    result = await asyncio.to_thread(
-                        self.provider.resume_pod, pod_id, gpu_count
-                    )
-                    logger.info(f"Resume API call returned: {result}")
-                except Exception as resume_err:
-                    logger.error(f"Failed to resume pod {pod_id}: {resume_err}")
-                    raise
-                # Wait for it to be ready
-                logger.info(
-                    "Waiting for Pod %s to become ready (up to %ss)...",
-                    pod_id,
-                    POD_READY_TIMEOUT,
-                )
-                await self._wait_for_pod_ready(session, timeout=POD_READY_TIMEOUT)
-                logger.info(f"Pod {pod_id} is now ready")
-
-            # If running, just wait for backend URL
-            elif status in ("RUNNING", "running"):
-                logger.info(f"Persistent pod {pod_id} already running")
-                # Update runtime info to get ports
-                self._update_session_from_runtime(session, pod_info)
-                # If no backend URL yet, wait for it
-                if not session.backend_base_url:
-                    await self._wait_for_backend_url(
-                        session, timeout=BACKEND_URL_TIMEOUT_SHORT
-                    )
-
-            else:
-                logger.warning(f"Persistent pod {pod_id} in unexpected state: {status}")
-                return None
-
-            # Store session
             async with self._lock:
                 self._session = session
-
-            if not session.backend_base_url:
-                logger.error(f"Persistent pod {pod_id} has no backend URL")
-                return None
-
-            logger.info(
-                f"Using persistent pod {pod_id}, URL: {session.backend_base_url}"
-            )
             return session
-
-        except Exception as e:
-            logger.error(f"Failed to use persistent pod {pod_id}: {e}")
-            return None
-
-    async def _wait_for_pod_ready(
-        self, session: RunPodSession, timeout: int = 300
-    ) -> None:
-        """Wait for a pod to reach RUNNING status."""
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
-        while datetime.now(timezone.utc) < deadline:
-            pod_info = await asyncio.to_thread(self.provider.get_status, session.pod_id)
-            status = pod_info.get("desiredStatus") or pod_info.get("status")
-            session.status = self._map_status(status)
-            self._update_session_from_runtime(session, pod_info)
-
-            if status in ("RUNNING", "running"):
-                logger.info(f"Pod {session.pod_id} is now running")
-                # Wait for backend URL
-                await self._wait_for_backend_url(session, timeout=BACKEND_URL_TIMEOUT)
-                return
-
-            logger.debug(f"Pod {session.pod_id} status: {status}, waiting...")
-            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL)
-
-        raise RunPodManagerError(
-            f"Pod {session.pod_id} did not become ready within {timeout}s"
-        )
-
-    async def _wait_for_backend_url(
-        self, session: RunPodSession, timeout: int = 120
-    ) -> None:
-        """Wait for backend URL to be populated (ports assigned)."""
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
-        while datetime.now(timezone.utc) < deadline:
-            if session.backend_base_url:
-                return
-
-            # Refresh pod info
-            pod_info = await asyncio.to_thread(self.provider.get_status, session.pod_id)
-            self._update_session_from_runtime(session, pod_info)
-
-            if session.backend_base_url:
-                logger.info(f"Backend URL ready: {session.backend_base_url}")
-                return
-
-            logger.debug(f"Waiting for backend URL on pod {session.pod_id}...")
-            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL)
-
-        logger.warning(f"Pod {session.pod_id} has no backend URL after {timeout}s")
 
     async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
         """
@@ -464,11 +528,24 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
 
-        # Wait for the model to be loaded before submitting training
-        # This is critical - /health returns OK while model is still loading!
-        if wait_for_model_ready:
-            await self._wait_for_training_ready(session)
+        try:
+            # /health can be healthy while the large trainer model is loading.
+            if wait_for_model_ready:
+                await self._wait_for_training_ready(session)
+        except asyncio.CancelledError:
+            service.request_cancellation(cleanup_token)
+            await self._release_after_cancellation(cleanup_token, "model readiness")
+            raise
+        except RunPodManagerError as exc:
+            service.record_operation_error(cleanup_token, exc)
+            try:
+                await service.release(cleanup_token, reason="model readiness failure")
+            except TrainingPodCleanupError as cleanup_exc:
+                raise cleanup_exc from exc
+            raise
 
         train_url = f"{session.backend_base_url}/train"
         logger.info(f"Submitting training job to {train_url}")
@@ -500,26 +577,117 @@ class RunPodTrainingMixin:
                 response = await client.post(train_url, files=files, data=data)
                 response.raise_for_status()
                 result = response.json()
+                if not isinstance(result, Mapping):
+                    raise RunPodManagerError(
+                        "Training workload returned a non-object submission response"
+                    )
+            except asyncio.CancelledError:
+                service.request_cancellation(cleanup_token)
+                await self._release_after_cancellation(
+                    cleanup_token, "training submission"
+                )
+                raise
             except httpx.ConnectError as e:
-                raise RunPodManagerError(
-                    f"Cannot connect to training pod at {train_url}: {e}"
-                ) from e
+                return await self._recover_or_cleanup_submission(
+                    client=client,
+                    session=session,
+                    companion_id=companion_id,
+                    cleanup_token=cleanup_token,
+                    cause=e,
+                )
             except httpx.HTTPStatusError as e:
-                error_body = e.response.text[:500] if e.response else "No response body"
-                raise RunPodManagerError(
-                    f"Training pod returned HTTP {e.response.status_code}: {error_body}"
-                ) from e
+                return await self._recover_or_cleanup_submission(
+                    client=client,
+                    session=session,
+                    companion_id=companion_id,
+                    cleanup_token=cleanup_token,
+                    cause=e,
+                )
             except httpx.TimeoutException as e:
+                return await self._recover_or_cleanup_submission(
+                    client=client,
+                    session=session,
+                    companion_id=companion_id,
+                    cleanup_token=cleanup_token,
+                    cause=e,
+                )
+            except (ValueError, RunPodManagerError) as exc:
+                service.record_operation_error(cleanup_token, exc)
+                try:
+                    await service.release(
+                        cleanup_token, reason="invalid submission response"
+                    )
+                except TrainingPodCleanupError as cleanup_exc:
+                    raise cleanup_exc from exc
                 raise RunPodManagerError(
-                    f"Timeout connecting to training pod at {train_url}"
-                ) from e
+                    f"Training submission failed ({type(exc).__name__})"
+                ) from exc
 
         job_id = result.get("job_id")
-        if not job_id:
-            raise RunPodManagerError(f"Training job did not return job_id: {result}")
+        if not isinstance(job_id, str) or not job_id:
+            error = RunPodManagerError("Training workload omitted its job ID")
+            service.record_operation_error(cleanup_token, error)
+            try:
+                await service.release(cleanup_token, reason="missing training job ID")
+            except TrainingPodCleanupError as cleanup_exc:
+                raise cleanup_exc from error
+            raise error
 
+        service.record_job(cleanup_token, job_id)
         logger.info(f"Training job submitted: {job_id}")
         return job_id
+
+    async def _recover_or_cleanup_submission(
+        self,
+        *,
+        client: Any,
+        session: RunPodSession,
+        companion_id: str,
+        cleanup_token: str,
+        cause: BaseException,
+    ) -> str:
+        """Recover an accepted job ID or stop capacity after an ambiguous POST."""
+
+        import httpx
+
+        service = self._get_training_pod_lease_service()
+        current_url = f"{session.backend_base_url}/current-job"
+        recovered_job_id: str | None = None
+        try:
+            response = await client.get(current_url)
+            if response.status_code == 200:
+                payload: object = response.json()
+                if isinstance(payload, Mapping):
+                    current = payload.get("current_job")
+                    if isinstance(current, Mapping):
+                        raw_id = current.get("job_id") or current.get("id")
+                        raw_companion = current.get("companion_id")
+                    else:
+                        raw_id = payload.get("job_id")
+                        raw_companion = payload.get("companion_id")
+                    if (
+                        isinstance(raw_id, str)
+                        and raw_id
+                        and raw_companion
+                        in {
+                            None,
+                            companion_id,
+                        }
+                    ):
+                        recovered_job_id = raw_id
+        except (httpx.HTTPError, ValueError):
+            recovered_job_id = None
+        if recovered_job_id:
+            service.record_job(cleanup_token, recovered_job_id)
+            return recovered_job_id
+        service.record_operation_error(cleanup_token, cause)
+        try:
+            await service.release(cleanup_token, reason="training submission failure")
+        except TrainingPodCleanupError as cleanup_exc:
+            raise cleanup_exc from cause
+        raise RunPodManagerError(
+            f"Training submission failed ({type(cause).__name__}); capacity was stopped"
+        ) from cause
 
     async def get_current_job(self, session: RunPodSession) -> Optional[Dict[str, Any]]:
         """
@@ -535,6 +703,9 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
+        service.heartbeat(cleanup_token)
 
         url = f"{session.backend_base_url}/current-job"
 
@@ -549,8 +720,11 @@ class RunPodTrainingMixin:
                 if data.get("current_job"):
                     return data
                 return None
-            except httpx.HTTPStatusError:
-                return None
+            except (httpx.HTTPError, ValueError) as exc:
+                service.record_operation_error(cleanup_token, exc)
+                raise RunPodManagerError(
+                    f"Training current-job observation failed ({type(exc).__name__})"
+                ) from exc
 
     async def cancel_training_job(
         self, session: RunPodSession, job_id: str
@@ -572,13 +746,38 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
+        service.request_cancellation(cleanup_token)
 
         url = f"{session.backend_base_url}/cancel/{job_id}"
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
-            response = await client.post(url)
-            response.raise_for_status()
-            return response.json()
+        cancellation: Dict[str, Any]
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+                response = await client.post(url)
+                response.raise_for_status()
+                payload: object = response.json()
+                if not isinstance(payload, dict):
+                    raise RunPodManagerError(
+                        "Training cancellation returned a non-object response"
+                    )
+                cancellation = payload
+        except asyncio.CancelledError:
+            await self._release_after_cancellation(cleanup_token, "job cancellation")
+            raise
+        except (httpx.HTTPError, ValueError, RunPodManagerError) as exc:
+            service.record_operation_error(cleanup_token, exc)
+            try:
+                await service.release(cleanup_token, reason="job cancellation failure")
+            except TrainingPodCleanupError as cleanup_exc:
+                raise cleanup_exc from exc
+            raise RunPodManagerError(
+                f"Training cancellation failed ({type(exc).__name__}); "
+                "capacity was stopped"
+            ) from exc
+        await service.release(cleanup_token, reason="job cancelled")
+        return cancellation
 
     async def clear_current_job(self, session: RunPodSession) -> Dict[str, Any]:
         """
@@ -597,15 +796,28 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
+        service.heartbeat(cleanup_token)
 
         url = f"{session.backend_base_url}/clear-current-job"
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
-            response = await client.post(url)
-            response.raise_for_status()
-            result = response.json()
-            logger.warning(f"Force-cleared job lock on pod: {result}")
-            return result
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+                response = await client.post(url)
+                response.raise_for_status()
+                result: object = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            service.record_operation_error(cleanup_token, exc)
+            raise RunPodManagerError(
+                f"Training lock clear failed ({type(exc).__name__})"
+            ) from exc
+        if not isinstance(result, dict):
+            error = RunPodManagerError("Training lock clear returned a non-object")
+            service.record_operation_error(cleanup_token, error)
+            raise error
+        logger.warning("Force-cleared the current training job lock")
+        return result
 
     async def poll_training_status(
         self, session: RunPodSession, job_id: str
@@ -624,13 +836,34 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
+        service.heartbeat(cleanup_token)
 
         status_url = f"{session.backend_base_url}/status/{job_id}"
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
-            response = await client.get(status_url)
-            response.raise_for_status()
-            return response.json()
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+                response = await client.get(status_url)
+                response.raise_for_status()
+                result: object = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            service.record_operation_error(cleanup_token, exc)
+            raise RunPodManagerError(
+                f"Training status observation failed ({type(exc).__name__}); "
+                f"reconcile cleanup token '{cleanup_token}'"
+            ) from exc
+        if not isinstance(result, dict):
+            error = RunPodManagerError("Training status returned a non-object response")
+            service.record_operation_error(cleanup_token, error)
+            raise error
+        raw_status = result.get("status") or result.get("state")
+        if not isinstance(raw_status, str) or not raw_status:
+            error = RunPodManagerError("Training status response omitted status")
+            service.record_operation_error(cleanup_token, error)
+            raise error
+        service.record_status(cleanup_token, raw_status)
+        return result
 
     async def download_lora(self, session: RunPodSession, job_id: str) -> bytes:
         """
@@ -647,14 +880,48 @@ class RunPodTrainingMixin:
 
         if not session.backend_base_url:
             raise RunPodManagerError("Session has no backend URL")
+        cleanup_token = self._training_token(session)
+        service = self._get_training_pod_lease_service()
+        service.heartbeat(cleanup_token)
 
         download_url = f"{session.backend_base_url}/download/{job_id}"
         logger.info(f"Downloading LoRA from {download_url}")
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DOWNLOAD) as client:
-            response = await client.get(download_url)
-            response.raise_for_status()
-            return response.content
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DOWNLOAD) as client:
+                response = await client.get(download_url)
+                response.raise_for_status()
+                content = response.content
+        except httpx.HTTPError as exc:
+            service.record_operation_error(cleanup_token, exc)
+            raise RunPodManagerError(
+                f"Training result download failed ({type(exc).__name__}); "
+                f"reconcile cleanup token '{cleanup_token}'"
+            ) from exc
+        service.record_result_retrieved(cleanup_token)
+        return content
+
+    @staticmethod
+    def _training_token(session: RunPodSession) -> str:
+        token = session.training_cleanup_token
+        if not token:
+            raise RunPodManagerError(
+                "Training session has no durable cleanup token; reacquire it through "
+                "start_training_pod"
+            )
+        return token
+
+    async def _release_after_cancellation(
+        self, cleanup_token: str, operation: str
+    ) -> None:
+        service = self._get_training_pod_lease_service()
+        cleanup = asyncio.create_task(
+            service.release(cleanup_token, reason=f"{operation} cancellation")
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
 
     async def generate_with_lora(
         self, session: RunPodSession, prompt: str, lora_path: str, num_outputs: int = 1
@@ -693,3 +960,10 @@ class RunPodTrainingMixin:
             )
             response.raise_for_status()
             return response.json()
+
+
+def _required_positive_number(settings: Mapping[str, Any], name: str) -> float:
+    value = settings.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise RunPodManagerError(f"training_pods.{name} must be a positive number")
+    return float(value)

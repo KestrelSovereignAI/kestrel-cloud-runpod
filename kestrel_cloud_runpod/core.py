@@ -283,6 +283,27 @@ class RunPodManagerCore:
             session = self._session
             if not session:
                 return {"active": False, "status": PodStatus.OFFLINE.value}
+        if session.training_cleanup_token:
+            release = getattr(self, "release_training_pod", None)
+            if release is None:
+                raise RunPodManagerError(
+                    "Training session has no durable lifecycle release implementation"
+                )
+            lease = await release(
+                session.training_cleanup_token, reason="manager stop_session"
+            )
+            session.status = PodStatus.OFFLINE
+            async with self._lock:
+                if self._session is session:
+                    self._session = None
+            payload = session.to_dict()
+            payload.update(
+                {
+                    "active": False,
+                    "training_cleanup_state": lease.cleanup_state.value,
+                }
+            )
+            return payload
         await asyncio.to_thread(self.provider.stop_pod, session.pod_id)
         session.status = PodStatus.TERMINATING
         async with self._lock:

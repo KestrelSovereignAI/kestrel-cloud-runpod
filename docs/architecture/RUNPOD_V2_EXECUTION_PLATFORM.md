@@ -12,12 +12,11 @@ Kestrel's Runpod integration predates Runpod Serverless. It creates and manages 
 
 That design was reasonable when inexpensive GPU capacity was scarce and model downloads made every replacement Pod expensive. Persistent disks and stopped Pods reduced repeat downloads, but tied the workload to a host or data-center capacity pool. Current Runpod provides a beta v2 REST control plane, queue and load-balancing Serverless endpoints, a live compute catalog, model caching, and billing records. These capabilities change the correct boundary: Kestrel should dispatch work to reusable execution services and manage durable leases, not recreate the old Pod lifecycle around a newer SDK.
 
-This record defines one vendor boundary for two workload families:
+This record defines one vendor boundary for three workload families:
 
 1. Frinz catalog selfie/image inference, dispatched asynchronously to queue-based Serverless workers while PostgreSQL remains authoritative.
-2. Private Ollama inference, leased through load-balanced Serverless for bursty interactive sessions or a dedicated Pod for sustained sessions.
-
-LoRA training is intentionally outside the first launch. Its future Runpod path must reuse this platform rather than create another provider implementation.
+2. LoRA training, executed locally or on CUDA through the shared catalog contract; persistent/reused training Pods have durable ownership and external cleanup.
+3. Private Ollama inference, leased through load-balanced Serverless for bursty interactive sessions or a dedicated Pod for sustained sessions.
 
 ## Decision
 
@@ -117,7 +116,7 @@ Estimates use the live placement rate. Actual spend is reconciled from `/billing
 | --- | --- | --- | --- |
 | Queue-based Serverless | Catalog image jobs and other finite asynchronous work | Runpod queues work and exposes job status/cancel/retry; Kestrel retains durable orchestration | Scale to zero by default; accept measured cold start in exchange for no idle Pod |
 | Load-balanced Serverless | Interactive Ollama/native HTTP streaming | Direct request routing, no durable queue and no automatic backlog handling; callers retry readiness/no-worker responses safely | Scale to zero for bursty sessions, with an intentional warm idle window |
-| Dedicated Pod | Sustained Ollama sessions, development/benchmarking, and future long-running workflows | Kestrel owns a durable lease, readiness, hard deadline, and external termination reconciliation | Prefer only when expected utilization makes the live Pod rate cheaper than Serverless initialization plus warm time |
+| Dedicated Pod | Sustained Ollama sessions, LoRA training when benchmark evidence favors it, and development canaries | Kestrel owns durable capacity, readiness, a hard deadline, and external stop/termination reconciliation | Prefer only when expected utilization or model-cache reuse beats measured Serverless initialization and idle tail |
 
 Runpod documents the behavior and tradeoffs of [queue and load-balancing endpoints](https://docs.runpod.io/serverless/load-balancing/overview). A catalog request never creates a Pod: it submits to a provisioned endpoint and lets Runpod scale workers. Endpoint definitions are managed declaratively through the v2 control plane and reused across jobs.
 
@@ -169,6 +168,8 @@ A lease records at least:
 - idempotency and reconciliation metadata.
 
 Creation, readiness, use, release, expiry, and teardown are explicit state transitions. Teardown never clears the provider ID before Runpod confirms termination. A periodic process outside the requesting agent terminates expired or orphaned Pods and keeps failures visible and retryable across restarts.
+
+Training Pod acquisition distinguishes capacity this invocation created/resumed from a Pod that was already running. The former is stopped on every readiness, route, submission, or cancellation failure; a failed stop retains the Pod ID and cleanup token for the external reconciler. The latter may be used when explicitly configured, but the invocation does not gain authority to stop shared pre-existing capacity. Provider job ID and result-recovery state remain attached to the same durable record through LoRA publication.
 
 Runpod notes that Pods with network volumes cannot be stopped, only terminated, and that a restarted Pod may receive zero GPUs when capacity changes. The provider therefore does not promise cheap resume as an availability strategy; it follows the current [Pod lifecycle contract](https://docs.runpod.io/pods/manage-pods).
 
@@ -239,9 +240,10 @@ Work is staged so each repository changes only the behavior it owns:
 5. [frinz-catalog#88](https://github.com/KestrelSovereignAI/frinz-catalog/issues/88) — benchmark cold start, VRAM, quality, reliability, and actual cost before cutover.
 6. [kestrel-sovereign#2844](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2844) — define the provider-neutral remote inference lease and readiness-gated route integration.
 7. [kestrel-cloud-runpod#9](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/9) — implement that contract with durable private Ollama leases and Serverless-versus-Pod selection.
-8. [kestrel-feature-lora#4](https://github.com/KestrelSovereignAI/kestrel-feature-lora/issues/4) — migrate the LoRA package's own stale adapter after the canonical v2 provider (#8) and provider-neutral registration boundary (#2844) exist. The catalog dispatcher (#688) and Ollama implementation (#9) are parallel consumers, not prerequisites for this cleanup.
+8. [kestrel-feature-lora#4](https://github.com/KestrelSovereignAI/kestrel-feature-lora/issues/4) — migrate the LoRA package's stale adapter onto the canonical v2 provider without duplicating lifecycle code.
+9. [kestrel-cloud-runpod#14](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/14) — persist ownership before training Pod create/resume, reconcile cleanup after crashes, and preserve provider IDs through workload failures.
 
-Catalog LoRA training remains deferred context in [frinz-catalog#77](https://github.com/KestrelSovereignAI/frinz-catalog/issues/77); it is not a launch dependency for selfie inference.
+Catalog LoRA training in [frinz-catalog#77](https://github.com/KestrelSovereignAI/frinz-catalog/issues/77) is launch-critical. The live gate must train real weights and consume them in a confirmed post-LoRA selfie.
 
 ```mermaid
 flowchart TD

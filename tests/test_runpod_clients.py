@@ -277,6 +277,24 @@ def test_create_timeout_is_ambiguous_and_not_retried():
     assert raised.value.detail == "ReadTimeout"
 
 
+def test_pod_action_timeout_is_ambiguous_and_not_retried():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = RunpodControlPlaneClient(
+        api_key="secret", http_transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(RunPodAmbiguousResultError) as raised:
+        client.pod_action("pod-1", "stop")
+
+    assert calls == 1
+    assert raised.value.resource == "/pods/pod-1/action"
+
+
 def test_invalid_list_envelope_fails_clearly():
     client = RunpodControlPlaneClient(
         api_key="secret",

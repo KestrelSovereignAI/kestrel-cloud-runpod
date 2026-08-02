@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-runpod"
-version = "0.4.0"
+version = "0.5.0"
 description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -59,6 +59,7 @@ RunPodFeature = "kestrel_cloud_runpod.feature:RunPodFeature"
 
 [project.scripts]
 kestrel-runpod-reconcile-ollama = "kestrel_cloud_runpod.ollama_reconciler:main"
+kestrel-runpod-reconcile-training = "kestrel_cloud_runpod.training_reconciler:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 49 tracked files (33 `.py`, 5 `.md`, 11 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 61 tracked files (45 `.py`, 5 `.md`, 11 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -67,6 +67,16 @@ Repo entry points and standard project files.
   - `class GPUProvider`; `class DirectRunPodProvider`; `class ManagedRunPodProvider`
 - **kestrel_cloud_runpod/training.py** — RunPod LoRA Training Methods.
   - `class RunPodTrainingMixin`
+- **kestrel_cloud_runpod/training_contracts.py** — Durable contracts for billable Runpod training Pod ownership.
+  - `class TrainingPodSource`; `class TrainingPodOwnership`; `class TrainingPodState`; `class TrainingPodCleanupState`; `class TrainingPodConflictError`; `class TrainingPodLifecycleError`; `class TrainingPodCleanupError`; `class TrainingPodRequest`; `…`
+- **kestrel_cloud_runpod/training_provider.py** — Runpod REST v2 capacity adapter for durable training Pod leases.
+  - `class TrainingPodObservation`; `class CreatedTrainingPod`; `class TrainingPodCapacityProvider`; `class RunpodTrainingPodProvider`
+- **kestrel_cloud_runpod/training_reconciler.py** — One-shot entry point for externally scheduled training Pod reconciliation.
+  - `class TrainingReconcileManager`; `async def reconcile_once(manager_factory)`; `def main()`
+- **kestrel_cloud_runpod/training_repository.py** — SQLite WAL persistence for restart-safe training Pod ownership.
+  - `class SQLiteTrainingPodRepository`; `def training_database_path(config)`
+- **kestrel_cloud_runpod/training_service.py** — Restart-safe acquisition and cleanup state machine for training Pods.
+  - `class TrainingPodLeaseService`
 
 ## `scripts/`
 
@@ -109,6 +119,20 @@ Repo entry points and standard project files.
   - `def test_direct_provider_selects_from_live_catalog_and_records_placement()`; `def test_direct_provider_fails_before_catalog_when_required_env_is_unset(monkeypatch)`; `def test_profile_rejects_persistent_volume_below_runpod_floor()`; `def test_direct_provider_lifecycle_and_v2_logs()`; `def test_private_cli_ssh_execution_has_clear_migration_error()`; `async def test_manager_get_logs_uses_provider_v2_log_stream()`; `def test_legacy_profile_fields_fail_with_migration_guidance()`; `def test_manager_maps_v2_http_runtime_port_to_pod_proxy_url()`; `…`
 - **tests/test_runpod_smoke.py** — Opt-in, read-only authenticated smoke checks for the beta v2 API.
   - `def test_live_v2_gpu_catalog_is_read_only_and_typed()`
+- **tests/test_training_contracts.py** — Public durable training ownership contracts.
+  - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`
+- **tests/test_training_mixin.py** — Manager integration for durable training capacity and workload recovery.
+  - `class FakeWorkloadClient`; `async def test_manager_session_tracks_job_result_and_confirmed_stop(tmp_path, monkeypatch)`; `async def test_submission_failure_stops_capacity_and_preserves_record(tmp_path, monkeypatch)`; `async def test_status_failure_keeps_job_and_cleanup_authority(tmp_path, monkeypatch)`; `async def test_cancel_stops_pod_and_stop_failure_is_retryable(tmp_path, monkeypatch)`
+- **tests/test_training_provider.py** — Runpod REST v2 training capacity adapter contracts.
+  - `async def test_observe_resolves_exact_http_proxy_route()`; `async def test_create_uses_provider_v2_boundary_and_validates_id()`; `async def test_find_by_name_rejects_duplicate_provider_resources()`; `async def test_stop_requires_v2_confirmation()`; `async def test_cancelled_start_waits_for_inflight_v2_mutation_to_resolve()`
+- **tests/test_training_reconciler.py** — External one-shot training reconciliation entry point.
+  - `async def test_reconcile_once_constructs_manager_and_runs_one_pass()`
+- **tests/test_training_repository.py** — Persistence, CAS, restart, and cross-process exclusion tests.
+  - `def test_reservation_survives_repository_restart(tmp_path)`; `def test_revision_cas_rejects_stale_writer(tmp_path)`; `def test_second_active_token_cannot_claim_same_pod(tmp_path)`; `def test_database_path_is_explicit_absolute_and_expands_environment(tmp_path, monkeypatch)`
+- **tests/test_training_service.py** — Billing-safe training acquisition, cancellation, and reconciliation tests.
+  - `async def test_resumed_pod_missing_route_is_stopped(tmp_path)`; `async def test_readiness_exception_stop_failure_retains_retryable_pod_after_restart(tmp_path)`; `async def test_preexisting_running_pod_route_failure_is_never_stopped(tmp_path)`; `async def test_ambiguous_create_reconciles_exact_name_and_stops_pod(tmp_path)`; `async def test_restart_recovers_crash_between_create_and_id_persistence(tmp_path)`; `async def test_restart_before_persistent_discovery_never_stops_preexisting_pod(tmp_path)`; `async def test_restart_reconciles_submitted_job_at_hard_deadline(tmp_path)`; `async def test_restart_recovers_submitted_job_status_before_hard_deadline(tmp_path)`; `…`
+- **tests/training_test_support.py** — Deterministic doubles for durable training Pod lifecycle tests.
+  - `class MutableClock`; `def training_profile()`; `def training_request(clock)`; `class FakeTrainingProvider`; `def training_service(tmp_path, clock, provider)`
 
 ## `vendor/`
 

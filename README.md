@@ -23,6 +23,7 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 | `RUNPOD_USER_AGENT` | Optional non-empty application User-Agent override |
 | `RUNPOD_OLLAMA_IMAGE` | Reviewed private Ollama Pod/Serverless image |
 | `RUNPOD_OLLAMA_LEASE_DB` | Optional absolute override for the durable SQLite lease store |
+| `RUNPOD_TRAINING_LEASE_DB` | Optional absolute override for durable training Pod ownership state |
 
 Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
 
@@ -33,6 +34,7 @@ Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
 - `RunpodControlPlaneClient` — typed v2 catalog, Pod, Serverless endpoint, worker/log, and billing client
 - `RunpodServerlessClient` — typed queue job run/status/cancel/retry/health client
 - Durable RunPod-backed private Ollama leases with readiness and cost gates
+- Durable LoRA training Pod ownership, cleanup tokens, and restart reconciliation
 
 ## Architecture
 
@@ -68,6 +70,8 @@ Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. This package does not ship the runtime image: `RUNPOD_OLLAMA_IMAGE` must identify a separately built and reviewed image that enforces `Authorization: Bearer $KESTREL_OLLAMA_BEARER_TOKEN`. The provider injects that value from `RUNPOD_OLLAMA_BEARER_TOKEN` and refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. The token is never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
 `accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection estimate still compares the expected Serverless initialization, active, and idle-tail window against the expected Pod session.
+
+Training Pods use the same durability rule. `start_training_pod()` reserves a SQLite/CAS cleanup token before a configured or reusable Pod is resumed, or before a deterministic Pod name is created. A Pod newly started by that call is either returned with a route, confirmed stopped, or retained as retryable state with its provider ID. A Pod already running before the call is marked `preexisting_running` and is never stopped by this lease. Submission, status, result, and cancellation operations heartbeat the same record and preserve the provider job/Pod IDs on failure. Run `kestrel-runpod-reconcile-training` from an external timer; process-local TTLs are not cleanup.
 
 ### Configuration migration from 0.2
 
