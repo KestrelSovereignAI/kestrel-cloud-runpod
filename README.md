@@ -30,7 +30,11 @@ the public SDK lease contract and never imports this package.
 | `RUNPOD_OLLAMA_LEASE_DB` | Optional absolute override for the durable SQLite lease store |
 | `RUNPOD_TRAINING_LEASE_DB` | Optional absolute override for durable training Pod ownership state |
 
-Optional `[runpod]` section in `kestrel.toml` for default profile preferences.
+Runtime settings and profiles live in the standalone
+`$KESTREL_HOME/runpod_config.toml`; [runpod_config.toml.example](runpod_config.toml.example)
+is the canonical shape. `RunPodManager(config=...)` may receive that same
+mapping explicitly. This package does not read a `[runpod]` section from
+`kestrel.toml`.
 
 ## What's provided
 
@@ -107,7 +111,7 @@ fresh host-only route without creating duplicate capacity.
 controls, but it no longer attaches, detaches, or reports an LLM route. The
 provider-neutral inference coordinator is the only LLM routing owner.
 
-Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
+Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
 For load-balanced Serverless, use a Runpod key restricted to the one endpoint as the scoped inference capability. Runpod authenticates it at the edge and the workload proxy verifies the same bearer defensively. For a dedicated Pod, `RUNPOD_OLLAMA_BEARER_TOKEN` is the scoped capability. The provider rejects either workload credential when it matches `RUNPOD_API_KEY`, and rejects one credential reused across both products. Rotate the Pod value per bounded lease/deployment; never reuse the full control-plane key. Both modes expose `/ping` on port 11434, returning `204` during model preparation and `200` only while Ollama is live, the capability is unexpired, and the exact pinned model remains present.
 
@@ -141,7 +145,7 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.34,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.7,<1` — `kestrel.toml` unified-config loader (runtime)
+- `kestrel-sovereign>=0.13.1,<1` — standalone Kestrel config-file loader (runtime)
 - `httpx>=0.27,<1`
 - `requests>=2.32,<3`
 

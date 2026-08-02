@@ -146,6 +146,7 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     from_lines = [line for line in dockerfile.splitlines() if line.startswith("FROM ")]
     assert len(from_lines) == 3
     assert all("@sha256:" in line for line in from_lines)
+    assert dockerfile.count(f"ARG RUNTIME_VERSION={OLLAMA_RUNTIME_VERSION}") == 2
     assert "FROM ollama/ollama:0.32.5@sha256:" in dockerfile
     assert "OLLAMA_COMMIT=eec8e0b9458b8a01be0c216a9cc53eefde24ef50" in dockerfile
     for fixed_module in (
@@ -177,6 +178,7 @@ def test_tracked_configs_share_the_runtime_policy_surface() -> None:
 def test_runtime_workflow_scans_and_publishes_one_exact_image() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
 
+    assert f"RUNTIME_VERSION: {OLLAMA_RUNTIME_VERSION}" in workflow
     assert workflow.count("docker/build-push-action@") == 1
     assert "Publish the exact scanned image" in workflow
     assert 'docker push "$RUNTIME_IMAGE_REF"' in workflow

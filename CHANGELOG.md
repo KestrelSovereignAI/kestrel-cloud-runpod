@@ -22,6 +22,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Raised the minimum `kestrel-sovereign-sdk` version to 0.34.0.
 - Poolless beta-v2 Serverless availability now fails with a specific no-create
   error instead of being silently discarded; no GPU-pool identifier is guessed.
+- The typed v2 control client now lists network volumes so cleanup gates can
+  prove that no storage resource remains after a disposable live run.
+- Full-agent Ollama leases now advertise OpenAI-compatible tool calling, and
+  runtime 1.1.0 refuses readiness unless the exact pinned model reports both
+  `completion` and `tools`. Tests preserve streaming tool schemas and tool-call
+  responses through the proxy.
 
 ## [0.5.0] - 2026-08-01
 

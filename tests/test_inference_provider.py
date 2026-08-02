@@ -76,7 +76,7 @@ def _request(clock: MutableClock, **changes) -> InferenceLeaseRequest:
         max_hourly_cost_usd=Decimal("1.00"),
         max_total_cost_usd=Decimal("1.00"),
         privacy=InferencePrivacy.AUTHENTICATED_ENDPOINT,
-        capabilities=("chat", "streaming"),
+        capabilities=("chat", "streaming", "tools"),
         allowed_regions=("us-tx-3",),
         expected_concurrency=1,
         expected_session_seconds=300,
@@ -132,6 +132,13 @@ def test_capabilities_are_deterministic_and_policy_scoped(tmp_path):
     assert first == second
     assert first[0].runtime == "ollama"
     assert first[0].privacy == (InferencePrivacy.AUTHENTICATED_ENDPOINT,)
+    assert first[0].capabilities == (
+        "chat",
+        "completions",
+        "embeddings",
+        "streaming",
+        "tools",
+    )
     assert first[0].regions == ("us-tx-3",)
     assert first[0].max_concurrency == 1
 

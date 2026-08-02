@@ -190,8 +190,14 @@ The model feature selects a model. A provider-neutral inference-lease service ac
 
 The package registers `runpod` in the SDK's dedicated inference-provider entry
 point group. Capability matching is deterministic (`ollama`, authenticated
-endpoint, OpenAI chat/completions/embeddings/streaming, one expected concurrent
-request, and explicitly configured Runpod data-center IDs). A quote is a
+endpoint, OpenAI chat/completions/embeddings/streaming/tools, one expected
+concurrent request, and explicitly configured Runpod data-center IDs). The
+runtime requires the exact digest-pinned model to report Ollama `completion`
+and `tools` capabilities before readiness, so the default full-agent route
+never degrades to a tool-free lane. This matches Ollama's documented
+[OpenAI-compatible tools support](https://docs.ollama.com/api/openai-compatibility)
+and [Qwen3 tool-calling contract](https://docs.ollama.com/capabilities/tool-calling).
+A quote is a
 read-only v2 catalog operation. The selected mode, observed price, configured
 cold-start estimate, full expected session, and Serverless idle tail must fit
 the caller's hourly, total, region, privacy, and readiness limits before the
@@ -296,11 +302,14 @@ The platform is not production-ready until all applicable gates pass:
 - no production infrastructure call uses v1 or GraphQL;
 - pinned-schema contract and drift tests pass;
 - every billable resource is attributable and externally reclaimable after process failure;
+- pre/post live-run v2 inventories account for Pods, Serverless endpoints, and
+  network volumes, with no unexpected resource remaining after cleanup;
 - ambiguous create, duplicate callback, webhook loss, cancellation, late completion, and teardown failure paths are tested;
 - catalog artifacts publish exactly once and workers have no database credential;
 - private Ollama routes activate only after the requested model is ready;
 - restricted credentials and privacy/cost constraints are verified;
-- cold-start p50/p95, execution p50/p95, VRAM, success rate, quality, and cost are inside approved thresholds; and
+- cold-start p50/p95, execution p50/p95, peak VRAM, peak host RAM, success
+  rate, quality, and cost are inside predeclared approved thresholds; and
 - actual v2 billing reconciles with estimates closely enough to enforce budget limits.
 
 ## Consequences

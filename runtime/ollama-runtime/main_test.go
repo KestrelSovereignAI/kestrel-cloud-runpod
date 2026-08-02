@@ -60,6 +60,13 @@ func authorizedRequest(t *testing.T, method, target, body string) *http.Request 
 	return request
 }
 
+func toolModel(name, digest string) map[string]any {
+	return map[string]any{
+		"name": name, "digest": digest,
+		"capabilities": []string{"completion", "tools"},
+	}
+}
+
 func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 	started := time.Now().UTC()
 	valid := map[string]string{
@@ -187,9 +194,9 @@ func TestHealthIsPublicButFailClosedUntilExactModelReady(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/api/tags" {
-			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]string{{
-				"name": "registry.example/team/model:v1", "digest": digest,
-			}}})
+			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]any{
+				toolModel("registry.example/team/model:v1", digest),
+			}})
 			return
 		}
 		writer.WriteHeader(http.StatusOK)
@@ -236,9 +243,9 @@ func TestReadinessRevalidatesExactModelAndCapabilityExpiry(t *testing.T) {
 	digest := strings.Repeat("b", 64)
 	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/api/tags" {
-			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]string{{
-				"name": "registry.example/team/model:v1", "digest": digest,
-			}}})
+			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]any{
+				toolModel("registry.example/team/model:v1", digest),
+			}})
 			return
 		}
 		writer.WriteHeader(http.StatusOK)
@@ -261,6 +268,31 @@ func TestReadinessRevalidatesExactModelAndCapabilityExpiry(t *testing.T) {
 	}).ServeHTTP(expired, httptest.NewRequest(http.MethodGet, "/ping", nil))
 	if expired.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expired capability readiness returned %d", expired.Code)
+	}
+}
+
+func TestExactPinnedModelWithoutToolCapabilityNeverBecomesReady(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/tags" {
+			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]any{{
+				"name":         "registry.example/team/model:v1",
+				"digest":       digest,
+				"capabilities": []string{"completion"},
+			}}})
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	})
+	config := testConfig(upstream)
+	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+
+	err := bootstrap(context.Background(), config, state, http.DefaultClient)
+	if err == nil || !strings.Contains(err.Error(), `capability "tools"`) {
+		t.Fatalf("expected explicit tools-capability failure, got %v", err)
+	}
+	if state.snapshot(config).Ready {
+		t.Fatal("model without tools became ready")
 	}
 }
 
@@ -335,6 +367,37 @@ func TestApprovedInferenceStripsWorkloadBearer(t *testing.T) {
 	upstreamRequest := <-requests
 	if upstreamRequest.Header.Get("Authorization") != "" {
 		t.Fatal("workload bearer was forwarded to Ollama")
+	}
+}
+
+func TestOpenAIStreamingToolsAndToolCallsPassThroughUnchanged(t *testing.T) {
+	requestBody := `{"model":"registry.example/team/model:v1","messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"stream":true}`
+	responseBody := "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\",\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Chicago\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+	received := make(chan string, 1)
+	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		received <- string(body)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, responseBody)
+	})
+	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authorizedRequest(
+		t, http.MethodPost, "/v1/chat/completions", requestBody,
+	))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("OpenAI chat completion returned %d", response.Code)
+	}
+	if got := <-received; got != requestBody {
+		t.Fatalf("tool request changed in transit:\n got %s\nwant %s", got, requestBody)
+	}
+	if got := response.Body.String(); got != responseBody {
+		t.Fatalf("tool-call response changed in transit:\n got %s\nwant %s", got, responseBody)
 	}
 }
 
@@ -414,9 +477,9 @@ func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 		case "/api/version":
 			writeJSON(writer, http.StatusOK, map[string]string{"version": "test"})
 		case "/api/tags":
-			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]string{{
-				"name": "registry.example/team/model:v1", "digest": digest,
-			}}})
+			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]any{
+				toolModel("registry.example/team/model:v1", digest),
+			}})
 		case "/api/generate":
 			generateCalls.Add(1)
 			writeJSON(writer, http.StatusOK, map[string]bool{"done": true})
@@ -447,9 +510,9 @@ func TestBootstrapPullsOnlyRequiredPinAndRejectsDigestMismatch(t *testing.T) {
 		case "/api/version":
 			writeJSON(writer, http.StatusOK, map[string]string{"version": "test"})
 		case "/api/tags":
-			models := []map[string]string{}
+			models := []map[string]any{}
 			if pulled.Load() {
-				models = append(models, map[string]string{"name": "registry.example/team/model:v1", "digest": digest})
+				models = append(models, toolModel("registry.example/team/model:v1", digest))
 			}
 			writeJSON(writer, http.StatusOK, map[string]any{"models": models})
 		case "/api/pull":
