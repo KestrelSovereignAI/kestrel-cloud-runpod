@@ -49,7 +49,7 @@ from .providers import _resolve_env_vars
 
 _PROVIDER_NAME = "runpod"
 _RUNTIME = "ollama"
-_CAPABILITIES = ("chat", "completions", "embeddings", "streaming")
+_CAPABILITIES = ("chat", "completions", "embeddings", "streaming", "tools")
 
 
 @dataclass(frozen=True)

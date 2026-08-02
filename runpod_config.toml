@@ -51,6 +51,8 @@ max_context_window = 32768
 [profiles.ollama.env]
   # Comma-separated name:tag@sha256:<64 lowercase hex> entries. This trusted
   # operator policy is required and request data cannot expand or override it.
+  # Every listed model must support Ollama completion and tools; runtime
+  # readiness verifies both before exposing a full-agent route.
   KESTREL_OLLAMA_ALLOWED_MODELS = "${RUNPOD_OLLAMA_ALLOWED_MODELS}"
   # The provider owns PORT, health, requested-model, bearer, expiry, and mode.
 

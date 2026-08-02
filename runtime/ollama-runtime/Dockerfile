@@ -2,7 +2,7 @@
 
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS proxy-builder
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.0.0
+ARG RUNTIME_VERSION=1.1.0
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -35,7 +35,7 @@ RUN go get \
       -o /out/ollama .
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.0.0
+ARG RUNTIME_VERSION=1.1.0
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \

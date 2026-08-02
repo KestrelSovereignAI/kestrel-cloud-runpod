@@ -11,7 +11,7 @@ from .models import RunPodManagerError
 from .ollama_contracts import OllamaLeaseMode
 
 OLLAMA_RUNTIME_CONTRACT = "ollama-runtime/v1"
-OLLAMA_RUNTIME_VERSION = "1.0.0"
+OLLAMA_RUNTIME_VERSION = "1.1.0"
 OLLAMA_RUNTIME_IMAGE_REPOSITORY = (
     "ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime"
 )

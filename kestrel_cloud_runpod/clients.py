@@ -24,6 +24,7 @@ from .models import (
     EndpointResource,
     EndpointUpdateRequest,
     GPUOffer,
+    NetworkVolume,
     PodCreateRequest,
     PodResource,
     RateLimit,
@@ -414,6 +415,17 @@ class RunpodControlPlaneClient:
         payload = _required_payload(self.transport.request_json("GET", "/pods"))
         return tuple(
             PodResource.from_dict(item) for item in _list_envelope(payload, "pods")
+        )
+
+    def list_network_volumes(self) -> tuple[NetworkVolume, ...]:
+        """List account volumes for read-only cleanup and cost verification."""
+
+        payload = _required_payload(
+            self.transport.request_json("GET", "/network-volumes")
+        )
+        return tuple(
+            NetworkVolume.from_dict(item)
+            for item in _list_envelope(payload, "networkVolumes")
         )
 
     def pod_action(self, pod_id: str, action: str) -> Optional[PodResource]:

@@ -33,9 +33,8 @@ classifiers = [
 ]
 dependencies = [
     "kestrel-sovereign-sdk>=0.34.0,<1",
-    # Framework runtime dep: feature uses kestrel_sovereign.config.load_config
-    # to honor the unified-kestrel.toml [runpod] section. Same shape as
-    # kestrel-cloud-gcp + kestrel-cloud-vastai.
+    # Framework runtime dep: the manager uses kestrel_sovereign.config.load_config
+    # to load the standalone $KESTREL_HOME/runpod_config.toml.
     "kestrel-sovereign>=0.13.1,<1",
     "httpx>=0.27.0,<1",
     "requests>=2.32.0,<3",

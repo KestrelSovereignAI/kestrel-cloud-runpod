@@ -15,7 +15,9 @@ streaming reverse proxy.
 - Model pulls and inference are restricted to `KESTREL_OLLAMA_ALLOWED_MODELS`.
   Each allowlist entry has the form `name:tag@sha256:<64 lowercase hex>`. The
   worker refuses readiness when the local digest differs from the configured
-  pin.
+  pin. Every allowlisted model is a full-agent route and must report Ollama's
+  `completion` and `tools` capabilities; the worker refuses readiness when
+  either is absent.
 - Ollama create, copy, delete, pull, push, and blob-management APIs are disabled
   externally. Bootstrap is the sole digest-verifying model-pull path.
   Unrecognized future routes fail closed instead of being forwarded.
@@ -35,8 +37,9 @@ The runtime starts its public proxy immediately. `/ping` returns `204` while
 Ollama boots, the pinned model is verified or pulled into `/models`, and the
 model is preloaded. It returns `200` only after those phases complete, matching
 [Runpod's load-balancer health contract](https://docs.runpod.io/serverless/load-balancing/overview).
-After startup every readiness probe revalidates Ollama and the exact digest; a
-digest mismatch, expired capability, or upstream failure returns `503`.
+After startup every readiness probe revalidates Ollama, the exact digest, and
+the model's completion/tool support. A mismatch, missing capability, expired
+workload capability, or upstream failure returns `503`.
 
 The provider sets `KESTREL_OLLAMA_MODEL_STORAGE_PATH` to `/models` for ephemeral
 container storage, `/workspace/ollama` for a Pod volume, or
@@ -60,7 +63,7 @@ measures the `/ping` `204` to `200` cold-start interval.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.0.0`; it does not change the
+The runtime is independently versioned as `1.1.0`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds

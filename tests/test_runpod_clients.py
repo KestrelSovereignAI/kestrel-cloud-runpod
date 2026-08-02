@@ -65,6 +65,18 @@ def _endpoint(**overrides):
     return value
 
 
+def _network_volume(**overrides):
+    value = {
+        "id": "volume-123",
+        "name": "model-cache",
+        "size": 100,
+        "dataCenter": "US-TX-3",
+        "type": "HIGH_PERFORMANCE",
+    }
+    value.update(overrides)
+    return value
+
+
 def test_control_client_auth_user_agent_catalog_query_and_timeouts():
     seen = []
 
@@ -366,6 +378,49 @@ def test_pod_lifecycle_request_shapes():
     ]
     assert json.loads(seen[0].content)["gpu"] == {"id": "gpu-id", "count": 1}
     assert json.loads(seen[3].content) == {"action": "stop"}
+
+
+def test_network_volume_inventory_is_typed_and_read_only():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"networkVolumes": [_network_volume()]})
+
+    client = RunpodControlPlaneClient(
+        api_key="secret", http_transport=httpx.MockTransport(handler)
+    )
+
+    volumes = client.list_network_volumes()
+
+    assert len(volumes) == 1
+    assert volumes[0].id == "volume-123"
+    assert volumes[0].size_gb == 100
+    assert volumes[0].volume_type.value == "HIGH_PERFORMANCE"
+    assert [(request.method, request.url.path) for request in seen] == [
+        ("GET", "/v2/network-volumes")
+    ]
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        _network_volume(type="unknown"),
+        _network_volume(size=1),
+        _network_volume(size=4097),
+        _network_volume(dataCenter=None),
+    ],
+)
+def test_network_volume_inventory_rejects_invalid_provider_shapes(volume):
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"networkVolumes": [volume]})
+        ),
+    )
+
+    with pytest.raises(RunPodManagerError, match="(?i)network volume"):
+        client.list_network_volumes()
 
 
 def test_endpoint_worker_and_billing_request_shapes():
