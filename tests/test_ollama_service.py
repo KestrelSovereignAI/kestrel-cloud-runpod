@@ -1,6 +1,7 @@
 """Lifecycle, crash recovery, readiness, cost, and teardown tests."""
 
 import asyncio
+import json
 from datetime import timedelta
 
 import pytest
@@ -39,25 +40,44 @@ def _service(tmp_path, clock, provider):
 
 
 def _persist_uncertain_creation(repository, request, clock):
+    plan = serverless_plan()
     lease, _ = repository.insert_request(request, now=clock())
     lease = repository.compare_and_set(
         lease,
         changes={
             "state": OllamaLeaseState.PROVISIONING,
-            "mode": serverless_plan().mode,
+            "mode": plan.mode,
             "resource_type": OllamaResourceType.SERVERLESS_ENDPOINT,
             "resource_name": resource_name(request.lease_id),
             "creation_uncertain": True,
             "provision_attempt_id": provision_attempt_id(request),
             "provision_attempts": 1,
             "provisioning_started_at": clock(),
-            "offered_rate_per_hr": 0.9,
-            "estimated_cost": 0.1,
+            **_persisted_plan_changes(plan),
         },
     )
     return repository.compare_and_set(
         lease, changes={"state": OllamaLeaseState.RECONCILE_REQUIRED}
     )
+
+
+def _persisted_plan_changes(plan):
+    return {
+        "offered_rate_per_hr": plan.placement.offered_cost_per_hr,
+        "estimated_cost": plan.estimated_cost,
+        "estimated_compute_cost": plan.estimated_compute_cost,
+        "maximum_compute_cost": plan.maximum_compute_cost,
+        "estimated_non_compute_cost": plan.estimated_non_compute_cost,
+        "maximum_non_compute_cost": plan.maximum_non_compute_cost,
+        "cost_ceiling": plan.cost_ceiling,
+        "cost_policy_components_json": json.dumps(
+            [item.value for item in plan.non_compute_components],
+            separators=(",", ":"),
+        ),
+        "maximum_concurrent_workers": plan.maximum_concurrent_workers,
+        "estimated_billable_seconds": plan.estimated_billable_seconds,
+        "maximum_billable_seconds": plan.maximum_billable_seconds,
+    }
 
 
 @pytest.mark.asyncio
@@ -160,13 +180,25 @@ async def test_reconciler_recovers_crash_after_requested_insert(tmp_path):
     lease, inserted = repository.insert_request(request, now=clock())
     assert inserted is True
     assert lease.state is OllamaLeaseState.REQUESTED
-    provider = FakeOllamaProvider(serverless_plan())
+    provider = FakeOllamaProvider(
+        serverless_plan(
+            estimated_cost=0.1,
+            maximum_compute_cost=0.6,
+            estimated_non_compute_cost=0.05,
+            maximum_non_compute_cost=0.2,
+        )
+    )
 
     restarted = _service(tmp_path, clock, provider)
     results = await restarted.reconcile()
 
     assert results[0].state is OllamaLeaseState.READY
     assert results[0].provider_resource_id == "provider-001"
+    assert results[0].estimated_compute_cost == 0.1
+    assert results[0].estimated_non_compute_cost == 0.05
+    assert results[0].maximum_non_compute_cost == 0.2
+    assert results[0].estimated_cost == pytest.approx(0.15)
+    assert results[0].cost_ceiling == pytest.approx(0.8)
     assert provider.provision_calls == 1
 
 
@@ -254,18 +286,18 @@ async def test_restart_reconciles_resource_created_before_id_was_persisted(tmp_p
     request = make_request(clock)
     repository = SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3")
     lease, _ = repository.insert_request(request, now=clock())
+    plan = serverless_plan()
     lease = repository.compare_and_set(
         lease,
         changes={
             "state": OllamaLeaseState.PROVISIONING,
-            "mode": serverless_plan().mode,
+            "mode": plan.mode,
             "resource_type": OllamaResourceType.SERVERLESS_ENDPOINT,
             "resource_name": resource_name(request.lease_id),
             "provision_attempt_id": provision_attempt_id(request),
             "provision_attempts": 1,
             "provisioning_started_at": clock(),
-            "offered_rate_per_hr": 0.9,
-            "estimated_cost": 0.1,
+            **_persisted_plan_changes(plan),
         },
     )
     provider = FakeOllamaProvider(serverless_plan())
@@ -427,7 +459,7 @@ async def test_readiness_timeout_tears_down_without_publishing_route(tmp_path):
 @pytest.mark.asyncio
 async def test_cost_cap_stops_slow_cold_start(tmp_path):
     clock = MutableClock()
-    provider = FakeOllamaProvider(serverless_plan(rate=3.6, estimated_cost=0.0001))
+    provider = FakeOllamaProvider(serverless_plan(rate=3.6, estimated_cost=0.001))
     provider.provider_ready = False
     service = _service(tmp_path, clock, provider)
 
@@ -435,12 +467,12 @@ async def test_cost_cap_stops_slow_cold_start(tmp_path):
         make_request(
             clock,
             readiness_timeout_seconds=10,
-            max_authorized_cost=0.0005,
+            max_authorized_cost=0.0015,
         )
     )
 
     assert lease.state is OllamaLeaseState.TERMINATED
-    assert lease.accrued_estimated_cost >= 0.0005
+    assert lease.accrued_estimated_cost >= 0.0015
     assert provider.teardown_calls == 1
 
 
@@ -448,7 +480,7 @@ async def test_cost_cap_stops_slow_cold_start(tmp_path):
 async def test_cost_cap_stops_cold_start_when_observation_keeps_failing(tmp_path):
     clock = MutableClock()
     provider = _AlwaysFailingObserveProvider(
-        serverless_plan(rate=3.6, estimated_cost=0.0001)
+        serverless_plan(rate=3.6, estimated_cost=0.001)
     )
     service = _service(tmp_path, clock, provider)
 
@@ -456,12 +488,12 @@ async def test_cost_cap_stops_cold_start_when_observation_keeps_failing(tmp_path
         make_request(
             clock,
             readiness_timeout_seconds=10,
-            max_authorized_cost=0.0005,
+            max_authorized_cost=0.0015,
         )
     )
 
     assert lease.state is OllamaLeaseState.TERMINATED
-    assert lease.accrued_estimated_cost >= 0.0005
+    assert lease.accrued_estimated_cost >= 0.0015
     assert provider.teardown_calls == 1
 
 
@@ -538,6 +570,35 @@ async def test_service_rejects_provider_plan_above_cost_cap_before_creation(tmp_
     lease = service.repository.get("lease-001")
     assert lease.state is OllamaLeaseState.FAILED
     assert provider.provision_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overhead, provisions", [(0.5, 1), (0.500001, 0)])
+async def test_direct_acquire_enforces_all_in_ceiling_boundary(
+    tmp_path, overhead, provisions
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(
+        serverless_plan(
+            estimated_cost=0.1,
+            maximum_compute_cost=0.5,
+            maximum_non_compute_cost=overhead,
+        )
+    )
+    service = _service(tmp_path, clock, provider)
+
+    if provisions:
+        lease = await service.acquire(
+            make_request(clock, max_authorized_cost=1.0),
+            wait_until_ready=False,
+        )
+        assert lease.cost_ceiling == 1.0
+        assert lease.maximum_non_compute_cost == 0.5
+    else:
+        with pytest.raises(RunPodManagerError, match="all-in cost ceiling"):
+            await service.acquire(make_request(clock, max_authorized_cost=1.0))
+
+    assert provider.provision_calls == provisions
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
@@ -10,6 +11,8 @@ from .models import FlashBoot, GPUProfile, RunPodManagerError
 from .ollama_contracts import (
     OllamaLease,
     OllamaLeaseRequest,
+    OllamaNonComputeCostComponent,
+    OllamaNonComputeCostPolicy,
 )
 from .ollama_provider import (
     RunpodOllamaCapacityProvider,
@@ -20,7 +23,7 @@ from .ollama_repository import (
     lease_database_path,
 )
 from .ollama_service import OllamaLeaseService
-from .providers import DirectRunPodProvider, GPUProvider
+from .providers import DirectRunPodProvider, GPUProvider, _resolve_env_vars
 
 
 class _OllamaManagerHost(Protocol):
@@ -117,6 +120,12 @@ class RunPodOllamaMixin:
             ),
             serverless_flashboot=flashboot,
             http_timeout_seconds=_required_float(raw_settings, "http_timeout_seconds"),
+            serverless_non_compute_cost=_required_non_compute_cost_policy(
+                raw_settings, "serverless_non_compute_cost"
+            ),
+            pod_non_compute_cost=_required_non_compute_cost_policy(
+                raw_settings, "pod_non_compute_cost"
+            ),
         )
         service = OllamaLeaseService(
             repository=SQLiteOllamaLeaseRepository(lease_database_path(raw_settings)),
@@ -154,3 +163,61 @@ def _required_float(settings: Mapping[str, Any], name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
         raise RunPodManagerError(f"ollama_leases.{name} must be a positive number")
     return float(value)
+
+
+def _required_non_compute_cost_policy(
+    settings: Mapping[str, Any], name: str
+) -> OllamaNonComputeCostPolicy:
+    raw = settings.get(name)
+    if not isinstance(raw, Mapping):
+        raise RunPodManagerError(
+            f"ollama_leases.{name} must explicitly configure non-compute cost"
+        )
+    raw_components = raw.get("covered_components")
+    if (
+        not isinstance(raw_components, list)
+        or not raw_components
+        or any(not isinstance(item, str) for item in raw_components)
+    ):
+        raise RunPodManagerError(
+            f"ollama_leases.{name}.covered_components must be a nonempty list"
+        )
+    try:
+        components = tuple(
+            sorted(
+                (OllamaNonComputeCostComponent(item) for item in raw_components),
+                key=lambda item: item.value,
+            )
+        )
+        return OllamaNonComputeCostPolicy(
+            estimated_cost_usd=_required_nonnegative_cost(
+                raw, "estimated_cost_usd", section=name
+            ),
+            maximum_cost_usd=_required_nonnegative_cost(
+                raw, "maximum_cost_usd", section=name
+            ),
+            covered_components=components,
+        )
+    except ValueError as exc:
+        raise RunPodManagerError(
+            f"ollama_leases.{name} contains an invalid cost policy"
+        ) from exc
+
+
+def _required_nonnegative_cost(
+    settings: Mapping[str, Any], name: str, *, section: str
+) -> float:
+    raw = settings.get(name)
+    if isinstance(raw, str):
+        raw = _resolve_env_vars({name: raw})[name]
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise RunPodManagerError(
+            f"ollama_leases.{section}.{name} must be configured"
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise RunPodManagerError(
+            f"ollama_leases.{section}.{name} must be finite and nonnegative"
+        )
+    return value

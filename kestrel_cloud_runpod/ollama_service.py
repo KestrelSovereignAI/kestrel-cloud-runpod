@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from collections.abc import Awaitable, Callable, Mapping
@@ -29,6 +30,7 @@ from .ollama_contracts import (
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
+    authorized_cost_exposure,
     provision_attempt_id,
     require_aware,
     resource_from_lease,
@@ -174,7 +176,18 @@ class OllamaLeaseService:
             provisioning_started_at=now,
             offered_rate_per_hr=plan.placement.offered_cost_per_hr,
             estimated_cost=plan.estimated_cost,
+            estimated_compute_cost=plan.estimated_compute_cost,
+            maximum_compute_cost=plan.maximum_compute_cost,
+            estimated_non_compute_cost=plan.estimated_non_compute_cost,
+            maximum_non_compute_cost=plan.maximum_non_compute_cost,
+            cost_ceiling=plan.cost_ceiling,
+            cost_policy_components_json=json.dumps(
+                [item.value for item in plan.non_compute_components],
+                separators=(",", ":"),
+            ),
+            maximum_concurrent_workers=plan.maximum_concurrent_workers,
             estimated_billable_seconds=plan.estimated_billable_seconds,
+            maximum_billable_seconds=plan.maximum_billable_seconds,
             selected_gpu_id=plan.placement.gpu_id,
             selected_gpu_pool=plan.placement.gpu_pool,
             selected_gpu_name=plan.placement.gpu_name,
@@ -239,7 +252,10 @@ class OllamaLeaseService:
             return lease
         now = self._now()
         accrued = accrued_cost(lease, now)
-        if now >= lease.hard_deadline or accrued >= lease.max_authorized_cost:
+        if (
+            now >= lease.hard_deadline
+            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+        ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         touched = self.repository.compare_and_set(
             lease,
@@ -315,12 +331,11 @@ class OllamaLeaseService:
             OllamaLeaseState.RECONCILE_REQUIRED,
         }:
             lease = await self._reconcile_creation(lease)
-        accrued = accrued_cost(lease, now)
         hard_expired = now >= lease.hard_deadline
         idle_expired = (
             lease.state is OllamaLeaseState.READY and now >= lease.idle_deadline
         )
-        over_cost = accrued >= lease.max_authorized_cost
+        over_cost = authorized_cost_exposure(lease, now) >= (lease.max_authorized_cost)
         readiness_expired = (
             lease.state
             in {
@@ -373,7 +388,7 @@ class OllamaLeaseService:
             now = self._now()
             if lease.state is OllamaLeaseState.WAITING_FOR_MODEL and (
                 now >= lease.hard_deadline
-                or accrued_cost(lease, now) >= lease.max_authorized_cost
+                or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
             ):
                 return await self._release(lease, reason="deadline_or_cost_cap")
             if now >= lease.readiness_deadline:
@@ -405,7 +420,10 @@ class OllamaLeaseService:
             lease,
             changes={"accrued_estimated_cost": accrued},
         )
-        if now >= lease.hard_deadline or accrued >= lease.max_authorized_cost:
+        if (
+            now >= lease.hard_deadline
+            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+        ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         if not observation.provider_ready or not observation.route_url:
             return lease
@@ -455,7 +473,7 @@ class OllamaLeaseService:
         if (
             now >= lease.hard_deadline
             or now >= lease.idle_deadline
-            or accrued >= lease.max_authorized_cost
+            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
         ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         try:
@@ -719,6 +737,8 @@ class OllamaLeaseService:
         if (
             not math.isfinite(plan.estimated_cost)
             or plan.estimated_cost < 0
+            or not math.isfinite(plan.cost_ceiling)
+            or plan.cost_ceiling < plan.estimated_cost
             or not math.isfinite(plan.placement.offered_cost_per_hr)
             or plan.placement.offered_cost_per_hr <= 0
             or not isinstance(plan.estimated_billable_seconds, int)
@@ -726,9 +746,9 @@ class OllamaLeaseService:
             or plan.estimated_billable_seconds <= 0
         ):
             raise RunPodManagerError("Provider returned an invalid Ollama cost plan")
-        if plan.estimated_cost > request.max_authorized_cost:
+        if plan.cost_ceiling > request.max_authorized_cost:
             raise RunPodManagerError(
-                "Provider Ollama plan exceeds the maximum authorized cost"
+                "Provider Ollama all-in cost ceiling exceeds the maximum authorized cost"
             )
         if (
             request.constraints.max_hourly_rate is not None

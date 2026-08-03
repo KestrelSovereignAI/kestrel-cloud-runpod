@@ -85,6 +85,24 @@ def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch):
             "serverless_execution_timeout_ms": 300_000,
             "serverless_flashboot": "FLASHBOOT",
             "http_timeout_seconds": 300,
+            "serverless_non_compute_cost": {
+                "estimated_cost_usd": 0.01,
+                "maximum_cost_usd": 0.02,
+                "covered_components": [
+                    "container_disk",
+                    "model_transfer",
+                    "retry_allowance",
+                ],
+            },
+            "pod_non_compute_cost": {
+                "estimated_cost_usd": 0.01,
+                "maximum_cost_usd": 0.02,
+                "covered_components": [
+                    "container_disk",
+                    "model_transfer",
+                    "retry_allowance",
+                ],
+            },
         }
     }
     profile = GPUProfile(
@@ -105,3 +123,7 @@ def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch):
 
     assert first is second
     assert first.repository.path == tmp_path / "leases.sqlite3"
+    assert first.provider.deployment.serverless_non_compute_cost.maximum_cost_usd == (
+        0.02
+    )
+    assert first.provider.deployment.pod_non_compute_cost.maximum_cost_usd == 0.02

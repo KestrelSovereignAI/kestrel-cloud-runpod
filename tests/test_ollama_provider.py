@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from ollama_test_support import MutableClock, make_request
+from ollama_test_support import MutableClock, make_request, non_compute_cost_policy
 
 from kestrel_cloud_runpod.models import (
     Availability,
@@ -59,6 +59,8 @@ def _deployment() -> RunpodOllamaDeployment:
         serverless_execution_timeout_ms=300_000,
         serverless_flashboot=FlashBoot.FLASHBOOT,
         http_timeout_seconds=10,
+        serverless_non_compute_cost=non_compute_cost_policy(),
+        pod_non_compute_cost=non_compute_cost_policy(),
     )
 
 
@@ -188,6 +190,10 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
         _deployment(),
         profile=replace(_profile(), network_volume_id="volume-1"),
         serverless_workers_max=2,
+        serverless_non_compute_cost=non_compute_cost_policy(
+            include_network_volume=True
+        ),
+        pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
     )
     provider = _provider(deployment=deployment)
     request = make_request(
@@ -543,7 +549,14 @@ async def test_pod_provision_injects_only_workload_scoped_token(monkeypatch):
 async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch):
     monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
     profile = replace(_profile(), network_volume_id="volume-1")
-    deployment = replace(_deployment(), profile=profile)
+    deployment = replace(
+        _deployment(),
+        profile=profile,
+        serverless_non_compute_cost=non_compute_cost_policy(
+            include_network_volume=True
+        ),
+        pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+    )
 
     serverless_client = _ControlClient()
     serverless = _provider(client=serverless_client, deployment=deployment)
@@ -575,3 +588,58 @@ async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch)
     assert pod_client.pod_request.env["KESTREL_OLLAMA_MODEL_STORAGE_PATH"] == (
         "/workspace/ollama"
     )
+
+
+def test_persistent_pod_volume_is_not_billed_as_a_network_volume():
+    """``volume_gb`` is container-persistent storage, not a network volume.
+
+    A Pod's ``volume_gb`` maps to ``mounts.persistent`` and is priced under
+    CONTAINER_DISK, which every policy already covers. NETWORK_VOLUME must
+    mean exactly one thing — an explicitly attached ``network_volume_id`` —
+    otherwise operators are forced to declare a component their deployment
+    never attaches, and the only signal that a shared network volume is in
+    play stops being trustworthy.
+    """
+    persistent_only = replace(_profile(), volume_gb=50, network_volume_id=None)
+
+    deployment = replace(
+        _deployment(),
+        profile=persistent_only,
+        serverless_non_compute_cost=non_compute_cost_policy(),
+        pod_non_compute_cost=non_compute_cost_policy(),
+    )
+    assert deployment.profile.volume_gb == 50
+    assert deployment.profile.network_volume_id is None
+
+    # Declaring NETWORK_VOLUME without one attached is now the error, because
+    # the policy must cover the *exact* configured components.
+    with pytest.raises(ValueError, match="does not cover the exact"):
+        replace(
+            _deployment(),
+            profile=persistent_only,
+            serverless_non_compute_cost=non_compute_cost_policy(),
+            pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+        )
+
+
+def test_attached_network_volume_still_requires_the_component():
+    """The real signal keeps working: an attached volume must be declared."""
+    attached = replace(_profile(), volume_gb=0, network_volume_id="volume-1")
+
+    with pytest.raises(ValueError, match="does not cover the exact"):
+        replace(
+            _deployment(),
+            profile=attached,
+            serverless_non_compute_cost=non_compute_cost_policy(),
+            pod_non_compute_cost=non_compute_cost_policy(),
+        )
+
+    deployment = replace(
+        _deployment(),
+        profile=attached,
+        serverless_non_compute_cost=non_compute_cost_policy(
+            include_network_volume=True
+        ),
+        pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+    )
+    assert deployment.profile.network_volume_id == "volume-1"

@@ -6,9 +6,9 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from kestrel_sdk.llm import (
@@ -230,8 +230,9 @@ class RunpodInferenceLeaseProvider:
             mode=mode,
             provider_region=provider_region,
             max_hourly_cost=quote.hourly_cost_usd,
-            max_total_cost=quote.estimated_total_cost_usd,
+            max_total_cost=request.max_total_cost_usd,
         )
+        internal_request = _bind_request_to_quoted_placement(internal_request, quote)
         plan: OllamaPlacementPlan | None = None
         readiness_elapsed = now >= (
             request.requested_at + timedelta(seconds=request.ready_deadline_seconds)
@@ -254,7 +255,7 @@ class RunpodInferenceLeaseProvider:
                 raise InferenceLeaseProvisioningError(
                     "Runpod could not refresh the selected Ollama capacity quote"
                 ) from exc
-            self._validate_realized_plan(plan, quote)
+            self._validate_realized_plan(plan, quote, request=request)
             self._validate_cold_start_window(
                 request,
                 policy=runtime.policy,
@@ -475,6 +476,13 @@ class RunpodInferenceLeaseProvider:
             raise InferenceLeaseConstraintError(
                 "quote readiness estimate does not match Runpod policy"
             )
+        if _quoted_cost(quote, "all_in_cost_ceiling_usd") > (
+            request.max_total_cost_usd
+        ):
+            raise InferenceLeaseConstraintError(
+                "Runpod quote all-in ceiling exceeds maximum total cost"
+            )
+        _validate_quote_cost_breakdown(quote)
 
     def _internal_request(
         self,
@@ -551,12 +559,24 @@ class RunpodInferenceLeaseProvider:
 
     @staticmethod
     def _validate_realized_plan(
-        plan: OllamaPlacementPlan, quote: InferenceLeaseQuote
+        plan: OllamaPlacementPlan,
+        quote: InferenceLeaseQuote,
+        *,
+        request: InferenceLeaseRequest,
     ) -> None:
         if plan.mode is not _quote_mode(quote):
             raise InferenceLeaseConstraintError(
                 "live Runpod plan changed the quoted execution mode"
             )
+        for metadata_name, realized in (
+            ("gpu_id", plan.placement.gpu_id),
+            ("gpu_pool", plan.placement.gpu_pool),
+            ("gpu_name", plan.placement.gpu_name),
+        ):
+            if quote.metadata.get(metadata_name) != realized:
+                raise InferenceLeaseConstraintError(
+                    "live Runpod placement differs from the accepted quote"
+                )
         if _money(plan.placement.offered_cost_per_hr) > quote.hourly_cost_usd:
             raise InferenceLeaseConstraintError(
                 "live Runpod hourly cost exceeds the accepted quote"
@@ -564,6 +584,36 @@ class RunpodInferenceLeaseProvider:
         if _money(plan.estimated_cost) > quote.estimated_total_cost_usd:
             raise InferenceLeaseConstraintError(
                 "live Runpod total cost exceeds the accepted quote"
+            )
+        if _money(plan.estimated_compute_cost) > _quoted_cost(
+            quote, "estimated_compute_cost_usd"
+        ) or _money(plan.maximum_compute_cost) > _quoted_cost(
+            quote, "maximum_compute_cost_usd"
+        ):
+            raise InferenceLeaseConstraintError(
+                "live Runpod compute exposure exceeds the accepted quote"
+            )
+        if _money(plan.estimated_non_compute_cost) != _quoted_cost(
+            quote, "estimated_non_compute_cost_usd"
+        ) or _money(plan.maximum_non_compute_cost) != _quoted_cost(
+            quote, "maximum_non_compute_cost_usd"
+        ):
+            raise InferenceLeaseConstraintError(
+                "live Runpod non-compute policy differs from the accepted quote"
+            )
+        if tuple(item.value for item in plan.non_compute_components) != (
+            _quoted_cost_components(quote)
+        ):
+            raise InferenceLeaseConstraintError(
+                "live Runpod non-compute components differ from the accepted quote"
+            )
+        realized_ceiling = _money(plan.cost_ceiling)
+        if (
+            realized_ceiling > _quoted_cost(quote, "all_in_cost_ceiling_usd")
+            or realized_ceiling > request.max_total_cost_usd
+        ):
+            raise InferenceLeaseConstraintError(
+                "live Runpod all-in ceiling exceeds the accepted authorization"
             )
         if (
             plan.maximum_serverless_cold_starts
@@ -720,8 +770,20 @@ def _quote_metadata(plan: OllamaPlacementPlan) -> dict[str, Any]:
         "gpu_pool": plan.placement.gpu_pool,
         "gpu_name": plan.placement.gpu_name,
         "estimated_billable_seconds": plan.estimated_billable_seconds,
+        "maximum_billable_seconds": plan.maximum_billable_seconds,
+        "maximum_concurrent_workers": plan.maximum_concurrent_workers,
         "maximum_serverless_cold_starts": (plan.maximum_serverless_cold_starts),
         "catalog_observed_at": plan.placement.catalog_observed_at.isoformat(),
+        "estimated_compute_cost_usd": str(_money(plan.estimated_compute_cost)),
+        "maximum_compute_cost_usd": str(_money(plan.maximum_compute_cost)),
+        "estimated_non_compute_cost_usd": str(_money(plan.estimated_non_compute_cost)),
+        "maximum_non_compute_cost_usd": str(_money(plan.maximum_non_compute_cost)),
+        "estimated_all_in_cost_usd": str(_money(plan.estimated_cost)),
+        "all_in_cost_ceiling_usd": str(_money(plan.cost_ceiling)),
+        "non_compute_components": tuple(
+            item.value for item in plan.non_compute_components
+        ),
+        "cost_kind": "conservative_authorization_not_observed_billing",
     }
 
 
@@ -733,6 +795,8 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
         "gpu_pool": lease.selected_gpu_pool,
         "gpu_name": lease.selected_gpu_name,
         "estimated_billable_seconds": lease.estimated_billable_seconds,
+        "maximum_billable_seconds": lease.maximum_billable_seconds,
+        "maximum_concurrent_workers": lease.maximum_concurrent_workers,
         "maximum_serverless_cold_starts": (
             maximum_serverless_cold_starts(
                 expected_session_seconds=lease.expected_session_seconds,
@@ -742,6 +806,22 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
             else 0
         ),
         "cold_start_seconds": lease.cold_start_seconds,
+        "estimated_compute_cost_usd": _optional_money_text(
+            lease.estimated_compute_cost
+        ),
+        "maximum_compute_cost_usd": _optional_money_text(lease.maximum_compute_cost),
+        "estimated_non_compute_cost_usd": _optional_money_text(
+            lease.estimated_non_compute_cost
+        ),
+        "maximum_non_compute_cost_usd": _optional_money_text(
+            lease.maximum_non_compute_cost
+        ),
+        "estimated_all_in_cost_usd": _optional_money_text(lease.estimated_cost),
+        "all_in_cost_ceiling_usd": _optional_money_text(lease.cost_ceiling),
+        "non_compute_components": tuple(
+            item.value for item in lease.cost_policy_components
+        ),
+        "cost_kind": "conservative_authorization_not_observed_billing",
     }
 
 
@@ -831,6 +911,89 @@ def _money(value: float) -> Decimal:
             "Runpod returned an invalid inference cost"
         )
     return Decimal(str(value))
+
+
+def _optional_money_text(value: float | None) -> str | None:
+    return str(_money(value)) if value is not None else None
+
+
+def _quoted_cost(quote: InferenceLeaseQuote, name: str) -> Decimal:
+    value = quote.metadata.get(name)
+    if not isinstance(value, str):
+        raise InferenceLeaseConstraintError(
+            f"Runpod quote has no valid {name.replace('_', ' ')}"
+        )
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise InferenceLeaseConstraintError(
+            f"Runpod quote has no valid {name.replace('_', ' ')}"
+        ) from exc
+    if not amount.is_finite() or amount < 0:
+        raise InferenceLeaseConstraintError(
+            f"Runpod quote has no valid {name.replace('_', ' ')}"
+        )
+    return amount
+
+
+def _quoted_cost_components(quote: InferenceLeaseQuote) -> tuple[str, ...]:
+    value = quote.metadata.get("non_compute_components")
+    if (
+        not isinstance(value, tuple)
+        or not value
+        or any(not isinstance(item, str) or not item for item in value)
+        or len(set(value)) != len(value)
+        or tuple(sorted(value)) != value
+    ):
+        raise InferenceLeaseConstraintError(
+            "Runpod quote has invalid non-compute cost components"
+        )
+    return value
+
+
+def _validate_quote_cost_breakdown(quote: InferenceLeaseQuote) -> None:
+    estimated_compute = _quoted_cost(quote, "estimated_compute_cost_usd")
+    maximum_compute = _quoted_cost(quote, "maximum_compute_cost_usd")
+    estimated_overhead = _quoted_cost(quote, "estimated_non_compute_cost_usd")
+    maximum_overhead = _quoted_cost(quote, "maximum_non_compute_cost_usd")
+    estimated_total = _quoted_cost(quote, "estimated_all_in_cost_usd")
+    ceiling = _quoted_cost(quote, "all_in_cost_ceiling_usd")
+    _quoted_cost_components(quote)
+    if (
+        maximum_compute < estimated_compute
+        or maximum_overhead < estimated_overhead
+        or estimated_total != estimated_compute + estimated_overhead
+        or ceiling != maximum_compute + maximum_overhead
+        or ceiling < estimated_total
+        or estimated_total != quote.estimated_total_cost_usd
+    ):
+        raise InferenceLeaseConstraintError(
+            "Runpod quote has an inconsistent all-in cost breakdown"
+        )
+
+
+def _bind_request_to_quoted_placement(
+    request: OllamaLeaseRequest, quote: InferenceLeaseQuote
+) -> OllamaLeaseRequest:
+    gpu_id = quote.metadata.get("gpu_id")
+    gpu_pool = quote.metadata.get("gpu_pool")
+    gpu_name = quote.metadata.get("gpu_name")
+    if not isinstance(gpu_id, str) or not gpu_id or not isinstance(gpu_name, str):
+        raise InferenceLeaseConstraintError(
+            "Runpod quote has an invalid exact GPU placement"
+        )
+    if gpu_pool is not None and (not isinstance(gpu_pool, str) or not gpu_pool):
+        raise InferenceLeaseConstraintError(
+            "Runpod quote has an invalid exact GPU pool"
+        )
+    return replace(
+        request,
+        constraints=replace(
+            request.constraints,
+            allowed_gpu_ids=(gpu_id,),
+            allowed_gpu_pools=((gpu_pool,) if gpu_pool is not None else ()),
+        ),
+    )
 
 
 def _validate_runtime_preflight(

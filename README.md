@@ -28,6 +28,10 @@ the public SDK lease contract and never imports this package.
 | `RUNPOD_OLLAMA_IMAGE` | Immutable `ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime@sha256:...` reference |
 | `RUNPOD_OLLAMA_ALLOWED_MODELS` | Comma-separated operator allowlist of `name:tag@sha256:<digest>` model pins |
 | `RUNPOD_OLLAMA_LEASE_DB` | Optional absolute override for the durable SQLite lease store |
+| `RUNPOD_OLLAMA_SERVERLESS_NON_COMPUTE_ESTIMATED_USD` | Operator-estimated per-session Serverless non-compute authorization |
+| `RUNPOD_OLLAMA_SERVERLESS_NON_COMPUTE_MAXIMUM_USD` | Conservative per-session Serverless non-compute authorization ceiling |
+| `RUNPOD_OLLAMA_POD_NON_COMPUTE_ESTIMATED_USD` | Operator-estimated per-session Pod non-compute authorization |
+| `RUNPOD_OLLAMA_POD_NON_COMPUTE_MAXIMUM_USD` | Conservative per-session Pod non-compute authorization ceiling |
 | `RUNPOD_POD_CAPACITY_LEASE_DB` | Absolute canonical SQLite store for catalog and migrated training Pod leases |
 | `RUNPOD_TRAINING_LEASE_DB` | Optional absolute override for durable training Pod ownership state |
 
@@ -153,10 +157,17 @@ and `status()` reconciles readiness until the exact allowlisted model is loaded
 behind an authenticated `/v1` route. SDK 0.35 `touch()` re-observes that exact
 route before durably renewing its idle deadline, preserves the owner and lease
 identity, and fails closed without provisioning replacement capacity when the
-route is no longer ready. Quote selection includes the configured Serverless or
-Pod cold-start estimate, hourly ceiling, expected session, and Serverless idle
-tail. Requests that cannot meet their region, readiness, privacy, concurrency,
-or total-cost limit fail before provisioning.
+route is no longer ready. Quote selection uses one immutable all-in plan: live
+GPU compute estimate/ceiling plus the deployment-supplied estimated/maximum
+non-compute authorization. The catalog prices each GPU individually, so a
+placement that attaches several is rated at that multiple of the offered rate;
+Serverless worker scaling is a separate factor applied to billable seconds, so
+GPUs-per-worker and maximum workers never substitute for one another. Affordability uses the all-in ceiling, while the SDK
+quote's standard total is the all-in estimate. Its content-free metadata exposes
+the compute/non-compute breakdown and explicitly labels it conservative
+authorization rather than observed provider billing. Requests that cannot meet
+their region, readiness, privacy, concurrency, or total-cost limit fail before
+provisioning.
 
 Set `quote_ttl_seconds`, `serverless_estimated_ready_seconds`, and
 `pod_estimated_ready_seconds` in `[ollama_leases]` from measured p95 startup
@@ -165,6 +176,17 @@ the provider advertises those normalized IDs as its regions and constrains the
 v2 create request to the quoted region. A shared model network volume reduces
 download time, but can narrow placement availability and Serverless requires a
 single writer.
+
+Both `[ollama_leases.serverless_non_compute_cost]` and
+`[ollama_leases.pod_non_compute_cost]` are mandatory and deliberately contain
+no built-in Runpod rates. Operators must supply per-session estimated and
+maximum amounts from their current deployment/billing policy. Each policy must
+attest the applicable `covered_components`: container disk, model
+transfer/egress, retry allowance, and `network_volume` when the profile mounts
+one. Missing, stale, non-finite, incomplete, or estimate-above-maximum policy
+fails closed before catalog selection. Update these values when storage size,
+region, model size, transfer behavior, retry allowance, or Runpod pricing
+changes.
 
 Runpod's beta v2 catalog currently reports the PRO 6000 MIG 1g.24gb and
 2g.48gb products as available for Serverless while returning `pool = null`.
@@ -187,7 +209,19 @@ Control-plane, Serverless data-plane, and Pod workload credentials are separate.
 
 For load-balanced Serverless, use a Runpod key restricted to the one endpoint as the scoped inference capability. Runpod authenticates it at the edge and the workload proxy verifies the same bearer defensively. For a dedicated Pod, `RUNPOD_OLLAMA_BEARER_TOKEN` is the scoped capability. The provider rejects either workload credential when it matches `RUNPOD_API_KEY`, and rejects one credential reused across both products. Rotate the Pod value per bounded lease/deployment; never reuse the full control-plane key. Both modes expose `/ping` on port 11434, returning `204` during model preparation and `200` only while Ollama is live, the capability is unexpired, and the exact pinned model remains present.
 
-`accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection quote covers every possible scale-to-zero cycle in the expected session: active time plus one initialization and idle tail for the initial worker and for every complete idle interval. A zero idle tail cannot produce a finite invocation-independent quote, so it is not eligible for interactive Serverless.
+`accrued_estimated_cost` is the conservative accrued-compute bound, not settled
+billing. Every lifecycle gate adds the durably reserved maximum non-compute
+authorization before comparing with the SDK request cap. The plan also proves
+that maximum compute through the hard deadline plus reserved overhead is within
+that cap, so a missed polling interval cannot authorize excess spend. Dedicated
+Pods accrue their continuous live catalog rate. Serverless uses wall-clock rate
+times the configured maximum workers until authoritative worker billing exists.
+Its expected-compute quote also covers every possible scale-to-zero cycle in
+the expected session: active time plus one initialization and idle tail for the
+initial worker and for every complete idle interval. A zero idle tail cannot
+produce a finite invocation-independent quote, so it is not eligible for
+interactive Serverless. Actual provider settlement remains a separate billing
+concern and must never be inferred from these authorization ceilings.
 
 `PodCapacityLeaseService` is the one writable dedicated-Pod lifecycle for new
 catalog attempts and old training callers. It quotes an exact live v2 GPU ID,

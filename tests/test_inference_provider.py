@@ -167,6 +167,102 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sdk_quote_and_acquire_expose_and_persist_all_in_cost_authority(
+    tmp_path,
+):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(
+            estimated_cost=0.1,
+            maximum_compute_cost=0.6,
+            estimated_non_compute_cost=0.05,
+            maximum_non_compute_cost=0.3,
+        )
+    )
+    adapter, service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock, max_total_cost_usd=Decimal("0.90"))
+
+    quote = await adapter.quote(request)
+
+    assert quote.estimated_total_cost_usd == Decimal("0.15")
+    assert quote.metadata["estimated_compute_cost_usd"] == "0.1"
+    assert quote.metadata["estimated_non_compute_cost_usd"] == "0.05"
+    assert quote.metadata["maximum_compute_cost_usd"] == "0.6"
+    assert quote.metadata["maximum_non_compute_cost_usd"] == "0.3"
+    assert quote.metadata["all_in_cost_ceiling_usd"] == "0.9"
+    assert quote.metadata["cost_kind"] == (
+        "conservative_authorization_not_observed_billing"
+    )
+
+    pending = await adapter.acquire(request, quote)
+    durable = service.repository.get(pending.lease_id)
+
+    assert durable is not None
+    assert durable.estimated_compute_cost == 0.1
+    assert durable.estimated_non_compute_cost == 0.05
+    assert durable.maximum_compute_cost == 0.6
+    assert durable.maximum_non_compute_cost == 0.3
+    assert durable.cost_ceiling == pytest.approx(0.9)
+    assert durable.cost_policy_components
+    assert capacity.provision_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overhead, available", [(0.5, True), (0.500001, False)])
+async def test_sdk_quote_enforces_all_in_ceiling_boundary(
+    tmp_path, overhead, available
+):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(
+            estimated_cost=0.1,
+            maximum_compute_cost=0.5,
+            maximum_non_compute_cost=overhead,
+        )
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock, max_total_cost_usd=Decimal("1.0"))
+
+    if available:
+        quote = await adapter.quote(request)
+        assert quote.metadata["all_in_cost_ceiling_usd"] == "1.0"
+    else:
+        with pytest.raises(InferenceLeaseProviderUnavailableError):
+            await adapter.quote(request)
+
+    assert capacity.provision_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sdk_acquire_revalidates_exact_non_compute_policy(tmp_path):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(
+            estimated_cost=0.1,
+            maximum_compute_cost=0.5,
+            estimated_non_compute_cost=0.05,
+            maximum_non_compute_cost=0.2,
+        )
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    capacity.selected_plan = serverless_plan(
+        estimated_cost=0.1,
+        maximum_compute_cost=0.5,
+        estimated_non_compute_cost=0.05,
+        maximum_non_compute_cost=0.21,
+    )
+
+    with pytest.raises(
+        InferenceLeaseConstraintError, match="non-compute policy differs"
+    ):
+        await adapter.acquire(request, quote)
+
+    assert capacity.provision_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_quote_expires_before_estimated_cold_start_window_closes(tmp_path):
     clock = MutableClock()
     adapter, _service, capacity = _adapter(tmp_path, clock)
