@@ -26,6 +26,7 @@ from kestrel_cloud_runpod.serverless_capacity_contracts import (
     ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
+    ServerlessEndpointHourCost,
     serverless_worker_cost_usd,
 )
 
@@ -76,6 +77,20 @@ def test_ambiguous_window_and_receipt_round_trip_are_content_free() -> None:
         billing_window_until=allocation.exclusive_billing_hour_starts[-1]
         + timedelta(hours=1),
         accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        endpoint_hour_costs=(
+            ServerlessEndpointHourCost(
+                provider_observation_id="runpod-serverless-hour:" + "5" * 64,
+                endpoint_id=allocation.endpoint_id,
+                utc_hour_start=allocation.exclusive_billing_hour_starts[0],
+                utc_hour_end=allocation.exclusive_billing_hour_starts[0]
+                + timedelta(hours=1),
+                gpu_cost_usd=Decimal("0.047"),
+                cpu_cost_usd=Decimal(0),
+                disk_cost_usd=Decimal("0.001"),
+                fee_cost_usd=Decimal("0.002"),
+                actual_cost_usd=Decimal("0.050"),
+            ),
+        ),
         gpu_cost_usd=Decimal("0.047"),
         cpu_cost_usd=Decimal(0),
         disk_cost_usd=Decimal("0.001"),
@@ -90,6 +105,14 @@ def test_ambiguous_window_and_receipt_round_trip_are_content_free() -> None:
         ServerlessAmbiguousWindowBillingReceipt.from_dict(serialized_receipt).to_dict()
         == serialized_receipt
     )
+    nested_extra = {
+        **serialized_receipt,
+        "endpoint_hour_costs": [
+            {**serialized_receipt["endpoint_hour_costs"][0], "raw": "private"}
+        ],
+    }
+    with pytest.raises(RunPodManagerError, match="unsupported"):
+        ServerlessAmbiguousWindowBillingReceipt.from_dict(nested_extra)
     encoded = json.dumps(
         {"window": serialized_window, "receipt": serialized_receipt},
         sort_keys=True,

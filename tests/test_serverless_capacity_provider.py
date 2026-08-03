@@ -333,18 +333,27 @@ def _terminal_job(**changes: object) -> ServerlessJob:
 
 
 def _two_hour_billing_page() -> BillingPage:
-    records = tuple(
+    records = (
         {
-            "startTime": f"2026-08-03T{hour:02d}:00:00+00:00",
-            "endTime": f"2026-08-03T{hour + 1:02d}:00:00+00:00",
+            "startTime": "2026-08-03T10:00:00+00:00",
+            "endTime": "2026-08-03T11:00:00+00:00",
             "serverlessId": "endpoint-selfie-01",
             "totalAmount": 0.0115,
             "gpuAmount": 0.010,
             "cpuAmount": 0.0,
             "diskAmount": 0.0005,
             "feeAmount": 0.001,
-        }
-        for hour in (10, 11)
+        },
+        {
+            "startTime": "2026-08-03T11:00:00+00:00",
+            "endTime": "2026-08-03T12:00:00+00:00",
+            "serverlessId": "endpoint-selfie-01",
+            "totalAmount": 0.022,
+            "gpuAmount": 0.018,
+            "cpuAmount": 0.0,
+            "diskAmount": 0.001,
+            "feeAmount": 0.003,
+        },
     )
     return BillingPage(
         records=records,
@@ -358,11 +367,11 @@ def _two_hour_billing_page() -> BillingPage:
             "recordCount": 2,
             "uniqueServerlessCount": 1,
             "totals": {
-                "totalAmount": 0.023,
-                "gpuAmount": 0.020,
+                "totalAmount": 0.0335,
+                "gpuAmount": 0.028,
                 "cpuAmount": 0.0,
-                "diskAmount": 0.001,
-                "feeAmount": 0.002,
+                "diskAmount": 0.0015,
+                "feeAmount": 0.004,
             },
         },
     )
@@ -527,6 +536,46 @@ async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss() ->
     assert receipt.actual_cost_usd == Decimal("0.05")
     assert receipt.capped_cost_usd == accepted.cost_ceiling_usd
     assert receipt.operator_loss_usd == Decimal("0.0145")
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_billing_preserves_ordered_unequal_endpoint_hours() -> None:
+    quote_clock = MutableClock()
+    quote_clock.value = datetime(2026, 8, 3, 10, 57, 30, tzinfo=UTC)
+    accepted = quote(quote_clock)
+    allocation = ambiguous_window(
+        accepted,
+        attempted_at=datetime(2026, 8, 3, 10, 58, tzinfo=UTC),
+    )
+    clock = MutableClock()
+    clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(
+            serverless_billing=lambda **_: _two_hour_billing_page()
+        ),
+        clock=clock,
+    )
+
+    receipt = await provider.final_ambiguous_window_billing(allocation, accepted)
+
+    assert receipt is not None
+    assert tuple(item.utc_hour_start for item in receipt.endpoint_hour_costs) == (
+        datetime(2026, 8, 3, 10, tzinfo=UTC),
+        datetime(2026, 8, 3, 11, tzinfo=UTC),
+    )
+    assert tuple(item.actual_cost_usd for item in receipt.endpoint_hour_costs) == (
+        Decimal("0.0115"),
+        Decimal("0.022"),
+    )
+    assert (
+        receipt.endpoint_hour_costs[0].provider_observation_id
+        != receipt.endpoint_hour_costs[1].provider_observation_id
+    )
+    assert all(
+        item.provider_observation_id.startswith("runpod-serverless-hour:")
+        for item in receipt.endpoint_hour_costs
+    )
+    assert receipt.actual_cost_usd == Decimal("0.0335")
 
 
 @pytest.mark.asyncio

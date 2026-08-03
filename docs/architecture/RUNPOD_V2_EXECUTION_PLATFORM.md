@@ -156,8 +156,13 @@ and cost ceiling. Cloud's `final_ambiguous_window_billing()` waits for all of
 those hours to close and maps strict REST-v2 endpoint aggregates to a typed
 receipt with actual cost, consumer-capped cost, and operator loss. An empty or
 partial response remains pending because v2 does not attest that billing is
-final. Frinz depends on this provider-neutral method and never reaches through
-Cloud to the Runpod control client.
+final. The canonical receipt evidence is the ordered sequence of endpoint-hour
+costs. Each item preserves the v2 record's UTC hour bounds, endpoint identity,
+all component amounts, total, and a deterministic provider-observation ID over
+the complete normalized source record; aggregate receipt amounts are validated
+as sums of that sequence. Frinz can therefore map the evidence losslessly to its
+provider-neutral ambiguous-window receipt and never reaches through Cloud to the
+Runpod control client.
 See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
 [job-state metrics](https://docs.runpod.io/serverless/endpoints/job-states).
 

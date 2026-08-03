@@ -11,7 +11,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   content-free v2 billing receipts for exclusive endpoint windows.
 - A provider-neutral ambiguous-submission settlement method that accepts an
   exact exclusive endpoint/hour allocation and ceiling, then returns strict v2
-  actual, capped, and operator-loss cost evidence without requiring a job ID.
+  ordered per-hour observations plus derived actual, capped, and operator-loss
+  cost evidence without requiring a job ID.
 
 ### Fixed
 

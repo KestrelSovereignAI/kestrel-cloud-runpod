@@ -130,9 +130,13 @@ known, the host keeps the same exclusive worst-case endpoint/hour allocation
 and calls `final_ambiguous_window_billing()`. This Cloud method needs no job
 status client: after every allocated hour closes, it reads only strict v2
 endpoint-hour billing and returns content-free actual, accepted-ceiling-capped,
-and operator-loss amounts. Empty or incomplete billing remains pending because
-v2 exposes no finalization marker; consumers never call the control-plane
-billing client directly or substitute an estimate for actual spend.
+and operator-loss amounts. The receipt's canonical ordered endpoint-hour costs
+retain each v2 record's UTC start/end, endpoint ID, component amounts, total,
+and a stable provider-observation ID derived from that complete normalized
+record; aggregate amounts must equal their sum. Empty or incomplete billing
+remains pending because v2 exposes no finalization marker; consumers never call
+the control-plane billing client directly or substitute an estimate for actual
+spend.
 
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 

@@ -233,24 +233,26 @@ def ambiguous_window(
 ) -> ServerlessAmbiguousBillingWindow:
     selected = item or quote()
     attempted_at = datetime(2026, 8, 3, 10, 0, 30, tzinfo=UTC)
-    billable_coverage_until = attempted_at + timedelta(
-        seconds=(
-            selected.maximum_queue_delay_seconds
-            + selected.maximum_worker_start_seconds
-            + selected.maximum_execution_seconds
-            + selected.idle_tail_seconds
-        )
-    )
     values: dict[str, object] = {
         "attempt_id": "attempt-selfie-ambiguous-0001",
         "endpoint_id": selected.endpoint_id,
         "provider_quote_id": selected.provider_quote_id,
         "exclusive_window_sha256": "7" * 64,
         "attempted_at": attempted_at,
-        "billable_coverage_until": billable_coverage_until,
         "accepted_cost_ceiling_usd": selected.cost_ceiling_usd,
     }
     values.update(changes)
+    if "billable_coverage_until" not in changes:
+        selected_attempted_at = values["attempted_at"]
+        assert isinstance(selected_attempted_at, datetime)
+        values["billable_coverage_until"] = selected_attempted_at + timedelta(
+            seconds=(
+                selected.maximum_queue_delay_seconds
+                + selected.maximum_worker_start_seconds
+                + selected.maximum_execution_seconds
+                + selected.idle_tail_seconds
+            )
+        )
     if "exclusive_billing_hour_starts" not in changes:
         start = values["attempted_at"]
         coverage_until = values["billable_coverage_until"]

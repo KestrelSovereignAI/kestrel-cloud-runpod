@@ -1048,6 +1048,87 @@ class ServerlessAmbiguousBillingWindow:
 
 
 @dataclass(frozen=True)
+class ServerlessEndpointHourCost:
+    """One canonical content-free Runpod v2 endpoint-hour observation."""
+
+    provider_observation_id: str
+    endpoint_id: str
+    utc_hour_start: datetime
+    utc_hour_end: datetime
+    gpu_cost_usd: Decimal
+    cpu_cost_usd: Decimal
+    disk_cost_usd: Decimal
+    fee_cost_usd: Decimal
+    actual_cost_usd: Decimal
+
+    def __post_init__(self) -> None:
+        _safe_identifier(self.provider_observation_id, "provider_observation_id")
+        _safe_identifier(self.endpoint_id, "endpoint_id")
+        require_aware(self.utc_hour_start, "utc_hour_start")
+        require_aware(self.utc_hour_end, "utc_hour_end")
+        start = self.utc_hour_start.astimezone(UTC)
+        end = self.utc_hour_end.astimezone(UTC)
+        if (
+            start.minute != 0
+            or start.second != 0
+            or start.microsecond != 0
+            or end != start + timedelta(hours=1)
+        ):
+            raise ValueError(
+                "Serverless endpoint-hour cost must cover exactly one UTC hour"
+            )
+        for name, value in (
+            ("gpu_cost_usd", self.gpu_cost_usd),
+            ("cpu_cost_usd", self.cpu_cost_usd),
+            ("disk_cost_usd", self.disk_cost_usd),
+            ("fee_cost_usd", self.fee_cost_usd),
+            ("actual_cost_usd", self.actual_cost_usd),
+        ):
+            _nonnegative_decimal(value, name)
+        if self.actual_cost_usd != (
+            self.gpu_cost_usd
+            + self.cpu_cost_usd
+            + self.disk_cost_usd
+            + self.fee_cost_usd
+        ):
+            raise ValueError(
+                "Serverless endpoint-hour cost components do not equal total"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider_observation_id": self.provider_observation_id,
+            "endpoint_id": self.endpoint_id,
+            "utc_hour_start": iso_datetime(self.utc_hour_start),
+            "utc_hour_end": iso_datetime(self.utc_hour_end),
+            "gpu_cost_usd": decimal_text(self.gpu_cost_usd),
+            "cpu_cost_usd": decimal_text(self.cpu_cost_usd),
+            "disk_cost_usd": decimal_text(self.disk_cost_usd),
+            "fee_cost_usd": decimal_text(self.fee_cost_usd),
+            "actual_cost_usd": decimal_text(self.actual_cost_usd),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ServerlessEndpointHourCost:
+        _exact_keys(
+            value,
+            _ENDPOINT_HOUR_COST_FIELDS,
+            "Serverless endpoint-hour cost",
+        )
+        return cls(
+            provider_observation_id=_required_string(value, "provider_observation_id"),
+            endpoint_id=_required_string(value, "endpoint_id"),
+            utc_hour_start=parse_datetime(_required_string(value, "utc_hour_start")),
+            utc_hour_end=parse_datetime(_required_string(value, "utc_hour_end")),
+            gpu_cost_usd=_required_decimal(value, "gpu_cost_usd"),
+            cpu_cost_usd=_required_decimal(value, "cpu_cost_usd"),
+            disk_cost_usd=_required_decimal(value, "disk_cost_usd"),
+            fee_cost_usd=_required_decimal(value, "fee_cost_usd"),
+            actual_cost_usd=_required_decimal(value, "actual_cost_usd"),
+        )
+
+
+@dataclass(frozen=True)
 class ServerlessAmbiguousWindowBillingReceipt:
     """Authoritative endpoint-hour cost for an ambiguous submission window."""
 
@@ -1065,6 +1146,7 @@ class ServerlessAmbiguousWindowBillingReceipt:
     billing_window_from: datetime
     billing_window_until: datetime
     accepted_cost_ceiling_usd: Decimal
+    endpoint_hour_costs: tuple[ServerlessEndpointHourCost, ...]
     gpu_cost_usd: Decimal
     cpu_cost_usd: Decimal
     disk_cost_usd: Decimal
@@ -1124,6 +1206,32 @@ class ServerlessAmbiguousWindowBillingReceipt:
             raise ValueError(
                 "Serverless ambiguous receipt window does not match its allocation"
             )
+        if (
+            not isinstance(self.endpoint_hour_costs, tuple)
+            or not self.endpoint_hour_costs
+        ):
+            raise ValueError(
+                "Serverless ambiguous receipt must contain endpoint-hour costs"
+            )
+        observed_hours: list[datetime] = []
+        observed_ids: set[str] = set()
+        for item in self.endpoint_hour_costs:
+            if not isinstance(item, ServerlessEndpointHourCost):
+                raise TypeError("Serverless endpoint-hour cost has an invalid type")
+            if item.endpoint_id != self.endpoint_id:
+                raise ValueError(
+                    "Serverless endpoint-hour cost does not match receipt endpoint"
+                )
+            if item.provider_observation_id in observed_ids:
+                raise ValueError(
+                    "Serverless endpoint-hour provider observation ID is duplicated"
+                )
+            observed_hours.append(item.utc_hour_start.astimezone(UTC))
+            observed_ids.add(item.provider_observation_id)
+        if tuple(observed_hours) != expected_hours:
+            raise ValueError(
+                "Serverless endpoint-hour costs do not match the ordered allocation"
+            )
         _positive_decimal(self.accepted_cost_ceiling_usd, "accepted_cost_ceiling_usd")
         for name, value in (
             ("gpu_cost_usd", self.gpu_cost_usd),
@@ -1143,6 +1251,14 @@ class ServerlessAmbiguousWindowBillingReceipt:
         ):
             raise ValueError(
                 "Serverless ambiguous billing components do not equal total cost"
+            )
+        derived_amounts = _endpoint_hour_cost_totals(self.endpoint_hour_costs)
+        if any(
+            getattr(self, name) != derived_amounts[name]
+            for name in _SERVERLESS_COST_FIELD_NAMES
+        ):
+            raise ValueError(
+                "Serverless ambiguous aggregate costs do not equal endpoint-hour costs"
             )
         if self.capped_cost_usd != min(
             self.actual_cost_usd, self.accepted_cost_ceiling_usd
@@ -1169,6 +1285,9 @@ class ServerlessAmbiguousWindowBillingReceipt:
             "billing_window_from": iso_datetime(self.billing_window_from),
             "billing_window_until": iso_datetime(self.billing_window_until),
             "accepted_cost_ceiling_usd": decimal_text(self.accepted_cost_ceiling_usd),
+            "endpoint_hour_costs": [
+                item.to_dict() for item in self.endpoint_hour_costs
+            ],
             "gpu_cost_usd": decimal_text(self.gpu_cost_usd),
             "cpu_cost_usd": decimal_text(self.cpu_cost_usd),
             "disk_cost_usd": decimal_text(self.disk_cost_usd),
@@ -1212,6 +1331,9 @@ class ServerlessAmbiguousWindowBillingReceipt:
             ),
             accepted_cost_ceiling_usd=_required_decimal(
                 value, "accepted_cost_ceiling_usd"
+            ),
+            endpoint_hour_costs=_required_endpoint_hour_costs(
+                value, "endpoint_hour_costs"
             ),
             gpu_cost_usd=_required_decimal(value, "gpu_cost_usd"),
             cpu_cost_usd=_required_decimal(value, "cpu_cost_usd"),
@@ -1395,6 +1517,31 @@ def _normalized_exclusive_hours(values: tuple[datetime, ...]) -> tuple[datetime,
     return tuple(normalized)
 
 
+def _endpoint_hour_cost_totals(
+    values: tuple[ServerlessEndpointHourCost, ...],
+) -> dict[str, Decimal]:
+    return {
+        name: sum((getattr(item, name) for item in values), start=Decimal(0))
+        for name in _SERVERLESS_COST_FIELD_NAMES
+    }
+
+
+def _required_endpoint_hour_costs(
+    value: Mapping[str, Any], key: str
+) -> tuple[ServerlessEndpointHourCost, ...]:
+    items = value.get(key)
+    if not isinstance(items, list) or not items:
+        raise RunPodManagerError(
+            f"Stored Serverless {key} must be a nonempty object list"
+        )
+    parsed: list[ServerlessEndpointHourCost] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise RunPodManagerError(f"Stored Serverless {key} must contain objects")
+        parsed.append(ServerlessEndpointHourCost.from_dict(item))
+    return tuple(parsed)
+
+
 def _required_decimal(value: Mapping[str, Any], key: str) -> Decimal:
     item = value.get(key)
     if not isinstance(item, str):
@@ -1494,6 +1641,28 @@ _AMBIGUOUS_WINDOW_FIELDS = frozenset(
     }
 )
 
+_ENDPOINT_HOUR_COST_FIELDS = frozenset(
+    {
+        "provider_observation_id",
+        "endpoint_id",
+        "utc_hour_start",
+        "utc_hour_end",
+        "gpu_cost_usd",
+        "cpu_cost_usd",
+        "disk_cost_usd",
+        "fee_cost_usd",
+        "actual_cost_usd",
+    }
+)
+
+_SERVERLESS_COST_FIELD_NAMES = (
+    "gpu_cost_usd",
+    "cpu_cost_usd",
+    "disk_cost_usd",
+    "fee_cost_usd",
+    "actual_cost_usd",
+)
+
 _AMBIGUOUS_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -1510,6 +1679,7 @@ _AMBIGUOUS_RECEIPT_FIELDS = frozenset(
         "billing_window_from",
         "billing_window_until",
         "accepted_cost_ceiling_usd",
+        "endpoint_hour_costs",
         "gpu_cost_usd",
         "cpu_cost_usd",
         "disk_cost_usd",
@@ -1532,6 +1702,7 @@ __all__ = [
     "ServerlessCapacityConstraints",
     "ServerlessCapacityQuote",
     "ServerlessCapacityQuoteRequest",
+    "ServerlessEndpointHourCost",
     "ServerlessEndpointProfile",
     "decimal_text",
     "iso_datetime",

@@ -29,6 +29,7 @@ from .serverless_capacity_contracts import (
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
+    ServerlessEndpointHourCost,
     ServerlessEndpointProfile,
     decimal_text,
     iso_datetime,
@@ -189,14 +190,15 @@ class RunpodServerlessCapacityProvider:
             bucket_size="hour",
             endpoint_id=attempt.endpoint_id,
         )
-        amounts = _authoritative_amounts(
+        endpoint_hour_costs = _authoritative_hour_costs(
             page,
             endpoint_id=attempt.endpoint_id,
             window_from=window_from,
             window_until=window_until,
         )
-        if amounts is None:
+        if endpoint_hour_costs is None:
             return None
+        amounts = _sum_hour_costs(endpoint_hour_costs)
         identity = {
             "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
             "provider_quote_id": quote.provider_quote_id,
@@ -280,14 +282,15 @@ class RunpodServerlessCapacityProvider:
             bucket_size="hour",
             endpoint_id=window.endpoint_id,
         )
-        amounts = _authoritative_amounts(
+        endpoint_hour_costs = _authoritative_hour_costs(
             page,
             endpoint_id=window.endpoint_id,
             window_from=window_from,
             window_until=window_until,
         )
-        if amounts is None:
+        if endpoint_hour_costs is None:
             return None
+        amounts = _sum_hour_costs(endpoint_hour_costs)
         actual_cost = amounts["actual_cost_usd"]
         capped_cost = min(actual_cost, window.accepted_cost_ceiling_usd)
         operator_loss = actual_cost - capped_cost
@@ -306,6 +309,7 @@ class RunpodServerlessCapacityProvider:
             "billing_window_from": iso_datetime(window_from),
             "billing_window_until": iso_datetime(window_until),
             "accepted_cost_ceiling_usd": decimal_text(window.accepted_cost_ceiling_usd),
+            "endpoint_hour_costs": [item.to_dict() for item in endpoint_hour_costs],
             **{name: decimal_text(value) for name, value in amounts.items()},
             "capped_cost_usd": decimal_text(capped_cost),
             "operator_loss_usd": decimal_text(operator_loss),
@@ -327,6 +331,7 @@ class RunpodServerlessCapacityProvider:
             billing_window_from=window_from,
             billing_window_until=window_until,
             accepted_cost_ceiling_usd=window.accepted_cost_ceiling_usd,
+            endpoint_hour_costs=endpoint_hour_costs,
             gpu_cost_usd=amounts["gpu_cost_usd"],
             cpu_cost_usd=amounts["cpu_cost_usd"],
             disk_cost_usd=amounts["disk_cost_usd"],
@@ -679,13 +684,13 @@ def _validate_terminal_job(
             raise RunPodManagerError(f"Serverless job {name} is unsafe")
 
 
-def _authoritative_amounts(
+def _authoritative_hour_costs(
     page: BillingPage,
     *,
     endpoint_id: str,
     window_from: datetime,
     window_until: datetime,
-) -> dict[str, Decimal] | None:
+) -> tuple[ServerlessEndpointHourCost, ...] | None:
     metadata = page.metadata
     _exact_keys(metadata, _BILLING_METADATA_KEYS, "billing metadata")
     query = _mapping(metadata.get("query"), "billing metadata.query")
@@ -728,7 +733,7 @@ def _authoritative_amounts(
         parsed.append((record_from, record_until, amounts))
     parsed.sort(key=lambda item: item[0])
     cursor = window_from
-    summed = {name: Decimal(0) for name in _AMOUNT_NAMES}
+    hourly_costs: list[ServerlessEndpointHourCost] = []
     for record_from, record_until, amounts in parsed:
         if record_until <= record_from:
             raise RunPodManagerError("Runpod billing record interval is invalid")
@@ -742,15 +747,52 @@ def _authoritative_amounts(
             raise RunPodManagerError(
                 "Runpod billing record exceeds the requested window"
             )
-        for name in _AMOUNT_NAMES:
-            summed[name] += amounts[name]
+        expected_record_until = record_from + timedelta(hours=1)
+        if record_until < expected_record_until:
+            return None
+        if record_until != expected_record_until:
+            raise RunPodManagerError(
+                "Runpod hourly billing record does not cover exactly one hour"
+            )
+        observation_identity = {
+            "source": "runpod-v2-serverless-billing",
+            "startTime": iso_datetime(record_from),
+            "endTime": iso_datetime(record_until),
+            "serverlessId": endpoint_id,
+            "totalAmount": decimal_text(amounts["actual_cost_usd"]),
+            "gpuAmount": decimal_text(amounts["gpu_cost_usd"]),
+            "cpuAmount": decimal_text(amounts["cpu_cost_usd"]),
+            "diskAmount": decimal_text(amounts["disk_cost_usd"]),
+            "feeAmount": decimal_text(amounts["fee_cost_usd"]),
+        }
+        try:
+            hourly_costs.append(
+                ServerlessEndpointHourCost(
+                    provider_observation_id=(
+                        "runpod-serverless-hour:" + json_sha256(observation_identity)
+                    ),
+                    endpoint_id=endpoint_id,
+                    utc_hour_start=record_from,
+                    utc_hour_end=record_until,
+                    gpu_cost_usd=amounts["gpu_cost_usd"],
+                    cpu_cost_usd=amounts["cpu_cost_usd"],
+                    disk_cost_usd=amounts["disk_cost_usd"],
+                    fee_cost_usd=amounts["fee_cost_usd"],
+                    actual_cost_usd=amounts["actual_cost_usd"],
+                )
+            )
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "Runpod billing record is not an exact UTC hour"
+            ) from exc
         cursor = record_until
     if cursor < window_until:
         return None
     expected_totals = _amounts_from_mapping(totals, "billing totals")
+    summed = _sum_hour_costs(tuple(hourly_costs))
     if summed != expected_totals:
         raise RunPodManagerError("Runpod billing totals do not equal its records")
-    return summed
+    return tuple(hourly_costs)
 
 
 _AMOUNT_NAMES = (
@@ -767,6 +809,15 @@ _AMOUNT_KEYS = {
     "disk_cost_usd": "diskAmount",
     "fee_cost_usd": "feeAmount",
 }
+
+
+def _sum_hour_costs(
+    values: tuple[ServerlessEndpointHourCost, ...],
+) -> dict[str, Decimal]:
+    return {
+        name: sum((getattr(item, name) for item in values), start=Decimal(0))
+        for name in _AMOUNT_NAMES
+    }
 
 
 def _amounts_from_mapping(value: Mapping[str, Any], context: str) -> dict[str, Decimal]:
