@@ -98,6 +98,9 @@ identity. Acknowledgement is the destructive boundary: it records
 `RESULT_RETRIEVED`, permanently terminates the disposable Pod, and begins
 billing reconciliation. A crash before the private database commit can replay
 the worker result after restart; cloud never persists the private payload.
+The host then polls the owner/workload-bound `get_catalog_capacity()` method
+until the returned canonical lease is settlement-ready; it does not reach into
+the capacity repository or infer actual cost from estimates.
 
 ## Crash and ambiguity rules
 

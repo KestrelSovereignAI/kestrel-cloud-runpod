@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 86 tracked files (61 `.py`, 7 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 87 tracked files (62 `.py`, 7 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -139,6 +139,8 @@ Repo entry points and standard project files.
   - `def test_request_binds_exact_parameter_digest_quote_cost_and_image()`; `def test_request_refuses_control_database_and_service_owned_environment(key)`; `def test_persisted_spec_contains_only_secret_identity_digest_and_expiry()`; `def test_changed_attempt_environment_changes_durable_identity()`
 - **tests/test_pod_capacity_provider.py** — Runpod v2 quote, exact recovery, termination, and billing adapter tests.
   - `async def test_quote_binds_parameter_digest_exact_gpu_rate_and_timing()`; `async def test_create_injects_exact_image_gpu_and_attempt_environment()`; `async def test_created_metadata_mismatch_preserves_known_pod_id()`; `async def test_exact_recovery_rejects_mismatch_and_multiple_matches()`; `async def test_final_billing_waits_for_records_then_returns_content_free_receipt()`; `async def test_final_billing_waits_until_records_cover_termination()`
+- **tests/test_pod_capacity_reconciler.py** — Installed, locked, content-free Pod-capacity reconciler command tests.
+  - `def test_distribution_installs_capacity_reconciler_entry_point()`; `async def test_reconcile_once_constructs_service_and_runs_one_pass(tmp_path)`; `def test_cli_runs_once_without_provisioning_and_emits_content_free_json(tmp_path)`; `def test_cli_missing_factory_fails_before_loading_or_provisioning()`; `def test_cli_auth_configuration_error_never_exposes_message_or_secret()`; `def test_cli_missing_catalog_dependency_fails_before_reconcile(tmp_path)`; `def test_cli_lock_contention_is_retryable_and_never_runs_service(tmp_path)`; `def test_cli_timeout_is_retryable_and_content_free(tmp_path)`; `…`
 - **tests/test_pod_capacity_service.py** — End-to-end durable catalog Pod lifecycle tests without live resources.
   - `async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path)`; `async def test_identical_replay_adopts_ready_lease_but_changed_env_conflicts(tmp_path)`; `async def test_ambiguous_create_never_retries_and_delayed_visibility_is_adopted(tmp_path)`; `async def test_known_created_mismatch_is_durably_terminated_and_billed(tmp_path)`; `async def test_submit_success_result_replays_until_ack_then_billing_reconciles(tmp_path)`; `async def test_result_replays_after_host_restart_until_durable_ack(tmp_path)`; `async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path)`; `async def test_cancellation_is_worker_authenticated_then_capacity_terminated(tmp_path)`; `…`
 - **tests/test_pod_capacity_transport.py** — Authenticated single-attempt workload transport tests.

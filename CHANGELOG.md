@@ -21,6 +21,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Replayable non-destructive result retrieval followed by an explicit,
   owner/workload-bound acknowledgement, so the private catalog can commit a
   strict-decoded result durably before Pod termination.
+- An owner/workload-bound capacity read accessor for polling authoritative
+  post-acknowledgement billing without exposing or coupling to SQLite.
 
 ### Changed
 

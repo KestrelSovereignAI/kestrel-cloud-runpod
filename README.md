@@ -212,6 +212,13 @@ A host crash before its result transaction commits can repeat
 destructive boundary and must follow the private durable commit; the hard
 runtime deadline remains the final cost and cleanup bound.
 
+After acknowledgement, poll
+`get_catalog_capacity(capacity_id=..., owner_id=..., workload_id=...)`. It
+fails closed on either binding mismatch and returns the canonical lease only;
+settlement is usable only when `settlement_ready` is true, at which point
+`billing_receipt` is authoritative. The host never reads the capacity SQLite
+repository directly.
+
 ### Configuration migration from 0.2
 
 Profiles no longer select a hardcoded `gpu_type_id` or record a `cost_per_hr`. Replace legacy fields with workload constraints:

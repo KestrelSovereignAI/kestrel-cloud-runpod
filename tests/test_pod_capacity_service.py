@@ -376,6 +376,44 @@ async def test_owner_mismatch_fails_before_transport_or_provider_mutation(
 
 
 @pytest.mark.asyncio
+async def test_get_catalog_capacity_is_owner_bound_and_reports_settlement(
+    tmp_path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    store = FakeCapabilityStore(clock)
+    runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    catalog_request = request(clock)
+    await runtime.acquire_catalog(catalog_request)
+
+    active = runtime.get_catalog_capacity(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    assert active.settlement_ready is False
+    assert active.billing_receipt is None
+    assert active.backend_base_url not in str(active.to_public_dict())
+
+    with pytest.raises(PodCapacityConflictError, match="owner/workload"):
+        runtime.get_catalog_capacity(
+            capacity_id=catalog_request.capacity_id,
+            owner_id="owner:different-user-0002",
+            workload_id=catalog_request.workload_id,
+        )
+
+    provider.billing_receipt = final_receipt(clock)
+    await runtime.release(catalog_request.capacity_id, reason="test settlement")
+    settled = runtime.get_catalog_capacity(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    assert settled.settlement_ready is True
+    assert settled.billing_receipt.actual_cost_usd == Decimal("0.061")
+
+
+@pytest.mark.asyncio
 async def test_definitive_pre_provider_rejection_is_authoritative_zero(
     tmp_path,
 ) -> None:

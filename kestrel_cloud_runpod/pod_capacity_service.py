@@ -19,6 +19,7 @@ from .pod_capacity_contracts import (
     CatalogPodWorkloadState,
     PodBillingReceipt,
     PodCapacityBillingState,
+    PodCapacityLease,
     PodCapacityQuote,
     PodCapacityQuoteRequest,
     PodCapacitySpec,
@@ -87,6 +88,17 @@ class PodCapacityLeaseService:
         """Return the provider's exact live Pod offer without mutating capacity."""
 
         return await self.provider.quote(request)
+
+    def get_catalog_capacity(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+    ) -> PodCapacityLease:
+        """Return owner-bound capacity and canonical settlement state."""
+
+        return self._catalog_lease(capacity_id, owner_id, workload_id)
 
     def validate_catalog_reconciler_dependencies(self) -> None:
         """Fail before polling when required host-owned dependencies are absent."""
