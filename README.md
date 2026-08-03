@@ -113,10 +113,12 @@ not per-job records. `final_billing()` therefore returns an authoritative receip
 only after the exact job is terminal, its complete closed billing window is
 available, the endpoint is configured as scale-to-zero with one worker, and the
 caller supplies the digest and complete UTC hour allocation of a durable
-host-owned exclusivity record proving that no other attempt shared any touched
-endpoint-hour bucket. Coverage extends from submission through completion plus
-the accepted idle tail, so settlement waits for the final covered hour to close
-even when that tail crosses an hour boundary. A missing, partial, or
+host-owned exclusivity record proving that no other attempt shared any reserved
+endpoint-hour bucket. That canonical allocation may be a conservative superset
+reserved from before submission through quote expiry plus the worst-case job
+duration; it must fully cover the exact submission-through-completion-plus-idle
+interval. Settlement queries every reserved hour and waits for the final one to
+close. A missing, partial, or
 still-open bucket remains pending. Any identity, interval, total, component, or
 unsupported-field mismatch fails closed.
 The receipt binds the accepted quote, profile, endpoint, job, attempt, accepted
@@ -128,7 +130,9 @@ idle-tail value remain `null`.
 If `/run` returns an ambiguous transport or server error before a job ID is
 known, the host keeps the same exclusive worst-case endpoint/hour allocation
 and calls `final_ambiguous_window_billing()`. This Cloud method needs no job
-status client: after every allocated hour closes, it reads only strict v2
+status client. The exact attempted-at worst-case interval must be fully covered
+by the canonical allocation, including any earlier or later quote-lifetime
+hours. After every allocated hour closes, it reads only strict v2
 endpoint-hour billing and returns content-free actual, accepted-ceiling-capped,
 and operator-loss amounts. The receipt's canonical ordered endpoint-hour costs
 retain each v2 record's UTC start/end, endpoint ID, component amounts, total,

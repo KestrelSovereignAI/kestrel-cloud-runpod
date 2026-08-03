@@ -28,6 +28,9 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}")
 _IMMUTABLE_REFERENCE_RE = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
 _MAX_SERVERLESS_POLICY_MS = 7 * 24 * 60 * 60 * 1_000
 _MAX_BILLABLE_COVERAGE_SECONDS = 7 * 24 * 60 * 60 + 3_600
+_MAX_EXCLUSIVE_BILLING_HOURS = (
+    math.ceil((_MAX_BILLABLE_COVERAGE_SECONDS + 300) / 3_600) + 1
+)
 _MIN_EXECUTION_TIMEOUT_MS = 5_000
 _MIN_JOB_TTL_MS = 10_000
 
@@ -666,30 +669,7 @@ class ServerlessBillingAttempt:
         ):
             _safe_identifier(value, name)
         _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
-        if (
-            not isinstance(self.exclusive_billing_hour_starts, tuple)
-            or not self.exclusive_billing_hour_starts
-        ):
-            raise ValueError(
-                "Serverless exclusive billing allocation must contain hour buckets"
-            )
-        previous: datetime | None = None
-        for value in self.exclusive_billing_hour_starts:
-            require_aware(value, "exclusive_billing_hour_starts")
-            normalized = value.astimezone(UTC)
-            if (
-                normalized.minute != 0
-                or normalized.second != 0
-                or normalized.microsecond != 0
-                or (
-                    previous is not None and normalized != previous + timedelta(hours=1)
-                )
-            ):
-                raise ValueError(
-                    "Serverless exclusive billing allocation must contain "
-                    "contiguous UTC hour starts"
-                )
-            previous = normalized
+        _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
         require_aware(self.submitted_at, "submitted_at")
         require_aware(self.completed_at, "completed_at")
         if self.completed_at <= self.submitted_at:
@@ -720,9 +700,9 @@ class ServerlessBillingAttempt:
         actual_hours = tuple(
             value.astimezone(UTC) for value in self.exclusive_billing_hour_starts
         )
-        if actual_hours != expected_hours:
+        if not _ordered_hours_cover(actual_hours, expected_hours):
             raise RunPodManagerError(
-                "Serverless exclusive billing allocation does not reserve every "
+                "Serverless exclusive billing allocation does not cover every "
                 "accepted endpoint-hour bucket"
             )
 
@@ -804,21 +784,18 @@ class ServerlessBillingReceipt:
             raise ValueError(
                 "Serverless billing coverage does not equal the accepted idle tail"
             )
-        expected_hours = serverless_billing_hour_starts(
+        required_hours = serverless_billing_hour_starts(
             self.attempt_started_at, self.billable_coverage_until
         )
-        for value in self.exclusive_billing_hour_starts:
-            require_aware(value, "exclusive_billing_hour_starts")
-        actual_hours = tuple(
-            value.astimezone(UTC) for value in self.exclusive_billing_hour_starts
-        )
-        if actual_hours != expected_hours:
+        actual_hours = _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
+        if not _ordered_hours_cover(actual_hours, required_hours):
             raise ValueError(
-                "Serverless receipt does not bind every exclusive endpoint-hour bucket"
+                "Serverless receipt allocation does not cover every attempted "
+                "endpoint-hour bucket"
             )
-        if self.billing_window_from != expected_hours[
+        if self.billing_window_from != actual_hours[
             0
-        ] or self.billing_window_until != expected_hours[-1] + timedelta(hours=1):
+        ] or self.billing_window_until != actual_hours[-1] + timedelta(hours=1):
             raise ValueError(
                 "Serverless billing receipt window does not match its hour allocation"
             )
@@ -964,13 +941,13 @@ class ServerlessAmbiguousBillingWindow:
         _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
         require_aware(self.attempted_at, "attempted_at")
         require_aware(self.billable_coverage_until, "billable_coverage_until")
-        expected_hours = serverless_billing_hour_starts(
+        required_hours = serverless_billing_hour_starts(
             self.attempted_at, self.billable_coverage_until
         )
         actual_hours = _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
-        if actual_hours != expected_hours:
+        if not _ordered_hours_cover(actual_hours, required_hours):
             raise ValueError(
-                "Serverless ambiguous allocation does not reserve every "
+                "Serverless ambiguous allocation does not cover every attempted "
                 "endpoint-hour bucket"
             )
         _positive_decimal(self.accepted_cost_ceiling_usd, "accepted_cost_ceiling_usd")
@@ -1192,17 +1169,18 @@ class ServerlessAmbiguousWindowBillingReceipt:
             raise ValueError(
                 "Serverless ambiguous billing receipt intervals are inconsistent"
             )
-        expected_hours = serverless_billing_hour_starts(
+        required_hours = serverless_billing_hour_starts(
             self.attempted_at, self.billable_coverage_until
         )
         actual_hours = _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
-        if actual_hours != expected_hours:
+        if not _ordered_hours_cover(actual_hours, required_hours):
             raise ValueError(
-                "Serverless ambiguous receipt does not bind every endpoint-hour bucket"
+                "Serverless ambiguous receipt allocation does not cover every "
+                "attempted endpoint-hour bucket"
             )
-        if self.billing_window_from != expected_hours[
+        if self.billing_window_from != actual_hours[
             0
-        ] or self.billing_window_until != expected_hours[-1] + timedelta(hours=1):
+        ] or self.billing_window_until != actual_hours[-1] + timedelta(hours=1):
             raise ValueError(
                 "Serverless ambiguous receipt window does not match its allocation"
             )
@@ -1228,7 +1206,7 @@ class ServerlessAmbiguousWindowBillingReceipt:
                 )
             observed_hours.append(item.utc_hour_start.astimezone(UTC))
             observed_ids.add(item.provider_observation_id)
-        if tuple(observed_hours) != expected_hours:
+        if tuple(observed_hours) != actual_hours:
             raise ValueError(
                 "Serverless endpoint-hour costs do not match the ordered allocation"
             )
@@ -1498,6 +1476,10 @@ def _normalized_exclusive_hours(values: tuple[datetime, ...]) -> tuple[datetime,
             "Serverless exclusive billing allocation must contain hour buckets"
         )
     normalized: list[datetime] = []
+    if len(values) > _MAX_EXCLUSIVE_BILLING_HOURS:
+        raise ValueError(
+            "Serverless exclusive billing allocation exceeds policy bounds"
+        )
     previous: datetime | None = None
     for value in values:
         require_aware(value, "exclusive_billing_hour_starts")
@@ -1515,6 +1497,17 @@ def _normalized_exclusive_hours(values: tuple[datetime, ...]) -> tuple[datetime,
         normalized.append(item)
         previous = item
     return tuple(normalized)
+
+
+def _ordered_hours_cover(
+    actual_hours: tuple[datetime, ...], required_hours: tuple[datetime, ...]
+) -> bool:
+    return (
+        bool(actual_hours)
+        and bool(required_hours)
+        and actual_hours[0] <= required_hours[0]
+        and actual_hours[-1] >= required_hours[-1]
+    )
 
 
 def _endpoint_hour_cost_totals(

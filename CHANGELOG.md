@@ -16,6 +16,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Accept the host's canonical quote-lifetime endpoint-hour allocation as a
+  conservative superset for both terminal and ambiguous submissions, while
+  still requiring it to cover the exact accepted attempt interval and settling
+  every reserved hour.
 - Quote interactive Serverless for every possible scale-to-zero cold start in
   the accepted session, bind that maximum into SDK metadata, and reject a zero
   idle tail whose invocation-independent cost cannot be bounded.

@@ -145,9 +145,12 @@ available only when the exact terminal job/attempt is bound to a caller-owned
 exclusive endpoint-window proof that allocates every touched UTC hour and every
 closed billing bucket is complete and internally consistent. Billable coverage
 ends at completion plus the accepted endpoint idle tail, not at job completion;
-the final touched hour must close before settlement. The receipt binds that
-coverage end and accepted tail while startup and observed idle-tail measurements
-remain null because v2 does not return them per job. This makes the current throughput tradeoff explicit:
+the host's canonical allocation may conservatively include earlier/later hours
+reserved through quote expiry and worst-case execution. Cloud requires that
+ordered contiguous allocation to cover the exact job interval, queries every
+reserved hour, and waits for the final allocated hour to close. The receipt
+binds the exact coverage end and accepted tail while startup and observed
+idle-tail measurements remain null because v2 does not return them per job. This makes the current throughput tradeoff explicit:
 Frinz must serialize accepted attempts by endpoint billing window or provision a
 separately attributable endpoint until Runpod exposes finer billing identity.
 An ambiguous `/run` acceptance has no provider job ID to query. The host still

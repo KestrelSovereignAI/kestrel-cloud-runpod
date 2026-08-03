@@ -579,6 +579,50 @@ async def test_ambiguous_billing_preserves_ordered_unequal_endpoint_hours() -> N
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_billing_queries_quote_lifetime_hour_superset() -> None:
+    quote_clock = MutableClock()
+    quote_clock.value = datetime(2026, 8, 3, 10, 59, 30, tzinfo=UTC)
+    accepted = quote(quote_clock)
+    reserved_hours = (
+        datetime(2026, 8, 3, 10, tzinfo=UTC),
+        datetime(2026, 8, 3, 11, tzinfo=UTC),
+    )
+    allocation = ambiguous_window(
+        accepted,
+        attempted_at=datetime(2026, 8, 3, 11, 0, 10, tzinfo=UTC),
+        exclusive_billing_hour_starts=reserved_hours,
+    )
+    billing_calls: list[dict[str, object]] = []
+    clock = MutableClock()
+    clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(
+            serverless_billing=lambda **kwargs: (
+                billing_calls.append(kwargs) or _two_hour_billing_page()
+            )
+        ),
+        clock=clock,
+    )
+
+    receipt = await provider.final_ambiguous_window_billing(allocation, accepted)
+
+    assert receipt is not None
+    assert receipt.exclusive_billing_hour_starts == reserved_hours
+    assert (
+        tuple(item.utc_hour_start for item in receipt.endpoint_hour_costs)
+        == reserved_hours
+    )
+    assert billing_calls == [
+        {
+            "start_time": "2026-08-03T10:00:00+00:00",
+            "end_time": "2026-08-03T12:00:00+00:00",
+            "bucket_size": "hour",
+            "endpoint_id": "endpoint-selfie-01",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_window_rejects_incomplete_allocation_or_ceiling() -> None:
     accepted = quote()
     allocation = ambiguous_window(accepted)
@@ -587,7 +631,7 @@ async def test_ambiguous_window_rejects_incomplete_allocation_or_ceiling() -> No
         clock=MutableClock(),
     )
 
-    with pytest.raises(ValueError, match="does not reserve every"):
+    with pytest.raises(ValueError, match="does not cover every"):
         replace(
             allocation,
             exclusive_billing_hour_starts=(datetime(2026, 8, 3, 9, tzinfo=UTC),),
@@ -675,6 +719,51 @@ async def test_final_billing_reserves_idle_tail_across_hour_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_final_billing_queries_quote_lifetime_hour_superset() -> None:
+    quote_clock = MutableClock()
+    quote_clock.value = datetime(2026, 8, 3, 10, 59, 30, tzinfo=UTC)
+    accepted = quote(quote_clock)
+    reserved_hours = (
+        datetime(2026, 8, 3, 10, tzinfo=UTC),
+        datetime(2026, 8, 3, 11, tzinfo=UTC),
+    )
+    billing_attempt = attempt(
+        accepted,
+        submitted_at=datetime(2026, 8, 3, 11, 0, 10, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 3, 11, 4, tzinfo=UTC),
+        exclusive_billing_hour_starts=reserved_hours,
+    )
+    billing_calls: list[dict[str, object]] = []
+    clock = MutableClock()
+    clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(
+            serverless_billing=lambda **kwargs: (
+                billing_calls.append(kwargs) or _two_hour_billing_page()
+            )
+        ),
+        job_client=SimpleNamespace(status=lambda *_: _terminal_job()),
+        clock=clock,
+    )
+
+    receipt = await provider.final_billing(billing_attempt, accepted)
+
+    assert receipt is not None
+    assert receipt.exclusive_billing_hour_starts == reserved_hours
+    assert receipt.billing_window_from == reserved_hours[0]
+    assert receipt.billing_window_until == reserved_hours[-1] + timedelta(hours=1)
+    assert receipt.actual_cost_usd == Decimal("0.0335")
+    assert billing_calls == [
+        {
+            "start_time": "2026-08-03T10:00:00+00:00",
+            "end_time": "2026-08-03T12:00:00+00:00",
+            "bucket_size": "hour",
+            "endpoint_id": "endpoint-selfie-01",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_final_billing_rejects_exclusivity_missing_idle_tail_hour() -> None:
     clock = MutableClock()
     clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
@@ -693,7 +782,7 @@ async def test_final_billing_rejects_exclusivity_missing_idle_tail_hour() -> Non
         clock=clock,
     )
 
-    with pytest.raises(RunPodManagerError, match="does not reserve every"):
+    with pytest.raises(RunPodManagerError, match="does not cover every"):
         await provider.final_billing(incomplete, accepted)
 
 

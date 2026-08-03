@@ -35,7 +35,6 @@ from .serverless_capacity_contracts import (
     iso_datetime,
     json_sha256,
     parse_datetime,
-    serverless_billing_hour_starts,
     serverless_worker_cost_usd,
 )
 
@@ -176,8 +175,8 @@ class RunpodServerlessCapacityProvider:
         billable_coverage_until = attempt.completed_at + timedelta(
             seconds=quote.idle_tail_seconds
         )
-        billing_hour_starts = serverless_billing_hour_starts(
-            attempt.submitted_at, billable_coverage_until
+        billing_hour_starts = tuple(
+            value.astimezone(UTC) for value in attempt.exclusive_billing_hour_starts
         )
         window_from = billing_hour_starts[0]
         window_until = billing_hour_starts[-1] + timedelta(hours=1)

@@ -305,6 +305,14 @@ def test_attempt_binds_exact_endpoint_job_quote_and_authorized_interval() -> Non
             valid,
             completed_at=valid.submitted_at + timedelta(seconds=301),
         ).validate_quote(item)
+    first_hour = valid.exclusive_billing_hour_starts[0]
+    with pytest.raises(ValueError, match="exceeds policy bounds"):
+        replace(
+            valid,
+            exclusive_billing_hour_starts=tuple(
+                first_hour + timedelta(hours=index) for index in range(1_000)
+            ),
+        )
 
 
 def _receipt() -> ServerlessBillingReceipt:
