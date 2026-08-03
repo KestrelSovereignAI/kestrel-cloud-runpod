@@ -14,6 +14,8 @@ from serverless_capacity_test_support import (
     ambiguous_window,
     attempt,
     constraints,
+    endpoint_spec,
+    planned_endpoint,
     profile,
     quote,
     request,
@@ -22,13 +24,57 @@ from serverless_capacity_test_support import (
 import kestrel_cloud_runpod
 from kestrel_cloud_runpod.models import Availability, CloudType, RunPodManagerError
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
+    RUNPOD_V2_OPENAPI_SHA256,
+    RUNPOD_V2_OPENAPI_SOURCE_URL,
+    PlannedServerlessEndpoint,
     ServerlessAmbiguousBillingWindow,
     ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
     ServerlessEndpointHourCost,
+    ServerlessEndpointSpec,
     serverless_worker_cost_usd,
 )
+
+
+def test_endpoint_spec_round_trip_is_canonical_and_digest_protected() -> None:
+    item = endpoint_spec(registry_id="registry-private-01")
+    serialized = item.to_dict()
+
+    assert serialized["spec_sha256"] == item.spec_sha256
+    assert ServerlessEndpointSpec.from_dict(serialized).to_dict() == serialized
+    with pytest.raises(RunPodManagerError, match="digest mismatches"):
+        ServerlessEndpointSpec.from_dict({**serialized, "disk_gb": 21})
+
+    planned = planned_endpoint(spec=item)
+    assert PlannedServerlessEndpoint.from_dict(planned.to_dict()) == planned
+    assert "endpoint_id" not in planned.to_dict()
+
+
+def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
+    payload = (
+        endpoint_spec(registry_id="registry-private-01")
+        .create_request(
+            "kestrel-selfie-run-0001",
+            gpu_pool="BLACKWELL_24",
+            data_center_id="US-TX-3",
+        )
+        .to_payload()
+    )
+
+    assert RUNPOD_V2_OPENAPI_SOURCE_URL == "https://api.runpod.io/v2/openapi.json"
+    assert RUNPOD_V2_OPENAPI_SHA256 == (
+        "0bbdd828569233765e310e773e34586b33a6e38f55afde989ebd670152ed5c13"
+    )
+    assert payload["type"] == "QUEUE"
+    assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}
+    assert payload["scaling"] == {"type": "QUEUE_DELAY", "queueDelay": 4.0}
+    assert payload["gpu"] == {"pools": ["BLACKWELL_24"], "count": 1}
+    assert payload["dataCenterIds"] == ["US-TX-3"]
+    assert payload["networkVolumes"] == []
+    assert payload["env"] == {}
+    assert payload["ports"] == []
+    assert payload["registry"] == "registry-private-01"
 
 
 def test_public_package_exports_serverless_construction_dependencies() -> None:
@@ -172,12 +218,13 @@ def test_quote_serialization_is_content_free() -> None:
     assert not any(marker in encoded for marker in forbidden)
 
 
-def test_endpoint_profile_requires_exact_scale_to_zero_pool_and_data_center() -> None:
+def test_endpoint_spec_requires_safe_scale_to_zero_placement_constraints() -> None:
     with pytest.raises(ValueError, match="single-worker"):
         profile(workers_max=2)
-    with pytest.raises(ValueError, match="exact endpoint pool"):
-        constraints(allowed_gpu_pools=("BLACKWELL_24", "ADA_24"))
-    with pytest.raises(ValueError, match="exact endpoint data center"):
+    assert constraints(
+        allowed_gpu_pools=("BLACKWELL_24", "ADA_24")
+    ).allowed_gpu_pools == ("BLACKWELL_24", "ADA_24")
+    with pytest.raises(ValueError, match="allowed endpoint data center"):
         constraints(allowed_data_center_ids=())
     with pytest.raises(ValueError, match="idle_tail_seconds"):
         profile(idle_tail_seconds=3_601)

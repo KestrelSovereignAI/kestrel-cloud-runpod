@@ -15,12 +15,18 @@ from kestrel_cloud_runpod.models import (
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
     SERVERLESS_CAPACITY_SCHEMA_VERSION,
+    PlannedServerlessCapacityQuote,
+    PlannedServerlessCapacityQuoteRequest,
+    PlannedServerlessEndpoint,
+    ServerlessActivatedSubmission,
     ServerlessAmbiguousBillingWindow,
     ServerlessBillingAttempt,
     ServerlessCapacityConstraints,
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
+    ServerlessEndpointActivationReceipt,
     ServerlessEndpointProfile,
+    ServerlessEndpointSpec,
     serverless_billing_hour_starts,
     serverless_worker_cost_usd,
 )
@@ -54,11 +60,8 @@ def constraints(**changes: object) -> ServerlessCapacityConstraints:
     return ServerlessCapacityConstraints(**values)  # type: ignore[arg-type]
 
 
-def profile(**changes: object) -> ServerlessEndpointProfile:
+def endpoint_spec(**changes: object) -> ServerlessEndpointSpec:
     values: dict[str, object] = {
-        "profile_id": "selfie-blackwell-01",
-        "endpoint_id": "endpoint-selfie-01",
-        "endpoint_name": "selfie-blackwell-01",
         "worker_reference": WORKER_REFERENCE,
         "constraints": constraints(),
         "workers_min": 0,
@@ -69,10 +72,32 @@ def profile(**changes: object) -> ServerlessEndpointProfile:
         "execution_timeout_ms": 120_000,
         "flashboot": FlashBoot.FLASHBOOT,
         "disk_gb": 20,
+        "registry_id": None,
         "network_volume_ids": (),
     }
     values.update(changes)
+    return ServerlessEndpointSpec(**values)  # type: ignore[arg-type]
+
+
+def profile(**changes: object) -> ServerlessEndpointProfile:
+    values: dict[str, object] = {
+        "profile_id": changes.pop("profile_id", "selfie-blackwell-01"),
+        "endpoint_id": changes.pop("endpoint_id", "endpoint-selfie-01"),
+        "endpoint_name": changes.pop("endpoint_name", "selfie-blackwell-01"),
+    }
+    supplied_spec = changes.pop("spec", None)
+    values["spec"] = supplied_spec or endpoint_spec(**changes)
     return ServerlessEndpointProfile(**values)  # type: ignore[arg-type]
+
+
+def planned_endpoint(**changes: object) -> PlannedServerlessEndpoint:
+    values: dict[str, object] = {
+        "plan_id": "selfie-run-0001",
+        "endpoint_name": "kestrel-selfie-run-0001",
+        "spec": endpoint_spec(),
+    }
+    values.update(changes)
+    return PlannedServerlessEndpoint(**values)  # type: ignore[arg-type]
 
 
 def request(**changes: object) -> ServerlessCapacityQuoteRequest:
@@ -95,6 +120,28 @@ def request(**changes: object) -> ServerlessCapacityQuoteRequest:
     }
     values.update(changes)
     return ServerlessCapacityQuoteRequest(**values)  # type: ignore[arg-type]
+
+
+def planned_request(**changes: object) -> PlannedServerlessCapacityQuoteRequest:
+    values: dict[str, object] = {
+        "endpoint": planned_endpoint(),
+        "workload_kind": "catalog-selfie",
+        "parameters_sha256": PARAMETERS_SHA256,
+        "estimated_queue_delay_seconds": 15,
+        "estimated_worker_start_seconds": 60,
+        "estimated_execution_seconds": 30,
+        "maximum_queue_delay_seconds": 120,
+        "maximum_worker_start_seconds": 120,
+        "maximum_execution_seconds": 50,
+        "maximum_billable_seconds": 180,
+        "job_execution_timeout_ms": 120_000,
+        "job_ttl_ms": 300_000,
+        "estimated_non_worker_cost_usd": Decimal("0.000500"),
+        "maximum_non_worker_cost_usd": Decimal("0.001000"),
+        "quote_ttl_seconds": 60,
+    }
+    values.update(changes)
+    return PlannedServerlessCapacityQuoteRequest(**values)  # type: ignore[arg-type]
 
 
 def offer(**changes: object) -> GPUOffer:
@@ -148,9 +195,53 @@ def endpoint(
             "timeout": selected.execution_timeout_ms,
             "flashboot": selected.flashboot.value,
             "disk": selected.disk_gb,
-            "env": {"PRIVATE_RUNTIME_VALUE": "must-not-serialize"},
+            "ports": [],
+            "env": {},
+            "args": None,
+            "registry": selected.registry_id,
         }
     )
+
+
+def planned_endpoint_resource(
+    planned: PlannedServerlessEndpoint | None = None,
+    *,
+    endpoint_id: str = "endpoint-planned-01",
+    **raw_changes: object,
+) -> EndpointResource:
+    selected = planned or planned_endpoint()
+    spec = selected.spec
+    raw: dict[str, object] = {
+        "id": endpoint_id,
+        "name": selected.endpoint_name,
+        "type": "QUEUE",
+        "requestUrls": {"run": f"https://api.runpod.ai/v2/{endpoint_id}/run"},
+        "image": spec.worker_reference,
+        "gpu": {
+            "pools": [spec.constraints.allowed_gpu_pools[0]],
+            "count": spec.constraints.gpu_count,
+        },
+        "workers": {
+            "min": spec.workers_min,
+            "max": spec.workers_max,
+            "idleTimeout": spec.idle_tail_seconds,
+        },
+        "scaling": {
+            "type": spec.scaling_type,
+            "queueDelay": float(spec.scaling_value),
+        },
+        "dataCenterIds": [spec.constraints.allowed_data_center_ids[0]],
+        "networkVolumes": [],
+        "timeout": spec.execution_timeout_ms,
+        "flashboot": spec.flashboot.value,
+        "disk": spec.disk_gb,
+        "ports": [],
+        "env": {},
+        "args": None,
+        "registry": spec.registry_id,
+    }
+    raw.update(raw_changes)
+    return EndpointResource.from_dict(raw)
 
 
 def quote(clock: MutableClock | None = None) -> ServerlessCapacityQuote:
@@ -251,6 +342,44 @@ def ambiguous_window(
                 + selected.maximum_worker_start_seconds
                 + selected.maximum_execution_seconds
                 + selected.idle_tail_seconds
+            )
+        )
+    if "exclusive_billing_hour_starts" not in changes:
+        start = values["attempted_at"]
+        coverage_until = values["billable_coverage_until"]
+        assert isinstance(start, datetime)
+        assert isinstance(coverage_until, datetime)
+        values["exclusive_billing_hour_starts"] = serverless_billing_hour_starts(
+            start, coverage_until
+        )
+    return ServerlessAmbiguousBillingWindow(**values)  # type: ignore[arg-type]
+
+
+def activated_ambiguous_window(
+    item: PlannedServerlessCapacityQuote,
+    activation: ServerlessEndpointActivationReceipt,
+    submission: ServerlessActivatedSubmission,
+    **changes: object,
+) -> ServerlessAmbiguousBillingWindow:
+    attempted_at = submission.authorized_at + timedelta(seconds=30)
+    values: dict[str, object] = {
+        "attempt_id": "attempt-selfie-activated-ambiguous-0001",
+        "endpoint_id": activation.endpoint_id,
+        "provider_quote_id": item.provider_quote_id,
+        "exclusive_window_sha256": submission.exclusive_window_sha256,
+        "attempted_at": attempted_at,
+        "accepted_cost_ceiling_usd": item.cost_ceiling_usd,
+    }
+    values.update(changes)
+    if "billable_coverage_until" not in changes:
+        selected_attempted_at = values["attempted_at"]
+        assert isinstance(selected_attempted_at, datetime)
+        values["billable_coverage_until"] = selected_attempted_at + timedelta(
+            seconds=(
+                item.maximum_queue_delay_seconds
+                + item.maximum_worker_start_seconds
+                + item.maximum_execution_seconds
+                + item.idle_tail_seconds
             )
         )
     if "exclusive_billing_hour_starts" not in changes:

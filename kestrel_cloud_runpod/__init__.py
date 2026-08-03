@@ -110,8 +110,14 @@ from .pod_transport import (
     CatalogPodWorkloadTransport,
 )
 from .serverless_capacity_contracts import (
+    RUNPOD_V2_OPENAPI_SHA256,
+    RUNPOD_V2_OPENAPI_SOURCE_URL,
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
     SERVERLESS_CAPACITY_SCHEMA_VERSION,
+    PlannedServerlessCapacityQuote,
+    PlannedServerlessCapacityQuoteRequest,
+    PlannedServerlessEndpoint,
+    ServerlessActivatedSubmission,
     ServerlessAmbiguousBillingWindow,
     ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingAttempt,
@@ -119,12 +125,19 @@ from .serverless_capacity_contracts import (
     ServerlessCapacityConstraints,
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
+    ServerlessEndpointActivationReceipt,
+    ServerlessEndpointCleanupReceipt,
     ServerlessEndpointHourCost,
     ServerlessEndpointProfile,
+    ServerlessEndpointSpec,
     serverless_billing_hour_starts,
     serverless_worker_cost_usd,
 )
-from .serverless_capacity_provider import RunpodServerlessCapacityProvider
+from .serverless_capacity_provider import (
+    RunpodServerlessCapacityProvider,
+    ServerlessEndpointActivationError,
+    ServerlessEndpointCleanupError,
+)
 from .training_contracts import (
     TrainingPodCleanupError,
     TrainingPodCleanupState,
@@ -144,6 +157,8 @@ except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
 __all__ = [
+    "RUNPOD_V2_OPENAPI_SHA256",
+    "RUNPOD_V2_OPENAPI_SOURCE_URL",
     "SERVERLESS_CAPACITY_CONTRACT_VERSION",
     "SERVERLESS_CAPACITY_SCHEMA_VERSION",
     "Availability",
@@ -173,6 +188,9 @@ __all__ = [
     "OllamaResourceType",
     "OllamaTeardownState",
     "PlacementRequirements",
+    "PlannedServerlessCapacityQuote",
+    "PlannedServerlessCapacityQuoteRequest",
+    "PlannedServerlessEndpoint",
     "PodBillingReceipt",
     "PodCapacityBillingState",
     "PodCapacityCleanupError",
@@ -210,6 +228,7 @@ __all__ = [
     "RunpodServerlessCapacityProvider",
     "RunpodServerlessClient",
     "SQLitePodCapacityRepository",
+    "ServerlessActivatedSubmission",
     "ServerlessAmbiguousBillingWindow",
     "ServerlessAmbiguousWindowBillingReceipt",
     "ServerlessBillingAttempt",
@@ -217,8 +236,13 @@ __all__ = [
     "ServerlessCapacityConstraints",
     "ServerlessCapacityQuote",
     "ServerlessCapacityQuoteRequest",
+    "ServerlessEndpointActivationError",
+    "ServerlessEndpointActivationReceipt",
+    "ServerlessEndpointCleanupError",
+    "ServerlessEndpointCleanupReceipt",
     "ServerlessEndpointHourCost",
     "ServerlessEndpointProfile",
+    "ServerlessEndpointSpec",
     "TrainingPodCleanupError",
     "TrainingPodCleanupState",
     "TrainingPodConflictError",

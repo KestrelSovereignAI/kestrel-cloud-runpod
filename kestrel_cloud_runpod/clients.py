@@ -511,6 +511,7 @@ class RunpodControlPlaneClient:
             "DELETE",
             f"/serverless/{_segment(endpoint_id)}",
             expected_statuses=(204,),
+            ambiguous_on_failure=True,
         )
 
     def list_endpoint_workers(self, endpoint_id: str) -> Mapping[str, Any]:
