@@ -98,7 +98,35 @@ class PodCapacityLeaseService:
     ) -> PodCapacityLease:
         """Return owner-bound capacity and canonical settlement state."""
 
-        return self._catalog_lease(capacity_id, owner_id, workload_id)
+        lease = self.find_catalog_capacity(
+            capacity_id=capacity_id,
+            owner_id=owner_id,
+            workload_id=workload_id,
+        )
+        if lease is None:
+            raise RunPodManagerError(
+                f"Catalog Pod capacity '{capacity_id}' was not found"
+            )
+        return lease
+
+    def find_catalog_capacity(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+    ) -> PodCapacityLease | None:
+        """Return bound capacity, or ``None`` without provisioning when absent."""
+
+        lease = self.repository.get(capacity_id)
+        if lease is None:
+            return None
+        spec = self._capacity_spec(lease)
+        if spec.request.owner_id != owner_id or spec.request.workload_id != workload_id:
+            raise TrainingPodConflictError(
+                "Pod capacity owner/workload identity does not match the lease"
+            )
+        return lease
 
     def validate_catalog_reconciler_dependencies(self) -> None:
         """Fail before polling when required host-owned dependencies are absent."""
@@ -1375,13 +1403,11 @@ class PodCapacityLeaseService:
     def _catalog_lease(
         self, capacity_id: str, owner_id: str, workload_id: str
     ) -> TrainingPodLease:
-        lease = self._required(capacity_id)
-        spec = self._capacity_spec(lease)
-        if spec.request.owner_id != owner_id or spec.request.workload_id != workload_id:
-            raise TrainingPodConflictError(
-                "Pod capacity owner/workload identity does not match the lease"
-            )
-        return lease
+        return self.get_catalog_capacity(
+            capacity_id=capacity_id,
+            owner_id=owner_id,
+            workload_id=workload_id,
+        )
 
     @staticmethod
     def _capacity_spec(lease: TrainingPodLease) -> PodCapacitySpec:

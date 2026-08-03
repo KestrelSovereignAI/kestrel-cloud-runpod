@@ -102,6 +102,12 @@ The host then polls the owner/workload-bound `get_catalog_capacity()` method
 until the returned canonical lease is settlement-ready; it does not reach into
 the capacity repository or infer actual cost from estimates.
 
+Cancellation and restart reconciliation may precede capacity acquisition.
+They use the non-mutating, owner/workload-bound `find_catalog_capacity()`
+method: true absence returns `None` without creating capacity, while any
+existing lease with a different binding fails closed. Private code never reads
+the capacity SQLite repository directly.
+
 ## Crash and ambiguity rules
 
 The lease and deterministic resource name are committed before `POST /pods`.

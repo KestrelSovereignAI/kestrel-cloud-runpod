@@ -219,6 +219,12 @@ settlement is usable only when `settlement_ready` is true, at which point
 `billing_receipt` is authoritative. The host never reads the capacity SQLite
 repository directly.
 
+For cancellation/restart recovery that may run before acquisition,
+`find_catalog_capacity(...)` performs the same owner/workload authorization and
+returns `None` only when no capacity claim exists. It is non-mutating and never
+provisions a Pod; an existing lease with a mismatched binding still fails
+closed.
+
 ### Configuration migration from 0.2
 
 Profiles no longer select a hardcoded `gpu_type_id` or record a `cost_per_hr`. Replace legacy fields with workload constraints:

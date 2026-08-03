@@ -384,6 +384,23 @@ async def test_get_catalog_capacity_is_owner_bound_and_reports_settlement(
     store = FakeCapabilityStore(clock)
     runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
     catalog_request = request(clock)
+
+    assert (
+        runtime.find_catalog_capacity(
+            capacity_id=catalog_request.capacity_id,
+            owner_id=catalog_request.owner_id,
+            workload_id=catalog_request.workload_id,
+        )
+        is None
+    )
+    assert provider.create_calls == []
+    with pytest.raises(RunPodManagerError, match="not found"):
+        runtime.get_catalog_capacity(
+            capacity_id=catalog_request.capacity_id,
+            owner_id=catalog_request.owner_id,
+            workload_id=catalog_request.workload_id,
+        )
+
     await runtime.acquire_catalog(catalog_request)
 
     active = runtime.get_catalog_capacity(
@@ -394,9 +411,23 @@ async def test_get_catalog_capacity_is_owner_bound_and_reports_settlement(
     assert active.settlement_ready is False
     assert active.billing_receipt is None
     assert active.backend_base_url not in str(active.to_public_dict())
+    assert (
+        runtime.find_catalog_capacity(
+            capacity_id=catalog_request.capacity_id,
+            owner_id=catalog_request.owner_id,
+            workload_id=catalog_request.workload_id,
+        )
+        == active
+    )
 
     with pytest.raises(PodCapacityConflictError, match="owner/workload"):
         runtime.get_catalog_capacity(
+            capacity_id=catalog_request.capacity_id,
+            owner_id="owner:different-user-0002",
+            workload_id=catalog_request.workload_id,
+        )
+    with pytest.raises(PodCapacityConflictError, match="owner/workload"):
+        runtime.find_catalog_capacity(
             capacity_id=catalog_request.capacity_id,
             owner_id="owner:different-user-0002",
             workload_id=catalog_request.workload_id,
