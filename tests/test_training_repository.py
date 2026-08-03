@@ -8,7 +8,10 @@ from training_test_support import MutableClock, training_request
 
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.training_contracts import (
+    TrainingPodCleanupState,
     TrainingPodConflictError,
+    TrainingPodOwnership,
+    TrainingPodSource,
     TrainingPodState,
     fallback_training_cleanup_token,
     iso_datetime,
@@ -124,11 +127,19 @@ def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(
     assert migrated is not None
     assert migrated.root_cleanup_token == child_token
     with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='training_pod_leases'"
+            ).fetchone()
+            is None
+        )
         root_column = next(
             row
-            for row in connection.execute("PRAGMA table_info(training_pod_leases)")
+            for row in connection.execute("PRAGMA table_info(pod_capacity_leases)")
             if row[1] == "root_cleanup_token"
         )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
     assert root_column[3] == 1
     family = repository.list_cleanup_family(
         root_token, legacy_cleanup_tokens=(child_token,)
@@ -159,3 +170,62 @@ def test_family_release_gate_blocks_a_late_fallback_reservation(tmp_path: Path) 
                 profile_id="training-h100",
             )
         )
+
+
+def test_versioned_table_migration_preserves_every_lifecycle_shape(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    database = tmp_path / "v1-state.sqlite3"
+    repository = SQLiteTrainingPodRepository(database)
+    expected = {}
+    shapes = (
+        ("requested", TrainingPodState.REQUESTED, False, None),
+        ("uncertain", TrainingPodState.STARTING, True, None),
+        ("ready", TrainingPodState.READY, False, "pod-ready"),
+        ("releasing", TrainingPodState.RELEASING, False, "pod-releasing"),
+        ("released", TrainingPodState.RELEASED, False, "pod-released"),
+    )
+    for name, state, uncertain, pod_id in shapes:
+        source = (
+            TrainingPodSource.CREATED
+            if pod_id is None
+            else TrainingPodSource.CONFIGURED_PERSISTENT
+        )
+        item = training_request(
+            clock,
+            token=f"training:migration-{name}-0001",
+            source=source,
+            pod_id=pod_id,
+        )
+        lease, _ = repository.reserve(item)
+        changes = {
+            "state": state,
+            "creation_uncertain": uncertain,
+            "ownership": (
+                TrainingPodOwnership.PROVISIONAL
+                if pod_id is None
+                else TrainingPodOwnership.OWNED
+            ),
+        }
+        if state is TrainingPodState.RELEASING:
+            changes["cleanup_state"] = TrainingPodCleanupState.PENDING
+        elif state is TrainingPodState.RELEASED:
+            changes["cleanup_state"] = TrainingPodCleanupState.COMPLETE
+        lease = repository.compare_and_set(lease, changes=changes)
+        expected[lease.cleanup_token] = lease
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "ALTER TABLE pod_capacity_leases RENAME TO training_pod_leases"
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    migrated = SQLiteTrainingPodRepository(database)
+    for cleanup_token, lease in expected.items():
+        restored = migrated.get(cleanup_token)
+        assert restored is not None
+        assert restored.state is lease.state
+        assert restored.creation_uncertain is lease.creation_uncertain
+        assert restored.provider_pod_id == lease.provider_pod_id
+        assert restored.cleanup_state is lease.cleanup_state

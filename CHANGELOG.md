@@ -2,6 +2,30 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.7.0] - 2026-08-02
+
+### Added
+
+- Provider-neutral schema-3 Pod capacity quotes bound to exact training
+  parameters, live v2 GPU identity/name/hourly price, startup/execution/runtime
+  estimates, and an upward-rounded maximum cost ceiling.
+- One-attempt catalog Pod acquisition with immutable image digests, scoped
+  restart-recoverable bearers, opaque submit/status/result/cancel transport,
+  deterministic ambiguous-create recovery, permanent termination, and final
+  `/billing/pods` receipts.
+- A cheap externally driven reconciliation surface that retains ambiguous and
+  billing-pending work without treating an estimate as actual cost.
+
+### Changed
+
+- Extracted training Pod lifecycle ownership into the canonical
+  `PodCapacityLeaseService`, provider, and repository. Legacy training imports
+  are compatibility aliases and cannot independently create or stop Pods.
+- Added an atomic versioned migration from `training_pod_leases` to the single
+  `pod_capacity_leases` table while preserving active and cleanup-family rows.
+- Catalog attempt Pods no longer use persistent/network volumes by default;
+  model-cache placement is an explicit benchmark decision.
+
 ## [0.6.1] - 2026-08-02
 
 ### Fixed
@@ -71,6 +95,7 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 - Migrated the Runpod integration to the beta v2 REST control plane with typed clients, live catalog placement, and pinned OpenAPI validation.
 
+[0.7.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.4.0...v0.5.0

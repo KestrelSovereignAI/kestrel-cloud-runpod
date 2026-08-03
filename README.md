@@ -28,6 +28,7 @@ the public SDK lease contract and never imports this package.
 | `RUNPOD_OLLAMA_IMAGE` | Immutable `ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime@sha256:...` reference |
 | `RUNPOD_OLLAMA_ALLOWED_MODELS` | Comma-separated operator allowlist of `name:tag@sha256:<digest>` model pins |
 | `RUNPOD_OLLAMA_LEASE_DB` | Optional absolute override for the durable SQLite lease store |
+| `RUNPOD_POD_CAPACITY_LEASE_DB` | Absolute canonical SQLite store for catalog and migrated training Pod leases |
 | `RUNPOD_TRAINING_LEASE_DB` | Optional absolute override for durable training Pod ownership state |
 
 Runtime settings and profiles live in the standalone
@@ -45,10 +46,14 @@ mapping explicitly. This package does not read a `[runpod]` section from
 - Durable RunPod-backed private Ollama leases with readiness and cost gates
 - Provider-neutral SDK 0.34 inference leases with OpenAI-compatible host-only routes
 - Durable LoRA training Pod ownership, cleanup tokens, and restart reconciliation
+- Generic single-attempt Pod capacity with live quotes, scoped bearer transport,
+  deterministic recovery, permanent termination, and authoritative Pod billing
 
 ## Architecture
 
 - [Runpod v2 execution platform](docs/architecture/RUNPOD_V2_EXECUTION_PLATFORM.md) — the accepted control-plane, Serverless, catalog inference, and private Ollama design.
+- [Catalog Pod capacity](docs/architecture/CATALOG_POD_CAPACITY.md) — the
+  public/private package boundary and LoRA-first dedicated-Pod lifecycle.
 
 Runpod has two distinct v2 services:
 
@@ -117,7 +122,38 @@ For load-balanced Serverless, use a Runpod key restricted to the one endpoint as
 
 `accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection estimate still compares the expected Serverless initialization, active, and idle-tail window against the expected Pod session.
 
-Training Pods use the same durability rule. `start_training_pod()` reserves a SQLite/CAS cleanup token before a configured or reusable Pod is resumed, or before a deterministic Pod name is created. A Pod newly started by that call is either returned with a route, confirmed stopped, or retained as retryable state with its provider ID. A Pod already running before the call is marked `preexisting_running` and is never stopped by this lease. When a hardware fallback is safe, each attempt has an exact token while the caller's original token is persisted as the cleanup-family root. Releasing a returned attempt token remains exact; releasing the root durably closes the family and stops every nonterminal child, including 0.5-era deterministic child hashes, after restart. Submission, status, result, and cancellation operations heartbeat the exact attempt and preserve the provider job/Pod IDs on failure. Run `kestrel-runpod-reconcile-training` from an external timer; process-local TTLs are not cleanup.
+`PodCapacityLeaseService` is the one writable dedicated-Pod lifecycle for new
+catalog attempts and old training callers. It quotes an exact live v2 GPU ID,
+display name, hourly price, startup/execution estimate, maximum runtime, and
+cost ceiling. Acquisition requires that exact quote, parameter digest, request
+digest, owner/workload/attempt identity, immutable worker image digest, and
+accepted cost ceiling. A unique bearer is loaded from an injected encrypted
+capability store and injected only into the one Pod; SQLite keeps its secret ID,
+digest, and expiry, never the token or private catalog payload.
+
+The workload transport carries the private catalog serializer's mapping
+unchanged to the schema-3 single-attempt runner. This public package does not
+import or publish `frinz_catalog` or `frinz_catalog_contracts`; those remain
+private GitHub-only dependencies in their owning repositories. Health is
+anonymous and content-free. Submit, status, result, and cancellation are
+attempt-bound and bearer-authenticated. A result is returned only after its
+attempt and request hashes match, then the disposable Pod is permanently
+terminated. `RELEASED` is not recorded until `/billing/pods` supplies final
+authoritative cost (or v2 definitively rejected creation, which records zero).
+
+The 0.7 repository migration atomically renames `training_pod_leases` to
+`pod_capacity_leases`, backfills generic non-secret fields, and preserves every
+active, uncertain, ready, releasing, released, and fallback-family row. The
+old `TrainingPodLeaseService`, repository, and provider imports are aliases to
+the canonical implementation, so they cannot create a second lifecycle.
+
+Legacy `start_training_pod()` callers retain their exact/root cleanup behavior:
+a newly started Pod is returned with a route, confirmed stopped, or retained as
+retryable state; pre-existing running capacity is never stopped without lease
+authority. Run `kestrel-runpod-reconcile-training` for those compatibility
+callers. New catalog hosts construct `PodCapacityLeaseService` with their
+encrypted capability store and call `reconcile()` from a cheap external timer;
+process-local TTLs are never cleanup authority.
 
 ### Configuration migration from 0.2
 

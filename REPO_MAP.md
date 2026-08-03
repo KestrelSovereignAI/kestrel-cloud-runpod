@@ -72,16 +72,12 @@ Repo entry points and standard project files.
   - `class GPUProvider`; `class DirectRunPodProvider`; `class ManagedRunPodProvider`
 - **kestrel_cloud_runpod/training.py** — RunPod LoRA Training Methods.
   - `class RunPodTrainingMixin`
-- **kestrel_cloud_runpod/training_contracts.py** — Durable contracts for billable Runpod training Pod ownership.
-  - `class TrainingPodSource`; `class TrainingPodOwnership`; `class TrainingPodState`; `class TrainingPodCleanupState`; `class TrainingPodConflictError`; `class TrainingPodLifecycleError`; `class TrainingPodCleanupError`; `class TrainingPodRequest`; `…`
-- **kestrel_cloud_runpod/training_provider.py** — Runpod REST v2 capacity adapter for durable training Pod leases.
-  - `class TrainingPodObservation`; `class CreatedTrainingPod`; `class TrainingPodCapacityProvider`; `class RunpodTrainingPodProvider`
+- **kestrel_cloud_runpod/training_contracts.py** — Compatibility names for the canonical Pod capacity contracts.
+- **kestrel_cloud_runpod/training_provider.py** — Compatibility names for the canonical Pod capacity provider.
 - **kestrel_cloud_runpod/training_reconciler.py** — One-shot entry point for externally scheduled training Pod reconciliation.
   - `class TrainingReconcileManager`; `async def reconcile_once(manager_factory)`; `def main()`
-- **kestrel_cloud_runpod/training_repository.py** — SQLite WAL persistence for restart-safe training Pod ownership.
-  - `class SQLiteTrainingPodRepository`; `def training_database_path(config)`
-- **kestrel_cloud_runpod/training_service.py** — Restart-safe acquisition and cleanup state machine for training Pods.
-  - `class TrainingPodLeaseService`
+- **kestrel_cloud_runpod/training_repository.py** — Compatibility import for the canonical Pod capacity repository.
+- **kestrel_cloud_runpod/training_service.py** — Compatibility import for the canonical Pod capacity lease service.
 
 ## `runtime/`
 
@@ -139,7 +135,7 @@ Repo entry points and standard project files.
 - **tests/test_runpod_smoke.py** — Opt-in, read-only authenticated smoke checks for the beta v2 API.
   - `def test_live_v2_gpu_catalog_is_read_only_and_typed()`; `def test_live_v2_network_volume_inventory_is_read_only_and_typed()`
 - **tests/test_training_contracts.py** — Public durable training ownership contracts.
-  - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`
+  - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`; `def test_child_request_fingerprint_is_bound_to_its_cleanup_family()`; `def test_request_defaults_root_for_pre_family_callers()`
 - **tests/test_training_mixin.py** — Manager integration for durable training capacity and workload recovery.
   - `class FakeWorkloadClient`; `async def test_manager_session_tracks_job_result_and_confirmed_stop(tmp_path, monkeypatch)`; `async def test_submission_failure_stops_capacity_and_preserves_record(tmp_path, monkeypatch)`; `async def test_status_failure_keeps_job_and_cleanup_authority(tmp_path, monkeypatch)`; `async def test_cancel_stops_pod_and_stop_failure_is_retryable(tmp_path, monkeypatch)`
 - **tests/test_training_provider.py** — Runpod REST v2 training capacity adapter contracts.
@@ -147,11 +143,11 @@ Repo entry points and standard project files.
 - **tests/test_training_reconciler.py** — External one-shot training reconciliation entry point.
   - `async def test_reconcile_once_constructs_manager_and_runs_one_pass()`
 - **tests/test_training_repository.py** — Persistence, CAS, restart, and cross-process exclusion tests.
-  - `def test_reservation_survives_repository_restart(tmp_path)`; `def test_revision_cas_rejects_stale_writer(tmp_path)`; `def test_second_active_token_cannot_claim_same_pod(tmp_path)`; `def test_database_path_is_explicit_absolute_and_expands_environment(tmp_path, monkeypatch)`
+  - `def test_reservation_survives_repository_restart(tmp_path)`; `def test_revision_cas_rejects_stale_writer(tmp_path)`; `def test_second_active_token_cannot_claim_same_pod(tmp_path)`; `def test_database_path_is_explicit_absolute_and_expands_environment(tmp_path, monkeypatch)`; `def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(tmp_path)`; `def test_family_release_gate_blocks_a_late_fallback_reservation(tmp_path)`; `def test_versioned_table_migration_preserves_every_lifecycle_shape(tmp_path)`
 - **tests/test_training_service.py** — Billing-safe training acquisition, cancellation, and reconciliation tests.
   - `async def test_resumed_pod_missing_route_is_stopped(tmp_path)`; `async def test_readiness_exception_stop_failure_retains_retryable_pod_after_restart(tmp_path)`; `async def test_preexisting_running_pod_route_failure_is_never_stopped(tmp_path)`; `async def test_ambiguous_create_reconciles_exact_name_and_stops_pod(tmp_path)`; `async def test_restart_recovers_crash_between_create_and_id_persistence(tmp_path)`; `async def test_reconciler_leaves_live_inflight_create_owned_by_acquirer(tmp_path)`; `async def test_restart_before_persistent_discovery_never_stops_preexisting_pod(tmp_path)`; `async def test_restart_reconciles_submitted_job_at_hard_deadline(tmp_path)`; `…`
 - **tests/training_test_support.py** — Deterministic doubles for durable training Pod lifecycle tests.
-  - `class MutableClock`; `def training_profile()`; `def training_request(clock)`; `class FakeTrainingProvider`; `def training_service(tmp_path, clock, provider)`
+  - `class MutableClock`; `def training_profile(profile_id)`; `def training_request(clock)`; `class FakeTrainingProvider`; `def training_service(tmp_path, clock, provider)`
 
 ## `vendor/`
 

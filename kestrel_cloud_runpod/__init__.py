@@ -61,6 +61,46 @@ from .ollama_contracts import (
     OllamaTeardownState,
 )
 from .ollama_service import OllamaLeaseService
+from .pod_capacity_contracts import (
+    CatalogAttemptCapability,
+    CatalogAttemptCapabilityStore,
+    CatalogPodCapacityRequest,
+    CatalogPodWorkloadState,
+    PodBillingReceipt,
+    PodCapacityBillingState,
+    PodCapacityCleanupError,
+    PodCapacityCleanupState,
+    PodCapacityConflictError,
+    PodCapacityConstraints,
+    PodCapacityLease,
+    PodCapacityLeaseRequest,
+    PodCapacityLifecycleError,
+    PodCapacityOwnership,
+    PodCapacityQuote,
+    PodCapacityQuoteRequest,
+    PodCapacitySource,
+    PodCapacitySpec,
+    PodCapacityState,
+    pod_cost_usd,
+)
+from .pod_capacity_provider import (
+    CreatedPodCapacity,
+    PodCapacityCreatedMismatchError,
+    PodCapacityObservation,
+    PodCapacityProvider,
+    RunpodPodCapacityProvider,
+)
+from .pod_capacity_repository import (
+    SQLitePodCapacityRepository,
+    pod_capacity_database_path,
+)
+from .pod_capacity_service import PodCapacityLeaseService
+from .pod_transport import (
+    CatalogPodTransportConflictError,
+    CatalogPodTransportError,
+    CatalogPodWorkloadObservation,
+    CatalogPodWorkloadTransport,
+)
 from .training_contracts import (
     TrainingPodCleanupError,
     TrainingPodCleanupState,
@@ -80,6 +120,15 @@ except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
 __all__ = [
+    "CatalogAttemptCapability",
+    "CatalogAttemptCapabilityStore",
+    "CatalogPodCapacityRequest",
+    "CatalogPodTransportConflictError",
+    "CatalogPodTransportError",
+    "CatalogPodWorkloadObservation",
+    "CatalogPodWorkloadState",
+    "CatalogPodWorkloadTransport",
+    "CreatedPodCapacity",
     "FlashBoot",
     "GPUProfile",
     "OllamaLease",
@@ -95,6 +144,25 @@ __all__ = [
     "OllamaResourceType",
     "OllamaTeardownState",
     "PlacementRequirements",
+    "PodBillingReceipt",
+    "PodCapacityBillingState",
+    "PodCapacityCleanupError",
+    "PodCapacityCleanupState",
+    "PodCapacityConflictError",
+    "PodCapacityConstraints",
+    "PodCapacityCreatedMismatchError",
+    "PodCapacityLease",
+    "PodCapacityLeaseRequest",
+    "PodCapacityLeaseService",
+    "PodCapacityLifecycleError",
+    "PodCapacityObservation",
+    "PodCapacityOwnership",
+    "PodCapacityProvider",
+    "PodCapacityQuote",
+    "PodCapacityQuoteRequest",
+    "PodCapacitySource",
+    "PodCapacitySpec",
+    "PodCapacityState",
     "PodStatus",
     "RunPodAPIError",
     "RunPodAmbiguousResultError",
@@ -104,7 +172,9 @@ __all__ = [
     "RunPodSession",
     "RunpodControlPlaneClient",
     "RunpodInferenceLeaseProvider",
+    "RunpodPodCapacityProvider",
     "RunpodServerlessClient",
+    "SQLitePodCapacityRepository",
     "TrainingPodCleanupError",
     "TrainingPodCleanupState",
     "TrainingPodConflictError",
@@ -116,4 +186,6 @@ __all__ = [
     "TrainingPodSource",
     "TrainingPodState",
     "__version__",
+    "pod_capacity_database_path",
+    "pod_cost_usd",
 ]
