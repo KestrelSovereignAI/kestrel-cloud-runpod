@@ -273,6 +273,15 @@ class PodCapacityQuote:
         )
         if estimated_seconds > self.maximum_runtime_seconds:
             raise ValueError("Pod capacity quote estimate exceeds maximum runtime")
+        # Cost is derived from placement.gpu_count while every authorization
+        # path - accepted_gpu_count, accepted_hourly_rate_usd, validate_against
+        # and the actual PodCreateRequest - reads constraints.gpu_count. If the
+        # two disagree the quote authorizes a different Pod than it priced, and
+        # the divergence survives a durable round trip because the stored
+        # placement blob carries its own count.
+        if self.placement.gpu_count != self.constraints.gpu_count:
+            raise ValueError("Pod capacity quote GPU count is inconsistent")
+
         expected_estimate = pod_cost_usd(
             self.hourly_cost_usd, estimated_seconds, self.placement.gpu_count
         )

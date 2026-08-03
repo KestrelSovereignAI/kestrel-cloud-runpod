@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from kestrel_cloud_runpod.models import (
     RunPodManagerError,
 )
 from kestrel_cloud_runpod.pod_capacity_contracts import (
+    pod_cost_usd,
     CatalogAttemptCapability,
     CatalogPodCapacityRequest,
     CatalogPodWorkloadState,
@@ -55,10 +57,10 @@ class MutableClock:
         self.value += timedelta(seconds=seconds)
 
 
-def constraints() -> PodCapacityConstraints:
+def constraints(gpu_count: int = 1) -> PodCapacityConstraints:
     return PodCapacityConstraints(
         min_vram_gb=24,
-        gpu_count=1,
+        gpu_count=gpu_count,
         cloud=CloudType.SECURE,
         min_cuda_version="12.8",
         allowed_gpu_ids=("NVIDIA RTX PRO 4500",),
@@ -69,15 +71,15 @@ def constraints() -> PodCapacityConstraints:
     )
 
 
-def quote(clock: MutableClock) -> PodCapacityQuote:
-    requirements = constraints().placement_requirements()
+def quote(clock: MutableClock, gpu_count: int = 1) -> PodCapacityQuote:
+    requirements = constraints(gpu_count).placement_requirements()
     placement = PlacementDecision(
         gpu_id="NVIDIA RTX PRO 4500",
         gpu_pool=None,
         gpu_name="RTX PRO 4500",
         memory_gb=32,
         cloud=CloudType.SECURE,
-        gpu_count=1,
+        gpu_count=gpu_count,
         offered_cost_per_hr=0.4,
         availability=Availability.HIGH,
         catalog_observed_at=clock(),
@@ -89,12 +91,14 @@ def quote(clock: MutableClock) -> PodCapacityQuote:
         provider_quote_id="runpod-pod:" + "d" * 64,
         workload_kind="catalog-lora",
         parameters_sha256=PARAMETERS_SHA,
-        constraints=constraints(),
+        constraints=constraints(gpu_count),
         gpu_type_id=placement.gpu_id,
         gpu_display_name=placement.gpu_name,
         hourly_cost_usd=Decimal("0.4"),
-        estimated_cost_usd=Decimal("0.040000"),
-        cost_ceiling_usd=Decimal("0.066667"),
+        # Derived the same way the quote's own check derives them, so the
+        # fixture stays consistent for any GPU count.
+        estimated_cost_usd=pod_cost_usd(Decimal("0.4"), 360, gpu_count),
+        cost_ceiling_usd=pod_cost_usd(Decimal("0.4"), 600, gpu_count),
         estimated_startup_seconds=60,
         estimated_execution_seconds=300,
         maximum_runtime_seconds=600,
@@ -190,6 +194,7 @@ class FakeCapacityProvider:
         self.realized: PodRealizedPlacement | None = realized_placement(clock)
         self.billing_receipt: PodBillingReceipt | None = None
         self.billing_calls: list[str] = []
+        self.billing_rates: list[Decimal] = []
 
     async def quote(self, request):
         return quote(self.clock)
@@ -264,9 +269,14 @@ class FakeCapacityProvider:
         capacity_spec,
         created_at: datetime,
         terminated_at: datetime,
+        realized_hourly_rate_usd: Decimal,
     ) -> PodBillingReceipt | None:
         self.billing_calls.append(pod_id)
-        return self.billing_receipt
+        self.billing_rates.append(realized_hourly_rate_usd)
+        if self.billing_receipt is None:
+            return None
+        # Mirror the real provider: the receipt records the REALIZED rate.
+        return replace(self.billing_receipt, hourly_price_usd=realized_hourly_rate_usd)
 
 
 class FakeWorkloadTransport:

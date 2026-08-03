@@ -119,6 +119,7 @@ class TrainingPodCapacityProvider(Protocol):
         capacity_spec: PodCapacitySpec,
         created_at: datetime,
         terminated_at: datetime,
+        realized_hourly_rate_usd: Decimal,
     ) -> PodBillingReceipt | None: ...
 
 
@@ -388,6 +389,7 @@ class RunpodPodCapacityProvider:
         capacity_spec: PodCapacitySpec,
         created_at: datetime,
         terminated_at: datetime,
+        realized_hourly_rate_usd: Decimal,
     ) -> PodBillingReceipt | None:
         """Return final v2 billing only after the requested interval is covered."""
 
@@ -440,14 +442,17 @@ class RunpodPodCapacityProvider:
             billed_from=billed_from,
             billed_until=billed_until,
             billed_seconds=billed_seconds,
-            # actual_cost_usd is the whole Pod's spend, so the price beside
-            # it must be the whole Pod's hourly rate, not the per-GPU catalog
-            # price. Pairing the two units made the evidence invariant
-            # unsatisfiable for any multi-GPU Pod.
-            hourly_price_usd=(
-                capacity_spec.request.quote.hourly_cost_usd
-                * Decimal(capacity_spec.request.quote.constraints.gpu_count)
-            ),
+            # The REALIZED whole-Pod rate, not the accepted one. actual_cost_usd
+            # beside it is realized spend, and two independent checks require
+            # this to equal evidence.realized_placement.hourly_rate_usd - while
+            # the placement itself is only required to come in at or under the
+            # accepted rate. Recording the accepted rate made settlement
+            # unreachable for an ordinary price drop and for the terminal
+            # cost of 0.0 the v2 spec documents: billing never became
+            # authoritative, the scoped capability was never revoked, and the
+            # owner's reservation was held indefinitely. The accepted rate is
+            # already preserved in PodCapacityEvidence.accepted_hourly_rate_usd.
+            hourly_price_usd=realized_hourly_rate_usd,
             actual_cost_usd=actual,
             reconciled_at=self._now(),
         )

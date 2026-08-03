@@ -1432,6 +1432,13 @@ class PodCapacityLeaseService:
                 capacity_spec=spec,
                 created_at=lease.created_at,
                 terminated_at=lease.terminated_at,
+                realized_hourly_rate_usd=(
+                    lease.evidence.realized_placement.hourly_rate_usd
+                    if lease.evidence is not None
+                    and lease.evidence.realized_placement is not None
+                    else spec.request.quote.hourly_cost_usd
+                    * Decimal(spec.request.quote.constraints.gpu_count)
+                ),
             )
             if receipt is None:
                 if lease.billing_state is PodCapacityBillingState.PENDING:
@@ -1698,7 +1705,12 @@ class PodCapacityLeaseService:
             billed_from=now,
             billed_until=now,
             billed_seconds=0,
-            hourly_price_usd=spec.request.quote.hourly_cost_usd,
+            # Whole-Pod, matching the real receipt: the same field must not
+            # carry two units, since PodBillingReceipt has no discriminator.
+            hourly_price_usd=(
+                spec.request.quote.hourly_cost_usd
+                * Decimal(spec.request.quote.constraints.gpu_count)
+            ),
             actual_cost_usd=Decimal(0),
             reconciled_at=now,
         )

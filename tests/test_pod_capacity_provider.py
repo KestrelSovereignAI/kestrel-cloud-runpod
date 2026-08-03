@@ -275,6 +275,7 @@ async def test_final_billing_waits_for_records_then_returns_content_free_receipt
             capacity_spec=spec,
             created_at=created,
             terminated_at=terminated,
+            realized_hourly_rate_usd=Decimal("0.4"),
         )
         is None
     )
@@ -283,6 +284,7 @@ async def test_final_billing_waits_for_records_then_returns_content_free_receipt
         capacity_spec=spec,
         created_at=created,
         terminated_at=terminated,
+        realized_hourly_rate_usd=Decimal("0.4"),
     )
     assert receipt is not None
     assert receipt.actual_cost_usd == Decimal("0.061")
@@ -327,6 +329,7 @@ async def test_final_billing_waits_until_records_cover_termination() -> None:
             capacity_spec=spec,
             created_at=created,
             terminated_at=terminated,
+            realized_hourly_rate_usd=Decimal("0.4"),
         )
         is None
     )
