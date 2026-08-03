@@ -135,8 +135,10 @@ phase in this contract, the TTL must cover maximum queue delay, worker startup,
 and execution rather than treating startup as free or outside job lifespan.
 
 Runpod documents that Serverless workers are billed from startup through
-execution and the configured idle tail, while queue delay and execution are the
-job-level metrics currently exposed by the data plane. The v2 billing route is
+execution and the configured idle tail. The data plane's job-level `delayTime`
+combines queue wait and worker cold start, so the receipt names it
+`pre_execution_delay_ms` and validates it against both accepted bounds; only
+execution is separately observed. The v2 billing route is
 coarser: it emits endpoint-level hourly buckets. Kestrel never derives a fictive
 job cost from execution time. An authoritative `ServerlessBillingReceipt` is
 available only when the exact terminal job/attempt is bound to a caller-owned
@@ -293,7 +295,7 @@ Runpod bills Serverless workers from start until full stop, including initializa
 Each catalog job and inference lease records:
 
 - dispatch/provisioning duration;
-- Runpod queue `delayTime` and worker cold-start metrics;
+- Runpod aggregate pre-execution `delayTime` (queue plus worker cold start);
 - image pull, model availability/download, and model-to-RAM/VRAM load durations;
 - execution and artifact upload duration;
 - warm reuse and idle-tail seconds;

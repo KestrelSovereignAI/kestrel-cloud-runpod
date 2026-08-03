@@ -393,7 +393,7 @@ async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -
     assert receipt.job_id == billing_attempt.job_id
     assert receipt.attempt_id == billing_attempt.attempt_id
     assert receipt.actual_cost_usd == Decimal("0.023")
-    assert receipt.queue_delay_ms == 2_000
+    assert receipt.pre_execution_delay_ms == 2_000
     assert receipt.worker_startup_ms is None
     assert receipt.execution_ms == 30_000
     assert receipt.accepted_idle_tail_ms == 10_000
@@ -421,6 +421,31 @@ async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -
     serialized = json.dumps(receipt.to_dict()).lower()
     assert "must-not-serialize" not in serialized
     assert "prompt" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_final_billing_accepts_cold_start_in_pre_execution_delay() -> None:
+    clock = MutableClock()
+    clock.value += timedelta(hours=1)
+    accepted = quote()
+    billing_attempt = attempt(
+        accepted,
+        completed_at=datetime(2026, 8, 3, 10, 4, 30, tzinfo=UTC),
+    )
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(serverless_billing=lambda **_: _billing_page()),
+        job_client=SimpleNamespace(
+            status=lambda *_: _terminal_job(delay_time_ms=200_000)
+        ),
+        clock=clock,
+    )
+
+    receipt = await provider.final_billing(billing_attempt, accepted)
+
+    assert receipt is not None
+    assert receipt.pre_execution_delay_ms == 200_000
+    assert receipt.worker_startup_ms is None
+    assert "queue_delay_ms" not in receipt.to_dict()
 
 
 @pytest.mark.asyncio
@@ -533,7 +558,7 @@ async def test_final_billing_waits_for_closed_bucket_delayed_or_partial_records(
         (_terminal_job(id="job-other"), "mismatched"),
         (_terminal_job(status="IN_PROGRESS"), "not terminal"),
         (_terminal_job(delay_time_ms=-1), "unsafe"),
-        (_terminal_job(delay_time_ms=120_001), "queue delay exceeds"),
+        (_terminal_job(delay_time_ms=240_001), "pre-execution delay exceeds"),
         (_terminal_job(execution_time_ms=180_001), "execution exceeds"),
     ],
 )

@@ -121,7 +121,9 @@ still-open bucket remains pending. Any identity, interval, total, component, or
 unsupported-field mismatch fails closed.
 The receipt binds the accepted quote, profile, endpoint, job, attempt, accepted
 idle-tail duration, exact billable coverage end, and every exclusive hour while
-leaving unavailable worker-startup and observed idle-tail values as `null`.
+projecting Runpod's aggregate queue-plus-cold-start `delayTime` as
+`pre_execution_delay_ms`. The unavailable worker-startup split and observed
+idle-tail value remain `null`.
 
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 

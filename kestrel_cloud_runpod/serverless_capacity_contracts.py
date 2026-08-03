@@ -747,7 +747,7 @@ class ServerlessBillingReceipt:
     billing_window_from: datetime
     billing_window_until: datetime
     hourly_worker_rate_usd: Decimal
-    queue_delay_ms: int | None
+    pre_execution_delay_ms: int | None
     worker_startup_ms: int | None
     execution_ms: int | None
     accepted_idle_tail_ms: int
@@ -824,7 +824,7 @@ class ServerlessBillingReceipt:
             )
         _positive_decimal(self.hourly_worker_rate_usd, "hourly_worker_rate_usd")
         for name, value in (
-            ("queue_delay_ms", self.queue_delay_ms),
+            ("pre_execution_delay_ms", self.pre_execution_delay_ms),
             ("worker_startup_ms", self.worker_startup_ms),
             ("execution_ms", self.execution_ms),
             ("idle_tail_ms", self.idle_tail_ms),
@@ -847,7 +847,7 @@ class ServerlessBillingReceipt:
         ):
             raise ValueError("Serverless billing components do not equal total cost")
         observed_job_ms = sum(
-            value for value in (self.queue_delay_ms, self.execution_ms) if value
+            value for value in (self.pre_execution_delay_ms, self.execution_ms) if value
         )
         attempt_ms = int(
             (self.attempt_completed_at - self.attempt_started_at).total_seconds()
@@ -878,7 +878,7 @@ class ServerlessBillingReceipt:
             "billing_window_from": iso_datetime(self.billing_window_from),
             "billing_window_until": iso_datetime(self.billing_window_until),
             "hourly_worker_rate_usd": decimal_text(self.hourly_worker_rate_usd),
-            "queue_delay_ms": self.queue_delay_ms,
+            "pre_execution_delay_ms": self.pre_execution_delay_ms,
             "worker_startup_ms": self.worker_startup_ms,
             "execution_ms": self.execution_ms,
             "accepted_idle_tail_ms": self.accepted_idle_tail_ms,
@@ -923,7 +923,9 @@ class ServerlessBillingReceipt:
                 _required_string(value, "billing_window_until")
             ),
             hourly_worker_rate_usd=_required_decimal(value, "hourly_worker_rate_usd"),
-            queue_delay_ms=_optional_int(value.get("queue_delay_ms"), "queue_delay_ms"),
+            pre_execution_delay_ms=_optional_int(
+                value.get("pre_execution_delay_ms"), "pre_execution_delay_ms"
+            ),
             worker_startup_ms=_optional_int(
                 value.get("worker_startup_ms"), "worker_startup_ms"
             ),
@@ -1157,7 +1159,7 @@ _RECEIPT_FIELDS = frozenset(
         "billing_window_from",
         "billing_window_until",
         "hourly_worker_rate_usd",
-        "queue_delay_ms",
+        "pre_execution_delay_ms",
         "worker_startup_ms",
         "execution_ms",
         "accepted_idle_tail_ms",

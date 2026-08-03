@@ -15,6 +15,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Extend authoritative Serverless billing coverage through the accepted idle
   tail, bind every exclusively allocated endpoint-hour bucket into the receipt,
   and wait for the last touched bucket to close before settlement.
+- Project Runpod `delayTime` as aggregate pre-execution delay and validate it
+  against the accepted queue plus worker-start bounds.
 - Export the public placement enums and Serverless cost/allocation helpers, and
   reject per-job execution-timeout or TTL policies outside Runpod's bounds.
 

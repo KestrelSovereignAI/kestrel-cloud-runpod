@@ -156,10 +156,12 @@ class RunpodServerlessCapacityProvider:
         _validate_terminal_job(job, attempt)
         if (
             job.delay_time_ms is not None
-            and job.delay_time_ms > quote.maximum_queue_delay_seconds * 1_000
+            and job.delay_time_ms
+            > (quote.maximum_queue_delay_seconds + quote.maximum_worker_start_seconds)
+            * 1_000
         ):
             raise RunPodManagerError(
-                "Serverless job queue delay exceeds the accepted maximum"
+                "Serverless job pre-execution delay exceeds the accepted maximum"
             )
         if (
             job.execution_time_ms is not None
@@ -210,7 +212,7 @@ class RunpodServerlessCapacityProvider:
             "billing_window_from": iso_datetime(window_from),
             "billing_window_until": iso_datetime(window_until),
             "hourly_worker_rate_usd": decimal_text(quote.hourly_worker_rate_usd),
-            "queue_delay_ms": job.delay_time_ms,
+            "pre_execution_delay_ms": job.delay_time_ms,
             "worker_startup_ms": None,
             "execution_ms": job.execution_time_ms,
             "accepted_idle_tail_ms": quote.idle_tail_seconds * 1_000,
@@ -234,7 +236,7 @@ class RunpodServerlessCapacityProvider:
             billing_window_from=window_from,
             billing_window_until=window_until,
             hourly_worker_rate_usd=quote.hourly_worker_rate_usd,
-            queue_delay_ms=job.delay_time_ms,
+            pre_execution_delay_ms=job.delay_time_ms,
             worker_startup_ms=None,
             execution_ms=job.execution_time_ms,
             accepted_idle_tail_ms=quote.idle_tail_seconds * 1_000,

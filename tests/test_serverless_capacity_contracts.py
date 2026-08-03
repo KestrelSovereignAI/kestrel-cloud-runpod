@@ -258,7 +258,7 @@ def _receipt() -> ServerlessBillingReceipt:
         )
         + timedelta(hours=1),
         hourly_worker_rate_usd=item.hourly_worker_rate_usd,
-        queue_delay_ms=2_000,
+        pre_execution_delay_ms=2_000,
         worker_startup_ms=None,
         execution_ms=30_000,
         accepted_idle_tail_ms=item.idle_tail_seconds * 1_000,
