@@ -15,6 +15,7 @@ from ollama_test_support import (
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseAuthorizationError,
+    accrued_cost,
     OllamaLeaseConflictError,
     OllamaLeaseReadinessError,
     OllamaLeaseState,
@@ -641,3 +642,53 @@ async def test_service_persists_the_placement_gpu_count_it_provisioned(tmp_path)
 
     assert lease.placement_gpu_count == 4
     assert service.repository.get(lease.lease_id).placement_gpu_count == 4
+
+
+@pytest.mark.asyncio
+async def test_touch_releases_a_ready_lease_that_passed_its_cost_cap(tmp_path):
+    """The cost clause of the release gate, on the path the SDK actually uses.
+
+    RunpodInferenceLeaseProvider.acquire calls service.acquire with
+    wait_until_ready=False, so the only previously-pinned gate (in
+    _wait_until_ready) never runs on the SDK path. touch/status/release do not
+    reach it either. Here the deadlines are still in the future and only the
+    cost cap has been exceeded.
+    """
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(serverless_plan(rate=1.0, estimated_cost=0.1))
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=capacity,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    # Idle and hard deadlines both stay far in the future, so the ONLY clause
+    # that can fire is the cost cap. Without this the release happens through
+    # the idle clause and the test proves nothing about cost.
+    request = make_request(
+        clock,
+        max_authorized_cost=0.5,
+        idle_timeout_seconds=7200,
+        hard_deadline=clock() + timedelta(hours=6),
+    )
+    lease = await service.acquire(request)
+    assert lease.state is OllamaLeaseState.READY
+
+    clock.advance(3600)
+    assert clock() < lease.hard_deadline
+    assert clock() < lease.idle_deadline
+    assert accrued_cost(lease, clock()) > request.max_authorized_cost
+
+    touched = await service.touch(
+        lease.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    assert touched.state in {
+        OllamaLeaseState.RELEASING,
+        OllamaLeaseState.TERMINATED,
+    }
+    assert touched.termination_reason == "deadline_or_cost_cap"
+    assert capacity.teardown_calls == 1

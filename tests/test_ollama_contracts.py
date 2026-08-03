@@ -661,3 +661,27 @@ def test_authorized_cost_exposure_fails_closed_without_reserved_overhead():
 
     assert accrued_cost(lease, now) < 1.0
     assert authorized_cost_exposure(lease, now) == pytest.approx(50.0)
+
+
+def test_accrued_cost_fails_closed_without_a_worker_count():
+    """A row with no worker count has no proof of its billing multiplier.
+
+    maximum_concurrent_workers is NULL on every pre-provisioning row and on
+    every legacy row (the column arrives via the additive migration), and
+    every cost-cap gate reads this value - so reporting near-zero accrual
+    instead of the full authorization would defer release indefinitely.
+    """
+    clock = MutableClock()
+    started = clock()
+    lease = replace(
+        _accrual_lease(),
+        offered_rate_per_hr=1.0,
+        provisioning_started_at=started,
+        hard_deadline=started + timedelta(hours=4),
+        accrued_estimated_cost=0.0,
+        placement_gpu_count=1,
+        maximum_concurrent_workers=None,
+        max_authorized_cost=50.0,
+    )
+
+    assert accrued_cost(lease, started + timedelta(seconds=1)) == pytest.approx(50.0)

@@ -457,3 +457,26 @@ def test_worker_cost_is_ceiled_and_rejects_nan() -> None:
     assert serverless_worker_cost_usd(Decimal("0.69"), 1, 1) == Decimal("0.000192")
     with pytest.raises(ValueError, match="finite and positive"):
         serverless_worker_cost_usd(Decimal("NaN"), 1, 1)
+
+
+def test_serverless_worker_cost_bills_every_gpu_in_the_worker() -> None:
+    """The catalog prices per GPU; a worker attaches gpu_count of them.
+
+    This is the sole rule converting the per-GPU rate into worker cost, and
+    ServerlessCapacityQuote re-uses it to derive-check itself - so without the
+    multiplier an understated quote validates cleanly and the accepted ceiling
+    binds to it. The identical defect was fixed and pinned for Pods; every
+    Serverless fixture uses a single GPU, which is why this was invisible.
+    """
+    one_hour = 3600
+    assert serverless_worker_cost_usd(Decimal("0.44"), 1, one_hour) == Decimal(
+        "0.440000"
+    )
+    assert serverless_worker_cost_usd(Decimal("0.44"), 4, one_hour) == Decimal(
+        "1.760000"
+    )
+    # Authorization rounds UP, never in the payer's favour.
+    assert serverless_worker_cost_usd(Decimal("0.44"), 3, 1) > Decimal("0.000366")
+    for bad in (0, -1, True):
+        with pytest.raises((ValueError, TypeError)):
+            serverless_worker_cost_usd(Decimal("0.44"), bad, one_hour)

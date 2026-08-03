@@ -598,7 +598,17 @@ class RunpodInferenceLeaseProvider:
                 raise InferenceLeaseConstraintError(
                     "live Runpod placement differs from the accepted quote"
                 )
-        if _money(plan.placement.offered_cost_per_hr) > quote.hourly_cost_usd:
+        # quote.hourly_cost_usd is the WHOLE-LEASE rate this module builds as
+        # per_gpu * gpu_count, so the live rate must be scaled the same way.
+        # Comparing the bare per-GPU price let a 2-GPU placement 80% over the
+        # accepted quote pass - $0.90/GPU against a $1.00/hr quote is
+        # $1.80/hr. It happened to be caught downstream by the estimated-cost
+        # check, which is monotonic in rate, but that is not this guard's job.
+        if (
+            _money(plan.placement.offered_cost_per_hr)
+            * Decimal(plan.placement.gpu_count)
+            > quote.hourly_cost_usd
+        ):
             raise InferenceLeaseConstraintError(
                 "live Runpod hourly cost exceeds the accepted quote"
             )
