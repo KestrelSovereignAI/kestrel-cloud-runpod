@@ -6,6 +6,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Added
 
+- The SDK 0.35 owner-scoped inference lease `touch` contract, backed by the
+  durable Ollama idle deadline and an exact live route re-observation that
+  never provisions replacement capacity.
 - Versioned, provider-neutral finite Serverless capacity quotes with exact
   endpoint/profile binding, read-only pre-submit drift validation, and complete
   content-free v2 billing receipts for exclusive endpoint windows.
@@ -13,6 +16,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   exact exclusive endpoint/hour allocation and ceiling, then returns strict v2
   ordered per-hour observations plus derived actual, capped, and operator-loss
   cost evidence without requiring a job ID.
+
+### Changed
+
+- Raised the minimum `kestrel-sovereign-sdk` version to 0.35.0.
 
 ### Fixed
 

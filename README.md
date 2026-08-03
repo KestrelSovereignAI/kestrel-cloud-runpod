@@ -150,10 +150,13 @@ Kestrel normally reaches that lifecycle through
 `RunpodInferenceLeaseProvider`. `quote()` reads the v2 catalog but creates
 nothing; `acquire()` returns `PENDING` after the one durable billable mutation;
 and `status()` reconciles readiness until the exact allowlisted model is loaded
-behind an authenticated `/v1` route. Quote selection includes the configured
-Serverless or Pod cold-start estimate, hourly ceiling, expected session, and
-Serverless idle tail. Requests that cannot meet their region, readiness,
-privacy, concurrency, or total-cost limit fail before provisioning.
+behind an authenticated `/v1` route. SDK 0.35 `touch()` re-observes that exact
+route before durably renewing its idle deadline, preserves the owner and lease
+identity, and fails closed without provisioning replacement capacity when the
+route is no longer ready. Quote selection includes the configured Serverless or
+Pod cold-start estimate, hourly ceiling, expected session, and Serverless idle
+tail. Requests that cannot meet their region, readiness, privacy, concurrency,
+or total-cost limit fail before provisioning.
 
 Set `quote_ttl_seconds`, `serverless_estimated_ready_seconds`, and
 `pod_estimated_ready_seconds` in `[ollama_leases]` from measured p95 startup
@@ -323,7 +326,7 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.34,<1` — features, tools, and inference-lease contracts
+- `kestrel-sovereign-sdk>=0.35,<1` — features, tools, and inference-lease contracts
 - `kestrel-sovereign>=0.13.1,<1` — standalone Kestrel config-file loader (runtime)
 - `httpx>=0.27,<1`
 - `requests>=2.32,<3`

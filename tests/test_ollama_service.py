@@ -1,6 +1,7 @@
 """Lifecycle, crash recovery, readiness, cost, and teardown tests."""
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 from ollama_test_support import (
@@ -91,6 +92,64 @@ async def test_duplicate_acquire_does_not_create_second_resource(tmp_path):
 
     assert second.lease_id == first.lease_id
     assert provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_touch_renews_only_after_reobserving_the_exact_ready_route(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock, idle_timeout_seconds=60))
+    original_idle_deadline = ready.idle_deadline
+    clock.advance(30)
+    provider.route_url = "https://rotated-private.example"
+
+    touched = await service.touch(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    durable = service.repository.get(ready.lease_id)
+    assert touched.lease_id == ready.lease_id
+    assert touched.owner_id == ready.owner_id
+    assert touched.workload_id == ready.workload_id
+    assert touched.last_used_at == clock()
+    assert touched.idle_deadline == clock() + timedelta(seconds=60)
+    assert touched.idle_deadline > original_idle_deadline
+    assert touched.public_route_url == "https://rotated-private.example"
+    assert durable is not None
+    assert durable.last_used_at == touched.last_used_at
+    assert durable.idle_deadline == touched.idle_deadline
+    assert durable.route_url is None
+    assert provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_touch_route_failure_does_not_renew_or_replace_capacity(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock, idle_timeout_seconds=60))
+    original_idle_deadline = ready.idle_deadline
+    original_last_used_at = ready.last_used_at
+    clock.advance(30)
+    provider.models = ()
+
+    with pytest.raises(OllamaLeaseReadinessError, match="temporarily unavailable"):
+        await service.touch(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.last_used_at == original_last_used_at
+    assert durable.idle_deadline == original_idle_deadline
+    assert durable.route_url is None
+    assert provider.provision_calls == 1
+    assert provider.teardown_calls == 0
 
 
 @pytest.mark.asyncio

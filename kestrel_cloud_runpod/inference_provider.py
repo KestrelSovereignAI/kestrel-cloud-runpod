@@ -301,6 +301,37 @@ class RunpodInferenceLeaseProvider:
             ) from exc
         return self._to_sdk_lease(internal, runtime=runtime)
 
+    async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+        """Renew one exact ready lease and return its live authoritative route."""
+
+        runtime = self._get_runtime()
+        internal = self._required(runtime.service, lease_id)
+        self._authorize(internal, owner_id)
+        workload_id = internal.workload_id
+        try:
+            internal = await runtime.service.touch(
+                lease_id,
+                owner_id=owner_id,
+                workload_id=workload_id,
+            )
+        except OllamaLeaseAuthorizationError as exc:
+            raise InferenceLeaseOwnershipError(
+                "inference lease is owned by another agent"
+            ) from exc
+        except RunPodManagerError as exc:
+            raise InferenceLeaseProvisioningError(
+                "Runpod could not renew the inference lease idle deadline"
+            ) from exc
+        if (
+            internal.lease_id != lease_id
+            or internal.owner_id != owner_id
+            or internal.workload_id != workload_id
+        ):
+            raise InferenceLeaseProvisioningError(
+                "Runpod returned an inference lease with inconsistent identity"
+            )
+        return self._to_sdk_lease(internal, runtime=runtime)
+
     async def release(self, owner_id: str, lease_id: str) -> InferenceLease:
         runtime = self._get_runtime()
         internal = self._required(runtime.service, lease_id)

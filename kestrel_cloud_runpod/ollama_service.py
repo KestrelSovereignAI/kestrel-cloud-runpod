@@ -222,13 +222,26 @@ class OllamaLeaseService:
     ) -> OllamaLease:
         lease = self._required(lease_id)
         self._authorize(lease, owner_id, workload_id)
+        if lease.state in {
+            OllamaLeaseState.FAILED,
+            OllamaLeaseState.RELEASING,
+            OllamaLeaseState.TERMINATED,
+        }:
+            # A lost touch response or an external reconciler may have already
+            # moved the exact authorized lease to a route-less terminal path.
+            # Return that durable truth idempotently so Core can detach its
+            # route; renewal must never recreate capacity or retry teardown.
+            return lease
         if lease.state is not OllamaLeaseState.READY:
             raise RunPodManagerError("Only a ready Ollama lease can be marked used")
+        lease = await self._ready_with_route(lease)
+        if lease.state is not OllamaLeaseState.READY:
+            return lease
         now = self._now()
         accrued = accrued_cost(lease, now)
         if now >= lease.hard_deadline or accrued >= lease.max_authorized_cost:
             return await self._release(lease, reason="deadline_or_cost_cap")
-        return self.repository.compare_and_set(
+        touched = self.repository.compare_and_set(
             lease,
             changes={
                 "last_used_at": now,
@@ -238,6 +251,11 @@ class OllamaLeaseService:
                 ),
                 "accrued_estimated_cost": accrued,
             },
+        )
+        return replace(
+            touched,
+            route_url=lease.route_url,
+            provider_health_url=lease.provider_health_url,
         )
 
     async def release(

@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.34.0,<1",
+    "kestrel-sovereign-sdk>=0.35.0,<1",
     # Framework runtime dep: the manager uses kestrel_sovereign.config.load_config
     # to load the standalone $KESTREL_HOME/runpod_config.toml.
     "kestrel-sovereign>=0.13.1,<1",

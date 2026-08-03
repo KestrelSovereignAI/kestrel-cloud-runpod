@@ -234,6 +234,136 @@ async def test_status_returns_only_exact_authenticated_ready_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_touch_renews_exact_lease_and_returns_authoritative_sdk_route(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    before = service.repository.get(ready.lease_id)
+    assert before is not None
+    clock.advance(30)
+    capacity.route_url = "https://rotated-private.example"
+
+    touched = await adapter.touch(request.owner_id, ready.lease_id)
+
+    durable = service.repository.get(ready.lease_id)
+    assert touched.lease_id == ready.lease_id
+    assert touched.owner_id == request.owner_id
+    assert touched.request_id == request.request_id
+    assert touched.quote_id == ready.quote_id
+    assert touched.state is InferenceLeaseState.READY
+    assert touched.route is not None
+    assert touched.route.endpoint.get_secret_value() == (
+        "https://rotated-private.example/v1"
+    )
+    assert touched.route.api_key.get_secret_value() == _ROUTE_KEY
+    assert touched.updated_at >= ready.updated_at
+    assert touched.expires_at == ready.expires_at
+    assert durable is not None
+    assert durable.last_used_at == clock()
+    assert durable.idle_deadline > before.idle_deadline
+    assert durable.route_url is None
+    assert capacity.provision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_touch_fails_closed_when_ready_route_is_no_longer_exact(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    before = service.repository.get(ready.lease_id)
+    assert before is not None
+    clock.advance(30)
+    capacity.models = ()
+
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not renew"):
+        await adapter.touch(request.owner_id, ready.lease_id)
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.last_used_at == before.last_used_at
+    assert durable.idle_deadline == before.idle_deadline
+    assert durable.route_url is None
+    assert capacity.provision_calls == 1
+    assert capacity.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_touch_cannot_resurrect_an_idle_expired_lease(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    clock.advance(request.idle_ttl_seconds + 1)
+
+    expired = await adapter.touch(request.owner_id, ready.lease_id)
+
+    durable = service.repository.get(ready.lease_id)
+    assert expired.lease_id == ready.lease_id
+    assert expired.owner_id == request.owner_id
+    assert expired.request_id == request.request_id
+    assert expired.state is InferenceLeaseState.EXPIRED
+    assert expired.route is None
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.termination_reason == "deadline_or_cost_cap"
+    assert capacity.provision_calls == 1
+    assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_touch_retry_returns_the_same_expired_lease_without_teardown(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    clock.advance(request.idle_ttl_seconds + 1)
+
+    first = await adapter.touch(request.owner_id, ready.lease_id)
+    durable_before_retry = service.repository.get(ready.lease_id)
+    duplicate = await adapter.touch(request.owner_id, ready.lease_id)
+
+    assert first.state is InferenceLeaseState.EXPIRED
+    assert duplicate.state is InferenceLeaseState.EXPIRED
+    assert duplicate.route is None
+    assert duplicate.expires_at == first.expires_at
+    assert service.repository.get(ready.lease_id) == durable_before_retry
+    assert capacity.provision_calls == 1
+    assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_touch_observes_expiry_after_external_reconciler_wins(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    clock.advance(request.idle_ttl_seconds + 1)
+
+    reconciled = await service.reconcile()
+    durable_before_touch = service.repository.get(ready.lease_id)
+    observed = await adapter.touch(request.owner_id, ready.lease_id)
+
+    assert reconciled[0].state is OllamaLeaseState.TERMINATED
+    assert observed.state is InferenceLeaseState.EXPIRED
+    assert observed.route is None
+    assert service.repository.get(ready.lease_id) == durable_before_touch
+    assert capacity.provision_calls == 1
+    assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_restart_reconciles_same_lease_without_duplicate_capacity(tmp_path):
     clock = MutableClock()
     first, _service, capacity = _adapter(tmp_path, clock)
@@ -255,18 +385,28 @@ async def test_restart_reconciles_same_lease_without_duplicate_capacity(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_owner_isolation_precedes_status_or_release_mutation(tmp_path):
+async def test_owner_isolation_precedes_status_touch_or_release_mutation(tmp_path):
     clock = MutableClock()
-    adapter, _service, capacity = _adapter(tmp_path, clock)
+    adapter, service, capacity = _adapter(tmp_path, clock)
     request = _request(clock)
     quote = await adapter.quote(request)
     pending = await adapter.acquire(request, quote)
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    before = service.repository.get(ready.lease_id)
+    assert before is not None
+    clock.advance(30)
 
     with pytest.raises(InferenceLeaseOwnershipError):
         await adapter.status("owner-other", pending.lease_id)
     with pytest.raises(InferenceLeaseOwnershipError):
+        await adapter.touch("owner-other", pending.lease_id)
+    with pytest.raises(InferenceLeaseOwnershipError):
         await adapter.release("owner-other", pending.lease_id)
 
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.last_used_at == before.last_used_at
+    assert durable.idle_deadline == before.idle_deadline
     assert capacity.teardown_calls == 0
 
 
