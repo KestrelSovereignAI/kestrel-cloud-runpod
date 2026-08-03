@@ -333,3 +333,60 @@ async def test_final_billing_waits_until_records_cover_termination() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize("realized", [Decimal("0.38"), Decimal("1.6"), Decimal("0")])
+@pytest.mark.asyncio
+async def test_receipt_records_the_realized_rate_not_the_accepted_one(
+    realized,
+) -> None:
+    """Two checks require the receipt rate to equal the REALIZED rate.
+
+    The placement is only required to come in at or under the accepted rate,
+    so recording the accepted rate made settlement unreachable on an ordinary
+    price drop and on the terminal cost of 0.0 the v2 spec documents. Zero is
+    included deliberately: it is the case the recovery path adopts.
+    """
+    clock = MutableClock()
+    spec = _spec(clock)
+    terminated = clock()
+    created = terminated - timedelta(seconds=600)
+    clock.value += timedelta(seconds=1)
+    page = BillingPage(
+        records=(
+            {
+                "podId": "pod-catalog-1",
+                "startTime": created.isoformat(),
+                "endTime": terminated.isoformat(),
+                "totalAmount": 0.061,
+            },
+        ),
+        metadata={
+            "query": {
+                "podId": "pod-catalog-1",
+                "startTime": created.isoformat(),
+                "endTime": terminated.isoformat(),
+            },
+            "totals": {"totalAmount": 0.061},
+        },
+    )
+    client = SimpleNamespace(pod_billing=lambda **_: page)
+    provider = RunpodPodCapacityProvider(SimpleNamespace(client=client), clock=clock)
+
+    receipt = await provider.final_billing(
+        "pod-catalog-1",
+        capacity_spec=spec,
+        created_at=created,
+        terminated_at=terminated,
+        realized_hourly_rate_usd=realized,
+    )
+
+    assert receipt is not None
+    assert receipt.hourly_price_usd == realized
+    # The accepted rate is the quote's per-GPU price x count; it must NOT be
+    # what lands here unless it happens to equal the realized rate.
+    accepted = spec.request.quote.hourly_cost_usd * Decimal(
+        spec.request.quote.constraints.gpu_count
+    )
+    if realized != accepted:
+        assert receipt.hourly_price_usd != accepted

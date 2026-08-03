@@ -646,7 +646,13 @@ class PodBillingReceipt:
             )
         if (
             not self.hourly_price_usd.is_finite()
-            or self.hourly_price_usd <= 0
+            # Zero is legitimate: this field carries the REALIZED whole-Pod
+            # rate, and the v2 spec reports cost 0.0 for an EXITED or
+            # TERMINATED Pod - which is exactly the Pod the recovery path
+            # adopts. Rejecting it made the receipt unconstructible, so
+            # settlement never completed, the scoped capability was never
+            # revoked, and the reservation was held indefinitely.
+            or self.hourly_price_usd < 0
             or not self.actual_cost_usd.is_finite()
             or self.actual_cost_usd < 0
         ):

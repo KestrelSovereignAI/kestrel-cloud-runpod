@@ -16,6 +16,7 @@ from pod_capacity_test_support import (
 
 from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodBillingReceipt,
+    PodCapacityEvidence,
     PodCapacitySpec,
     PodRealizedPlacement,
     attempt_environment_sha256,
@@ -223,3 +224,27 @@ def test_terminated_pod_reporting_zero_cost_is_adoptable():
 
     realized.validate_against(single)
     assert realized.hourly_rate_usd == Decimal("0")
+
+
+def test_evidence_records_the_accepted_rate_in_whole_pod_units():
+    """accepted_hourly_rate_usd is compared against the realized whole-Pod
+    rate, so it must be recorded in that unit, not the per-GPU catalog price.
+    """
+    clock = MutableClock()
+    quad = request(clock, gpu_count=4)
+    evidence = PodCapacityEvidence.from_spec(
+        PodCapacitySpec(
+            request=quad,
+            capability_secret_id="secret:catalog-capability-0001",
+            capability_token_sha256="a" * 64,
+            capability_expires_at=quad.bearer_expires_at,
+            attempt_environment_sha256=attempt_environment_sha256(
+                quad.attempt_environment
+            ),
+        )
+    )
+
+    # 0.40/GPU x 4 GPUs = 1.6 whole-Pod.
+    assert evidence.accepted_hourly_rate_usd == Decimal("1.6")
+    assert evidence.accepted_hourly_rate_usd != quad.quote.hourly_cost_usd
+    assert evidence.accepted_gpu_count == 4

@@ -108,7 +108,9 @@ def quote(clock: MutableClock, gpu_count: int = 1) -> PodCapacityQuote:
     )
 
 
-def request(clock: MutableClock, **changes: Any) -> CatalogPodCapacityRequest:
+def request(
+    clock: MutableClock, gpu_count: int = 1, **changes: Any
+) -> CatalogPodCapacityRequest:
     values: dict[str, Any] = {
         "capacity_id": "capacity:catalog-attempt-0001",
         "cleanup_family_id": "capacity:catalog-attempt-0001",
@@ -121,8 +123,9 @@ def request(clock: MutableClock, **changes: Any) -> CatalogPodCapacityRequest:
         "parameters_sha256": PARAMETERS_SHA,
         "image_reference": IMAGE,
         "profile_id": "catalog-lora",
-        "quote": quote(clock),
-        "accepted_max_cost_usd": Decimal("0.066667"),
+        "quote": quote(clock, gpu_count),
+        # Must equal the quote's own ceiling, which scales with the GPU count.
+        "accepted_max_cost_usd": pod_cost_usd(Decimal("0.4"), 600, gpu_count),
         "created_at": clock(),
         "readiness_deadline": clock() + timedelta(seconds=30),
         "hard_deadline": clock() + timedelta(seconds=600),

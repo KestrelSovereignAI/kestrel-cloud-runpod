@@ -715,3 +715,32 @@ async def test_multi_gpu_quote_round_trips_exactly_and_stays_acquirable(
     assert quote.hourly_cost_usd == cap
     # The per-GPU budget acquire derives must still admit the quoted GPU.
     assert float(quote.hourly_cost_usd / D(gpu_count)) >= price
+
+
+@pytest.mark.asyncio
+async def test_durable_lease_hourly_cost_covers_every_gpu(tmp_path):
+    """_lease_costs feeds the SDK's hourly bound after a restart.
+
+    offered_rate_per_hr is persisted as the catalog's PER-GPU price, so a
+    reload that forgot placement_gpu_count reported half the truth for a
+    2-GPU lease and the SDK's own guard passed a lease it should refuse.
+    """
+    from decimal import Decimal as D
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.8, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock, max_hourly_cost_usd=D("1.6"))
+
+    quote = await adapter.quote(request)
+    lease = await adapter.acquire(request, quote)
+
+    stored = service.repository.get(lease.lease_id)
+    assert stored.placement_gpu_count == 2
+    assert stored.offered_rate_per_hr == 0.8
+
+    # Re-read through the SDK surface: the hourly cost must be the whole lease.
+    reloaded = await adapter.status(request.owner_id, lease.lease_id)
+    assert reloaded.hourly_cost_usd == D("1.6")
