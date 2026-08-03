@@ -88,6 +88,25 @@ class PodCapacityLeaseService:
 
         return await self.provider.quote(request)
 
+    def validate_catalog_reconciler_dependencies(self) -> None:
+        """Fail before polling when required host-owned dependencies are absent."""
+
+        self._require_capability_store()
+        self._require_workload_transport()
+        if not self.profiles:
+            raise RunPodManagerError(
+                "Pod capacity reconciliation requires configured GPU profiles"
+            )
+        missing_profiles = {
+            lease.profile_id
+            for lease in self.repository.list_for_reconciliation()
+            if lease.is_catalog_attempt and lease.profile_id not in self.profiles
+        }
+        if missing_profiles:
+            raise RunPodManagerError(
+                "Pod capacity reconciliation is missing durable catalog profiles"
+            )
+
     async def acquire_catalog(
         self, request: CatalogPodCapacityRequest
     ) -> TrainingPodLease:
@@ -622,13 +641,14 @@ class PodCapacityLeaseService:
         owner_id: str,
         workload_id: str,
     ) -> Mapping[str, Any]:
-        """Return the opaque normalized receipt and terminate its disposable Pod."""
+        """Return an opaque result replay without acknowledging or tearing it down."""
 
         lease = self._catalog_lease(capacity_id, owner_id, workload_id)
         if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
             raise RunPodManagerError("Catalog Pod result is not ready")
         spec = self._capacity_spec(lease)
         capability = await self._load_capability(spec)
+        lease = self.heartbeat(lease.cleanup_token)
         payload = await self._require_workload_transport().result(
             base_url=self._route(lease),
             attempt_id=spec.request.attempt_id,
@@ -639,16 +659,41 @@ class PodCapacityLeaseService:
         if current.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
             await self.release(capacity_id, reason="late result after cancellation")
             raise RunPodManagerError("Cancelled catalog attempt cannot accept a result")
-        self.repository.compare_and_set(
-            current,
-            changes={
-                "state": TrainingPodState.RESULT_RETRIEVED,
-                "last_heartbeat_at": self._now(),
-                "last_provider_error": None,
-            },
-        )
-        await self.release(capacity_id, reason="catalog result retrieved")
         return payload
+
+    async def acknowledge_catalog_result(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+    ) -> TrainingPodLease:
+        """Acknowledge durable host persistence, then terminate disposable capacity."""
+
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
+            raise RunPodManagerError(
+                "Catalog Pod result cannot be acknowledged before success"
+            )
+        if lease.is_terminal:
+            return lease
+        if lease.state is TrainingPodState.JOB_COMPLETED:
+            lease = self.repository.compare_and_set(
+                lease,
+                changes={
+                    "state": TrainingPodState.RESULT_RETRIEVED,
+                    "last_heartbeat_at": self._now(),
+                    "last_provider_error": None,
+                },
+            )
+        elif lease.state not in {
+            TrainingPodState.RESULT_RETRIEVED,
+            TrainingPodState.RELEASING,
+        }:
+            raise RunPodManagerError(
+                "Catalog Pod result acknowledgement is inconsistent with lease state"
+            )
+        return await self.release(capacity_id, reason="catalog result acknowledged")
 
     async def cancel_catalog_workload(
         self,
@@ -967,6 +1012,7 @@ class PodCapacityLeaseService:
             TrainingPodState.RELEASING,
             TrainingPodState.CANCEL_REQUESTED,
             TrainingPodState.RECONCILE_REQUIRED,
+            TrainingPodState.RESULT_RETRIEVED,
         }:
             return await self._release_one(cleanup_token, reason="retry teardown")
         if now >= lease.hard_deadline:

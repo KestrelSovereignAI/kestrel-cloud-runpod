@@ -136,10 +136,13 @@ unchanged to the schema-3 single-attempt runner. This public package does not
 import or publish `frinz_catalog` or `frinz_catalog_contracts`; those remain
 private GitHub-only dependencies in their owning repositories. Health is
 anonymous and content-free. Submit, status, result, and cancellation are
-attempt-bound and bearer-authenticated. A result is returned only after its
-attempt and request hashes match, then the disposable Pod is permanently
-terminated. `RELEASED` is not recorded until `/billing/pods` supplies final
-authoritative cost (or v2 definitively rejected creation, which records zero).
+attempt-bound and bearer-authenticated. Result retrieval is non-destructive and
+replayable after its attempt and request hashes match. The private host must
+strict-decode and durably commit that result before calling
+`acknowledge_catalog_result(capacity_id=..., owner_id=..., workload_id=...)`.
+Only acknowledgement permanently terminates the Pod. `RELEASED` is not
+recorded until `/billing/pods` supplies final authoritative cost (or v2
+definitively rejected creation, which records zero).
 
 The 0.7 repository migration atomically renames `training_pod_leases` to
 `pod_capacity_leases`, backfills generic non-secret fields, and preserves every
@@ -154,6 +157,60 @@ authority. Run `kestrel-runpod-reconcile-training` for those compatibility
 callers. New catalog hosts construct `PodCapacityLeaseService` with their
 encrypted capability store and call `reconcile()` from a cheap external timer;
 process-local TTLs are never cleanup authority.
+
+Install one host-owned synchronous factory that constructs the public service
+with explicit Runpod v2 credentials, the absolute SQLite repository path, GPU
+profiles, the private encrypted `CatalogAttemptCapabilityStore`, and
+`CatalogPodWorkloadTransport`. Then schedule the installed one-shot command:
+
+```python
+from kestrel_cloud_runpod import (
+    CatalogPodWorkloadTransport,
+    PodCapacityLeaseService,
+    RunpodPodCapacityProvider,
+    SQLitePodCapacityRepository,
+)
+from kestrel_cloud_runpod.providers import DirectRunPodProvider
+
+
+def build_capacity_service() -> PodCapacityLeaseService:
+    settings = load_host_settings()  # host-owned, fail-fast secret/config loader
+    direct = DirectRunPodProvider(api_key=settings.runpod_api_key)
+    return PodCapacityLeaseService(
+        repository=SQLitePodCapacityRepository(settings.capacity_database_path),
+        provider=RunpodPodCapacityProvider(direct),
+        profiles=settings.gpu_profiles,
+        poll_interval_seconds=settings.poll_interval_seconds,
+        orphan_timeout_seconds=settings.orphan_timeout_seconds,
+        capability_store=settings.encrypted_capability_store,
+        workload_transport=CatalogPodWorkloadTransport(),
+    )
+```
+
+The factory is construction-only: it must not quote, acquire, or contact a
+worker. Keep it in the private host package and point the command at its import
+path:
+
+```bash
+export RUNPOD_POD_CAPACITY_SERVICE_FACTORY='catalog_host.runpod:build_capacity_service'
+export RUNPOD_POD_CAPACITY_RECONCILE_TIMEOUT_SECONDS='240'
+kestrel-runpod-reconcile-capacity
+```
+
+For example, a systemd timer can invoke that command once per minute with the
+two non-secret settings above and `RUNPOD_API_KEY` supplied by its credential
+store. The command never acquires capacity. It takes a nonblocking advisory
+lock derived from the canonical database path, runs one bounded `reconcile()`
+pass, and emits one content-free JSON object. Exit `0` means the pass completed;
+`75` means another invocation owns the lock, the pass timed out, or durable
+state requires retry; `78` means host configuration/auth construction failed;
+and `70` means a typed runtime failure. Error output never includes exception
+messages, identifiers, routes, payloads, tokens, or provider response bodies.
+
+A host crash before its result transaction commits can repeat
+`retrieve_catalog_result()` against the same worker. Acknowledgement is the
+destructive boundary and must follow the private durable commit; the hard
+runtime deadline remains the final cost and cleanup bound.
 
 ### Configuration migration from 0.2
 

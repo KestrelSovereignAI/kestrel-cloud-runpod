@@ -15,6 +15,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `/billing/pods` receipts.
 - A cheap externally driven reconciliation surface that retains ambiguous and
   billing-pending work without treating an estimate as actual cost.
+- An installed, single-pass `kestrel-runpod-reconcile-capacity` command with
+  explicit host dependency injection, per-database process locking, bounded
+  execution, content-free JSON summaries, and scheduler-facing exit statuses.
+- Replayable non-destructive result retrieval followed by an explicit,
+  owner/workload-bound acknowledgement, so the private catalog can commit a
+  strict-decoded result durably before Pod termination.
 
 ### Changed
 

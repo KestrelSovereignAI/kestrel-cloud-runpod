@@ -91,6 +91,14 @@ only the attempt and request-hash bindings needed to prevent cross-attempt
 delivery; the private package validates the complete schema and artifact
 receipt.
 
+`retrieve_catalog_result()` is an authenticated, non-destructive replay. The
+private host strict-decodes and durably commits that opaque result first, then
+calls `acknowledge_catalog_result()` with the same capacity/owner/workload
+identity. Acknowledgement is the destructive boundary: it records
+`RESULT_RETRIEVED`, permanently terminates the disposable Pod, and begins
+billing reconciliation. A crash before the private database commit can replay
+the worker result after restart; cloud never persists the private payload.
+
 ## Crash and ambiguity rules
 
 The lease and deterministic resource name are committed before `POST /pods`.
@@ -124,6 +132,17 @@ nonterminal and must not release a Frinz reservation as zero.
 Frinz compares the authoritative actual cost with the accepted ceiling. An
 over-ceiling bill is retained as evidence but settlement remains fail-closed;
 cloud never owns or mutates the funds ledger.
+
+The installed `kestrel-runpod-reconcile-capacity` command is the canonical
+external driver. `RUNPOD_POD_CAPACITY_SERVICE_FACTORY=module:callable` names a
+host-owned synchronous factory which wires the public service to Runpod auth,
+the absolute SQLite path, GPU profiles, the private encrypted capability store,
+and the opaque worker transport. The command validates those dependencies
+before polling, obtains a process advisory lock derived from that one database,
+and calls only `reconcile()` under a configured timeout. It cannot quote,
+acquire, submit, or otherwise provision work. Its JSON contains aggregate state
+counts only; stable exit statuses distinguish success, retryable/busy state,
+configuration failure, and a typed runtime failure.
 
 ## Spin-up and storage policy
 

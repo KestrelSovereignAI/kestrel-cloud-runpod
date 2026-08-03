@@ -62,6 +62,7 @@ runpod = "kestrel_cloud_runpod.inference_provider:RunpodInferenceLeaseProvider"
 
 [project.scripts]
 kestrel-runpod-reconcile-ollama = "kestrel_cloud_runpod.ollama_reconciler:main"
+kestrel-runpod-reconcile-capacity = "kestrel_cloud_runpod.pod_capacity_reconciler:main"
 kestrel-runpod-reconcile-training = "kestrel_cloud_runpod.training_reconciler:main"
 
 [build-system]

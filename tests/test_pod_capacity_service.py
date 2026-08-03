@@ -164,7 +164,7 @@ async def test_known_created_mismatch_is_durably_terminated_and_billed(
 
 
 @pytest.mark.asyncio
-async def test_submit_success_result_terminates_then_billing_reconciles(
+async def test_submit_success_result_replays_until_ack_then_billing_reconciles(
     tmp_path,
 ) -> None:
     clock = MutableClock()
@@ -203,6 +203,21 @@ async def test_submit_success_result_terminates_then_billing_reconciles(
         workload_id=catalog_request.workload_id,
     )
     assert result == transport.result_payload
+    replay = await runtime.retrieve_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    assert replay == result
+    completed = runtime.repository.get(catalog_request.capacity_id)
+    assert completed.state is PodCapacityState.JOB_COMPLETED
+    assert provider.terminate_calls == []
+
+    await runtime.acknowledge_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
     pending = runtime.repository.get(catalog_request.capacity_id)
     assert pending.state is PodCapacityState.RELEASING
     assert pending.billing_state is PodCapacityBillingState.PENDING
@@ -213,6 +228,97 @@ async def test_submit_success_result_terminates_then_billing_reconciles(
     final = runtime.repository.get(catalog_request.capacity_id)
     assert final.settlement_ready is True
     assert final.billing_receipt.actual_cost_usd == Decimal("0.061")
+
+
+@pytest.mark.asyncio
+async def test_result_replays_after_host_restart_until_durable_ack(tmp_path) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    store = FakeCapabilityStore(clock)
+    transport = FakeWorkloadTransport()
+    first_process = service(tmp_path, clock, provider, store, transport)
+    catalog_request = request(clock)
+    await first_process.acquire_catalog(catalog_request)
+    await first_process.submit_catalog_workload(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        payload={
+            "dispatch_attempt_id": catalog_request.attempt_id,
+            "request_sha256": catalog_request.request_sha256,
+        },
+    )
+    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    await first_process.observe_catalog_workload(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    expected = await first_process.retrieve_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+
+    restarted = service(tmp_path, clock, provider, store, transport)
+    replay = await restarted.retrieve_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    assert replay == expected
+    assert provider.terminate_calls == []
+
+    await restarted.acknowledge_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+    assert provider.terminate_calls == ["pod-catalog-1"]
+
+
+@pytest.mark.asyncio
+async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    store = FakeCapabilityStore(clock)
+    transport = FakeWorkloadTransport()
+    first_process = service(tmp_path, clock, provider, store, transport)
+    catalog_request = request(clock)
+    await first_process.acquire_catalog(catalog_request)
+    await first_process.submit_catalog_workload(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        payload={
+            "dispatch_attempt_id": catalog_request.attempt_id,
+            "request_sha256": catalog_request.request_sha256,
+        },
+    )
+    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    await first_process.observe_catalog_workload(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+    )
+
+    async def interrupted_release(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    first_process.release = interrupted_release
+    with pytest.raises(asyncio.CancelledError):
+        await first_process.acknowledge_catalog_result(
+            capacity_id=catalog_request.capacity_id,
+            owner_id=catalog_request.owner_id,
+            workload_id=catalog_request.workload_id,
+        )
+    acknowledged = first_process.repository.get(catalog_request.capacity_id)
+    assert acknowledged.state is PodCapacityState.RESULT_RETRIEVED
+    assert provider.terminate_calls == []
+
+    restarted = service(tmp_path, clock, provider, store, transport)
+    await restarted.reconcile()
+    assert provider.terminate_calls == ["pod-catalog-1"]
 
 
 @pytest.mark.asyncio
