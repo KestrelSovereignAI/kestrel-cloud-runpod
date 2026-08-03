@@ -90,7 +90,11 @@ performs only `GET /catalog/gpus?product=SERVERLESS&include=AVAILABILITY` and
 `GET /serverless/{id}`. It records schema/contract versions, the profile digest,
 exact GPU/pool/data center, catalog observation, live worker rate, benchmark,
 queue/startup/execution/idle timing bounds, maximum billable seconds, estimated
-cost, maximum cost, and expiry. The caller supplies explicit estimated and
+cost, maximum cost, expiry, and the exact per-job execution-timeout and queue TTL
+policy. Execution timeout is constrained to 5 seconds through 7 days and job TTL
+to 10 seconds through 7 days; the quote freshness TTL remains at most five
+minutes. The authorized job TTL must cover the full maximum queue, worker-start,
+and execution interval. The caller supplies explicit estimated and
 maximum non-worker amounts so disk and platform fees are included in the wallet
 reservation rather than hidden behind the GPU rate. Generated content, endpoint
 request URLs, worker configuration, credentials, and raw provider bodies are
@@ -108,13 +112,16 @@ Runpod v2 currently reports Serverless billing in endpoint-level hourly buckets,
 not per-job records. `final_billing()` therefore returns an authoritative receipt
 only after the exact job is terminal, its complete closed billing window is
 available, the endpoint is configured as scale-to-zero with one worker, and the
-caller supplies the digest of a durable host-owned exclusivity record proving
-that no other attempt shared that endpoint window. A missing, partial, or
+caller supplies the digest and complete UTC hour allocation of a durable
+host-owned exclusivity record proving that no other attempt shared any touched
+endpoint-hour bucket. Coverage extends from submission through completion plus
+the accepted idle tail, so settlement waits for the final covered hour to close
+even when that tail crosses an hour boundary. A missing, partial, or
 still-open bucket remains pending. Any identity, interval, total, component, or
 unsupported-field mismatch fails closed.
-The receipt binds the accepted quote, profile, endpoint, job, attempt, and
-exclusive window while leaving unavailable worker-startup and idle-tail
-observations as `null`.
+The receipt binds the accepted quote, profile, endpoint, job, attempt, accepted
+idle-tail duration, exact billable coverage end, and every exclusive hour while
+leaving unavailable worker-startup and observed idle-tail values as `null`.
 
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 

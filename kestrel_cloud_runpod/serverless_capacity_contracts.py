@@ -8,7 +8,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
@@ -26,6 +26,10 @@ SERVERLESS_CAPACITY_CONTRACT_VERSION = "serverless-capacity-v1"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}")
 _IMMUTABLE_REFERENCE_RE = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
+_MAX_SERVERLESS_POLICY_MS = 7 * 24 * 60 * 60 * 1_000
+_MAX_BILLABLE_COVERAGE_SECONDS = 7 * 24 * 60 * 60 + 3_600
+_MIN_EXECUTION_TIMEOUT_MS = 5_000
+_MIN_JOB_TTL_MS = 10_000
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,15 @@ class ServerlessEndpointProfile:
         if self.scaling_value < Decimal("0.5"):
             raise ValueError("Serverless QUEUE_DELAY target must be at least 0.5")
         _positive_int(self.execution_timeout_ms, "execution_timeout_ms")
+        if not (
+            _MIN_EXECUTION_TIMEOUT_MS
+            <= self.execution_timeout_ms
+            <= _MAX_SERVERLESS_POLICY_MS
+        ):
+            raise ValueError(
+                "Serverless endpoint execution_timeout_ms must be between "
+                "5 seconds and 7 days"
+            )
         if not isinstance(self.flashboot, FlashBoot):
             raise TypeError("Serverless endpoint flashboot must be a FlashBoot")
         _positive_int(self.disk_gb, "disk_gb")
@@ -203,6 +216,8 @@ class ServerlessCapacityQuoteRequest:
     maximum_worker_start_seconds: int
     maximum_execution_seconds: int
     maximum_billable_seconds: int
+    job_execution_timeout_ms: int
+    job_ttl_ms: int
     estimated_non_worker_cost_usd: Decimal
     maximum_non_worker_cost_usd: Decimal
     quote_ttl_seconds: int = 60
@@ -226,6 +241,21 @@ class ServerlessCapacityQuoteRequest:
         _positive_int(self.maximum_worker_start_seconds, "maximum_worker_start_seconds")
         _positive_int(self.maximum_execution_seconds, "maximum_execution_seconds")
         _positive_int(self.maximum_billable_seconds, "maximum_billable_seconds")
+        _positive_int(self.job_execution_timeout_ms, "job_execution_timeout_ms")
+        _positive_int(self.job_ttl_ms, "job_ttl_ms")
+        if not (
+            _MIN_EXECUTION_TIMEOUT_MS
+            <= self.job_execution_timeout_ms
+            <= _MAX_SERVERLESS_POLICY_MS
+        ):
+            raise ValueError(
+                "Serverless job_execution_timeout_ms must be between "
+                "5 seconds and 7 days"
+            )
+        if not _MIN_JOB_TTL_MS <= self.job_ttl_ms <= _MAX_SERVERLESS_POLICY_MS:
+            raise ValueError(
+                "Serverless job_ttl_ms must be between 10 seconds and 7 days"
+            )
         _nonnegative_decimal(
             self.estimated_non_worker_cost_usd,
             "estimated_non_worker_cost_usd",
@@ -260,10 +290,21 @@ class ServerlessCapacityQuoteRequest:
             raise ValueError("Serverless maximum billable time is inconsistent")
         if estimated_billable > maximum_billable:
             raise ValueError("Serverless estimated billable time exceeds its maximum")
-        if self.maximum_execution_seconds * 1_000 > self.profile.execution_timeout_ms:
+        if self.job_execution_timeout_ms > self.profile.execution_timeout_ms:
             raise ValueError(
-                "Serverless maximum execution exceeds the endpoint timeout"
+                "Serverless job execution timeout exceeds the endpoint timeout"
             )
+        if self.maximum_execution_seconds * 1_000 > self.job_execution_timeout_ms:
+            raise ValueError(
+                "Serverless maximum execution exceeds the job execution timeout"
+            )
+        maximum_job_lifespan_ms = (
+            self.maximum_queue_delay_seconds
+            + self.maximum_worker_start_seconds
+            + self.maximum_execution_seconds
+        ) * 1_000
+        if maximum_job_lifespan_ms > self.job_ttl_ms:
+            raise ValueError("Serverless maximum job lifespan exceeds the job TTL")
         if self.estimated_non_worker_cost_usd > self.maximum_non_worker_cost_usd:
             raise ValueError("Serverless estimated non-worker cost exceeds its maximum")
 
@@ -299,6 +340,8 @@ class ServerlessCapacityQuote:
     maximum_queue_delay_seconds: int
     maximum_worker_start_seconds: int
     maximum_execution_seconds: int
+    job_execution_timeout_ms: int
+    job_ttl_ms: int
     estimated_billable_seconds: int
     maximum_billable_seconds: int
     estimated_worker_cost_usd: Decimal
@@ -373,6 +416,8 @@ class ServerlessCapacityQuote:
             ("maximum_queue_delay_seconds", self.maximum_queue_delay_seconds),
             ("maximum_worker_start_seconds", self.maximum_worker_start_seconds),
             ("maximum_execution_seconds", self.maximum_execution_seconds),
+            ("job_execution_timeout_ms", self.job_execution_timeout_ms),
+            ("job_ttl_ms", self.job_ttl_ms),
             ("estimated_billable_seconds", self.estimated_billable_seconds),
             ("maximum_billable_seconds", self.maximum_billable_seconds),
         ):
@@ -396,6 +441,25 @@ class ServerlessCapacityQuote:
             + self.idle_tail_seconds
         ):
             raise ValueError("Serverless maximum billable time is inconsistent")
+        if not (
+            _MIN_EXECUTION_TIMEOUT_MS
+            <= self.job_execution_timeout_ms
+            <= _MAX_SERVERLESS_POLICY_MS
+        ):
+            raise ValueError("Serverless job execution timeout is invalid")
+        if not _MIN_JOB_TTL_MS <= self.job_ttl_ms <= _MAX_SERVERLESS_POLICY_MS:
+            raise ValueError("Serverless job TTL is invalid")
+        if self.maximum_execution_seconds * 1_000 > self.job_execution_timeout_ms:
+            raise ValueError(
+                "Serverless maximum execution exceeds the job execution timeout"
+            )
+        maximum_job_lifespan_ms = (
+            self.maximum_queue_delay_seconds
+            + self.maximum_worker_start_seconds
+            + self.maximum_execution_seconds
+        ) * 1_000
+        if maximum_job_lifespan_ms > self.job_ttl_ms:
+            raise ValueError("Serverless maximum job lifespan exceeds the job TTL")
         if (
             self.estimated_queue_delay_seconds is not None
             and self.estimated_queue_delay_seconds > self.maximum_queue_delay_seconds
@@ -468,6 +532,8 @@ class ServerlessCapacityQuote:
             "maximum_queue_delay_seconds": self.maximum_queue_delay_seconds,
             "maximum_worker_start_seconds": self.maximum_worker_start_seconds,
             "maximum_execution_seconds": self.maximum_execution_seconds,
+            "job_execution_timeout_ms": self.job_execution_timeout_ms,
+            "job_ttl_ms": self.job_ttl_ms,
             "estimated_billable_seconds": self.estimated_billable_seconds,
             "maximum_billable_seconds": self.maximum_billable_seconds,
             "estimated_worker_cost_usd": decimal_text(self.estimated_worker_cost_usd),
@@ -528,6 +594,8 @@ class ServerlessCapacityQuote:
                 value, "maximum_worker_start_seconds"
             ),
             maximum_execution_seconds=_required_int(value, "maximum_execution_seconds"),
+            job_execution_timeout_ms=_required_int(value, "job_execution_timeout_ms"),
+            job_ttl_ms=_required_int(value, "job_ttl_ms"),
             estimated_billable_seconds=_required_int(
                 value, "estimated_billable_seconds"
             ),
@@ -551,6 +619,31 @@ class ServerlessCapacityQuote:
         )
 
 
+def serverless_billing_hour_starts(
+    attempt_started_at: datetime, billable_coverage_until: datetime
+) -> tuple[datetime, ...]:
+    """Return every UTC endpoint-hour bucket touched by a billable interval."""
+
+    require_aware(attempt_started_at, "attempt_started_at")
+    require_aware(billable_coverage_until, "billable_coverage_until")
+    start = attempt_started_at.astimezone(UTC)
+    coverage_until = billable_coverage_until.astimezone(UTC)
+    if coverage_until <= start:
+        raise ValueError("Serverless billable coverage interval is invalid")
+    if (coverage_until - start).total_seconds() > _MAX_BILLABLE_COVERAGE_SECONDS:
+        raise ValueError("Serverless billable coverage interval exceeds policy bounds")
+    first = start.replace(minute=0, second=0, microsecond=0)
+    window_until = coverage_until.replace(minute=0, second=0, microsecond=0)
+    if coverage_until != window_until:
+        window_until += timedelta(hours=1)
+    hours: list[datetime] = []
+    cursor = first
+    while cursor < window_until:
+        hours.append(cursor)
+        cursor += timedelta(hours=1)
+    return tuple(hours)
+
+
 @dataclass(frozen=True)
 class ServerlessBillingAttempt:
     """Exact externally-owned attempt interval presented for settlement."""
@@ -560,6 +653,7 @@ class ServerlessBillingAttempt:
     endpoint_id: str
     provider_quote_id: str
     exclusive_window_sha256: str
+    exclusive_billing_hour_starts: tuple[datetime, ...]
     submitted_at: datetime
     completed_at: datetime
 
@@ -572,6 +666,30 @@ class ServerlessBillingAttempt:
         ):
             _safe_identifier(value, name)
         _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
+        if (
+            not isinstance(self.exclusive_billing_hour_starts, tuple)
+            or not self.exclusive_billing_hour_starts
+        ):
+            raise ValueError(
+                "Serverless exclusive billing allocation must contain hour buckets"
+            )
+        previous: datetime | None = None
+        for value in self.exclusive_billing_hour_starts:
+            require_aware(value, "exclusive_billing_hour_starts")
+            normalized = value.astimezone(UTC)
+            if (
+                normalized.minute != 0
+                or normalized.second != 0
+                or normalized.microsecond != 0
+                or (
+                    previous is not None and normalized != previous + timedelta(hours=1)
+                )
+            ):
+                raise ValueError(
+                    "Serverless exclusive billing allocation must contain "
+                    "contiguous UTC hour starts"
+                )
+            previous = normalized
         require_aware(self.submitted_at, "submitted_at")
         require_aware(self.completed_at, "completed_at")
         if self.completed_at <= self.submitted_at:
@@ -587,11 +705,25 @@ class ServerlessBillingAttempt:
                 "Serverless job submission falls outside the accepted quote interval"
             )
         maximum_elapsed = (
-            quote.maximum_queue_delay_seconds + quote.maximum_billable_seconds
+            quote.maximum_queue_delay_seconds
+            + quote.maximum_worker_start_seconds
+            + quote.maximum_execution_seconds
         )
         if (self.completed_at - self.submitted_at).total_seconds() > maximum_elapsed:
             raise RunPodManagerError(
                 "Serverless attempt exceeds the accepted maximum interval"
+            )
+        coverage_until = self.completed_at + timedelta(seconds=quote.idle_tail_seconds)
+        expected_hours = serverless_billing_hour_starts(
+            self.submitted_at, coverage_until
+        )
+        actual_hours = tuple(
+            value.astimezone(UTC) for value in self.exclusive_billing_hour_starts
+        )
+        if actual_hours != expected_hours:
+            raise RunPodManagerError(
+                "Serverless exclusive billing allocation does not reserve every "
+                "accepted endpoint-hour bucket"
             )
 
 
@@ -608,14 +740,17 @@ class ServerlessBillingReceipt:
     job_id: str
     attempt_id: str
     exclusive_window_sha256: str
+    exclusive_billing_hour_starts: tuple[datetime, ...]
     attempt_started_at: datetime
     attempt_completed_at: datetime
+    billable_coverage_until: datetime
     billing_window_from: datetime
     billing_window_until: datetime
     hourly_worker_rate_usd: Decimal
     queue_delay_ms: int | None
     worker_startup_ms: int | None
     execution_ms: int | None
+    accepted_idle_tail_ms: int
     idle_tail_ms: int | None
     gpu_cost_usd: Decimal
     cpu_cost_usd: Decimal
@@ -639,9 +774,14 @@ class ServerlessBillingReceipt:
             _safe_identifier(value, name)
         _sha256(self.endpoint_profile_sha256, "endpoint_profile_sha256")
         _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
+        if not isinstance(self.exclusive_billing_hour_starts, tuple):
+            raise TypeError(
+                "Serverless exclusive billing hour starts must be an immutable tuple"
+            )
         for name, value in (
             ("attempt_started_at", self.attempt_started_at),
             ("attempt_completed_at", self.attempt_completed_at),
+            ("billable_coverage_until", self.billable_coverage_until),
             ("billing_window_from", self.billing_window_from),
             ("billing_window_until", self.billing_window_until),
             ("reconciled_at", self.reconciled_at),
@@ -651,10 +791,37 @@ class ServerlessBillingReceipt:
             self.billing_window_from
             <= self.attempt_started_at
             < self.attempt_completed_at
+            < self.billable_coverage_until
             <= self.billing_window_until
             <= self.reconciled_at
         ):
             raise ValueError("Serverless billing receipt intervals are inconsistent")
+        _positive_int(self.accepted_idle_tail_ms, "accepted_idle_tail_ms")
+        expected_coverage_until = self.attempt_completed_at + timedelta(
+            milliseconds=self.accepted_idle_tail_ms
+        )
+        if self.billable_coverage_until != expected_coverage_until:
+            raise ValueError(
+                "Serverless billing coverage does not equal the accepted idle tail"
+            )
+        expected_hours = serverless_billing_hour_starts(
+            self.attempt_started_at, self.billable_coverage_until
+        )
+        for value in self.exclusive_billing_hour_starts:
+            require_aware(value, "exclusive_billing_hour_starts")
+        actual_hours = tuple(
+            value.astimezone(UTC) for value in self.exclusive_billing_hour_starts
+        )
+        if actual_hours != expected_hours:
+            raise ValueError(
+                "Serverless receipt does not bind every exclusive endpoint-hour bucket"
+            )
+        if self.billing_window_from != expected_hours[
+            0
+        ] or self.billing_window_until != expected_hours[-1] + timedelta(hours=1):
+            raise ValueError(
+                "Serverless billing receipt window does not match its hour allocation"
+            )
         _positive_decimal(self.hourly_worker_rate_usd, "hourly_worker_rate_usd")
         for name, value in (
             ("queue_delay_ms", self.queue_delay_ms),
@@ -702,14 +869,19 @@ class ServerlessBillingReceipt:
             "job_id": self.job_id,
             "attempt_id": self.attempt_id,
             "exclusive_window_sha256": self.exclusive_window_sha256,
+            "exclusive_billing_hour_starts": [
+                iso_datetime(value) for value in self.exclusive_billing_hour_starts
+            ],
             "attempt_started_at": iso_datetime(self.attempt_started_at),
             "attempt_completed_at": iso_datetime(self.attempt_completed_at),
+            "billable_coverage_until": iso_datetime(self.billable_coverage_until),
             "billing_window_from": iso_datetime(self.billing_window_from),
             "billing_window_until": iso_datetime(self.billing_window_until),
             "hourly_worker_rate_usd": decimal_text(self.hourly_worker_rate_usd),
             "queue_delay_ms": self.queue_delay_ms,
             "worker_startup_ms": self.worker_startup_ms,
             "execution_ms": self.execution_ms,
+            "accepted_idle_tail_ms": self.accepted_idle_tail_ms,
             "idle_tail_ms": self.idle_tail_ms,
             "gpu_cost_usd": decimal_text(self.gpu_cost_usd),
             "cpu_cost_usd": decimal_text(self.cpu_cost_usd),
@@ -732,11 +904,17 @@ class ServerlessBillingReceipt:
             job_id=_required_string(value, "job_id"),
             attempt_id=_required_string(value, "attempt_id"),
             exclusive_window_sha256=_required_string(value, "exclusive_window_sha256"),
+            exclusive_billing_hour_starts=_required_datetime_tuple(
+                value, "exclusive_billing_hour_starts"
+            ),
             attempt_started_at=parse_datetime(
                 _required_string(value, "attempt_started_at")
             ),
             attempt_completed_at=parse_datetime(
                 _required_string(value, "attempt_completed_at")
+            ),
+            billable_coverage_until=parse_datetime(
+                _required_string(value, "billable_coverage_until")
             ),
             billing_window_from=parse_datetime(
                 _required_string(value, "billing_window_from")
@@ -750,6 +928,7 @@ class ServerlessBillingReceipt:
                 value.get("worker_startup_ms"), "worker_startup_ms"
             ),
             execution_ms=_optional_int(value.get("execution_ms"), "execution_ms"),
+            accepted_idle_tail_ms=_required_int(value, "accepted_idle_tail_ms"),
             idle_tail_ms=_optional_int(value.get("idle_tail_ms"), "idle_tail_ms"),
             gpu_cost_usd=_required_decimal(value, "gpu_cost_usd"),
             cpu_cost_usd=_required_decimal(value, "cpu_cost_usd"),
@@ -888,6 +1067,24 @@ def _optional_int(value: Any, name: str) -> int | None:
     return value
 
 
+def _required_datetime_tuple(
+    value: Mapping[str, Any], key: str
+) -> tuple[datetime, ...]:
+    items = value.get(key)
+    if not isinstance(items, list) or not items:
+        raise RunPodManagerError(
+            f"Stored Serverless {key} must be a nonempty timestamp list"
+        )
+    parsed: list[datetime] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise RunPodManagerError(
+                f"Stored Serverless {key} must contain timestamp strings"
+            )
+        parsed.append(parse_datetime(item))
+    return tuple(parsed)
+
+
 def _required_decimal(value: Mapping[str, Any], key: str) -> Decimal:
     item = value.get(key)
     if not isinstance(item, str):
@@ -927,6 +1124,8 @@ _QUOTE_FIELDS = frozenset(
         "maximum_queue_delay_seconds",
         "maximum_worker_start_seconds",
         "maximum_execution_seconds",
+        "job_execution_timeout_ms",
+        "job_ttl_ms",
         "estimated_billable_seconds",
         "maximum_billable_seconds",
         "estimated_worker_cost_usd",
@@ -951,14 +1150,17 @@ _RECEIPT_FIELDS = frozenset(
         "job_id",
         "attempt_id",
         "exclusive_window_sha256",
+        "exclusive_billing_hour_starts",
         "attempt_started_at",
         "attempt_completed_at",
+        "billable_coverage_until",
         "billing_window_from",
         "billing_window_until",
         "hourly_worker_rate_usd",
         "queue_delay_ms",
         "worker_startup_ms",
         "execution_ms",
+        "accepted_idle_tail_ms",
         "idle_tail_ms",
         "gpu_cost_usd",
         "cpu_cost_usd",
@@ -984,5 +1186,6 @@ __all__ = [
     "json_sha256",
     "parse_datetime",
     "require_aware",
+    "serverless_billing_hour_starts",
     "serverless_worker_cost_usd",
 ]

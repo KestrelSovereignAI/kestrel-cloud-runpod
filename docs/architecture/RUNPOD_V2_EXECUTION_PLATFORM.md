@@ -128,7 +128,11 @@ The selected pool must resolve to one exact GPU, the endpoint must constrain
 workers to that single pool and one data center, and its immutable worker,
 autoscaling, timeout, disk, and idle-tail settings must match the profile. A
 second read-only observation immediately before dispatch rejects stale quotes or
-upward price and placement drift.
+upward price and placement drift. The quote also binds the exact `/run` policy:
+execution timeout must be between 5 seconds and 7 days, while queue TTL must be
+between 10 seconds and 7 days. Because initialization is a distinct billable
+phase in this contract, the TTL must cover maximum queue delay, worker startup,
+and execution rather than treating startup as free or outside job lifespan.
 
 Runpod documents that Serverless workers are billed from startup through
 execution and the configured idle tail, while queue delay and execution are the
@@ -136,9 +140,12 @@ job-level metrics currently exposed by the data plane. The v2 billing route is
 coarser: it emits endpoint-level hourly buckets. Kestrel never derives a fictive
 job cost from execution time. An authoritative `ServerlessBillingReceipt` is
 available only when the exact terminal job/attempt is bound to a caller-owned
-exclusive endpoint-window proof and every closed billing bucket is complete and
-internally consistent. Startup and idle-tail measurements remain null because v2
-does not return them per job. This makes the current throughput tradeoff explicit:
+exclusive endpoint-window proof that allocates every touched UTC hour and every
+closed billing bucket is complete and internally consistent. Billable coverage
+ends at completion plus the accepted endpoint idle tail, not at job completion;
+the final touched hour must close before settlement. The receipt binds that
+coverage end and accepted tail while startup and observed idle-tail measurements
+remain null because v2 does not return them per job. This makes the current throughput tradeoff explicit:
 Frinz must serialize accepted attempts by endpoint billing window or provision a
 separately attributable endpoint until Runpod exposes finer billing identity.
 See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and

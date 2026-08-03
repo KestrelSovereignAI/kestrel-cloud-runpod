@@ -32,6 +32,7 @@ from .serverless_capacity_contracts import (
     iso_datetime,
     json_sha256,
     parse_datetime,
+    serverless_billing_hour_starts,
     serverless_worker_cost_usd,
 )
 
@@ -167,9 +168,14 @@ class RunpodServerlessCapacityProvider:
             raise RunPodManagerError(
                 "Serverless job execution exceeds the accepted maximum"
             )
-        window_from, window_until = _hour_window(
-            attempt.submitted_at, attempt.completed_at
+        billable_coverage_until = attempt.completed_at + timedelta(
+            seconds=quote.idle_tail_seconds
         )
+        billing_hour_starts = serverless_billing_hour_starts(
+            attempt.submitted_at, billable_coverage_until
+        )
+        window_from = billing_hour_starts[0]
+        window_until = billing_hour_starts[-1] + timedelta(hours=1)
         if now < window_until:
             return None
         page = await asyncio.to_thread(
@@ -195,14 +201,19 @@ class RunpodServerlessCapacityProvider:
             "job_id": attempt.job_id,
             "attempt_id": attempt.attempt_id,
             "exclusive_window_sha256": attempt.exclusive_window_sha256,
+            "exclusive_billing_hour_starts": [
+                iso_datetime(value) for value in billing_hour_starts
+            ],
             "attempt_started_at": iso_datetime(attempt.submitted_at),
             "attempt_completed_at": iso_datetime(attempt.completed_at),
+            "billable_coverage_until": iso_datetime(billable_coverage_until),
             "billing_window_from": iso_datetime(window_from),
             "billing_window_until": iso_datetime(window_until),
             "hourly_worker_rate_usd": decimal_text(quote.hourly_worker_rate_usd),
             "queue_delay_ms": job.delay_time_ms,
             "worker_startup_ms": None,
             "execution_ms": job.execution_time_ms,
+            "accepted_idle_tail_ms": quote.idle_tail_seconds * 1_000,
             "idle_tail_ms": None,
             **{name: decimal_text(value) for name, value in amounts.items()},
         }
@@ -216,14 +227,17 @@ class RunpodServerlessCapacityProvider:
             job_id=attempt.job_id,
             attempt_id=attempt.attempt_id,
             exclusive_window_sha256=attempt.exclusive_window_sha256,
+            exclusive_billing_hour_starts=billing_hour_starts,
             attempt_started_at=attempt.submitted_at,
             attempt_completed_at=attempt.completed_at,
+            billable_coverage_until=billable_coverage_until,
             billing_window_from=window_from,
             billing_window_until=window_until,
             hourly_worker_rate_usd=quote.hourly_worker_rate_usd,
             queue_delay_ms=job.delay_time_ms,
             worker_startup_ms=None,
             execution_ms=job.execution_time_ms,
+            accepted_idle_tail_ms=quote.idle_tail_seconds * 1_000,
             idle_tail_ms=None,
             gpu_cost_usd=amounts["gpu_cost_usd"],
             cpu_cost_usd=amounts["cpu_cost_usd"],
@@ -315,6 +329,8 @@ class RunpodServerlessCapacityProvider:
             "maximum_queue_delay_seconds": request.maximum_queue_delay_seconds,
             "maximum_worker_start_seconds": request.maximum_worker_start_seconds,
             "maximum_execution_seconds": request.maximum_execution_seconds,
+            "job_execution_timeout_ms": request.job_execution_timeout_ms,
+            "job_ttl_ms": request.job_ttl_ms,
             "maximum_billable_seconds": request.maximum_billable_seconds,
             "estimated_non_worker_cost_usd": decimal_text(
                 request.estimated_non_worker_cost_usd
@@ -353,6 +369,8 @@ class RunpodServerlessCapacityProvider:
             maximum_queue_delay_seconds=request.maximum_queue_delay_seconds,
             maximum_worker_start_seconds=request.maximum_worker_start_seconds,
             maximum_execution_seconds=request.maximum_execution_seconds,
+            job_execution_timeout_ms=request.job_execution_timeout_ms,
+            job_ttl_ms=request.job_ttl_ms,
             estimated_billable_seconds=estimated_billable,
             maximum_billable_seconds=request.maximum_billable_seconds,
             estimated_worker_cost_usd=estimated_worker,
@@ -396,6 +414,8 @@ def _validate_request_binding(
         or request.maximum_queue_delay_seconds != quote.maximum_queue_delay_seconds
         or request.maximum_worker_start_seconds != quote.maximum_worker_start_seconds
         or request.maximum_execution_seconds != quote.maximum_execution_seconds
+        or request.job_execution_timeout_ms != quote.job_execution_timeout_ms
+        or request.job_ttl_ms != quote.job_ttl_ms
         or request.maximum_billable_seconds != quote.maximum_billable_seconds
         or request.estimated_non_worker_cost_usd != quote.estimated_non_worker_cost_usd
         or request.maximum_non_worker_cost_usd != quote.maximum_non_worker_cost_usd
@@ -567,16 +587,6 @@ def _validate_terminal_job(
             not isinstance(value, int) or isinstance(value, bool) or value < 0
         ):
             raise RunPodManagerError(f"Serverless job {name} is unsafe")
-
-
-def _hour_window(start: datetime, end: datetime) -> tuple[datetime, datetime]:
-    start_utc = start.astimezone(UTC)
-    end_utc = end.astimezone(UTC)
-    window_from = start_utc.replace(minute=0, second=0, microsecond=0)
-    window_until = end_utc.replace(minute=0, second=0, microsecond=0)
-    if end_utc != window_until:
-        window_until += timedelta(hours=1)
-    return window_from, window_until
 
 
 def _authoritative_amounts(

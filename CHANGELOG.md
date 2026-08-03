@@ -10,6 +10,14 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   endpoint/profile binding, read-only pre-submit drift validation, and complete
   content-free v2 billing receipts for exclusive endpoint windows.
 
+### Fixed
+
+- Extend authoritative Serverless billing coverage through the accepted idle
+  tail, bind every exclusively allocated endpoint-hour bucket into the receipt,
+  and wait for the last touched bucket to close before settlement.
+- Export the public placement enums and Serverless cost/allocation helpers, and
+  reject per-job execution-timeout or TTL policies outside Runpod's bounds.
+
 ## [0.7.0] - 2026-08-02
 
 ### Added

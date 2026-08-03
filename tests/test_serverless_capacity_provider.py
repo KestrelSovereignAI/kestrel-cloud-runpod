@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -251,6 +251,20 @@ async def test_submission_validation_rejects_rate_pool_workload_and_expiry_drift
             accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
         )
 
+    with pytest.raises(RunPodManagerError, match="workload or configured profile"):
+        await provider.validate_quote_for_submission(
+            request(job_execution_timeout_ms=119_000),
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+
+    with pytest.raises(RunPodManagerError, match="workload or configured profile"):
+        await provider.validate_quote_for_submission(
+            request(job_ttl_ms=301_000),
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+
     clock.value = accepted.expires_at
     with pytest.raises(RunPodManagerError, match="expired"):
         await provider.validate_quote_for_submission(
@@ -317,6 +331,42 @@ def _terminal_job(**changes: object) -> ServerlessJob:
     return ServerlessJob(**values)  # type: ignore[arg-type]
 
 
+def _two_hour_billing_page() -> BillingPage:
+    records = tuple(
+        {
+            "startTime": f"2026-08-03T{hour:02d}:00:00+00:00",
+            "endTime": f"2026-08-03T{hour + 1:02d}:00:00+00:00",
+            "serverlessId": "endpoint-selfie-01",
+            "totalAmount": 0.0115,
+            "gpuAmount": 0.010,
+            "cpuAmount": 0.0,
+            "diskAmount": 0.0005,
+            "feeAmount": 0.001,
+        }
+        for hour in (10, 11)
+    )
+    return BillingPage(
+        records=records,
+        metadata={
+            "query": {
+                "startTime": "2026-08-03T10:00:00+00:00",
+                "endTime": "2026-08-03T12:00:00+00:00",
+                "bucketSize": "hour",
+                "serverlessId": "endpoint-selfie-01",
+            },
+            "recordCount": 2,
+            "uniqueServerlessCount": 1,
+            "totals": {
+                "totalAmount": 0.023,
+                "gpuAmount": 0.020,
+                "cpuAmount": 0.0,
+                "diskAmount": 0.001,
+                "feeAmount": 0.002,
+            },
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -> None:
     clock = MutableClock()
@@ -346,7 +396,14 @@ async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -
     assert receipt.queue_delay_ms == 2_000
     assert receipt.worker_startup_ms is None
     assert receipt.execution_ms == 30_000
+    assert receipt.accepted_idle_tail_ms == 10_000
     assert receipt.idle_tail_ms is None
+    assert receipt.billable_coverage_until == billing_attempt.completed_at + timedelta(
+        seconds=accepted.idle_tail_seconds
+    )
+    assert receipt.exclusive_billing_hour_starts == (
+        datetime(2026, 8, 3, 10, tzinfo=UTC),
+    )
     assert billing_calls == [
         {
             "start_time": "2026-08-03T10:00:00+00:00",
@@ -364,6 +421,76 @@ async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -
     serialized = json.dumps(receipt.to_dict()).lower()
     assert "must-not-serialize" not in serialized
     assert "prompt" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_final_billing_reserves_idle_tail_across_hour_boundary() -> None:
+    clock = MutableClock()
+    quote_clock = MutableClock()
+    quote_clock.value = datetime(2026, 8, 3, 10, 57, 30, tzinfo=UTC)
+    accepted = quote(quote_clock)
+    billing_attempt = attempt(
+        accepted,
+        submitted_at=datetime(2026, 8, 3, 10, 58, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 3, 10, 59, 55, tzinfo=UTC),
+    )
+    billing_calls: list[dict[str, object]] = []
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(
+            serverless_billing=lambda **kwargs: (
+                billing_calls.append(kwargs) or _two_hour_billing_page()
+            )
+        ),
+        job_client=SimpleNamespace(status=lambda *_: _terminal_job()),
+        clock=clock,
+    )
+
+    clock.value = datetime(2026, 8, 3, 11, 59, 59, tzinfo=UTC)
+    assert await provider.final_billing(billing_attempt, accepted) is None
+    assert billing_calls == []
+
+    clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
+    receipt = await provider.final_billing(billing_attempt, accepted)
+
+    assert receipt is not None
+    assert receipt.billable_coverage_until == datetime(2026, 8, 3, 11, 0, 5, tzinfo=UTC)
+    assert receipt.accepted_idle_tail_ms == 10_000
+    assert receipt.idle_tail_ms is None
+    assert receipt.exclusive_billing_hour_starts == (
+        datetime(2026, 8, 3, 10, tzinfo=UTC),
+        datetime(2026, 8, 3, 11, tzinfo=UTC),
+    )
+    assert billing_calls == [
+        {
+            "start_time": "2026-08-03T10:00:00+00:00",
+            "end_time": "2026-08-03T12:00:00+00:00",
+            "bucket_size": "hour",
+            "endpoint_id": "endpoint-selfie-01",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_billing_rejects_exclusivity_missing_idle_tail_hour() -> None:
+    clock = MutableClock()
+    clock.value = datetime(2026, 8, 3, 12, tzinfo=UTC)
+    quote_clock = MutableClock()
+    quote_clock.value = datetime(2026, 8, 3, 10, 57, 30, tzinfo=UTC)
+    accepted = quote(quote_clock)
+    incomplete = attempt(
+        accepted,
+        submitted_at=datetime(2026, 8, 3, 10, 58, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 3, 10, 59, 55, tzinfo=UTC),
+        exclusive_billing_hour_starts=(datetime(2026, 8, 3, 10, tzinfo=UTC),),
+    )
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(),
+        job_client=SimpleNamespace(),
+        clock=clock,
+    )
+
+    with pytest.raises(RunPodManagerError, match="does not reserve every"):
+        await provider.final_billing(incomplete, accepted)
 
 
 @pytest.mark.asyncio

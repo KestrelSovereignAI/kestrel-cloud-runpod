@@ -18,12 +18,20 @@ from serverless_capacity_test_support import (
     request,
 )
 
-from kestrel_cloud_runpod.models import Availability, RunPodManagerError
+import kestrel_cloud_runpod
+from kestrel_cloud_runpod.models import Availability, CloudType, RunPodManagerError
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
     serverless_worker_cost_usd,
 )
+
+
+def test_public_package_exports_serverless_construction_dependencies() -> None:
+    assert kestrel_cloud_runpod.Availability is Availability
+    assert kestrel_cloud_runpod.CloudType is CloudType
+    assert kestrel_cloud_runpod.serverless_worker_cost_usd is serverless_worker_cost_usd
+    assert callable(kestrel_cloud_runpod.serverless_billing_hour_starts)
 
 
 def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math() -> None:
@@ -35,6 +43,8 @@ def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math() -> N
     assert item.maximum_worker_cost_usd == Decimal("0.034500")
     assert item.estimated_cost_usd == Decimal("0.019667")
     assert item.cost_ceiling_usd == Decimal("0.035500")
+    assert item.job_execution_timeout_ms == 120_000
+    assert item.job_ttl_ms == 300_000
     assert ServerlessCapacityQuote.from_dict(serialized).to_dict() == serialized
 
 
@@ -128,6 +138,62 @@ def test_request_requires_bounded_queue_billable_and_non_worker_estimates() -> N
             maximum_execution_seconds=121,
             maximum_worker_start_seconds=169,
             maximum_billable_seconds=300,
+            job_execution_timeout_ms=121_000,
+        )
+
+
+def test_serverless_job_policy_accepts_provider_boundaries_and_rejects_overflow() -> (
+    None
+):
+    minimum_profile = profile(execution_timeout_ms=5_000)
+    request(
+        profile=minimum_profile,
+        estimated_execution_seconds=5,
+        maximum_execution_seconds=5,
+        maximum_billable_seconds=135,
+        job_execution_timeout_ms=5_000,
+    )
+    request(
+        estimated_queue_delay_seconds=4,
+        estimated_worker_start_seconds=1,
+        estimated_execution_seconds=5,
+        maximum_queue_delay_seconds=4,
+        maximum_worker_start_seconds=1,
+        maximum_execution_seconds=5,
+        maximum_billable_seconds=16,
+        job_ttl_ms=10_000,
+    )
+    maximum_profile = profile(execution_timeout_ms=604_800_000)
+    request(
+        profile=maximum_profile,
+        job_execution_timeout_ms=604_800_000,
+        job_ttl_ms=604_800_000,
+    )
+
+    for timeout_ms in (4_999, 604_800_001):
+        with pytest.raises(ValueError, match="between 5 seconds and 7 days"):
+            profile(execution_timeout_ms=timeout_ms)
+        with pytest.raises(ValueError, match="between 5 seconds and 7 days"):
+            request(job_execution_timeout_ms=timeout_ms)
+    for ttl_ms in (9_999, 604_800_001):
+        with pytest.raises(ValueError, match="between 10 seconds and 7 days"):
+            request(job_ttl_ms=ttl_ms)
+
+    request(job_ttl_ms=290_000)
+    with pytest.raises(ValueError, match="maximum job lifespan"):
+        request(job_ttl_ms=289_999)
+    with pytest.raises(ValueError, match="maximum job lifespan"):
+        request(
+            profile=maximum_profile,
+            estimated_queue_delay_seconds=1,
+            maximum_queue_delay_seconds=1,
+            maximum_worker_start_seconds=1,
+            estimated_worker_start_seconds=1,
+            estimated_execution_seconds=604_799,
+            maximum_execution_seconds=604_799,
+            maximum_billable_seconds=604_810,
+            job_execution_timeout_ms=604_800_000,
+            job_ttl_ms=604_800_000,
         )
 
 
@@ -179,8 +245,11 @@ def _receipt() -> ServerlessBillingReceipt:
         job_id=billing_attempt.job_id,
         attempt_id=billing_attempt.attempt_id,
         exclusive_window_sha256=billing_attempt.exclusive_window_sha256,
+        exclusive_billing_hour_starts=(billing_attempt.exclusive_billing_hour_starts),
         attempt_started_at=billing_attempt.submitted_at,
         attempt_completed_at=billing_attempt.completed_at,
+        billable_coverage_until=billing_attempt.completed_at
+        + timedelta(seconds=item.idle_tail_seconds),
         billing_window_from=billing_attempt.submitted_at.replace(
             minute=0, second=0, microsecond=0
         ),
@@ -192,6 +261,7 @@ def _receipt() -> ServerlessBillingReceipt:
         queue_delay_ms=2_000,
         worker_startup_ms=None,
         execution_ms=30_000,
+        accepted_idle_tail_ms=item.idle_tail_seconds * 1_000,
         idle_tail_ms=None,
         gpu_cost_usd=Decimal("0.02"),
         cpu_cost_usd=Decimal(0),
@@ -211,6 +281,7 @@ def test_receipt_round_trip_keeps_unobservable_components_null_and_content_free(
     receipt = _receipt()
     serialized = receipt.to_dict()
     assert serialized["worker_startup_ms"] is None
+    assert serialized["accepted_idle_tail_ms"] == 10_000
     assert serialized["idle_tail_ms"] is None
     assert ServerlessBillingReceipt.from_dict(serialized).to_dict() == serialized
     with pytest.raises(RunPodManagerError, match="unsupported"):

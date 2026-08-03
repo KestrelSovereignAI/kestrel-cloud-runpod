@@ -20,6 +20,7 @@ from kestrel_cloud_runpod.serverless_capacity_contracts import (
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
     ServerlessEndpointProfile,
+    serverless_billing_hour_starts,
     serverless_worker_cost_usd,
 )
 
@@ -85,6 +86,8 @@ def request(**changes: object) -> ServerlessCapacityQuoteRequest:
         "maximum_worker_start_seconds": 120,
         "maximum_execution_seconds": 50,
         "maximum_billable_seconds": 180,
+        "job_execution_timeout_ms": 120_000,
+        "job_ttl_ms": 300_000,
         "estimated_non_worker_cost_usd": Decimal("0.000500"),
         "maximum_non_worker_cost_usd": Decimal("0.001000"),
         "quote_ttl_seconds": 60,
@@ -183,6 +186,8 @@ def quote(clock: MutableClock | None = None) -> ServerlessCapacityQuote:
         maximum_queue_delay_seconds=120,
         maximum_worker_start_seconds=120,
         maximum_execution_seconds=50,
+        job_execution_timeout_ms=120_000,
+        job_ttl_ms=300_000,
         estimated_billable_seconds=100,
         maximum_billable_seconds=180,
         estimated_worker_cost_usd=estimated_worker,
@@ -196,14 +201,27 @@ def quote(clock: MutableClock | None = None) -> ServerlessCapacityQuote:
     )
 
 
-def attempt(item: ServerlessCapacityQuote | None = None) -> ServerlessBillingAttempt:
+def attempt(
+    item: ServerlessCapacityQuote | None = None, **changes: object
+) -> ServerlessBillingAttempt:
     selected = item or quote()
-    return ServerlessBillingAttempt(
-        attempt_id="attempt-selfie-0001",
-        job_id="job-selfie-0001",
-        endpoint_id=selected.endpoint_id,
-        provider_quote_id=selected.provider_quote_id,
-        exclusive_window_sha256="e" * 64,
-        submitted_at=datetime(2026, 8, 3, 10, 0, 30, tzinfo=UTC),
-        completed_at=datetime(2026, 8, 3, 10, 4, tzinfo=UTC),
-    )
+    values: dict[str, object] = {
+        "attempt_id": "attempt-selfie-0001",
+        "job_id": "job-selfie-0001",
+        "endpoint_id": selected.endpoint_id,
+        "provider_quote_id": selected.provider_quote_id,
+        "exclusive_window_sha256": "e" * 64,
+        "submitted_at": datetime(2026, 8, 3, 10, 0, 30, tzinfo=UTC),
+        "completed_at": datetime(2026, 8, 3, 10, 4, tzinfo=UTC),
+    }
+    values.update(changes)
+    if "exclusive_billing_hour_starts" not in changes:
+        completed_at = values["completed_at"]
+        submitted_at = values["submitted_at"]
+        assert isinstance(completed_at, datetime)
+        assert isinstance(submitted_at, datetime)
+        values["exclusive_billing_hour_starts"] = serverless_billing_hour_starts(
+            submitted_at,
+            completed_at + timedelta(seconds=selected.idle_tail_seconds),
+        )
+    return ServerlessBillingAttempt(**values)  # type: ignore[arg-type]

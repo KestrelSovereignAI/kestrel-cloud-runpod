@@ -38,6 +38,8 @@ from .feature import RunPodFeature
 from .inference_provider import RunpodInferenceLeaseProvider
 from .manager import RunPodManager
 from .models import (
+    Availability,
+    CloudType,
     FlashBoot,
     GPUProfile,
     PlacementRequirements,
@@ -115,6 +117,8 @@ from .serverless_capacity_contracts import (
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
     ServerlessEndpointProfile,
+    serverless_billing_hour_starts,
+    serverless_worker_cost_usd,
 )
 from .serverless_capacity_provider import RunpodServerlessCapacityProvider
 from .training_contracts import (
@@ -138,6 +142,7 @@ except PackageNotFoundError:
 __all__ = [
     "SERVERLESS_CAPACITY_CONTRACT_VERSION",
     "SERVERLESS_CAPACITY_SCHEMA_VERSION",
+    "Availability",
     "CatalogAttemptCapability",
     "CatalogAttemptCapabilityStore",
     "CatalogPodCapacityRequest",
@@ -147,6 +152,7 @@ __all__ = [
     "CatalogPodWorkloadState",
     "CatalogPodWorkloadTransport",
     "CatalogWorkerEvidence",
+    "CloudType",
     "CreatedPodCapacity",
     "FlashBoot",
     "GPUProfile",
@@ -219,4 +225,6 @@ __all__ = [
     "__version__",
     "pod_capacity_database_path",
     "pod_cost_usd",
+    "serverless_billing_hour_starts",
+    "serverless_worker_cost_usd",
 ]
