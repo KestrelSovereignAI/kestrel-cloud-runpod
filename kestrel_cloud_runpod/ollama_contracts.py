@@ -460,6 +460,12 @@ class OllamaLease:
     termination_reason: str | None
     teardown_attempts: int
     revision: int
+    # How many GPUs the placement attaches. ``offered_rate_per_hr`` stays the
+    # catalog's PER-GPU price, exactly as /catalog/gpus reported it, so the
+    # count is carried alongside rather than folded in - a stored rate that
+    # silently meant something new would misread every existing row. Defaults
+    # to a single GPU, which is what every pre-existing lease had.
+    placement_gpu_count: int = 1
 
     @property
     def public_route_url(self) -> str | None:
@@ -620,10 +626,24 @@ def select_ollama_plan(
                 )
             )
     pod = decisions.get(ComputeProduct.POD)
-    if pod is not None and request.mode in {
-        OllamaLeaseMode.AUTO,
-        OllamaLeaseMode.DEDICATED_POD,
-    }:
+    # A Pod bills continuously from provisioning to its hard deadline, so its
+    # estimate is the expected session and its ceiling is the time actually
+    # left. Once less time remains than the session needs, no honest Pod plan
+    # exists: constructing one would trip the plan's own
+    # maximum >= estimate invariant and raise out of select_ollama_plan. That
+    # escapes _provision_requested and reconcile(), which both catch only
+    # RunPodManagerError, poisoning the whole reconcile pass and stranding
+    # every later lease - including READY ones holding a running Pod past its
+    # deadline. Decline the candidate instead; Serverless may still be viable.
+    if (
+        pod is not None
+        and remaining_seconds >= request.expected_session_seconds
+        and request.mode
+        in {
+            OllamaLeaseMode.AUTO,
+            OllamaLeaseMode.DEDICATED_POD,
+        }
+    ):
         policy = _required_non_compute_cost_policy(
             non_compute_cost_policies,
             OllamaLeaseMode.DEDICATED_POD,
@@ -718,6 +738,7 @@ def accrued_cost(lease: OllamaLease, now: datetime) -> float:
         Decimal(str(lease.offered_rate_per_hr))
         * Decimal(str(elapsed))
         * Decimal(multiplier)
+        * Decimal(lease.placement_gpu_count)
         / Decimal(3600)
     )
 

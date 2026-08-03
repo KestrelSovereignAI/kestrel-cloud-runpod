@@ -172,7 +172,11 @@ class RunpodInferenceLeaseProvider:
                 item[0].mode.value,
             ),
         )
-        hourly = _money(plan.placement.offered_cost_per_hr)
+        # The SDK enforces max_hourly_cost_usd against this field, so it must
+        # be what the lease actually burns per hour. /catalog/gpus prices per
+        # GPU, so a multi-GPU placement burns that multiple - reporting the
+        # per-unit price let a 2-GPU placement pass a cap it exceeds outright.
+        hourly = _money(plan.placement.offered_cost_per_hr * plan.placement.gpu_count)
         total = _money(plan.estimated_cost)
         readiness_deadline = request.requested_at + timedelta(
             seconds=request.ready_deadline_seconds
@@ -498,7 +502,12 @@ class RunpodInferenceLeaseProvider:
         expected_session_seconds = request.expected_session_seconds
         if mode is OllamaLeaseMode.DEDICATED_POD:
             expected_session_seconds += ready_seconds
-        hourly_limit = float(max_hourly_cost)
+        # select_gpu and validate_plan both compare this against the catalog's
+        # PER-GPU price, so convert the caller's whole-lease cap into a per-GPU
+        # budget. Comparing a lease cap against a unit price authorized
+        # gpu_count times the intended spend.
+        gpu_count = max(1, int(policy.profile.gpu_count))
+        hourly_limit = float(max_hourly_cost) / gpu_count
         if policy.profile.max_cost_per_hr is not None:
             hourly_limit = min(hourly_limit, policy.profile.max_cost_per_hr)
         return OllamaLeaseRequest(
@@ -848,7 +857,13 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
         raise InferenceLeaseProvisioningError(
             "Runpod inference lease has corrupt durable constraints"
         )
-    hourly = lease.offered_rate_per_hr
+    # offered_rate_per_hr is the catalog's PER-GPU price; the lease burns it
+    # once per attached GPU.
+    hourly = (
+        None
+        if lease.offered_rate_per_hr is None
+        else lease.offered_rate_per_hr * lease.placement_gpu_count
+    )
     if hourly is None:
         raw_hourly = constraints.get("max_hourly_rate")
         if not isinstance(raw_hourly, (int, float)) or isinstance(raw_hourly, bool):

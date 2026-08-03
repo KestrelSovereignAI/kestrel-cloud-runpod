@@ -175,6 +175,7 @@ class OllamaLeaseService:
             provision_attempts=lease.provision_attempts + 1,
             provisioning_started_at=now,
             offered_rate_per_hr=plan.placement.offered_cost_per_hr,
+            placement_gpu_count=plan.placement.gpu_count,
             estimated_cost=plan.estimated_cost,
             estimated_compute_cost=plan.estimated_compute_cost,
             maximum_compute_cost=plan.maximum_compute_cost,

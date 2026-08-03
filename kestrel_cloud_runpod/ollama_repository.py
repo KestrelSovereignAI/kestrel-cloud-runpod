@@ -55,6 +55,7 @@ class SQLiteOllamaLeaseRepository:
             "model_pull_attempts",
             "model_ready_at",
             "offered_rate_per_hr",
+            "placement_gpu_count",
             "estimated_cost",
             "estimated_compute_cost",
             "maximum_compute_cost",
@@ -131,6 +132,7 @@ class SQLiteOllamaLeaseRepository:
                     serverless_idle_tail_seconds INTEGER NOT NULL,
                     idle_timeout_seconds INTEGER NOT NULL,
                     offered_rate_per_hr REAL,
+                    placement_gpu_count INTEGER NOT NULL DEFAULT 1,
                     estimated_cost REAL,
                     estimated_compute_cost REAL,
                     maximum_compute_cost REAL,
@@ -180,6 +182,9 @@ class SQLiteOllamaLeaseRepository:
                 "cost_policy_components_json": "TEXT",
                 "maximum_concurrent_workers": "INTEGER",
                 "maximum_billable_seconds": "INTEGER",
+                # Existing rows predate multi-GPU rating and were all single
+                # GPU, so the default is both correct and conservative.
+                "placement_gpu_count": "INTEGER NOT NULL DEFAULT 1",
             }
             for name, column_type in additive_columns.items():
                 if name not in columns:
@@ -426,6 +431,12 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         serverless_idle_tail_seconds=row["serverless_idle_tail_seconds"],
         idle_timeout_seconds=row["idle_timeout_seconds"],
         offered_rate_per_hr=row["offered_rate_per_hr"],
+        placement_gpu_count=(
+            row["placement_gpu_count"]
+            if "placement_gpu_count" in row.keys()
+            and row["placement_gpu_count"] is not None
+            else 1
+        ),
         estimated_cost=row["estimated_cost"],
         estimated_compute_cost=row["estimated_compute_cost"],
         maximum_compute_cost=row["maximum_compute_cost"],

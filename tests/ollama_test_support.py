@@ -205,21 +205,26 @@ def serverless_plan(
     maximum_compute_cost: float | None = None,
     estimated_non_compute_cost: float = 0.0,
     maximum_non_compute_cost: float = 0.0,
+    gpu_count: int = 1,
 ) -> OllamaPlacementPlan:
     decision = make_decision(
         ComputeProduct.SERVERLESS,
         rate=rate,
         gpu_id="gpu-serverless",
         pool="pool-24",
+        gpu_count=gpu_count,
     )
     compute_ceiling = (
         estimated_cost if maximum_compute_cost is None else maximum_compute_cost
     )
+    # Costs are rated as rate x seconds x gpu_count / 3600, so the seconds that
+    # produce a given cost shrink as GPUs are added.
+    unit_rate = Decimal(str(rate)) * Decimal(gpu_count)
     estimated_billable_seconds = round(
-        Decimal(str(estimated_cost)) * Decimal(3600) / Decimal(str(rate))
+        Decimal(str(estimated_cost)) * Decimal(3600) / unit_rate
     )
     maximum_billable_seconds = round(
-        Decimal(str(compute_ceiling)) * Decimal(3600) / Decimal(str(rate))
+        Decimal(str(compute_ceiling)) * Decimal(3600) / unit_rate
     )
     estimated_total = float(
         Decimal(str(estimated_cost)) + Decimal(str(estimated_non_compute_cost))

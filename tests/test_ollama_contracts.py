@@ -1,5 +1,6 @@
 """Cost selection and public-route contracts for Ollama leases."""
 
+from datetime import timedelta
 from dataclasses import replace
 
 import pytest
@@ -13,7 +14,12 @@ from ollama_test_support import (
 
 from kestrel_cloud_runpod.models import ComputeProduct, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaLease,
     OllamaLeaseMode,
+    OllamaLeaseState,
+    OllamaResourceType,
+    OllamaTeardownState,
+    accrued_cost,
     OllamaPlacementPlan,
     OllamaResourceType,
     canonical_model_name,
@@ -437,3 +443,152 @@ def test_serverless_gpu_count_and_worker_ceiling_stay_orthogonal():
         base.estimated_compute_cost
     )
     assert more_workers.maximum_billable_seconds > base.maximum_billable_seconds
+
+
+def test_pod_candidate_declines_when_time_cannot_cover_the_session():
+    """A Pod whose ceiling would fall below its estimate must not be built.
+
+    Constructing it trips the plan's own maximum >= estimate invariant and
+    raises ValueError out of select_ollama_plan. Neither _provision_requested
+    nor reconcile() catches anything but RunPodManagerError, so that escape
+    poisons the whole reconcile pass and strands every later lease - including
+    READY ones holding a running Pod past its hard deadline.
+    """
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        expected_session_seconds=900,
+        readiness_timeout_seconds=1800,
+        hard_deadline=clock() + timedelta(seconds=2400),
+        max_authorized_cost=50.0,
+    )
+    # 1600s elapsed: only 800s remain, less than the 900s session.
+    planned_at = clock() + timedelta(seconds=1600)
+
+    plan = select_ollama_plan(
+        request,
+        {
+            ComputeProduct.SERVERLESS: make_decision(
+                ComputeProduct.SERVERLESS, rate=1.0, gpu_id="sl", pool="pool-24"
+            ),
+            ComputeProduct.POD: make_decision(
+                ComputeProduct.POD, rate=0.1, gpu_id="pod", pool=None
+            ),
+        },
+        non_compute_cost_policies=non_compute_cost_policies(),
+        planned_at=planned_at,
+        serverless_max_workers=1,
+    )
+
+    # The cheaper Pod is declined rather than raising; Serverless still wins.
+    assert plan.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+
+
+def test_accrued_cost_bills_every_gpu_in_the_placement():
+    """The runtime cost gate must not understate a multi-GPU lease.
+
+    offered_rate_per_hr is the catalog's per-GPU price, so omitting the count
+    left authorized_cost_exposure inert until gpu_count times the intended
+    spend had already accrued.
+    """
+    clock = MutableClock()
+    started = clock()
+    base = dict(
+        offered_rate_per_hr=1.0,
+        provisioning_started_at=started,
+        hard_deadline=started + timedelta(hours=4),
+        maximum_concurrent_workers=1,
+        accrued_estimated_cost=0.0,
+    )
+    single = replace(_accrual_lease(), **base, placement_gpu_count=1)
+    quad = replace(_accrual_lease(), **base, placement_gpu_count=4)
+    now = started + timedelta(hours=1)
+
+    assert accrued_cost(single, now) == pytest.approx(1.0)
+    assert accrued_cost(quad, now) == pytest.approx(4.0)
+
+
+def _accrual_lease() -> OllamaLease:
+    """A minimally populated READY lease for accrual arithmetic."""
+    clock = MutableClock()
+    now = clock()
+    return OllamaLease(
+        lease_id="lease-accrual",
+        owner_id="owner-1",
+        workload_id="workload-1",
+        request_fingerprint="fp",
+        model="qwen3:8b",
+        constraints_json="{}",
+        mode=OllamaLeaseMode.DEDICATED_POD,
+        resource_type=OllamaResourceType.POD,
+        provider_resource_id="pod-1",
+        resource_name="kestrel-ollama-1",
+        creation_uncertain=False,
+        provision_attempt_id="attempt-1",
+        provision_attempts=1,
+        route_url=None,
+        provider_health_url=None,
+        state=OllamaLeaseState.READY,
+        teardown_state=OllamaTeardownState.NOT_REQUESTED,
+        created_at=now,
+        updated_at=now,
+        provisioning_started_at=now,
+        ready_at=now,
+        last_used_at=now,
+        idle_deadline=now + timedelta(hours=1),
+        hard_deadline=now + timedelta(hours=4),
+        readiness_deadline=now + timedelta(minutes=30),
+        model_pull_started_at=None,
+        model_pull_attempts=0,
+        model_ready_at=None,
+        expected_session_seconds=3600,
+        expected_active_seconds=300,
+        serverless_initialization_seconds=60,
+        serverless_idle_tail_seconds=30,
+        idle_timeout_seconds=300,
+        offered_rate_per_hr=1.0,
+        estimated_cost=1.0,
+        estimated_compute_cost=1.0,
+        maximum_compute_cost=4.0,
+        estimated_non_compute_cost=0.0,
+        maximum_non_compute_cost=0.0,
+        cost_ceiling=4.0,
+        cost_policy_components=(),
+        maximum_concurrent_workers=1,
+        estimated_billable_seconds=3600,
+        maximum_billable_seconds=14400,
+        accrued_estimated_cost=0.0,
+        max_authorized_cost=50.0,
+        cold_start_seconds=None,
+        selected_gpu_id="pod",
+        selected_gpu_pool=None,
+        selected_gpu_name="pod",
+        catalog_observed_at=now,
+        last_provider_error=None,
+        termination_reason=None,
+        teardown_attempts=0,
+        revision=1,
+    )
+
+
+def test_pod_capacity_quote_authorizes_every_gpu():
+    """A catalog Pod reserves per-GPU rate x count, not the unit price.
+
+    /catalog/gpus lists price.secure per GPU with maxCount as a separate
+    attachment limit, and the Pod is created with every GPU the constraints
+    ask for, so rating without the count authorized a 4-GPU Pod at a quarter
+    of its real cost - and the quote's own derivation check re-used the same
+    GPU-blind formula, so the understated quote validated cleanly.
+    """
+    from decimal import Decimal
+
+    from kestrel_cloud_runpod.pod_capacity_contracts import pod_cost_usd
+
+    one_hour = 3600
+    assert pod_cost_usd(Decimal("0.44"), one_hour, 1) == Decimal("0.440000")
+    assert pod_cost_usd(Decimal("0.44"), one_hour, 4) == Decimal("1.760000")
+    # Rounding must never favour the payer: authorization rounds up.
+    assert pod_cost_usd(Decimal("0.44"), 1, 3) > Decimal("0.000366")
+    for bad in (0, -1, True):
+        with pytest.raises(ValueError, match="Pod cost inputs are invalid"):
+            pod_cost_usd(Decimal("0.44"), one_hour, bad)

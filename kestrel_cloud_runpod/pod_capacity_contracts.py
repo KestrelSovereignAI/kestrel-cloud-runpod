@@ -273,9 +273,13 @@ class PodCapacityQuote:
         )
         if estimated_seconds > self.maximum_runtime_seconds:
             raise ValueError("Pod capacity quote estimate exceeds maximum runtime")
-        expected_estimate = pod_cost_usd(self.hourly_cost_usd, estimated_seconds)
+        expected_estimate = pod_cost_usd(
+            self.hourly_cost_usd, estimated_seconds, self.placement.gpu_count
+        )
         expected_ceiling = pod_cost_usd(
-            self.hourly_cost_usd, self.maximum_runtime_seconds
+            self.hourly_cost_usd,
+            self.maximum_runtime_seconds,
+            self.placement.gpu_count,
         )
         if (
             self.estimated_cost_usd != expected_estimate
@@ -1673,8 +1677,18 @@ def decimal_text(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
-def pod_cost_usd(hourly_cost_usd: Decimal, billed_seconds: int) -> Decimal:
-    """Round a rate-derived upper bound up so reservations never underfund."""
+def pod_cost_usd(
+    hourly_cost_usd: Decimal, billed_seconds: int, gpu_count: int = 1
+) -> Decimal:
+    """Round a rate-derived upper bound up so reservations never underfund.
+
+    ``hourly_cost_usd`` is the catalog's **per-GPU** price - ``/catalog/gpus``
+    lists ``price.secure``/``price.community`` per unit, with ``maxCount`` as a
+    separate attachment limit - and the Pod is created with every GPU the
+    constraints ask for. Rating without ``gpu_count`` authorized a 4-GPU Pod at
+    a quarter of its real cost, and the quote's own derivation check re-used
+    the same GPU-blind formula, so the understated quote validated cleanly.
+    """
 
     if (
         not hourly_cost_usd.is_finite()
@@ -1682,9 +1696,14 @@ def pod_cost_usd(hourly_cost_usd: Decimal, billed_seconds: int) -> Decimal:
         or not isinstance(billed_seconds, int)
         or isinstance(billed_seconds, bool)
         or billed_seconds < 0
+        or not isinstance(gpu_count, int)
+        or isinstance(gpu_count, bool)
+        or gpu_count < 1
     ):
         raise ValueError("Pod cost inputs are invalid")
-    value = hourly_cost_usd * Decimal(billed_seconds) / Decimal(3600)
+    value = (
+        hourly_cost_usd * Decimal(billed_seconds) * Decimal(gpu_count) / Decimal(3600)
+    )
     return value.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
 
 

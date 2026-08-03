@@ -151,8 +151,10 @@ class RunpodPodCapacityProvider:
         estimated_seconds = (
             request.estimated_startup_seconds + request.estimated_execution_seconds
         )
-        estimated = pod_cost_usd(hourly, estimated_seconds)
-        ceiling = pod_cost_usd(hourly, request.maximum_runtime_seconds)
+        estimated = pod_cost_usd(hourly, estimated_seconds, placement.gpu_count)
+        ceiling = pod_cost_usd(
+            hourly, request.maximum_runtime_seconds, placement.gpu_count
+        )
         identity = {
             "capability_version": "runpod-pod-capacity-v1",
             "workload_kind": request.workload_kind,

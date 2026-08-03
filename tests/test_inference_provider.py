@@ -647,3 +647,41 @@ async def test_positive_cost_refusal_never_provisions(tmp_path):
         await adapter.quote(request)
 
     assert capacity.provision_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sdk_quote_hourly_cost_covers_every_gpu_in_the_placement(tmp_path):
+    """``hourly_cost_usd`` is what the SDK enforces ``max_hourly_cost_usd`` on.
+
+    /catalog/gpus prices per GPU, so reporting the unit price let a multi-GPU
+    placement pass an hourly cap it exceeds outright — the endpoint really is
+    created with ``gpu_count`` GPUs. The total-cost dimension was already
+    corrected; this is the hourly dimension the SDK guards independently.
+    """
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.8, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+
+    quote = await adapter.quote(_request(clock))
+
+    # 0.8/GPU/hr across 2 GPUs is 1.60/hr, not 0.80.
+    assert quote.hourly_cost_usd == Decimal("1.6")
+
+
+@pytest.mark.asyncio
+async def test_sdk_quote_rejects_a_multi_gpu_placement_over_the_hourly_cap(
+    tmp_path,
+):
+    """The cap must bind on the whole lease, not on one GPU of it."""
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.8, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+
+    quote = await adapter.quote(_request(clock, max_hourly_cost_usd=Decimal("1.00")))
+
+    with pytest.raises(InferenceLeaseConstraintError, match="hourly"):
+        quote.validate_for(_request(clock, max_hourly_cost_usd=Decimal("1.00")))
