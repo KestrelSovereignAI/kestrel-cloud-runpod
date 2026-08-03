@@ -39,7 +39,7 @@ _DIGEST = "a" * 64
 _ROUTE_KEY = "route-only-key-which-is-longer-than-32-characters"
 
 
-def _profile() -> GPUProfile:
+def _profile(gpu_count: int = 1) -> GPUProfile:
     return GPUProfile(
         id="ollama",
         name="Private Ollama",
@@ -53,6 +53,7 @@ def _profile() -> GPUProfile:
         ports=["11434/http"],
         inference_port=11434,
         min_vram_gb=24,
+        gpu_count=gpu_count,
         allowed_data_center_ids=("US-TX-3",),
         max_context_window=32768,
         env={"KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@sha256:{_DIGEST}"},
@@ -87,7 +88,7 @@ def _request(clock: MutableClock, **changes) -> InferenceLeaseRequest:
     return replace(request, **changes)
 
 
-def _adapter(tmp_path, clock, capacity=None):
+def _adapter(tmp_path, clock, capacity=None, gpu_count=1):
     capacity = capacity or FakeOllamaProvider(serverless_plan())
     service = OllamaLeaseService(
         repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
@@ -98,7 +99,7 @@ def _adapter(tmp_path, clock, capacity=None):
     )
     adapter = RunpodInferenceLeaseProvider(
         service=service,
-        profile=_profile(),
+        profile=_profile(gpu_count),
         settings=_settings(),
         route_key=lambda resource_type: (
             _ROUTE_KEY
@@ -744,3 +745,59 @@ async def test_durable_lease_hourly_cost_covers_every_gpu(tmp_path):
     # Re-read through the SDK surface: the hourly cost must be the whole lease.
     reloaded = await adapter.status(request.owner_id, lease.lease_id)
     assert reloaded.hourly_cost_usd == D("1.6")
+
+
+@pytest.mark.asyncio
+async def test_profile_gpu_count_converts_the_caller_cap_to_a_per_gpu_budget(
+    tmp_path,
+):
+    """select_gpu and validate_plan compare against the PER-GPU catalog price.
+
+    Passing the caller's whole-lease cap through unconverted authorized
+    gpu_count times the intended spend. This exercises the PROFILE's GPU
+    count, which the other multi-GPU tests never vary — they only change the
+    fake plan's placement.
+    """
+    from decimal import Decimal as D
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, service, _c = _adapter(tmp_path, clock, capacity=capacity, gpu_count=2)
+    request = _request(clock, max_hourly_cost_usd=D("1.00"))
+
+    quote = await adapter.quote(request)
+    lease = await adapter.acquire(request, quote)
+
+    stored = service.repository.get(lease.lease_id)
+    constraints = json.loads(stored.constraints_json)
+    # $1.00/hr across 2 GPUs is a $0.50/GPU budget, not $1.00/GPU.
+    assert constraints["max_hourly_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_unprovisioned_lease_reports_the_whole_lease_hourly_cost(tmp_path):
+    """A row that never reached PROVISIONING still owes an honest hourly cost.
+
+    _lease_costs falls back to the durable per-GPU budget; returning it
+    unscaled understated the SDK's hourly bound by gpu_count for exactly the
+    crash/cancel window this module exists to survive.
+    """
+    from decimal import Decimal as D
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, service, _c = _adapter(tmp_path, clock, capacity=capacity, gpu_count=2)
+    request = _request(clock, max_hourly_cost_usd=D("1.00"))
+    quote = await adapter.quote(request)
+    lease = await adapter.acquire(request, quote)
+
+    # Simulate the crash window: the row exists with no realized rate yet.
+    stored = service.repository.get(lease.lease_id)
+    service.repository.compare_and_set(stored, changes={"offered_rate_per_hr": None})
+
+    reloaded = await adapter.status(request.owner_id, lease.lease_id)
+    assert reloaded.hourly_cost_usd == D("1.00")

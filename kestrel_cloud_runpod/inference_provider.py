@@ -882,7 +882,14 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
             raise InferenceLeaseProvisioningError(
                 "Runpod inference lease has no durable hourly cost bound"
             )
-        hourly = float(raw_hourly)
+        # max_hourly_rate is stored as the PER-GPU budget (see
+        # _internal_request), so scale it the same way the realized branch
+        # above does. A row that never reached PROVISIONING - a crash or a
+        # plan failure in that window, both of which this module exists to
+        # survive - otherwise reports an hourly cost short by gpu_count.
+        hourly = _money(raw_hourly) * Decimal(
+            max(1, int(constraints.get("gpu_count", 1) or 1))
+        )
     total = lease.estimated_cost
     if total is None:
         total = lease.max_authorized_cost

@@ -20,6 +20,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
+    authorized_cost_exposure,
     OllamaPlacementPlan,
     OllamaResourceType,
     canonical_model_name,
@@ -592,3 +593,71 @@ def test_pod_capacity_quote_authorizes_every_gpu():
     for bad in (0, -1, True):
         with pytest.raises(ValueError, match="Pod cost inputs are invalid"):
             pod_cost_usd(Decimal("0.44"), one_hour, bad)
+
+
+def test_accrued_cost_bills_every_serverless_worker():
+    """Worker count multiplies billable seconds, orthogonally to GPUs.
+
+    Every fixture uses one worker, so dropping the multiplier was invisible -
+    and it under-counts a Serverless lease's accrued spend by the worker
+    count, delaying the release gate by that factor.
+    """
+    clock = MutableClock()
+    started = clock()
+    base = dict(
+        offered_rate_per_hr=1.0,
+        provisioning_started_at=started,
+        hard_deadline=started + timedelta(hours=4),
+        accrued_estimated_cost=0.0,
+        placement_gpu_count=1,
+    )
+    one = replace(_accrual_lease(), **base, maximum_concurrent_workers=1)
+    five = replace(_accrual_lease(), **base, maximum_concurrent_workers=5)
+    now = started + timedelta(hours=1)
+
+    assert accrued_cost(one, now) == pytest.approx(1.0)
+    assert accrued_cost(five, now) == pytest.approx(5.0)
+
+
+def test_authorized_cost_exposure_reserves_non_compute_overhead():
+    """The release gate must count reserved non-compute exposure, not just
+    accrued compute - otherwise a lease is released later than authorized."""
+    clock = MutableClock()
+    started = clock()
+    lease = replace(
+        _accrual_lease(),
+        offered_rate_per_hr=1.0,
+        provisioning_started_at=started,
+        hard_deadline=started + timedelta(hours=4),
+        accrued_estimated_cost=0.0,
+        placement_gpu_count=1,
+        maximum_concurrent_workers=1,
+        maximum_non_compute_cost=0.25,
+    )
+    now = started + timedelta(hours=1)
+
+    assert accrued_cost(lease, now) == pytest.approx(1.0)
+    # Compute alone is 1.00; the reserved overhead must be added.
+    assert authorized_cost_exposure(lease, now) == pytest.approx(1.25)
+
+
+def test_authorized_cost_exposure_fails_closed_without_reserved_overhead():
+    """A legacy row carries no proof that storage/transfer was reserved, so it
+    must report its full authorization and be released at its next gate."""
+    clock = MutableClock()
+    started = clock()
+    lease = replace(
+        _accrual_lease(),
+        offered_rate_per_hr=1.0,
+        provisioning_started_at=started,
+        hard_deadline=started + timedelta(hours=4),
+        accrued_estimated_cost=0.0,
+        placement_gpu_count=1,
+        maximum_concurrent_workers=1,
+        maximum_non_compute_cost=None,
+        max_authorized_cost=50.0,
+    )
+    now = started + timedelta(seconds=1)
+
+    assert accrued_cost(lease, now) < 1.0
+    assert authorized_cost_exposure(lease, now) == pytest.approx(50.0)
