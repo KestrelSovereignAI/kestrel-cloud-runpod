@@ -101,6 +101,8 @@ async def test_create_injects_exact_image_gpu_and_attempt_environment() -> None:
             "image": spec.request.image_reference,
             "gpu": {"id": spec.request.quote.gpu_type_id, "count": 1},
             "cloud": "SECURE",
+            "dataCenterId": "US-TX-3",
+            "cost": 0.4,
             "_kestrel_placement": spec.request.quote.placement,
         }
 
@@ -154,6 +156,48 @@ async def test_created_metadata_mismatch_preserves_known_pod_id() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "expected_message"),
+    [
+        ({"dataCenterId": "EU-RO-1"}, "immutable placement"),
+        ({"cost": 0.41}, "immutable placement"),
+        ({"cloud": "COMMUNITY"}, "immutable placement"),
+    ],
+)
+async def test_create_rejects_realized_placement_outside_quote(
+    override, expected_message
+) -> None:
+    clock = MutableClock()
+    spec = _spec(clock)
+
+    def start_pod(effective_profile, metadata):
+        payload = {
+            "id": "pod-catalog-mismatch",
+            "name": spec.request.resource_name,
+            "image": spec.request.image_reference,
+            "gpu": {"id": spec.request.quote.gpu_type_id, "count": 1},
+            "cloud": "SECURE",
+            "dataCenterId": "US-TX-3",
+            "cost": 0.4,
+            "_kestrel_placement": spec.request.quote.placement,
+        }
+        payload.update(override)
+        return payload
+
+    provider = RunpodPodCapacityProvider(
+        SimpleNamespace(start_pod=start_pod), clock=clock
+    )
+    with pytest.raises(PodCapacityCreatedMismatchError, match=expected_message):
+        await provider.create(
+            profile=profile(),
+            resource_name=spec.request.resource_name,
+            companion_id=spec.request.owner_id,
+            environment={"CATALOG_WORKER_MODE": "pod"},
+            capacity_spec=spec,
+        )
+
+
+@pytest.mark.asyncio
 async def test_exact_recovery_rejects_mismatch_and_multiple_matches() -> None:
     clock = MutableClock()
     spec = _spec(clock)
@@ -163,12 +207,16 @@ async def test_exact_recovery_rejects_mismatch_and_multiple_matches() -> None:
         "image": spec.request.image_reference,
         "gpu": {"id": spec.request.quote.gpu_type_id, "count": 1},
         "cloud": "SECURE",
+        "dataCenterId": "US-TX-3",
+        "cost": 0.4,
     }
     direct = SimpleNamespace(list_pods=lambda: [valid])
     provider = RunpodPodCapacityProvider(direct, clock=clock)
-    assert (
-        await provider.find_exact(spec.request.resource_name, spec) == "pod-catalog-1"
-    )
+    recovered = await provider.find_exact(spec.request.resource_name, spec)
+    assert recovered is not None
+    assert recovered.provider_pod_id == "pod-catalog-1"
+    assert recovered.realized_placement is not None
+    assert recovered.realized_placement.data_center_id == "US-TX-3"
 
     direct.list_pods = lambda: [{**valid, "image": "wrong@sha256:" + "f" * 64}]
     with pytest.raises(RunPodManagerError, match="mismatched"):

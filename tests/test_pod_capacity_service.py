@@ -164,6 +164,32 @@ async def test_known_created_mismatch_is_durably_terminated_and_billed(
 
 
 @pytest.mark.asyncio
+async def test_missing_realized_placement_is_durably_terminated_and_billed(
+    tmp_path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    provider.realized = None
+    provider.billing_receipt = final_receipt(clock)
+    store = FakeCapabilityStore(clock)
+    runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    catalog_request = request(clock)
+
+    with pytest.raises(PodCapacityLifecycleError) as raised:
+        await runtime.acquire_catalog(catalog_request)
+
+    assert raised.value.billing_risk is False
+    assert provider.terminate_calls == ["pod-catalog-1"]
+    durable = runtime.repository.get(catalog_request.capacity_id)
+    assert durable is not None
+    assert durable.provider_pod_id == "pod-catalog-1"
+    assert durable.settlement_ready is True
+    assert durable.evidence is not None
+    assert durable.evidence.realized_placement is None
+    assert store.revoked == [catalog_request.attempt_id]
+
+
+@pytest.mark.asyncio
 async def test_submit_success_result_replays_until_ack_then_billing_reconciles(
     tmp_path,
 ) -> None:

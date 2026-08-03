@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from enum import Enum
+from itertools import pairwise
 from typing import Any, Protocol
 
 from pydantic import SecretStr
@@ -674,6 +675,657 @@ class PodBillingReceipt:
         )
 
 
+@dataclass(frozen=True)
+class PodRealizedPlacement:
+    """Realized v2 placement plus the catalog name bound by exact GPU ID."""
+
+    provider_pod_id: str
+    gpu_type_id: str
+    gpu_display_name: str
+    gpu_count: int
+    cloud: CloudType
+    data_center_id: str
+    hourly_rate_usd: Decimal
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        for name, value in (("provider_pod_id", self.provider_pod_id),):
+            _safe_identifier(value, name)
+        _provider_identifier(self.data_center_id, "data_center_id")
+        _display_name(self.gpu_type_id, "gpu_type_id")
+        _display_name(self.gpu_display_name, "gpu_display_name")
+        if (
+            not isinstance(self.gpu_count, int)
+            or isinstance(self.gpu_count, bool)
+            or self.gpu_count < 1
+        ):
+            raise ValueError("Realized Pod GPU count must be positive")
+        if not isinstance(self.cloud, CloudType):
+            raise TypeError("Realized Pod cloud must be a CloudType")
+        if not self.hourly_rate_usd.is_finite() or self.hourly_rate_usd <= 0:
+            raise ValueError("Realized Pod hourly rate must be positive")
+        require_aware(self.observed_at, "realized placement observed_at")
+
+    def validate_against(self, quote: PodCapacityQuote) -> None:
+        """Reject a realized Pod outside the exact accepted quote constraints."""
+
+        if (
+            self.gpu_type_id != quote.gpu_type_id
+            or self.gpu_display_name != quote.gpu_display_name
+            or self.gpu_count != quote.constraints.gpu_count
+            or self.cloud is not quote.constraints.cloud
+            or self.hourly_rate_usd > quote.hourly_cost_usd
+            or (
+                quote.constraints.allowed_data_center_ids
+                and self.data_center_id not in quote.constraints.allowed_data_center_ids
+            )
+        ):
+            raise ValueError("Realized Pod placement does not match accepted quote")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider_pod_id": self.provider_pod_id,
+            "gpu_type_id": self.gpu_type_id,
+            "gpu_display_name": self.gpu_display_name,
+            "gpu_count": self.gpu_count,
+            "cloud": self.cloud.value,
+            "data_center_id": self.data_center_id,
+            "hourly_rate_usd": decimal_text(self.hourly_rate_usd),
+            "observed_at": iso_datetime(self.observed_at),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PodRealizedPlacement:
+        _exact_keys(
+            value,
+            {
+                "provider_pod_id",
+                "gpu_type_id",
+                "gpu_display_name",
+                "gpu_count",
+                "cloud",
+                "data_center_id",
+                "hourly_rate_usd",
+                "observed_at",
+            },
+            "realized placement",
+        )
+        return cls(
+            provider_pod_id=_required_string(value, "provider_pod_id"),
+            gpu_type_id=_required_string(value, "gpu_type_id"),
+            gpu_display_name=_required_string(value, "gpu_display_name"),
+            gpu_count=_required_int(value, "gpu_count"),
+            cloud=CloudType(_required_string(value, "cloud")),
+            data_center_id=_required_string(value, "data_center_id"),
+            hourly_rate_usd=_required_decimal(value, "hourly_rate_usd"),
+            observed_at=_datetime(_required_string(value, "observed_at")),
+        )
+
+
+_WORKER_TIMING_FIELDS = frozenset(
+    {
+        "image_pull_and_container_boot_seconds",
+        "image_pull_seconds",
+        "container_boot_seconds",
+        "model_load_seconds",
+        "execution_seconds",
+        "training_seconds",
+        "artifact_upload_seconds",
+    }
+)
+_WORKER_METRIC_FIELDS = frozenset(
+    {"peak_vram_bytes", "peak_host_ram_bytes", "gpu_seconds", "idle_seconds"}
+)
+
+
+@dataclass(frozen=True)
+class CatalogWorkerEvidence:
+    """Strict content-free telemetry attested by one exact catalog worker."""
+
+    schema_version: int
+    attempt_id: str
+    request_sha256: str
+    image_digest: str
+    container_process_started_at: datetime | None
+    image_pull_and_container_boot_seconds: Decimal | None
+    image_pull_seconds: Decimal | None
+    container_boot_seconds: Decimal | None
+    model_load_seconds: Decimal | None
+    execution_seconds: Decimal | None
+    training_seconds: Decimal | None
+    artifact_upload_seconds: Decimal | None
+    peak_vram_bytes: int | None
+    peak_host_ram_bytes: int | None
+    gpu_seconds: Decimal | None
+    idle_seconds: Decimal | None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("Catalog worker evidence must use schema 1")
+        _safe_identifier(self.attempt_id, "worker evidence attempt_id")
+        _sha256(self.request_sha256, "worker evidence request_sha256")
+        _image_digest(self.image_digest)
+        if self.container_process_started_at is not None:
+            require_aware(
+                self.container_process_started_at,
+                "worker evidence container_process_started_at",
+            )
+        for name in _WORKER_TIMING_FIELDS:
+            value = getattr(self, name)
+            if value is not None and (not value.is_finite() or value < 0):
+                raise ValueError(
+                    f"Catalog worker {name} must be finite and nonnegative"
+                )
+        for name in ("peak_vram_bytes", "peak_host_ram_bytes"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"Catalog worker {name} must be nonnegative")
+        for name in ("gpu_seconds", "idle_seconds"):
+            value = getattr(self, name)
+            if value is not None and (not value.is_finite() or value < 0):
+                raise ValueError(
+                    f"Catalog worker {name} must be finite and nonnegative"
+                )
+        split = (self.image_pull_seconds, self.container_boot_seconds)
+        if (split[0] is None) != (split[1] is None):
+            raise ValueError(
+                "Catalog worker image-pull and container-boot split must be complete"
+            )
+        if split[0] is not None and split[1] is not None:
+            if self.image_pull_and_container_boot_seconds is None:
+                raise ValueError(
+                    "Catalog worker combined startup timing is required with a split"
+                )
+            if self.image_pull_and_container_boot_seconds != split[0] + split[1]:
+                raise ValueError(
+                    "Catalog worker combined startup timing contradicts its split"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "attempt_id": self.attempt_id,
+            "request_sha256": self.request_sha256,
+            "image_digest": self.image_digest,
+            "container_process_started_at": (
+                iso_datetime(self.container_process_started_at)
+                if self.container_process_started_at is not None
+                else None
+            ),
+            "timings_seconds": {
+                name: decimal_text(getattr(self, name))
+                for name in sorted(_WORKER_TIMING_FIELDS)
+            },
+            "metrics": {
+                "peak_vram_bytes": self.peak_vram_bytes,
+                "peak_host_ram_bytes": self.peak_host_ram_bytes,
+                "gpu_seconds": decimal_text(self.gpu_seconds),
+                "idle_seconds": decimal_text(self.idle_seconds),
+            },
+        }
+
+    @classmethod
+    def from_envelope(cls, value: Mapping[str, Any]) -> CatalogWorkerEvidence:
+        """Parse an allowlisted envelope; arbitrary private result fields fail."""
+
+        _exact_keys(
+            value,
+            {
+                "schema_version",
+                "attempt_id",
+                "request_sha256",
+                "image_digest",
+                "container_process_started_at",
+                "timings_seconds",
+                "metrics",
+            },
+            "worker evidence",
+        )
+        timings = _required_mapping(value, "timings_seconds")
+        metrics = _required_mapping(value, "metrics")
+        _exact_keys(timings, _WORKER_TIMING_FIELDS, "worker evidence timings")
+        _exact_keys(metrics, _WORKER_METRIC_FIELDS, "worker evidence metrics")
+        raw_started = value.get("container_process_started_at")
+        if raw_started is not None and not isinstance(raw_started, str):
+            raise ValueError(
+                "Catalog worker container_process_started_at must be a timestamp or null"
+            )
+        return cls(
+            schema_version=_required_int(value, "schema_version"),
+            attempt_id=_required_string(value, "attempt_id"),
+            request_sha256=_required_string(value, "request_sha256"),
+            image_digest=_required_string(value, "image_digest"),
+            container_process_started_at=(
+                _datetime(raw_started) if isinstance(raw_started, str) else None
+            ),
+            **{
+                name: _envelope_optional_decimal(timings.get(name), name)
+                for name in _WORKER_TIMING_FIELDS
+            },
+            peak_vram_bytes=_optional_nonnegative_int(
+                metrics.get("peak_vram_bytes"), "peak_vram_bytes"
+            ),
+            peak_host_ram_bytes=_optional_nonnegative_int(
+                metrics.get("peak_host_ram_bytes"), "peak_host_ram_bytes"
+            ),
+            gpu_seconds=_envelope_optional_decimal(
+                metrics.get("gpu_seconds"), "gpu_seconds"
+            ),
+            idle_seconds=_envelope_optional_decimal(
+                metrics.get("idle_seconds"), "idle_seconds"
+            ),
+        )
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CatalogWorkerEvidence:
+        """Load the canonical JSON representation from durable storage."""
+
+        return cls.from_envelope(value)
+
+
+@dataclass(frozen=True)
+class PodCapacityLifecycleEvidence:
+    """First-observation timestamps; unavailable phases remain explicit nulls."""
+
+    reservation_at: datetime
+    provider_create_accepted_at: datetime | None = None
+    provider_adopted_at: datetime | None = None
+    first_running_observed_at: datetime | None = None
+    worker_ready_at: datetime | None = None
+    workload_submitted_at: datetime | None = None
+    workload_running_at: datetime | None = None
+    workload_terminal_at: datetime | None = None
+    stop_confirmed_at: datetime | None = None
+    billing_reconciled_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in self.__dict__.items():
+            if value is not None:
+                require_aware(value, f"capacity evidence {name}")
+        # These observations share the host service clock. Missing intermediate
+        # phases are valid, but timestamps that exist cannot run backwards.
+        ordered = (
+            self.reservation_at,
+            self.provider_create_accepted_at or self.provider_adopted_at,
+            self.first_running_observed_at,
+            self.worker_ready_at,
+            self.workload_submitted_at,
+            self.workload_running_at,
+            self.workload_terminal_at,
+            self.stop_confirmed_at,
+            self.billing_reconciled_at,
+        )
+        observed = tuple(value for value in ordered if value is not None)
+        if any(later < earlier for earlier, later in pairwise(observed)):
+            raise ValueError("Pod capacity host lifecycle timestamps must be monotonic")
+        if (
+            self.provider_create_accepted_at is not None
+            and self.provider_adopted_at is not None
+        ):
+            raise ValueError(
+                "Pod capacity cannot be both create-accepted and recovery-adopted"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: iso_datetime(value) if value is not None else None
+            for name, value in self.__dict__.items()
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PodCapacityLifecycleEvidence:
+        expected = set(cls.__dataclass_fields__)
+        _exact_keys(value, expected, "capacity lifecycle evidence")
+        parsed: dict[str, datetime | None] = {}
+        for name in expected:
+            item = value.get(name)
+            if item is not None and not isinstance(item, str):
+                raise RunPodManagerError(
+                    f"Stored capacity lifecycle evidence {name} is invalid"
+                )
+            parsed[name] = _datetime(item) if item is not None else None
+        reservation = parsed.pop("reservation_at")
+        if reservation is None:
+            raise RunPodManagerError(
+                "Stored capacity lifecycle evidence reservation_at is missing"
+            )
+        return cls(reservation_at=reservation, **parsed)
+
+
+@dataclass(frozen=True)
+class PodCapacityEvidence:
+    """Immutable, versioned, content-free proof for one disposable Pod attempt."""
+
+    schema_version: int
+    capacity_id: str
+    resource_name: str
+    provider_quote_id: str
+    catalog_observed_at: datetime
+    attempt_id: str
+    request_sha256: str
+    image_digest: str
+    accepted_gpu_type_id: str
+    accepted_gpu_display_name: str
+    accepted_gpu_count: int
+    accepted_cloud: CloudType
+    accepted_hourly_rate_usd: Decimal
+    lifecycle: PodCapacityLifecycleEvidence
+    realized_placement: PodRealizedPlacement | None = None
+    worker: CatalogWorkerEvidence | None = None
+    billing: PodBillingReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("Pod capacity evidence must use schema 1")
+        for name, value in (
+            ("capacity_id", self.capacity_id),
+            ("resource_name", self.resource_name),
+            ("provider_quote_id", self.provider_quote_id),
+            ("attempt_id", self.attempt_id),
+        ):
+            _safe_identifier(value, name)
+        _display_name(self.accepted_gpu_type_id, "accepted_gpu_type_id")
+        _display_name(self.accepted_gpu_display_name, "accepted_gpu_display_name")
+        require_aware(self.catalog_observed_at, "evidence catalog_observed_at")
+        _sha256(self.request_sha256, "evidence request_sha256")
+        _image_digest(self.image_digest)
+        if (
+            not isinstance(self.accepted_gpu_count, int)
+            or isinstance(self.accepted_gpu_count, bool)
+            or self.accepted_gpu_count < 1
+        ):
+            raise ValueError("Accepted GPU count must be positive")
+        if not isinstance(self.accepted_cloud, CloudType):
+            raise TypeError("Accepted cloud must be a CloudType")
+        if (
+            not self.accepted_hourly_rate_usd.is_finite()
+            or self.accepted_hourly_rate_usd <= 0
+        ):
+            raise ValueError("Accepted Pod hourly rate must be positive")
+        if self.catalog_observed_at > self.lifecycle.reservation_at:
+            raise ValueError("Accepted catalog observation cannot follow reservation")
+        if self.realized_placement is not None:
+            realized = self.realized_placement
+            if (
+                realized.gpu_type_id != self.accepted_gpu_type_id
+                or realized.gpu_display_name != self.accepted_gpu_display_name
+                or realized.gpu_count != self.accepted_gpu_count
+                or realized.cloud is not self.accepted_cloud
+                or realized.hourly_rate_usd > self.accepted_hourly_rate_usd
+            ):
+                raise ValueError(
+                    "Persisted realized placement contradicts the accepted quote"
+                )
+        if self.worker is not None and (
+            self.worker.attempt_id != self.attempt_id
+            or self.worker.request_sha256 != self.request_sha256
+            or self.worker.image_digest != self.image_digest
+        ):
+            raise ValueError("Persisted worker evidence binding is inconsistent")
+        if self.billing is not None:
+            if self.realized_placement is not None and (
+                self.billing.provider_pod_id != self.realized_placement.provider_pod_id
+                or self.billing.hourly_price_usd
+                != self.realized_placement.hourly_rate_usd
+            ):
+                raise ValueError("Persisted billing evidence binding is inconsistent")
+            if (
+                self.lifecycle.billing_reconciled_at is not None
+                and self.lifecycle.billing_reconciled_at != self.billing.reconciled_at
+            ):
+                raise ValueError(
+                    "Persisted billing reconciliation timestamp is inconsistent"
+                )
+
+    @classmethod
+    def from_spec(cls, spec: PodCapacitySpec) -> PodCapacityEvidence:
+        request = spec.request
+        quote = request.quote
+        return cls(
+            schema_version=1,
+            capacity_id=request.capacity_id,
+            resource_name=request.resource_name,
+            provider_quote_id=quote.provider_quote_id,
+            catalog_observed_at=quote.observed_at,
+            attempt_id=request.attempt_id,
+            request_sha256=request.request_sha256,
+            image_digest=request.image_reference.rsplit("@", 1)[1],
+            accepted_gpu_type_id=quote.gpu_type_id,
+            accepted_gpu_display_name=quote.gpu_display_name,
+            accepted_gpu_count=quote.constraints.gpu_count,
+            accepted_cloud=quote.constraints.cloud,
+            accepted_hourly_rate_usd=quote.hourly_cost_usd,
+            lifecycle=PodCapacityLifecycleEvidence(reservation_at=request.created_at),
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        lifecycle = self.lifecycle
+        return (
+            self.realized_placement is not None
+            and self.worker is not None
+            and (
+                lifecycle.provider_create_accepted_at is not None
+                or lifecycle.provider_adopted_at is not None
+            )
+            and lifecycle.first_running_observed_at is not None
+            and lifecycle.worker_ready_at is not None
+            and lifecycle.workload_submitted_at is not None
+            and lifecycle.workload_running_at is not None
+            and lifecycle.workload_terminal_at is not None
+            and lifecycle.stop_confirmed_at is not None
+            and lifecycle.billing_reconciled_at is not None
+            and self.billing is not None
+            and self.billing.billed_until >= lifecycle.stop_confirmed_at
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "identity": {
+                "capacity_id": self.capacity_id,
+                "resource_name": self.resource_name,
+                "attempt_id": self.attempt_id,
+                "request_sha256": self.request_sha256,
+                "image_digest": self.image_digest,
+            },
+            "accepted_quote": {
+                "provider_quote_id": self.provider_quote_id,
+                "catalog_observed_at": iso_datetime(self.catalog_observed_at),
+                "gpu_type_id": self.accepted_gpu_type_id,
+                "gpu_display_name": self.accepted_gpu_display_name,
+                "gpu_count": self.accepted_gpu_count,
+                "cloud": self.accepted_cloud.value,
+                "hourly_rate_usd": decimal_text(self.accepted_hourly_rate_usd),
+            },
+            "realized_placement": (
+                self.realized_placement.to_dict()
+                if self.realized_placement is not None
+                else None
+            ),
+            "lifecycle": self.lifecycle.to_dict(),
+            "worker": self.worker.to_dict() if self.worker is not None else None,
+            "billing": self.billing.to_dict() if self.billing is not None else None,
+            "provenance": {
+                "identity": "accepted_catalog_request",
+                "accepted_quote": "runpod_rest_v2_catalog",
+                "realized_placement": (
+                    {
+                        "gpu_id_cloud_data_center_rate": "runpod_rest_v2_pod",
+                        "gpu_display_name": (
+                            "accepted_catalog_name_after_exact_gpu_id_match"
+                        ),
+                        "observed_at": "pod_capacity_provider_clock",
+                    }
+                    if self.realized_placement
+                    else None
+                ),
+                "lifecycle": "pod_capacity_lease_service_clock",
+                "worker": (
+                    {
+                        "telemetry": "bound_catalog_worker",
+                        "container_process_started_at": "bound_catalog_worker_clock",
+                    }
+                    if self.worker
+                    else None
+                ),
+                "billing": "runpod_rest_v2_billing" if self.billing else None,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PodCapacityEvidence:
+        _exact_keys(
+            value,
+            {
+                "schema_version",
+                "identity",
+                "accepted_quote",
+                "realized_placement",
+                "lifecycle",
+                "worker",
+                "billing",
+                "provenance",
+            },
+            "capacity evidence",
+        )
+        identity = _required_mapping(value, "identity")
+        quote = _required_mapping(value, "accepted_quote")
+        _exact_keys(
+            identity,
+            {
+                "capacity_id",
+                "resource_name",
+                "attempt_id",
+                "request_sha256",
+                "image_digest",
+            },
+            "capacity evidence identity",
+        )
+        _exact_keys(
+            quote,
+            {
+                "provider_quote_id",
+                "catalog_observed_at",
+                "gpu_type_id",
+                "gpu_display_name",
+                "gpu_count",
+                "cloud",
+                "hourly_rate_usd",
+            },
+            "capacity evidence quote",
+        )
+        # Provenance is fixed rather than caller-controlled metadata.
+        provenance = _required_mapping(value, "provenance")
+        _exact_keys(
+            provenance,
+            {
+                "identity",
+                "accepted_quote",
+                "realized_placement",
+                "lifecycle",
+                "worker",
+                "billing",
+            },
+            "capacity evidence provenance",
+        )
+        realized = value.get("realized_placement")
+        worker = value.get("worker")
+        billing = value.get("billing")
+        for name, item in (
+            ("realized_placement", realized),
+            ("worker", worker),
+            ("billing", billing),
+        ):
+            if item is not None and not isinstance(item, Mapping):
+                raise RunPodManagerError(
+                    f"Stored capacity evidence {name} must be an object or null"
+                )
+        if isinstance(billing, Mapping):
+            _exact_keys(
+                billing,
+                {
+                    "provider_billing_id",
+                    "provider_pod_id",
+                    "billed_from",
+                    "billed_until",
+                    "billed_seconds",
+                    "hourly_price_usd",
+                    "actual_cost_usd",
+                    "reconciled_at",
+                },
+                "capacity evidence billing",
+            )
+        expected_provenance = {
+            "identity": "accepted_catalog_request",
+            "accepted_quote": "runpod_rest_v2_catalog",
+            "realized_placement": (
+                {
+                    "gpu_id_cloud_data_center_rate": "runpod_rest_v2_pod",
+                    "gpu_display_name": (
+                        "accepted_catalog_name_after_exact_gpu_id_match"
+                    ),
+                    "observed_at": "pod_capacity_provider_clock",
+                }
+                if isinstance(realized, Mapping)
+                else None
+            ),
+            "lifecycle": "pod_capacity_lease_service_clock",
+            "worker": (
+                {
+                    "telemetry": "bound_catalog_worker",
+                    "container_process_started_at": "bound_catalog_worker_clock",
+                }
+                if isinstance(worker, Mapping)
+                else None
+            ),
+            "billing": (
+                "runpod_rest_v2_billing" if isinstance(billing, Mapping) else None
+            ),
+        }
+        if dict(provenance) != expected_provenance:
+            raise RunPodManagerError(
+                "Stored capacity evidence provenance is inconsistent"
+            )
+        return cls(
+            schema_version=_required_int(value, "schema_version"),
+            capacity_id=_required_string(identity, "capacity_id"),
+            resource_name=_required_string(identity, "resource_name"),
+            provider_quote_id=_required_string(quote, "provider_quote_id"),
+            catalog_observed_at=_datetime(
+                _required_string(quote, "catalog_observed_at")
+            ),
+            attempt_id=_required_string(identity, "attempt_id"),
+            request_sha256=_required_string(identity, "request_sha256"),
+            image_digest=_required_string(identity, "image_digest"),
+            accepted_gpu_type_id=_required_string(quote, "gpu_type_id"),
+            accepted_gpu_display_name=_required_string(quote, "gpu_display_name"),
+            accepted_gpu_count=_required_int(quote, "gpu_count"),
+            accepted_cloud=CloudType(_required_string(quote, "cloud")),
+            accepted_hourly_rate_usd=_required_decimal(quote, "hourly_rate_usd"),
+            lifecycle=PodCapacityLifecycleEvidence.from_dict(
+                _required_mapping(value, "lifecycle")
+            ),
+            realized_placement=(
+                PodRealizedPlacement.from_dict(realized)
+                if isinstance(realized, Mapping)
+                else None
+            ),
+            worker=(
+                CatalogWorkerEvidence.from_dict(worker)
+                if isinstance(worker, Mapping)
+                else None
+            ),
+            billing=(
+                PodBillingReceipt.from_dict(billing)
+                if isinstance(billing, Mapping)
+                else None
+            ),
+        )
+
+
 class TrainingPodConflictError(RunPodManagerError):
     """A cleanup token or Pod is already claimed by another active lease."""
 
@@ -731,11 +1383,13 @@ class TrainingPodRequest:
     capacity_spec: PodCapacitySpec | None = None
 
     def __post_init__(self) -> None:
-        if self.root_cleanup_token is None:
-            object.__setattr__(self, "root_cleanup_token", self.cleanup_token)
+        root_cleanup_token = self.root_cleanup_token
+        if root_cleanup_token is None:
+            root_cleanup_token = self.cleanup_token
+            object.__setattr__(self, "root_cleanup_token", root_cleanup_token)
         for name, value in (
             ("cleanup_token", self.cleanup_token),
-            ("root_cleanup_token", self.root_cleanup_token),
+            ("root_cleanup_token", root_cleanup_token),
             ("companion_id", self.companion_id),
             ("profile_id", self.profile_id),
             ("resource_name", self.resource_name),
@@ -744,7 +1398,7 @@ class TrainingPodRequest:
                 raise ValueError(f"Training Pod {name} must be a non-empty string")
         for name, value in (
             ("cleanup_token", self.cleanup_token),
-            ("root_cleanup_token", self.root_cleanup_token),
+            ("root_cleanup_token", root_cleanup_token),
         ):
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", value):
                 raise ValueError(f"Training Pod {name} has an invalid format")
@@ -855,6 +1509,7 @@ class TrainingPodLease:
     billing_state: PodCapacityBillingState = PodCapacityBillingState.NOT_APPLICABLE
     billing_receipt: PodBillingReceipt | None = None
     terminated_at: datetime | None = None
+    evidence: PodCapacityEvidence | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -889,6 +1544,17 @@ class TrainingPodLease:
             self.is_terminal
             and self.billing_state is PodCapacityBillingState.AUTHORITATIVE
             and self.billing_receipt is not None
+        )
+
+    @property
+    def terminal_success_evidence_complete(self) -> bool:
+        """Success is proven only after teardown and authoritative full billing."""
+
+        return (
+            self.workload_state is CatalogPodWorkloadState.SUCCEEDED
+            and self.settlement_ready
+            and self.evidence is not None
+            and self.evidence.is_complete
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -927,6 +1593,10 @@ class TrainingPodLease:
                 if self.terminated_at is not None
                 else None
             ),
+            "evidence": self.evidence.to_dict() if self.evidence is not None else None,
+            "terminal_success_evidence_complete": (
+                self.terminal_success_evidence_complete
+            ),
             "capacity": (
                 {
                     "owner_id": self.capacity_spec.request.owner_id,
@@ -936,14 +1606,6 @@ class TrainingPodLease:
                     "workload_kind": self.capacity_spec.request.workload_kind,
                     "request_sha256": self.capacity_spec.request.request_sha256,
                     "parameters_sha256": (self.capacity_spec.request.parameters_sha256),
-                    "image_reference": self.capacity_spec.request.image_reference,
-                    "capability_secret_id": (self.capacity_spec.capability_secret_id),
-                    "capability_token_sha256": (
-                        self.capacity_spec.capability_token_sha256
-                    ),
-                    "capability_expires_at": iso_datetime(
-                        self.capacity_spec.capability_expires_at
-                    ),
                     "quote": self.capacity_spec.request.quote.to_dict(),
                 }
                 if self.capacity_spec is not None
@@ -1115,6 +1777,11 @@ def _placement_from_dict(
     from .models import Availability
 
     raw_availability = value.get("availability")
+    raw_hourly_rate = value.get("offered_cost_per_hr")
+    if isinstance(raw_hourly_rate, bool) or not isinstance(
+        raw_hourly_rate, (int, float)
+    ):
+        raise RunPodManagerError("Stored Pod capacity offered rate is invalid")
     return PlacementDecision(
         gpu_id=_required_string(value, "gpu_id"),
         gpu_pool=_optional_string(value.get("gpu_pool")),
@@ -1122,7 +1789,7 @@ def _placement_from_dict(
         memory_gb=_required_int(value, "memory_gb"),
         cloud=CloudType(_required_string(value, "cloud")),
         gpu_count=_required_int(value, "gpu_count"),
-        offered_cost_per_hr=float(value.get("offered_cost_per_hr")),
+        offered_cost_per_hr=float(raw_hourly_rate),
         availability=(
             Availability(str(raw_availability))
             if raw_availability is not None
@@ -1138,6 +1805,58 @@ def _required_mapping(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     if not isinstance(item, Mapping):
         raise RunPodManagerError(f"Stored Pod capacity {key} must be an object")
     return item
+
+
+def _exact_keys(
+    value: Mapping[str, Any], expected: set[str] | frozenset[str], name: str
+) -> None:
+    actual = set(value)
+    if actual != set(expected):
+        raise RunPodManagerError(f"{name} fields do not match the versioned contract")
+
+
+def _display_name(value: str, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 128
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"Pod capacity {name} is invalid")
+
+
+def _provider_identifier(value: str, name: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value
+    ):
+        raise ValueError(f"Pod capacity {name} is invalid")
+
+
+def _image_digest(value: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise ValueError("Catalog worker image digest is invalid")
+
+
+def _envelope_optional_decimal(value: Any, name: str) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
+        raise TypeError(f"Catalog worker {name} must be numeric or null")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Catalog worker {name} must be numeric or null") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise ValueError(f"Catalog worker {name} must be finite and nonnegative")
+    return parsed
+
+
+def _optional_nonnegative_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"Catalog worker {name} must be a nonnegative integer or null")
+    return value
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:

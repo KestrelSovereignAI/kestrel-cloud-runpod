@@ -139,7 +139,7 @@ def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(
             for row in connection.execute("PRAGMA table_info(pod_capacity_leases)")
             if row[1] == "root_cleanup_token"
         )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert root_column[3] == 1
     family = repository.list_cleanup_family(
         root_token, legacy_cleanup_tokens=(child_token,)

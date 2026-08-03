@@ -26,6 +26,7 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodBillingReceipt,
     PodCapacityConstraints,
     PodCapacityQuote,
+    PodRealizedPlacement,
 )
 from kestrel_cloud_runpod.pod_capacity_provider import (
     CreatedPodCapacity,
@@ -186,6 +187,7 @@ class FakeCapacityProvider:
         self.terminate_calls: list[str] = []
         self.find_result: str | None = None
         self.create_error: Exception | None = None
+        self.realized: PodRealizedPlacement | None = realized_placement(clock)
         self.billing_receipt: PodBillingReceipt | None = None
         self.billing_calls: list[str] = []
 
@@ -226,14 +228,26 @@ class FakeCapacityProvider:
         return CreatedPodCapacity(
             provider_pod_id="pod-catalog-1",
             placement=quote(self.clock).placement,
+            realized_placement=self.realized,
             raw={"id": "pod-catalog-1"},
         )
 
     async def find_by_name(self, resource_name: str) -> str | None:
         raise AssertionError("catalog recovery must validate immutable metadata")
 
-    async def find_exact(self, resource_name: str, capacity_spec) -> str | None:
-        return self.find_result
+    async def find_exact(
+        self, resource_name: str, capacity_spec
+    ) -> CreatedPodCapacity | None:
+        if self.find_result is None:
+            return None
+        return CreatedPodCapacity(
+            provider_pod_id=self.find_result,
+            placement=None,
+            realized_placement=realized_placement(
+                self.clock, provider_pod_id=self.find_result
+            ),
+            raw=None,
+        )
 
     async def stop(self, pod_id: str) -> bool:
         raise AssertionError("catalog capacity must be terminated, not stopped")
@@ -335,4 +349,19 @@ def final_receipt(clock: MutableClock) -> PodBillingReceipt:
         hourly_price_usd=Decimal("0.4"),
         actual_cost_usd=Decimal("0.061"),
         reconciled_at=clock(),
+    )
+
+
+def realized_placement(
+    clock: MutableClock, *, provider_pod_id: str = "pod-catalog-1"
+) -> PodRealizedPlacement:
+    return PodRealizedPlacement(
+        provider_pod_id=provider_pod_id,
+        gpu_type_id="NVIDIA RTX PRO 4500",
+        gpu_display_name="RTX PRO 4500",
+        gpu_count=1,
+        cloud=CloudType.SECURE,
+        data_center_id="US-TX-3",
+        hourly_rate_usd=Decimal("0.4"),
+        observed_at=clock(),
     )

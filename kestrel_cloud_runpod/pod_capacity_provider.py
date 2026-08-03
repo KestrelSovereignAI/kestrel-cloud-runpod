@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from .models import (
+    CloudType,
     ComputeProduct,
     GPUProfile,
     PlacementDecision,
@@ -25,6 +26,7 @@ from .pod_capacity_contracts import (
     PodCapacityQuote,
     PodCapacityQuoteRequest,
     PodCapacitySpec,
+    PodRealizedPlacement,
     decimal_text,
     iso_datetime,
     pod_cost_usd,
@@ -62,6 +64,7 @@ class CreatedTrainingPod:
 
     provider_pod_id: str
     placement: PlacementDecision | None
+    realized_placement: PodRealizedPlacement | None = None
     raw: Mapping[str, Any] | None = None
 
 
@@ -107,7 +110,7 @@ class TrainingPodCapacityProvider(Protocol):
 
     async def find_exact(
         self, resource_name: str, capacity_spec: PodCapacitySpec
-    ) -> str | None: ...
+    ) -> CreatedTrainingPod | None: ...
 
     async def final_billing(
         self,
@@ -267,14 +270,21 @@ class RunpodPodCapacityProvider:
                 method="POST",
                 resource="/pods",
             )
+        realized: PodRealizedPlacement | None = None
         if capacity_spec is not None:
             try:
                 _validate_realized_placement(placement, capacity_spec)
                 _validate_recovery_payload(result, resource_name, capacity_spec)
+                realized = _realized_placement(
+                    result, pod_id, capacity_spec, self._now()
+                )
             except RunPodManagerError as exc:
                 raise PodCapacityCreatedMismatchError(pod_id) from exc
         return CreatedTrainingPod(
-            provider_pod_id=pod_id, placement=placement, raw=dict(result)
+            provider_pod_id=pod_id,
+            placement=placement,
+            realized_placement=realized,
+            raw=dict(result),
         )
 
     async def find_by_name(self, resource_name: str) -> str | None:
@@ -293,7 +303,7 @@ class RunpodPodCapacityProvider:
 
     async def find_exact(
         self, resource_name: str, capacity_spec: PodCapacitySpec
-    ) -> str | None:
+    ) -> CreatedTrainingPod | None:
         """Recover only one Pod whose v2 shape matches the immutable request."""
 
         pods = await asyncio.to_thread(self.provider.list_pods)
@@ -309,7 +319,14 @@ class RunpodPodCapacityProvider:
         pod_id = match.get("id")
         if not isinstance(pod_id, str) or not pod_id:
             raise RunPodManagerError("Runpod v2 Pod list item omitted its ID")
-        return pod_id
+        return CreatedTrainingPod(
+            provider_pod_id=pod_id,
+            placement=None,
+            realized_placement=_realized_placement(
+                match, pod_id, capacity_spec, self._now()
+            ),
+            raw=dict(match),
+        )
 
     async def stop(self, pod_id: str) -> bool:
         """Request idempotent stop and report whether v2 confirms non-billing state."""
@@ -477,7 +494,7 @@ def _pod_base_url(
     return None
 
 
-async def _mutation_to_thread(operation, /, *args: Any) -> _T:
+async def _mutation_to_thread(operation: Callable[..., _T], /, *args: Any) -> _T:
     """Do not propagate cancellation until an in-flight v2 mutation resolves."""
 
     task: asyncio.Task[_T] = asyncio.create_task(asyncio.to_thread(operation, *args))
@@ -524,8 +541,11 @@ def _validate_recovery_payload(
     if not isinstance(gpu, Mapping):
         raise RunPodManagerError("Matching Runpod Pod omitted GPU placement")
     image = payload.get("image") or payload.get("imageName")
+    raw_gpu_count = gpu.get("count")
     try:
-        gpu_count = int(gpu.get("count"))
+        if isinstance(raw_gpu_count, bool) or not isinstance(raw_gpu_count, (int, str)):
+            raise TypeError
+        gpu_count = int(raw_gpu_count)
     except (TypeError, ValueError):
         gpu_count = 0
     expected = (
@@ -541,11 +561,61 @@ def _validate_recovery_payload(
         )
 
 
+def _realized_placement(
+    payload: Mapping[str, Any],
+    pod_id: str,
+    capacity_spec: PodCapacitySpec,
+    observed_at: datetime,
+) -> PodRealizedPlacement:
+    """Project only provider placement fields needed for durable public evidence."""
+
+    gpu = payload.get("gpu")
+    if not isinstance(gpu, Mapping):
+        raise RunPodManagerError("Runpod v2 Pod omitted realized GPU placement")
+    raw_gpu_count = gpu.get("count")
+    try:
+        if isinstance(raw_gpu_count, bool) or not isinstance(raw_gpu_count, (int, str)):
+            raise TypeError
+        gpu_count = int(raw_gpu_count)
+    except (TypeError, ValueError) as exc:
+        raise RunPodManagerError("Runpod v2 Pod GPU count is invalid") from exc
+    raw_data_center = payload.get("dataCenterId")
+    if not isinstance(raw_data_center, str) or not raw_data_center.strip():
+        raise RunPodManagerError("Runpod v2 Pod omitted realized data center")
+    raw_cloud = payload.get("cloud")
+    if not isinstance(raw_cloud, str):
+        raise RunPodManagerError("Runpod v2 Pod omitted realized cloud")
+    try:
+        cloud = CloudType(raw_cloud.upper())
+    except ValueError as exc:
+        raise RunPodManagerError("Runpod v2 Pod cloud is invalid") from exc
+    raw_rate = payload.get("cost")
+    rate = _provider_decimal(raw_rate, "Pod hourly rate")
+    quote = capacity_spec.request.quote
+    realized = PodRealizedPlacement(
+        provider_pod_id=pod_id,
+        gpu_type_id=str(gpu.get("id", "")),
+        gpu_display_name=quote.gpu_display_name,
+        gpu_count=gpu_count,
+        cloud=cloud,
+        data_center_id=raw_data_center,
+        hourly_rate_usd=rate,
+        observed_at=observed_at,
+    )
+    try:
+        realized.validate_against(quote)
+    except ValueError as exc:
+        raise RunPodManagerError(
+            "Created Pod placement does not match accepted quote"
+        ) from exc
+    return realized
+
+
 def _provider_datetime(value: Any, name: str) -> datetime:
     if not isinstance(value, str):
         raise RunPodManagerError(f"Runpod v2 {name} is missing")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise RunPodManagerError(f"Runpod v2 {name} is invalid") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:

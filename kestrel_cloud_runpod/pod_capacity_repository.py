@@ -17,6 +17,7 @@ from .pod_capacity_contracts import (
     CatalogPodWorkloadState,
     PodBillingReceipt,
     PodCapacityBillingState,
+    PodCapacityEvidence,
     PodCapacitySpec,
     TrainingPodCleanupState,
     TrainingPodConflictError,
@@ -52,6 +53,7 @@ class SQLitePodCapacityRepository:
             "billing_state",
             "billing_receipt_json",
             "terminated_at",
+            "evidence_json",
         }
     )
 
@@ -117,6 +119,7 @@ class SQLitePodCapacityRepository:
                     billing_state TEXT NOT NULL DEFAULT 'not_applicable',
                     billing_receipt_json TEXT,
                     terminated_at TEXT,
+                    evidence_json TEXT,
                     revision INTEGER NOT NULL DEFAULT 0
                 )
                 """
@@ -158,6 +161,7 @@ class SQLitePodCapacityRepository:
                 "billing_state": "TEXT NOT NULL DEFAULT 'not_applicable'",
                 "billing_receipt_json": "TEXT",
                 "terminated_at": "TEXT",
+                "evidence_json": "TEXT",
             }
             for name, definition in generic_columns.items():
                 if name not in columns:
@@ -206,7 +210,7 @@ class SQLitePodCapacityRepository:
                 "idx_training_pods_cleanup_family",
             ):
                 connection.execute(f"DROP INDEX IF EXISTS {legacy_index}")
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
 
     def reserve(self, request: TrainingPodRequest) -> tuple[TrainingPodLease, bool]:
         """Persist an acquisition claim before any provider network operation."""
@@ -237,6 +241,15 @@ class SQLitePodCapacityRepository:
                 PodCapacityBillingState.PENDING.value
                 if request.capacity_spec is not None
                 else PodCapacityBillingState.NOT_APPLICABLE.value
+            ),
+            (
+                json.dumps(
+                    PodCapacityEvidence.from_spec(request.capacity_spec).to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if request.capacity_spec is not None
+                else None
             ),
             now,
             now,
@@ -274,15 +287,15 @@ class SQLitePodCapacityRepository:
                         cleanup_token, root_cleanup_token, request_fingerprint,
                         companion_id, profile_id, source, resource_name,
                         provider_pod_id, ownership, state, cleanup_state,
-                        capacity_spec_json, billing_state,
+                        capacity_spec_json, billing_state, evidence_json,
                         family_release_requested, family_release_complete, created_at,
                         updated_at, last_heartbeat_at, readiness_deadline, hard_deadline
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
-                    (*values[:13], False, False, *values[13:]),
+                    (*values[:14], False, False, *values[14:]),
                 )
                 inserted = True
             except sqlite3.IntegrityError as exc:
@@ -428,6 +441,20 @@ training_database_path = pod_capacity_database_path
 
 
 def _lease_from_row(row: sqlite3.Row) -> TrainingPodLease:
+    billing_receipt = (
+        PodBillingReceipt.from_dict(json.loads(row["billing_receipt_json"]))
+        if row["billing_receipt_json"] is not None
+        else None
+    )
+    evidence = (
+        PodCapacityEvidence.from_dict(json.loads(row["evidence_json"]))
+        if row["evidence_json"] is not None
+        else None
+    )
+    if evidence is not None and evidence.billing != billing_receipt:
+        raise RunPodManagerError(
+            "Stored Pod capacity billing and evidence receipts are inconsistent"
+        )
     return TrainingPodLease(
         cleanup_token=row["cleanup_token"],
         root_cleanup_token=row["root_cleanup_token"],
@@ -461,16 +488,13 @@ def _lease_from_row(row: sqlite3.Row) -> TrainingPodLease:
         workload_state=CatalogPodWorkloadState(row["workload_state"]),
         workload_error_type=row["workload_error_type"],
         billing_state=PodCapacityBillingState(row["billing_state"]),
-        billing_receipt=(
-            PodBillingReceipt.from_dict(json.loads(row["billing_receipt_json"]))
-            if row["billing_receipt_json"] is not None
-            else None
-        ),
+        billing_receipt=billing_receipt,
         terminated_at=(
             _datetime(row["terminated_at"])
             if row["terminated_at"] is not None
             else None
         ),
+        evidence=evidence,
     )
 
 
@@ -498,6 +522,8 @@ def _db_value(value: Any) -> Any:
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, PodBillingReceipt):
+        return json.dumps(value.to_dict(), sort_keys=True, separators=(",", ":"))
+    if isinstance(value, PodCapacityEvidence):
         return json.dumps(value.to_dict(), sort_keys=True, separators=(",", ":"))
     return value
 

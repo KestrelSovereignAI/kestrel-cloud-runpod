@@ -87,8 +87,9 @@ CONTAINER_DIGEST=sha256:<immutable image digest>
 
 Database and Runpod control-plane credentials are rejected from attempt
 environment input. The bearer expiry must cover the hard runtime plus teardown
-envelope and cannot exceed the worker's 24-hour bound. Durable/public state
-contains only the secret ID, token digest, and expiry.
+envelope and cannot exceed the worker's 24-hour bound. Durable internal state
+contains only the secret ID, token digest, and expiry. The public projection
+exposes none of those capability fields.
 
 The worker interface is deliberately small: anonymous `GET /health`, then
 bearer-authenticated `POST /v1/catalog/jobs/{attempt}`, `GET` status, `GET
@@ -107,6 +108,47 @@ the worker result after restart; cloud never persists the private payload.
 The host then polls the owner/workload-bound `get_catalog_capacity()` method
 until the returned canonical lease is settlement-ready; it does not reach into
 the capacity repository or infer actual cost from estimates.
+
+## Realized evidence contract
+
+Every new catalog capacity reservation initializes schema-1
+`PodCapacityEvidence` in the canonical lease row. The immutable public contract
+contains only:
+
+- deterministic capacity/resource identity, accepted quote/catalog identity,
+  request/attempt/image digests, and exact accepted GPU/cloud/rate;
+- the provider Pod ID and realized GPU ID/count, cloud, data center, and hourly
+  rate after validation against that quote (the display name remains the
+  accepted catalog name bound by the exact realized GPU ID);
+- first-observed reservation, create acceptance or recovery adoption, running,
+  worker readiness, submission, workload-running/terminal, stop-confirmation,
+  and billing-reconciliation timestamps;
+- a separately projected schema-1 worker envelope containing only the exact
+  attempt/request/image binding, allowlisted nonnegative timings, peak VRAM and
+  host RAM, GPU seconds, and idle seconds; and
+- the authoritative content-free Pod billing receipt.
+
+`record_catalog_worker_evidence()` accepts the projected envelope after the
+private adapter has decoded the opaque result. It never parses or stores the
+private result itself. Unknown fields, arbitrary mappings, binding mismatches,
+non-finite/negative values, and a changed second receipt fail closed; an
+identical normalized replay is idempotent. If the provider cannot observe an
+image-pull/container-boot split, both component fields remain null. A reported
+split must be complete and sum exactly to the combined value.
+
+Every host-clock lifecycle timestamp is written by revision CAS in the same
+transaction as the transition it proves. Duplicate polling and CAS races keep
+the first value. Provider placement observation and worker process-start clocks
+have explicit provenance and are not silently reordered into the host clock.
+Rows migrated from an older schema return `evidence = null`; migration never
+fabricates historical timestamps.
+
+`terminal_success_evidence_complete` becomes true only for a succeeded
+workload after worker evidence is durable, Runpod confirms termination, and an
+authoritative billing interval covers that stop. The public serializer omits
+the workload route, bearer/capability metadata, private image reference,
+prompts, responses, artifacts, signed URLs, weights, and raw worker/provider
+objects.
 
 Cancellation and restart reconciliation may precede capacity acquisition.
 They use the non-mutating, owner/workload-bound `find_catalog_capacity()`

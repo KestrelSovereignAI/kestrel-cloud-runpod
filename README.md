@@ -47,7 +47,8 @@ mapping explicitly. This package does not read a `[runpod]` section from
 - Provider-neutral SDK 0.34 inference leases with OpenAI-compatible host-only routes
 - Durable LoRA training Pod ownership, cleanup tokens, and restart reconciliation
 - Generic single-attempt Pod capacity with live quotes, scoped bearer transport,
-  deterministic recovery, permanent termination, and authoritative Pod billing
+  deterministic recovery, immutable content-free realized/worker evidence,
+  permanent termination, and authoritative Pod billing
 - Read-only `PodCapacityQuoteService` composition for ephemeral/scaled API
   processes that must never construct the writable SQLite lease authority
 
@@ -132,6 +133,14 @@ digest, owner/workload/attempt identity, immutable worker image digest, and
 accepted cost ceiling. A unique bearer is loaded from an injected encrypted
 capability store and injected only into the one Pod; SQLite keeps its secret ID,
 digest, and expiry, never the token or private catalog payload.
+
+The public lease projection omits even that internal capability metadata. New
+catalog rows expose a versioned `evidence` object with the accepted quote,
+validated realized GPU/cloud/data-center/rate, first-observed lifecycle times,
+an exact-bound allowlisted worker telemetry envelope, and authoritative billing.
+The private host records that projected envelope with
+`record_catalog_worker_evidence()` before acknowledging its durable result.
+Legacy rows expose `evidence = None`; no historical phase is inferred.
 
 The workload transport carries the private catalog serializer's mapping
 unchanged to the schema-3 single-attempt runner. This public package does not
@@ -218,8 +227,9 @@ After acknowledgement, poll
 `get_catalog_capacity(capacity_id=..., owner_id=..., workload_id=...)`. It
 fails closed on either binding mismatch and returns the canonical lease only;
 settlement is usable only when `settlement_ready` is true, at which point
-`billing_receipt` is authoritative. The host never reads the capacity SQLite
-repository directly.
+`billing_receipt` is authoritative. A succeeded launch gate additionally
+requires `terminal_success_evidence_complete`. The host never reads the
+capacity SQLite repository directly.
 
 For cancellation/restart recovery that may run before acquisition,
 `find_catalog_capacity(...)` performs the same owner/workload authorization and

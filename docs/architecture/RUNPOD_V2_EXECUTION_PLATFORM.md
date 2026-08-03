@@ -178,6 +178,15 @@ A lease records at least:
 
 Creation, readiness, use, release, expiry, and teardown are explicit state transitions. Teardown never clears the provider ID before Runpod confirms termination. A periodic process outside the requesting agent terminates expired or orphaned Pods and keeps failures visible and retryable across restarts.
 
+Disposable catalog Pods also retain one immutable, versioned, content-free
+evidence projection on that same lease row. It binds accepted catalog identity
+to realized GPU/cloud/data-center/rate, first-observed lifecycle timestamps,
+strict allowlisted worker timings/resources, confirmed stop, and authoritative
+billing. The projection never contains routes, credentials, private payloads,
+artifact capabilities, images, signed URLs, weights, or raw mappings. Success
+evidence remains incomplete until the Pod is stopped and billing covers the
+full interval; migrated rows report explicit missing evidence.
+
 Training Pod acquisition distinguishes capacity this invocation created/resumed from a Pod that was already running. The former is stopped on every readiness, route, submission, or cancellation failure; a failed stop retains the Pod ID and cleanup token for the external reconciler. The latter may be used when explicitly configured, but the invocation does not gain authority to stop shared pre-existing capacity. Hardware fallback attempts retain exact attempt tokens and share the caller's persisted root cleanup identity. Root cleanup is a durable closed-family transition: it blocks later child reservations, releases every active child, and is resumed after a crash. The SQLite migration recognizes deterministic pre-family child hashes by recomputing them for configured profile IDs because those UUID hashes cannot be inverted. Provider job ID and result-recovery state remain attached to the same durable record through LoRA publication.
 
 Runpod notes that Pods with network volumes cannot be stopped, only terminated, and that a restarted Pod may receive zero GPUs when capacity changes. The provider therefore does not promise cheap resume as an availability strategy; it follows the current [Pod lifecycle contract](https://docs.runpod.io/pods/manage-pods).

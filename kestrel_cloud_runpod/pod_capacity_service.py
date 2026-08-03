@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -17,12 +18,14 @@ from .pod_capacity_contracts import (
     CatalogAttemptCapabilityStore,
     CatalogPodCapacityRequest,
     CatalogPodWorkloadState,
+    CatalogWorkerEvidence,
     PodBillingReceipt,
     PodCapacityBillingState,
     PodCapacityLease,
     PodCapacityQuote,
     PodCapacityQuoteRequest,
     PodCapacitySpec,
+    PodRealizedPlacement,
     TrainingPodCleanupError,
     TrainingPodCleanupState,
     TrainingPodConflictError,
@@ -49,6 +52,7 @@ from .pod_transport import (
 )
 
 logger = logging.getLogger(__name__)
+_EVIDENCE_UNSET = object()
 
 
 class PodCapacityLeaseService:
@@ -336,6 +340,8 @@ class PodCapacityLeaseService:
                     capacity_spec=lease.capacity_spec,
                 )
             created = await self.provider.create(**create_args)
+            if lease.is_catalog_attempt and created.realized_placement is None:
+                raise PodCapacityCreatedMismatchError(created.provider_pod_id)
         except asyncio.CancelledError:
             lease = self._required(lease.cleanup_token)
             await self._cleanup_cancelled_acquisition(lease, "Pod create cancellation")
@@ -344,15 +350,17 @@ class PodCapacityLeaseService:
             # The create response supplied a concrete ID, so this is owned
             # capacity rather than an ambiguous lost-response case. Persist the
             # ID before termination so a crash cannot strand a billable Pod.
-            lease = self.repository.compare_and_set(
+            accepted_at = self._now()
+            lease = self._transition_with_evidence(
                 self._required(lease.cleanup_token),
                 changes={
                     "provider_pod_id": exc.provider_pod_id,
                     "ownership": TrainingPodOwnership.OWNED,
                     "creation_uncertain": False,
                     "last_provider_error": sanitize_training_error(exc),
-                    "last_heartbeat_at": self._now(),
+                    "last_heartbeat_at": accepted_at,
                 },
+                lifecycle={"provider_create_accepted_at": accepted_at},
             )
             try:
                 released = await self._release_one(
@@ -387,17 +395,24 @@ class PodCapacityLeaseService:
                 "last_provider_error": sanitize_training_error(exc),
                 "last_heartbeat_at": self._now(),
             }
+            evidence_lifecycle: dict[str, datetime] = {}
+            evidence_billing: PodBillingReceipt | object = _EVIDENCE_UNSET
             if lease.is_catalog_attempt:
                 receipt = self._zero_cost_receipt(lease, "create-rejected")
+                reconciled_at = self._now()
                 changes.update(
                     state=TrainingPodState.RELEASING,
                     billing_state=PodCapacityBillingState.AUTHORITATIVE,
                     billing_receipt_json=receipt,
-                    terminated_at=self._now(),
+                    terminated_at=reconciled_at,
                 )
-            released = self.repository.compare_and_set(
+                evidence_lifecycle["billing_reconciled_at"] = reconciled_at
+                evidence_billing = receipt
+            released = self._transition_with_evidence(
                 lease,
                 changes=changes,
+                lifecycle=evidence_lifecycle,
+                billing=evidence_billing,
             )
             if released.is_catalog_attempt:
                 released = await self._revoke_and_release(released)
@@ -405,15 +420,18 @@ class PodCapacityLeaseService:
                 "Pod create", released, billing_risk=False
             ) from exc
 
-        lease = self.repository.compare_and_set(
+        accepted_at = self._now()
+        lease = self._transition_with_evidence(
             self._required(lease.cleanup_token),
             changes={
                 "provider_pod_id": created.provider_pod_id,
                 "ownership": TrainingPodOwnership.OWNED,
                 "creation_uncertain": False,
-                "last_heartbeat_at": self._now(),
+                "last_heartbeat_at": accepted_at,
                 "last_provider_error": None,
             },
+            lifecycle={"provider_create_accepted_at": accepted_at},
+            realized_placement=created.realized_placement,
         )
         return await self._wait_ready(lease, profile)
 
@@ -435,13 +453,19 @@ class PodCapacityLeaseService:
                 return await self._raise_after_cleanup(
                     lease, operation="readiness observation", cause=exc
                 )
-            lease = self.repository.compare_and_set(
+            observed_at = self._now()
+            lease = self._transition_with_evidence(
                 self._required(lease.cleanup_token),
                 changes={
                     "backend_base_url": observation.backend_base_url,
-                    "last_heartbeat_at": self._now(),
+                    "last_heartbeat_at": observed_at,
                     "last_provider_error": None,
                 },
+                lifecycle=(
+                    {"first_running_observed_at": observed_at}
+                    if observation.is_running
+                    else {}
+                ),
             )
             if observation.is_failed or observation.is_stopped:
                 cause = RunPodManagerError(
@@ -467,12 +491,14 @@ class PodCapacityLeaseService:
                             raise
                         lease = self._required(lease.cleanup_token)
                         continue
-                return self.repository.compare_and_set(
+                ready_at = self._now()
+                return self._transition_with_evidence(
                     lease,
                     changes={
                         "state": TrainingPodState.READY,
-                        "last_heartbeat_at": self._now(),
+                        "last_heartbeat_at": ready_at,
                     },
+                    lifecycle={"worker_ready_at": ready_at},
                 )
             try:
                 await self._sleep(self.poll_interval_seconds)
@@ -635,7 +661,9 @@ class PodCapacityLeaseService:
             bearer_token=capability.bearer_token,
             payload=payload,
         )
-        self._record_catalog_observation(lease.cleanup_token, observation)
+        self._record_catalog_observation(
+            lease.cleanup_token, observation, submitted=True
+        )
         return observation
 
     async def observe_catalog_workload(
@@ -700,6 +728,59 @@ class PodCapacityLeaseService:
             await self.release(capacity_id, reason="late result after cancellation")
             raise RunPodManagerError("Cancelled catalog attempt cannot accept a result")
         return payload
+
+    def record_catalog_worker_evidence(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+        envelope: Mapping[str, Any],
+    ) -> TrainingPodLease:
+        """Persist one independently projected content-free worker envelope."""
+
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        spec = self._capacity_spec(lease)
+        if lease.evidence is None:
+            raise RunPodManagerError(
+                "Legacy Pod capacity has explicit missing realized evidence"
+            )
+        worker = CatalogWorkerEvidence.from_envelope(envelope)
+        expected_image_digest = spec.request.image_reference.rsplit("@", 1)[1]
+        if (
+            worker.attempt_id != spec.request.attempt_id
+            or worker.request_sha256 != spec.request.request_sha256
+            or worker.image_digest != expected_image_digest
+        ):
+            raise TrainingPodConflictError(
+                "Catalog worker evidence does not match the exact attempt binding"
+            )
+        if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
+            raise RunPodManagerError(
+                "Catalog worker evidence cannot be accepted before workload success"
+            )
+        if (
+            worker.container_process_started_at is not None
+            and worker.container_process_started_at > self._now()
+        ):
+            raise RunPodManagerError(
+                "Catalog worker process-start evidence is from the future"
+            )
+        if lease.evidence.worker is not None:
+            if lease.evidence.worker != worker:
+                raise TrainingPodConflictError(
+                    "Catalog worker evidence was already recorded differently"
+                )
+            return lease
+        if lease.is_terminal:
+            raise RunPodManagerError(
+                "Terminal catalog capacity cannot accept new worker evidence"
+            )
+        return self._transition_with_evidence(
+            lease,
+            changes={"last_heartbeat_at": self._now()},
+            worker=worker,
+        )
 
     async def acknowledge_catalog_result(
         self,
@@ -876,24 +957,31 @@ class PodCapacityLeaseService:
             if lease.provider_pod_id is None and lease.creation_uncertain:
                 raise self._cleanup_error(reason, lease)
         if lease.provider_pod_id is None:
+            terminal_at = self._now()
             changes: dict[str, Any] = {
                 "state": TrainingPodState.RELEASED,
                 "cleanup_state": TrainingPodCleanupState.COMPLETE,
                 "backend_base_url": None,
                 "last_provider_error": None,
-                "last_heartbeat_at": self._now(),
+                "last_heartbeat_at": terminal_at,
             }
+            evidence_lifecycle: dict[str, datetime] = {}
+            evidence_billing: PodBillingReceipt | object = _EVIDENCE_UNSET
             if lease.is_catalog_attempt:
                 receipt = self._zero_cost_receipt(lease, "no-provider-capacity")
                 changes.update(
                     state=TrainingPodState.RELEASING,
                     billing_state=PodCapacityBillingState.AUTHORITATIVE,
                     billing_receipt_json=receipt,
-                    terminated_at=self._now(),
+                    terminated_at=terminal_at,
                 )
-            released = self._transition_nonterminal(
+                evidence_lifecycle["billing_reconciled_at"] = terminal_at
+                evidence_billing = receipt
+            released = self._transition_with_evidence(
                 lease,
                 changes=changes,
+                lifecycle=evidence_lifecycle,
+                billing=evidence_billing,
             )
             if released.is_catalog_attempt:
                 released = await self._revoke_and_release(released)
@@ -958,9 +1046,12 @@ class PodCapacityLeaseService:
                 billing_state=PodCapacityBillingState.PENDING,
                 terminated_at=completed_at,
             )
-        released = self._transition_nonterminal(
+        released = self._transition_with_evidence(
             lease,
             changes=changes,
+            lifecycle=(
+                {"stop_confirmed_at": completed_at} if lease.is_catalog_attempt else {}
+            ),
         )
         if released.is_catalog_attempt:
             return await self._reconcile_billing(released)
@@ -1019,6 +1110,8 @@ class PodCapacityLeaseService:
                 "cleanup_state": TrainingPodCleanupState.COMPLETE,
                 "last_provider_error": None,
             }
+            evidence_lifecycle: dict[str, datetime] = {}
+            evidence_billing: PodBillingReceipt | object = _EVIDENCE_UNSET
             if lease.is_catalog_attempt:
                 receipt = self._zero_cost_receipt(lease, "before-create")
                 changes.update(
@@ -1027,9 +1120,13 @@ class PodCapacityLeaseService:
                     billing_receipt_json=receipt,
                     terminated_at=now,
                 )
-            released = self.repository.compare_and_set(
+                evidence_lifecycle["billing_reconciled_at"] = now
+                evidence_billing = receipt
+            released = self._transition_with_evidence(
                 lease,
                 changes=changes,
+                lifecycle=evidence_lifecycle,
+                billing=evidence_billing,
             )
             if released.is_catalog_attempt:
                 released = await self._revoke_and_release(released)
@@ -1113,7 +1210,13 @@ class PodCapacityLeaseService:
                         billing_state=PodCapacityBillingState.PENDING,
                         terminated_at=now,
                     )
-                stopped = self.repository.compare_and_set(lease, changes=changes)
+                stopped = self._transition_with_evidence(
+                    lease,
+                    changes=changes,
+                    lifecycle=(
+                        {"stop_confirmed_at": now} if lease.is_catalog_attempt else {}
+                    ),
+                )
                 if stopped.is_catalog_attempt:
                     return await self._reconcile_billing(stopped)
                 return stopped
@@ -1131,15 +1234,18 @@ class PodCapacityLeaseService:
     ) -> TrainingPodLease:
         try:
             if lease.capacity_spec is not None:
-                pod_id = await self.provider.find_exact(
+                recovered = await self.provider.find_exact(
                     lease.resource_name, lease.capacity_spec
                 )
+                pod_id = recovered.provider_pod_id if recovered is not None else None
             else:
+                recovered = None
                 pod_id = await self.provider.find_by_name(lease.resource_name)
         except RunPodManagerError as exc:
             return self._record_retryable_failure(lease, exc, creation_uncertain=True)
         if pod_id is not None:
-            return self._transition_nonterminal(
+            adopted_at = self._now()
+            return self._transition_with_evidence(
                 lease,
                 changes={
                     "provider_pod_id": pod_id,
@@ -1149,6 +1255,16 @@ class PodCapacityLeaseService:
                     "cleanup_state": TrainingPodCleanupState.PENDING,
                     "last_provider_error": None,
                 },
+                lifecycle=(
+                    {"provider_adopted_at": adopted_at}
+                    if lease.is_catalog_attempt
+                    else {}
+                ),
+                realized_placement=(
+                    recovered.realized_placement
+                    if recovered is not None
+                    else _EVIDENCE_UNSET
+                ),
             )
         if self._now() < lease.readiness_deadline or lease.is_catalog_attempt:
             return self._transition_nonterminal(
@@ -1328,15 +1444,34 @@ class PodCapacityLeaseService:
                 raise RunPodManagerError(
                     "Provider billing receipt does not match the leased Pod"
                 )
+            if (
+                lease.terminated_at is None
+                or receipt.billed_until < lease.terminated_at
+            ):
+                raise RunPodManagerError(
+                    "Provider billing receipt does not cover confirmed Pod teardown"
+                )
+            if (
+                lease.evidence is not None
+                and lease.evidence.realized_placement is not None
+                and receipt.hourly_price_usd
+                != lease.evidence.realized_placement.hourly_rate_usd
+            ):
+                raise RunPodManagerError(
+                    "Provider billing rate does not match realized Pod rate"
+                )
         try:
-            reconciled = self.repository.compare_and_set(
+            reconciled_at = receipt.reconciled_at
+            reconciled = self._transition_with_evidence(
                 lease,
                 changes={
                     "billing_state": PodCapacityBillingState.AUTHORITATIVE,
                     "billing_receipt_json": receipt,
                     "last_provider_error": None,
-                    "last_heartbeat_at": self._now(),
+                    "last_heartbeat_at": reconciled_at,
                 },
+                lifecycle={"billing_reconciled_at": reconciled_at},
+                billing=receipt,
             )
         except TrainingPodConflictError:
             current = self._required(lease.cleanup_token)
@@ -1344,6 +1479,79 @@ class PodCapacityLeaseService:
                 raise
             reconciled = current
         return await self._revoke_and_release(reconciled)
+
+    def _transition_with_evidence(
+        self,
+        lease: TrainingPodLease,
+        *,
+        changes: Mapping[str, Any],
+        lifecycle: Mapping[str, datetime] | None = None,
+        realized_placement: PodRealizedPlacement | None | object = _EVIDENCE_UNSET,
+        worker: CatalogWorkerEvidence | object = _EVIDENCE_UNSET,
+        billing: PodBillingReceipt | None | object = _EVIDENCE_UNSET,
+    ) -> TrainingPodLease:
+        """CAS state and first-observation evidence without stale overwrites."""
+
+        current = lease
+        while not current.is_terminal:
+            persisted = dict(changes)
+            evidence = current.evidence
+            if evidence is not None:
+                updated_lifecycle = evidence.lifecycle
+                if lifecycle:
+                    first_values = {
+                        name: (
+                            getattr(updated_lifecycle, name)
+                            if getattr(updated_lifecycle, name) is not None
+                            else value
+                        )
+                        for name, value in lifecycle.items()
+                    }
+                    updated_lifecycle = replace(updated_lifecycle, **first_values)
+                realized = evidence.realized_placement
+                if realized_placement is not _EVIDENCE_UNSET:
+                    if realized_placement is None:
+                        raise RunPodManagerError(
+                            "Catalog Pod realized placement cannot be absent"
+                        )
+                    if realized is not None and realized != realized_placement:
+                        raise TrainingPodConflictError(
+                            "Catalog Pod realized placement evidence already differs"
+                        )
+                    realized = realized or realized_placement
+                worker_value = evidence.worker
+                if worker is not _EVIDENCE_UNSET:
+                    if not isinstance(worker, CatalogWorkerEvidence):
+                        raise TypeError("Catalog worker evidence is invalid")
+                    if worker_value is not None and worker_value != worker:
+                        raise TrainingPodConflictError(
+                            "Catalog worker evidence was already recorded differently"
+                        )
+                    worker_value = worker_value or worker
+                billing_value = evidence.billing
+                if billing is not _EVIDENCE_UNSET:
+                    if billing is not None and not isinstance(
+                        billing, PodBillingReceipt
+                    ):
+                        raise TypeError("Catalog billing evidence is invalid")
+                    if billing_value is not None and billing_value != billing:
+                        raise TrainingPodConflictError(
+                            "Catalog billing evidence was already recorded differently"
+                        )
+                    billing_value = billing_value or billing
+                updated_evidence = replace(
+                    evidence,
+                    lifecycle=updated_lifecycle,
+                    realized_placement=realized,
+                    worker=worker_value,
+                    billing=billing_value,
+                )
+                persisted["evidence_json"] = updated_evidence
+            try:
+                return self.repository.compare_and_set(current, changes=persisted)
+            except TrainingPodConflictError:
+                current = self._required(lease.cleanup_token)
+        return current
 
     async def _revoke_and_release(self, lease: TrainingPodLease) -> TrainingPodLease:
         """Make bearer revocation part of the durable terminal transition."""
@@ -1370,35 +1578,58 @@ class PodCapacityLeaseService:
         self,
         capacity_id: str,
         observation: CatalogPodWorkloadObservation,
+        *,
+        submitted: bool = False,
     ) -> TrainingPodLease:
         lease = self._required(capacity_id)
         if lease.is_terminal:
             return lease
         if lease.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
             return lease
+        spec = self._capacity_spec(lease)
+        if (
+            observation.attempt_id != spec.request.attempt_id
+            or observation.request_sha256 != spec.request.request_sha256
+        ):
+            raise TrainingPodConflictError(
+                "Catalog workload observation does not match the exact attempt binding"
+            )
+        observed_at = self._now()
         changes: dict[str, Any] = {
             "workload_state": observation.state,
             "workload_error_type": observation.error_type,
             "last_provider_error": None,
-            "last_heartbeat_at": self._now(),
+            "last_heartbeat_at": observed_at,
         }
+        lifecycle: dict[str, datetime] = {}
+        if submitted:
+            lifecycle["workload_submitted_at"] = observed_at
         if observation.state is CatalogPodWorkloadState.RUNNING:
             changes.update(
                 state=TrainingPodState.JOB_SUBMITTED,
                 provider_job_id=observation.attempt_id,
             )
+            lifecycle["workload_running_at"] = observed_at
         elif observation.state is CatalogPodWorkloadState.SUCCEEDED:
             changes.update(
                 state=TrainingPodState.JOB_COMPLETED,
                 provider_job_id=observation.attempt_id,
             )
+            lifecycle["workload_terminal_at"] = observed_at
         elif observation.state in {
             CatalogPodWorkloadState.FAILED,
             CatalogPodWorkloadState.CANCELLED,
             CatalogPodWorkloadState.CANCEL_REQUESTED,
         }:
             changes["state"] = TrainingPodState.CANCEL_REQUESTED
-        return self._transition_nonterminal(lease, changes=changes)
+            if observation.state in {
+                CatalogPodWorkloadState.FAILED,
+                CatalogPodWorkloadState.CANCELLED,
+            }:
+                lifecycle["workload_terminal_at"] = observed_at
+        return self._transition_with_evidence(
+            lease, changes=changes, lifecycle=lifecycle
+        )
 
     def _catalog_lease(
         self, capacity_id: str, owner_id: str, workload_id: str
