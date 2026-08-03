@@ -48,6 +48,8 @@ mapping explicitly. This package does not read a `[runpod]` section from
 - Durable LoRA training Pod ownership, cleanup tokens, and restart reconciliation
 - Generic single-attempt Pod capacity with live quotes, scoped bearer transport,
   deterministic recovery, permanent termination, and authoritative Pod billing
+- Read-only `PodCapacityQuoteService` composition for ephemeral/scaled API
+  processes that must never construct the writable SQLite lease authority
 
 ## Architecture
 

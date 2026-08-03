@@ -90,6 +90,7 @@ from .pod_capacity_provider import (
     PodCapacityProvider,
     RunpodPodCapacityProvider,
 )
+from .pod_capacity_quote import PodCapacityQuoteProvider, PodCapacityQuoteService
 from .pod_capacity_repository import (
     SQLitePodCapacityRepository,
     pod_capacity_database_path,
@@ -159,7 +160,9 @@ __all__ = [
     "PodCapacityOwnership",
     "PodCapacityProvider",
     "PodCapacityQuote",
+    "PodCapacityQuoteProvider",
     "PodCapacityQuoteRequest",
+    "PodCapacityQuoteService",
     "PodCapacitySource",
     "PodCapacitySpec",
     "PodCapacityState",

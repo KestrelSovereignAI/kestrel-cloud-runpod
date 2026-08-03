@@ -66,6 +66,12 @@ is still live, and the hard deadline cannot exceed the quoted maximum runtime.
 The provider re-queries v2 immediately before create and constrains placement
 to the exact quoted GPU ID and no higher hourly rate.
 
+`PodCapacityQuoteService` is the read-only composition for horizontally scaled
+or ephemeral API processes. It owns only the live provider and configured GPU
+profiles; it has no repository and therefore cannot reserve, create, find,
+reconcile, or stop capacity. A host that needs both roles constructs a separate
+`PodCapacityLeaseService` only inside its durable executor.
+
 ## One Pod, one attempt
 
 The service loads or creates one durable capability through
@@ -141,6 +147,22 @@ nonterminal and must not release a Frinz reservation as zero.
 Frinz compares the authoritative actual cost with the accepted ceiling. An
 over-ceiling bill is retained as evidence but settlement remains fail-closed;
 cloud never owns or mutates the funds ledger.
+
+## Repository deployment invariant
+
+`SQLitePodCapacityRepository` is a durable single-writer authority. Its path
+must reside on a crash-durable local or attached block filesystem, and one host
+must fence all other executors before any provider mutation. An ephemeral or
+horizontally scaled runtime such as a multi-replica Cloud Run web service is
+invalid: each replica would create an independent authority and could duplicate
+or orphan billable Pods.
+
+The host is responsible for cross-host singleton fencing, persistent-disk
+attachment policy, process restart, database backup/recovery, and monitoring.
+The repository's WAL/process lock protects one filesystem; it does not make two
+separate disks a distributed database. Stateless API replicas should use only
+`PodCapacityQuoteService` and persist accepted quote/job/cancellation intent in
+their own durable application database for the external executor to consume.
 
 The installed `kestrel-runpod-reconcile-capacity` command is the canonical
 external driver. `RUNPOD_POD_CAPACITY_SERVICE_FACTORY=module:callable` names a
