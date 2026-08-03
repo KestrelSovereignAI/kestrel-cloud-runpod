@@ -150,6 +150,14 @@ coverage end and accepted tail while startup and observed idle-tail measurements
 remain null because v2 does not return them per job. This makes the current throughput tradeoff explicit:
 Frinz must serialize accepted attempts by endpoint billing window or provision a
 separately attributable endpoint until Runpod exposes finer billing identity.
+An ambiguous `/run` acceptance has no provider job ID to query. The host still
+retains its exact worst-case exclusive endpoint/hour allocation, accepted quote,
+and cost ceiling. Cloud's `final_ambiguous_window_billing()` waits for all of
+those hours to close and maps strict REST-v2 endpoint aggregates to a typed
+receipt with actual cost, consumer-capped cost, and operator loss. An empty or
+partial response remains pending because v2 does not attest that billing is
+final. Frinz depends on this provider-neutral method and never reaches through
+Cloud to the Runpod control client.
 See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
 [job-state metrics](https://docs.runpod.io/serverless/endpoints/job-states).
 
@@ -263,9 +271,18 @@ For bursty interactive sessions, the default candidate is load-balanced Serverle
 For long or continuously active sessions, a dedicated Pod is considered using live catalog data. The decision compares expected utilization against both alternatives:
 
 ```text
-serverless_estimate = serverless_rate * (initialization + execution + idle_tail)
+maximum_cold_starts = 1 + floor(expected_session / idle_tail)
+serverless_estimate = serverless_rate *
+    (execution + maximum_cold_starts * (initialization + idle_tail))
 pod_estimate        = pod_rate * lease_duration
 ```
+
+The Serverless estimate is an invocation-independent upper bound for the
+accepted session window: every complete idle interval may scale the worker to
+zero and force another billable initialization. A zero idle tail has no finite
+cold-start bound and is therefore ineligible for interactive Serverless. The
+accepted maximum is included in SDK quote metadata and revalidated immediately
+before acquisition.
 
 Storage, model transfer, and failure/retry costs are added to both estimates. A Pod is selected only when it fits the cost cap and measured readiness target. Model pull and model-to-VRAM load are part of cold-start time and billable session cost.
 

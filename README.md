@@ -125,6 +125,15 @@ projecting Runpod's aggregate queue-plus-cold-start `delayTime` as
 `pre_execution_delay_ms`. The unavailable worker-startup split and observed
 idle-tail value remain `null`.
 
+If `/run` returns an ambiguous transport or server error before a job ID is
+known, the host keeps the same exclusive worst-case endpoint/hour allocation
+and calls `final_ambiguous_window_billing()`. This Cloud method needs no job
+status client: after every allocated hour closes, it reads only strict v2
+endpoint-hour billing and returns content-free actual, accepted-ceiling-capped,
+and operator-loss amounts. Empty or incomplete billing remains pending because
+v2 exposes no finalization marker; consumers never call the control-plane
+billing client directly or substitute an estimate for actual spend.
+
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 
 Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload IDs, the exact model, placement constraints, expected warm utilization, an idle timeout, hard deadline, and maximum spend. The service compares current Pod and Serverless catalog offers. Bursty traffic can use native load-balanced Serverless; sustained sessions can use a dedicated Pod. Queue Serverless is not selected for interactive streaming. `lease.public_route_url` remains `None` until both Runpod health and Ollama `/api/tags` prove the requested model is ready. An external scheduler must run `RunPodManager.reconcile_ollama_leases()` periodically so expiry and teardown retries survive requester crashes. The `kestrel-runpod-reconcile-ollama` command performs one fail-fast pass and is suitable for a timer or job runner.
@@ -167,7 +176,7 @@ Control-plane, Serverless data-plane, and Pod workload credentials are separate.
 
 For load-balanced Serverless, use a Runpod key restricted to the one endpoint as the scoped inference capability. Runpod authenticates it at the edge and the workload proxy verifies the same bearer defensively. For a dedicated Pod, `RUNPOD_OLLAMA_BEARER_TOKEN` is the scoped capability. The provider rejects either workload credential when it matches `RUNPOD_API_KEY`, and rejects one credential reused across both products. Rotate the Pod value per bounded lease/deployment; never reuse the full control-plane key. Both modes expose `/ping` on port 11434, returning `204` during model preparation and `200` only while Ollama is live, the capability is unexpired, and the exact pinned model remains present.
 
-`accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection estimate still compares the expected Serverless initialization, active, and idle-tail window against the expected Pod session.
+`accrued_estimated_cost` is intentionally a billing-safe upper bound. Dedicated Pods accrue their continuous live catalog rate. Until the Serverless readiness API exposes active worker-seconds or billing reconciliation supplies them, Serverless uses the same wall-clock bound; it may release early, but it cannot authorize spend beyond the caller's cap. The selection quote covers every possible scale-to-zero cycle in the expected session: active time plus one initialization and idle tail for the initial worker and for every complete idle interval. A zero idle tail cannot produce a finite invocation-independent quote, so it is not eligible for interactive Serverless.
 
 `PodCapacityLeaseService` is the one writable dedicated-Pod lifecycle for new
 catalog attempts and old training callers. It quotes an exact live v2 GPU ID,

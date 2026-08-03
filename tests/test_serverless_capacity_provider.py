@@ -12,6 +12,7 @@ import httpx
 import pytest
 from serverless_capacity_test_support import (
     MutableClock,
+    ambiguous_window,
     attempt,
     endpoint,
     offer,
@@ -421,6 +422,135 @@ async def test_final_billing_binds_terminal_job_and_complete_endpoint_window() -
     serialized = json.dumps(receipt.to_dict()).lower()
     assert "must-not-serialize" not in serialized
     assert "prompt" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_window_billing_needs_no_job_id_or_job_client() -> None:
+    clock = MutableClock()
+    clock.value += timedelta(hours=1)
+    billing_calls: list[dict[str, object]] = []
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(
+            serverless_billing=lambda **kwargs: (
+                billing_calls.append(kwargs) or _billing_page()
+            )
+        ),
+        clock=clock,
+    )
+    accepted = quote()
+    allocation = ambiguous_window(accepted)
+
+    receipt = await provider.final_ambiguous_window_billing(allocation, accepted)
+    replay = await provider.final_ambiguous_window_billing(allocation, accepted)
+
+    assert receipt is not None and replay is not None
+    assert receipt.provider_billing_id == replay.provider_billing_id
+    assert receipt.attempt_id == allocation.attempt_id
+    assert receipt.actual_cost_usd == Decimal("0.023")
+    assert receipt.capped_cost_usd == Decimal("0.023")
+    assert receipt.operator_loss_usd == Decimal(0)
+    assert receipt.accepted_cost_ceiling_usd == accepted.cost_ceiling_usd
+    assert billing_calls == [
+        {
+            "start_time": "2026-08-03T10:00:00+00:00",
+            "end_time": "2026-08-03T11:00:00+00:00",
+            "bucket_size": "hour",
+            "endpoint_id": "endpoint-selfie-01",
+        },
+        {
+            "start_time": "2026-08-03T10:00:00+00:00",
+            "end_time": "2026-08-03T11:00:00+00:00",
+            "bucket_size": "hour",
+            "endpoint_id": "endpoint-selfie-01",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_window_billing_waits_for_closed_complete_buckets() -> None:
+    clock = MutableClock()
+    calls = 0
+
+    def billing(**_: object) -> BillingPage:
+        nonlocal calls
+        calls += 1
+        return _billing_page(records=False)
+
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(serverless_billing=billing),
+        clock=clock,
+    )
+    accepted = quote()
+    allocation = ambiguous_window(accepted)
+
+    assert await provider.final_ambiguous_window_billing(allocation, accepted) is None
+    assert calls == 0
+    clock.value += timedelta(hours=1)
+    assert await provider.final_ambiguous_window_billing(allocation, accepted) is None
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss() -> None:
+    clock = MutableClock()
+    clock.value += timedelta(hours=1)
+    page = _billing_page(
+        extra_record={
+            "totalAmount": 0.050,
+            "gpuAmount": 0.047,
+        }
+    )
+    page = replace(
+        page,
+        metadata={
+            **page.metadata,
+            "totals": {
+                "totalAmount": 0.050,
+                "gpuAmount": 0.047,
+                "cpuAmount": 0.0,
+                "diskAmount": 0.001,
+                "feeAmount": 0.002,
+            },
+        },
+    )
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(serverless_billing=lambda **_: page),
+        clock=clock,
+    )
+    accepted = quote()
+
+    receipt = await provider.final_ambiguous_window_billing(
+        ambiguous_window(accepted), accepted
+    )
+
+    assert receipt is not None
+    assert receipt.actual_cost_usd == Decimal("0.05")
+    assert receipt.capped_cost_usd == accepted.cost_ceiling_usd
+    assert receipt.operator_loss_usd == Decimal("0.0145")
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_window_rejects_incomplete_allocation_or_ceiling() -> None:
+    accepted = quote()
+    allocation = ambiguous_window(accepted)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=SimpleNamespace(),
+        clock=MutableClock(),
+    )
+
+    with pytest.raises(ValueError, match="does not reserve every"):
+        replace(
+            allocation,
+            exclusive_billing_hour_starts=(datetime(2026, 8, 3, 9, tzinfo=UTC),),
+        )
+    with pytest.raises(RunPodManagerError, match="ceiling does not match"):
+        await provider.final_ambiguous_window_billing(
+            replace(
+                allocation,
+                accepted_cost_ceiling_usd=accepted.cost_ceiling_usd + Decimal("0.01"),
+            ),
+            accepted,
+        )
 
 
 @pytest.mark.asyncio

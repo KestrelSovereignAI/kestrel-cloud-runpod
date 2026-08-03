@@ -23,6 +23,8 @@ from .placement import select_gpu
 from .serverless_capacity_contracts import (
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
     SERVERLESS_CAPACITY_SCHEMA_VERSION,
+    ServerlessAmbiguousBillingWindow,
+    ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingAttempt,
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
@@ -246,6 +248,92 @@ class RunpodServerlessCapacityProvider:
             disk_cost_usd=amounts["disk_cost_usd"],
             fee_cost_usd=amounts["fee_cost_usd"],
             actual_cost_usd=amounts["actual_cost_usd"],
+            reconciled_at=now,
+        )
+
+    async def final_ambiguous_window_billing(
+        self,
+        window: ServerlessAmbiguousBillingWindow,
+        quote: ServerlessCapacityQuote,
+    ) -> ServerlessAmbiguousWindowBillingReceipt | None:
+        """Settle an exclusive endpoint-hour window without a provider job ID.
+
+        This is the fail-closed recovery path for a submission whose acceptance
+        was ambiguous. It performs no job lookup and trusts no estimate as
+        actual cost: the last allocated hour must close and REST v2 must return
+        a complete set of endpoint-hour aggregates before a receipt is emitted.
+        """
+
+        window.validate_quote(quote)
+        now = self._now()
+        billing_hour_starts = tuple(
+            value.astimezone(UTC) for value in window.exclusive_billing_hour_starts
+        )
+        window_from = billing_hour_starts[0]
+        window_until = billing_hour_starts[-1] + timedelta(hours=1)
+        if now < window_until:
+            return None
+        page = await asyncio.to_thread(
+            self.control_client.serverless_billing,
+            start_time=iso_datetime(window_from),
+            end_time=iso_datetime(window_until),
+            bucket_size="hour",
+            endpoint_id=window.endpoint_id,
+        )
+        amounts = _authoritative_amounts(
+            page,
+            endpoint_id=window.endpoint_id,
+            window_from=window_from,
+            window_until=window_until,
+        )
+        if amounts is None:
+            return None
+        actual_cost = amounts["actual_cost_usd"]
+        capped_cost = min(actual_cost, window.accepted_cost_ceiling_usd)
+        operator_loss = actual_cost - capped_cost
+        identity = {
+            "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            "provider_quote_id": quote.provider_quote_id,
+            "endpoint_profile_sha256": quote.endpoint_profile_sha256,
+            "endpoint_id": window.endpoint_id,
+            "attempt_id": window.attempt_id,
+            "exclusive_window_sha256": window.exclusive_window_sha256,
+            "exclusive_billing_hour_starts": [
+                iso_datetime(value) for value in billing_hour_starts
+            ],
+            "attempted_at": iso_datetime(window.attempted_at),
+            "billable_coverage_until": iso_datetime(window.billable_coverage_until),
+            "billing_window_from": iso_datetime(window_from),
+            "billing_window_until": iso_datetime(window_until),
+            "accepted_cost_ceiling_usd": decimal_text(window.accepted_cost_ceiling_usd),
+            **{name: decimal_text(value) for name, value in amounts.items()},
+            "capped_cost_usd": decimal_text(capped_cost),
+            "operator_loss_usd": decimal_text(operator_loss),
+        }
+        return ServerlessAmbiguousWindowBillingReceipt(
+            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
+            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            provider_billing_id=(
+                "runpod-serverless-ambiguous-billing:" + json_sha256(identity)
+            ),
+            provider_quote_id=quote.provider_quote_id,
+            endpoint_profile_sha256=quote.endpoint_profile_sha256,
+            endpoint_id=window.endpoint_id,
+            attempt_id=window.attempt_id,
+            exclusive_window_sha256=window.exclusive_window_sha256,
+            exclusive_billing_hour_starts=billing_hour_starts,
+            attempted_at=window.attempted_at,
+            billable_coverage_until=window.billable_coverage_until,
+            billing_window_from=window_from,
+            billing_window_until=window_until,
+            accepted_cost_ceiling_usd=window.accepted_cost_ceiling_usd,
+            gpu_cost_usd=amounts["gpu_cost_usd"],
+            cpu_cost_usd=amounts["cpu_cost_usd"],
+            disk_cost_usd=amounts["disk_cost_usd"],
+            fee_cost_usd=amounts["fee_cost_usd"],
+            actual_cost_usd=actual_cost,
+            capped_cost_usd=capped_cost,
+            operator_loss_usd=operator_loss,
             reconciled_at=now,
         )
 

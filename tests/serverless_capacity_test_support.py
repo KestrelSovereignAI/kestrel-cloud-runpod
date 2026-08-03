@@ -15,6 +15,7 @@ from kestrel_cloud_runpod.models import (
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
     SERVERLESS_CAPACITY_SCHEMA_VERSION,
+    ServerlessAmbiguousBillingWindow,
     ServerlessBillingAttempt,
     ServerlessCapacityConstraints,
     ServerlessCapacityQuote,
@@ -225,3 +226,37 @@ def attempt(
             completed_at + timedelta(seconds=selected.idle_tail_seconds),
         )
     return ServerlessBillingAttempt(**values)  # type: ignore[arg-type]
+
+
+def ambiguous_window(
+    item: ServerlessCapacityQuote | None = None, **changes: object
+) -> ServerlessAmbiguousBillingWindow:
+    selected = item or quote()
+    attempted_at = datetime(2026, 8, 3, 10, 0, 30, tzinfo=UTC)
+    billable_coverage_until = attempted_at + timedelta(
+        seconds=(
+            selected.maximum_queue_delay_seconds
+            + selected.maximum_worker_start_seconds
+            + selected.maximum_execution_seconds
+            + selected.idle_tail_seconds
+        )
+    )
+    values: dict[str, object] = {
+        "attempt_id": "attempt-selfie-ambiguous-0001",
+        "endpoint_id": selected.endpoint_id,
+        "provider_quote_id": selected.provider_quote_id,
+        "exclusive_window_sha256": "7" * 64,
+        "attempted_at": attempted_at,
+        "billable_coverage_until": billable_coverage_until,
+        "accepted_cost_ceiling_usd": selected.cost_ceiling_usd,
+    }
+    values.update(changes)
+    if "exclusive_billing_hour_starts" not in changes:
+        start = values["attempted_at"]
+        coverage_until = values["billable_coverage_until"]
+        assert isinstance(start, datetime)
+        assert isinstance(coverage_until, datetime)
+        values["exclusive_billing_hour_starts"] = serverless_billing_hour_starts(
+            start, coverage_until
+        )
+    return ServerlessAmbiguousBillingWindow(**values)  # type: ignore[arg-type]

@@ -190,7 +190,11 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
         serverless_workers_max=2,
     )
     provider = _provider(deployment=deployment)
-    request = make_request(MutableClock())
+    request = make_request(
+        MutableClock(),
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
     plan = await provider.plan(request)
 
     with pytest.raises(RunPodManagerError, match="exactly one Serverless worker"):
@@ -209,8 +213,9 @@ async def test_plan_uses_product_specific_live_catalog_prices(monkeypatch):
 
     plan = await provider.plan(make_request(MutableClock()))
 
-    assert plan.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
-    assert plan.placement.gpu_id == "gpu-serverless"
+    assert plan.mode is OllamaLeaseMode.DEDICATED_POD
+    assert plan.placement.gpu_id == "gpu-pod"
+    assert plan.estimated_cost == pytest.approx(0.5)
 
 
 @pytest.mark.asyncio
@@ -226,9 +231,7 @@ async def test_poolless_serverless_availability_fails_clearly_without_create(
         return (
             replace(
                 _offer(ComputeProduct.SERVERLESS),
-                id=(
-                    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"
-                ),
+                id=("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"),
                 pool=None,
                 secure=False,
                 community=False,
@@ -268,9 +271,7 @@ async def test_pooled_serverless_offer_survives_unrelated_poolless_offer(
         return (
             replace(
                 pooled,
-                id=(
-                    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"
-                ),
+                id=("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"),
                 pool=None,
                 availability=Availability.HIGH,
             ),
@@ -282,7 +283,9 @@ async def test_pooled_serverless_offer_survives_unrelated_poolless_offer(
 
     plan = await provider.plan(
         make_request(
-            MutableClock(), mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+            MutableClock(),
+            mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            max_authorized_cost=5.0,
         )
     )
 
@@ -300,7 +303,11 @@ async def test_serverless_provision_is_load_balanced_and_configuration_owned(
     monkeypatch.setenv("HOST_SECRET_THAT_MUST_NOT_EXPAND", "leaked-secret")
     client = _ControlClient()
     provider = _provider(client=client)
-    request = make_request(MutableClock())
+    request = make_request(
+        MutableClock(),
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
     plan = await provider.plan(request)
 
     resource = await provider.provision(
@@ -381,9 +388,7 @@ async def test_pod_initializing_health_is_not_ready():
             return httpx.Response(204)
         return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
 
-    observation = await _provider(
-        transport=httpx.MockTransport(handler)
-    ).observe(
+    observation = await _provider(transport=httpx.MockTransport(handler)).observe(
         ProvisionedOllamaResource(
             resource_type=OllamaResourceType.POD,
             provider_resource_id="pod-1",
@@ -542,7 +547,11 @@ async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch)
 
     serverless_client = _ControlClient()
     serverless = _provider(client=serverless_client, deployment=deployment)
-    serverless_request = make_request(MutableClock())
+    serverless_request = make_request(
+        MutableClock(),
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
     serverless_plan = await serverless.plan(serverless_request)
     await serverless.provision(
         request=serverless_request,

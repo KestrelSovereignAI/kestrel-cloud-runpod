@@ -155,6 +155,7 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
     assert quote.region == "us-tx-3"
     assert quote.estimated_ready_seconds == 30
     assert quote.metadata["mode"] == "serverless_load_balancer"
+    assert quote.metadata["maximum_serverless_cold_starts"] == 1
     assert capacity.provision_calls == 0
 
     lease = await adapter.acquire(request, quote)

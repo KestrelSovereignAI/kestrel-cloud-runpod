@@ -40,6 +40,7 @@ from .ollama_contracts import (
     OllamaPlacementPlan,
     OllamaResourceConstraints,
     OllamaResourceType,
+    maximum_serverless_cold_starts,
     require_aware,
 )
 from .ollama_provider import RunpodOllamaCapacityProvider
@@ -512,9 +513,7 @@ class RunpodInferenceLeaseProvider:
         mode: OllamaLeaseMode,
         now: datetime,
     ) -> None:
-        if policy.ready_seconds(mode) > self._remaining_readiness_seconds(
-            request, now
-        ):
+        if policy.ready_seconds(mode) > self._remaining_readiness_seconds(request, now):
             raise InferenceLeaseConstraintError(
                 "Runpod estimated cold start no longer fits the readiness deadline"
             )
@@ -534,6 +533,13 @@ class RunpodInferenceLeaseProvider:
         if _money(plan.estimated_cost) > quote.estimated_total_cost_usd:
             raise InferenceLeaseConstraintError(
                 "live Runpod total cost exceeds the accepted quote"
+            )
+        if (
+            plan.maximum_serverless_cold_starts
+            != _quoted_maximum_serverless_cold_starts(quote)
+        ):
+            raise InferenceLeaseConstraintError(
+                "live Runpod cold-start exposure differs from the accepted quote"
             )
 
     def _to_sdk_lease(self, lease: OllamaLease, *, runtime: _Runtime) -> InferenceLease:
@@ -683,6 +689,7 @@ def _quote_metadata(plan: OllamaPlacementPlan) -> dict[str, Any]:
         "gpu_pool": plan.placement.gpu_pool,
         "gpu_name": plan.placement.gpu_name,
         "estimated_billable_seconds": plan.estimated_billable_seconds,
+        "maximum_serverless_cold_starts": (plan.maximum_serverless_cold_starts),
         "catalog_observed_at": plan.placement.catalog_observed_at.isoformat(),
     }
 
@@ -695,8 +702,27 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
         "gpu_pool": lease.selected_gpu_pool,
         "gpu_name": lease.selected_gpu_name,
         "estimated_billable_seconds": lease.estimated_billable_seconds,
+        "maximum_serverless_cold_starts": (
+            maximum_serverless_cold_starts(
+                expected_session_seconds=lease.expected_session_seconds,
+                idle_tail_seconds=lease.serverless_idle_tail_seconds,
+            )
+            if lease.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+            else 0
+        ),
         "cold_start_seconds": lease.cold_start_seconds,
     }
+
+
+def _quoted_maximum_serverless_cold_starts(
+    quote: InferenceLeaseQuote,
+) -> int:
+    value = quote.metadata.get("maximum_serverless_cold_starts")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise InferenceLeaseConstraintError(
+            "Runpod quote has an invalid Serverless cold-start bound"
+        )
+    return value
 
 
 def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:

@@ -160,4 +160,5 @@ def serverless_plan(
         placement=decision,
         estimated_cost=estimated_cost,
         estimated_billable_seconds=390,
+        maximum_serverless_cold_starts=1,
     )

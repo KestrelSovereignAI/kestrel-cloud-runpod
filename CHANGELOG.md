@@ -9,9 +9,15 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Versioned, provider-neutral finite Serverless capacity quotes with exact
   endpoint/profile binding, read-only pre-submit drift validation, and complete
   content-free v2 billing receipts for exclusive endpoint windows.
+- A provider-neutral ambiguous-submission settlement method that accepts an
+  exact exclusive endpoint/hour allocation and ceiling, then returns strict v2
+  actual, capped, and operator-loss cost evidence without requiring a job ID.
 
 ### Fixed
 
+- Quote interactive Serverless for every possible scale-to-zero cold start in
+  the accepted session, bind that maximum into SDK metadata, and reject a zero
+  idle tail whose invocation-independent cost cannot be bounded.
 - Extend authoritative Serverless billing coverage through the accepted idle
   tail, bind every exclusively allocated endpoint-hour bucket into the receipt,
   and wait for the last touched bucket to close before settlement.

@@ -11,6 +11,7 @@ import pytest
 from serverless_capacity_test_support import (
     PARAMETERS_SHA256,
     MutableClock,
+    ambiguous_window,
     attempt,
     constraints,
     profile,
@@ -21,6 +22,8 @@ from serverless_capacity_test_support import (
 import kestrel_cloud_runpod
 from kestrel_cloud_runpod.models import Availability, CloudType, RunPodManagerError
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
+    ServerlessAmbiguousBillingWindow,
+    ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
     serverless_worker_cost_usd,
@@ -46,6 +49,55 @@ def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math() -> N
     assert item.job_execution_timeout_ms == 120_000
     assert item.job_ttl_ms == 300_000
     assert ServerlessCapacityQuote.from_dict(serialized).to_dict() == serialized
+
+
+def test_ambiguous_window_and_receipt_round_trip_are_content_free() -> None:
+    accepted = quote()
+    allocation = ambiguous_window(accepted)
+    allocation.validate_quote(accepted)
+    serialized_window = allocation.to_dict()
+    assert (
+        ServerlessAmbiguousBillingWindow.from_dict(serialized_window).to_dict()
+        == serialized_window
+    )
+    receipt = ServerlessAmbiguousWindowBillingReceipt(
+        schema_version=1,
+        contract_version="serverless-capacity-v1",
+        provider_billing_id="runpod-serverless-ambiguous-billing:" + "6" * 64,
+        provider_quote_id=accepted.provider_quote_id,
+        endpoint_profile_sha256=accepted.endpoint_profile_sha256,
+        endpoint_id=allocation.endpoint_id,
+        attempt_id=allocation.attempt_id,
+        exclusive_window_sha256=allocation.exclusive_window_sha256,
+        exclusive_billing_hour_starts=allocation.exclusive_billing_hour_starts,
+        attempted_at=allocation.attempted_at,
+        billable_coverage_until=allocation.billable_coverage_until,
+        billing_window_from=allocation.exclusive_billing_hour_starts[0],
+        billing_window_until=allocation.exclusive_billing_hour_starts[-1]
+        + timedelta(hours=1),
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        gpu_cost_usd=Decimal("0.047"),
+        cpu_cost_usd=Decimal(0),
+        disk_cost_usd=Decimal("0.001"),
+        fee_cost_usd=Decimal("0.002"),
+        actual_cost_usd=Decimal("0.050"),
+        capped_cost_usd=accepted.cost_ceiling_usd,
+        operator_loss_usd=Decimal("0.0145"),
+        reconciled_at=allocation.exclusive_billing_hour_starts[-1] + timedelta(hours=1),
+    )
+    serialized_receipt = receipt.to_dict()
+    assert (
+        ServerlessAmbiguousWindowBillingReceipt.from_dict(serialized_receipt).to_dict()
+        == serialized_receipt
+    )
+    encoded = json.dumps(
+        {"window": serialized_window, "receipt": serialized_receipt},
+        sort_keys=True,
+    ).lower()
+    assert not any(
+        marker in encoded
+        for marker in ("prompt", "response", "signed_url", "image", '"raw"')
+    )
 
 
 @pytest.mark.parametrize(

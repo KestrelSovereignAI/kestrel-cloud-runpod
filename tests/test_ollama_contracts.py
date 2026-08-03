@@ -8,7 +8,10 @@ from ollama_test_support import MutableClock, make_decision, make_request
 from kestrel_cloud_runpod.models import ComputeProduct, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
+    OllamaPlacementPlan,
+    OllamaResourceType,
     canonical_model_name,
+    maximum_serverless_cold_starts,
     sanitize_provider_error,
     select_ollama_plan,
 )
@@ -16,7 +19,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
 
 def test_bursty_session_selects_lower_effective_serverless_cost():
     clock = MutableClock()
-    request = make_request(clock)
+    request = make_request(clock, max_authorized_cost=5.0)
     plan = select_ollama_plan(
         request,
         {
@@ -27,13 +30,103 @@ def test_bursty_session_selects_lower_effective_serverless_cost():
                 pool="pool-24",
             ),
             ComputeProduct.POD: make_decision(
-                ComputeProduct.POD, rate=0.5, gpu_id="pod", pool=None
+                ComputeProduct.POD, rate=4.0, gpu_id="pod", pool=None
             ),
         },
     )
 
     assert plan.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
-    assert plan.estimated_cost == pytest.approx(390 / 3600)
+    assert plan.maximum_serverless_cold_starts == 121
+    assert plan.estimated_billable_seconds == 11_190
+    assert plan.estimated_cost == pytest.approx(11_190 / 3600)
+
+
+def test_serverless_quote_covers_every_possible_scale_to_zero_cycle():
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        expected_session_seconds=300,
+        expected_active_seconds=60,
+        serverless_initialization_seconds=20,
+        serverless_idle_tail_seconds=60,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+    )
+
+    plan = select_ollama_plan(
+        request,
+        {
+            ComputeProduct.SERVERLESS: make_decision(
+                ComputeProduct.SERVERLESS,
+                rate=1.0,
+                gpu_id="serverless",
+                pool="pool-24",
+            )
+        },
+    )
+
+    assert plan.maximum_serverless_cold_starts == 6
+    assert plan.estimated_billable_seconds == 540
+    assert plan.estimated_cost == pytest.approx(540 / 3600)
+
+
+def test_zero_idle_tail_has_no_finite_serverless_cold_start_bound():
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        serverless_idle_tail_seconds=0,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+    )
+
+    assert (
+        maximum_serverless_cold_starts(
+            expected_session_seconds=300,
+            idle_tail_seconds=0,
+        )
+        is None
+    )
+    with pytest.raises(RunPodManagerError, match="No Runpod Ollama mode"):
+        select_ollama_plan(
+            request,
+            {
+                ComputeProduct.SERVERLESS: make_decision(
+                    ComputeProduct.SERVERLESS,
+                    rate=1.0,
+                    gpu_id="serverless",
+                    pool="pool-24",
+                )
+            },
+        )
+
+
+def test_placement_plan_rejects_missing_or_cross_product_cold_start_bound():
+    serverless = make_decision(
+        ComputeProduct.SERVERLESS,
+        rate=1.0,
+        gpu_id="serverless",
+        pool="pool-24",
+    )
+    with pytest.raises(ValueError, match="require a cold-start bound"):
+        OllamaPlacementPlan(
+            mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+            placement=serverless,
+            estimated_cost=0.1,
+            estimated_billable_seconds=100,
+        )
+    with pytest.raises(ValueError, match="cannot declare Serverless"):
+        OllamaPlacementPlan(
+            mode=OllamaLeaseMode.DEDICATED_POD,
+            resource_type=OllamaResourceType.POD,
+            placement=make_decision(
+                ComputeProduct.POD,
+                rate=1.0,
+                gpu_id="pod",
+                pool=None,
+            ),
+            estimated_cost=0.1,
+            estimated_billable_seconds=100,
+            maximum_serverless_cold_starts=1,
+        )
 
 
 def test_sustained_session_selects_pod_at_live_rates():

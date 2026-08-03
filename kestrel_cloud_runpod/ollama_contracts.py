@@ -233,6 +233,16 @@ class OllamaPlacementPlan:
     placement: PlacementDecision
     estimated_cost: float
     estimated_billable_seconds: int
+    maximum_serverless_cold_starts: int = 0
+
+    def __post_init__(self) -> None:
+        maximum = self.maximum_serverless_cold_starts
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+            raise ValueError("Ollama Serverless cold-start bound must be nonnegative")
+        if self.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT and maximum < 1:
+            raise ValueError("Ollama Serverless plans require a cold-start bound")
+        if self.resource_type is OllamaResourceType.POD and maximum != 0:
+            raise ValueError("Ollama Pod plans cannot declare Serverless cold starts")
 
 
 @dataclass(frozen=True)
@@ -398,20 +408,25 @@ def select_ollama_plan(
         OllamaLeaseMode.AUTO,
         OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
     }:
-        billable = (
-            request.serverless_initialization_seconds
-            + request.expected_active_seconds
-            + request.serverless_idle_tail_seconds
+        maximum_cold_starts = maximum_serverless_cold_starts(
+            expected_session_seconds=request.expected_session_seconds,
+            idle_tail_seconds=request.serverless_idle_tail_seconds,
         )
-        candidates.append(
-            OllamaPlacementPlan(
-                mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-                resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
-                placement=serverless,
-                estimated_cost=serverless.offered_cost_per_hr * billable / 3600,
-                estimated_billable_seconds=billable,
+        if maximum_cold_starts is not None:
+            billable = request.expected_active_seconds + maximum_cold_starts * (
+                request.serverless_initialization_seconds
+                + request.serverless_idle_tail_seconds
             )
-        )
+            candidates.append(
+                OllamaPlacementPlan(
+                    mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+                    resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+                    placement=serverless,
+                    estimated_cost=serverless.offered_cost_per_hr * billable / 3600,
+                    estimated_billable_seconds=billable,
+                    maximum_serverless_cold_starts=maximum_cold_starts,
+                )
+            )
     pod = decisions.get(ComputeProduct.POD)
     if pod is not None and request.mode in {
         OllamaLeaseMode.AUTO,
@@ -426,6 +441,7 @@ def select_ollama_plan(
                     pod.offered_cost_per_hr * request.expected_session_seconds / 3600
                 ),
                 estimated_billable_seconds=request.expected_session_seconds,
+                maximum_serverless_cold_starts=0,
             )
         )
     affordable = [
@@ -444,6 +460,22 @@ def select_ollama_plan(
             + (f": {details}" if details else "")
         )
     return min(affordable, key=lambda candidate: candidate.estimated_cost)
+
+
+def maximum_serverless_cold_starts(
+    *, expected_session_seconds: int, idle_tail_seconds: int
+) -> int | None:
+    """Return a conservative cold-start bound for a scale-to-zero session.
+
+    A new worker may be required after every complete idle-tail interval.  The
+    extra initial start covers the inclusive session boundary.  A zero idle
+    tail cannot provide a finite invocation-independent bound, so callers must
+    omit Serverless rather than quote a knowingly incomplete cost.
+    """
+
+    if idle_tail_seconds <= 0:
+        return None
+    return 1 + expected_session_seconds // idle_tail_seconds
 
 
 def accrued_cost(lease: OllamaLease, now: datetime) -> float:

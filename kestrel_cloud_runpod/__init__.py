@@ -61,6 +61,7 @@ from .ollama_contracts import (
     OllamaResourceConstraints,
     OllamaResourceType,
     OllamaTeardownState,
+    maximum_serverless_cold_starts,
 )
 from .ollama_service import OllamaLeaseService
 from .pod_capacity_contracts import (
@@ -111,6 +112,8 @@ from .pod_transport import (
 from .serverless_capacity_contracts import (
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
     SERVERLESS_CAPACITY_SCHEMA_VERSION,
+    ServerlessAmbiguousBillingWindow,
+    ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingAttempt,
     ServerlessBillingReceipt,
     ServerlessCapacityConstraints,
@@ -206,6 +209,8 @@ __all__ = [
     "RunpodServerlessCapacityProvider",
     "RunpodServerlessClient",
     "SQLitePodCapacityRepository",
+    "ServerlessAmbiguousBillingWindow",
+    "ServerlessAmbiguousWindowBillingReceipt",
     "ServerlessBillingAttempt",
     "ServerlessBillingReceipt",
     "ServerlessCapacityConstraints",
@@ -223,6 +228,7 @@ __all__ = [
     "TrainingPodSource",
     "TrainingPodState",
     "__version__",
+    "maximum_serverless_cold_starts",
     "pod_capacity_database_path",
     "pod_cost_usd",
     "serverless_billing_hour_starts",

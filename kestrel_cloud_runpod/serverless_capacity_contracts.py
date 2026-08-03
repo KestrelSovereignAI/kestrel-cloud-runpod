@@ -941,6 +941,289 @@ class ServerlessBillingReceipt:
         )
 
 
+@dataclass(frozen=True)
+class ServerlessAmbiguousBillingWindow:
+    """Exclusive worst-case endpoint window for an ambiguous submission."""
+
+    attempt_id: str
+    endpoint_id: str
+    provider_quote_id: str
+    exclusive_window_sha256: str
+    exclusive_billing_hour_starts: tuple[datetime, ...]
+    attempted_at: datetime
+    billable_coverage_until: datetime
+    accepted_cost_ceiling_usd: Decimal
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("attempt_id", self.attempt_id),
+            ("endpoint_id", self.endpoint_id),
+            ("provider_quote_id", self.provider_quote_id),
+        ):
+            _safe_identifier(value, name)
+        _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
+        require_aware(self.attempted_at, "attempted_at")
+        require_aware(self.billable_coverage_until, "billable_coverage_until")
+        expected_hours = serverless_billing_hour_starts(
+            self.attempted_at, self.billable_coverage_until
+        )
+        actual_hours = _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
+        if actual_hours != expected_hours:
+            raise ValueError(
+                "Serverless ambiguous allocation does not reserve every "
+                "endpoint-hour bucket"
+            )
+        _positive_decimal(self.accepted_cost_ceiling_usd, "accepted_cost_ceiling_usd")
+
+    def validate_quote(self, quote: ServerlessCapacityQuote) -> None:
+        """Bind the ambiguous mutation window to its exact accepted quote."""
+
+        if self.endpoint_id != quote.endpoint_id:
+            raise RunPodManagerError(
+                "Serverless ambiguous billing endpoint does not match quote"
+            )
+        if self.provider_quote_id != quote.provider_quote_id:
+            raise RunPodManagerError(
+                "Serverless ambiguous billing quote identity does not match"
+            )
+        if self.accepted_cost_ceiling_usd != quote.cost_ceiling_usd:
+            raise RunPodManagerError(
+                "Serverless ambiguous billing ceiling does not match quote"
+            )
+        if not quote.catalog_observed_at <= self.attempted_at < quote.expires_at:
+            raise RunPodManagerError(
+                "Serverless ambiguous submission falls outside the accepted quote"
+            )
+        expected_coverage_until = self.attempted_at + timedelta(
+            seconds=(
+                quote.maximum_queue_delay_seconds
+                + quote.maximum_worker_start_seconds
+                + quote.maximum_execution_seconds
+                + quote.idle_tail_seconds
+            )
+        )
+        if self.billable_coverage_until != expected_coverage_until:
+            raise RunPodManagerError(
+                "Serverless ambiguous allocation does not cover the accepted "
+                "worst-case billable interval"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "endpoint_id": self.endpoint_id,
+            "provider_quote_id": self.provider_quote_id,
+            "exclusive_window_sha256": self.exclusive_window_sha256,
+            "exclusive_billing_hour_starts": [
+                iso_datetime(value) for value in self.exclusive_billing_hour_starts
+            ],
+            "attempted_at": iso_datetime(self.attempted_at),
+            "billable_coverage_until": iso_datetime(self.billable_coverage_until),
+            "accepted_cost_ceiling_usd": decimal_text(self.accepted_cost_ceiling_usd),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ServerlessAmbiguousBillingWindow:
+        _exact_keys(
+            value,
+            _AMBIGUOUS_WINDOW_FIELDS,
+            "Serverless ambiguous billing window",
+        )
+        return cls(
+            attempt_id=_required_string(value, "attempt_id"),
+            endpoint_id=_required_string(value, "endpoint_id"),
+            provider_quote_id=_required_string(value, "provider_quote_id"),
+            exclusive_window_sha256=_required_string(value, "exclusive_window_sha256"),
+            exclusive_billing_hour_starts=_required_datetime_tuple(
+                value, "exclusive_billing_hour_starts"
+            ),
+            attempted_at=parse_datetime(_required_string(value, "attempted_at")),
+            billable_coverage_until=parse_datetime(
+                _required_string(value, "billable_coverage_until")
+            ),
+            accepted_cost_ceiling_usd=_required_decimal(
+                value, "accepted_cost_ceiling_usd"
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ServerlessAmbiguousWindowBillingReceipt:
+    """Authoritative endpoint-hour cost for an ambiguous submission window."""
+
+    schema_version: int
+    contract_version: str
+    provider_billing_id: str
+    provider_quote_id: str
+    endpoint_profile_sha256: str
+    endpoint_id: str
+    attempt_id: str
+    exclusive_window_sha256: str
+    exclusive_billing_hour_starts: tuple[datetime, ...]
+    attempted_at: datetime
+    billable_coverage_until: datetime
+    billing_window_from: datetime
+    billing_window_until: datetime
+    accepted_cost_ceiling_usd: Decimal
+    gpu_cost_usd: Decimal
+    cpu_cost_usd: Decimal
+    disk_cost_usd: Decimal
+    fee_cost_usd: Decimal
+    actual_cost_usd: Decimal
+    capped_cost_usd: Decimal
+    operator_loss_usd: Decimal
+    reconciled_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SERVERLESS_CAPACITY_SCHEMA_VERSION:
+            raise ValueError(
+                "Serverless ambiguous billing receipt schema is unsupported"
+            )
+        if self.contract_version != SERVERLESS_CAPACITY_CONTRACT_VERSION:
+            raise ValueError(
+                "Serverless ambiguous billing receipt contract is unsupported"
+            )
+        for name, value in (
+            ("provider_billing_id", self.provider_billing_id),
+            ("provider_quote_id", self.provider_quote_id),
+            ("endpoint_id", self.endpoint_id),
+            ("attempt_id", self.attempt_id),
+        ):
+            _safe_identifier(value, name)
+        _sha256(self.endpoint_profile_sha256, "endpoint_profile_sha256")
+        _sha256(self.exclusive_window_sha256, "exclusive_window_sha256")
+        for name, value in (
+            ("attempted_at", self.attempted_at),
+            ("billable_coverage_until", self.billable_coverage_until),
+            ("billing_window_from", self.billing_window_from),
+            ("billing_window_until", self.billing_window_until),
+            ("reconciled_at", self.reconciled_at),
+        ):
+            require_aware(value, name)
+        if not (
+            self.billing_window_from
+            <= self.attempted_at
+            < self.billable_coverage_until
+            <= self.billing_window_until
+            <= self.reconciled_at
+        ):
+            raise ValueError(
+                "Serverless ambiguous billing receipt intervals are inconsistent"
+            )
+        expected_hours = serverless_billing_hour_starts(
+            self.attempted_at, self.billable_coverage_until
+        )
+        actual_hours = _normalized_exclusive_hours(self.exclusive_billing_hour_starts)
+        if actual_hours != expected_hours:
+            raise ValueError(
+                "Serverless ambiguous receipt does not bind every endpoint-hour bucket"
+            )
+        if self.billing_window_from != expected_hours[
+            0
+        ] or self.billing_window_until != expected_hours[-1] + timedelta(hours=1):
+            raise ValueError(
+                "Serverless ambiguous receipt window does not match its allocation"
+            )
+        _positive_decimal(self.accepted_cost_ceiling_usd, "accepted_cost_ceiling_usd")
+        for name, value in (
+            ("gpu_cost_usd", self.gpu_cost_usd),
+            ("cpu_cost_usd", self.cpu_cost_usd),
+            ("disk_cost_usd", self.disk_cost_usd),
+            ("fee_cost_usd", self.fee_cost_usd),
+            ("actual_cost_usd", self.actual_cost_usd),
+            ("capped_cost_usd", self.capped_cost_usd),
+            ("operator_loss_usd", self.operator_loss_usd),
+        ):
+            _nonnegative_decimal(value, name)
+        if self.actual_cost_usd != (
+            self.gpu_cost_usd
+            + self.cpu_cost_usd
+            + self.disk_cost_usd
+            + self.fee_cost_usd
+        ):
+            raise ValueError(
+                "Serverless ambiguous billing components do not equal total cost"
+            )
+        if self.capped_cost_usd != min(
+            self.actual_cost_usd, self.accepted_cost_ceiling_usd
+        ):
+            raise ValueError("Serverless ambiguous capped cost is inconsistent")
+        if self.operator_loss_usd != self.actual_cost_usd - self.capped_cost_usd:
+            raise ValueError("Serverless ambiguous operator loss is inconsistent")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "contract_version": self.contract_version,
+            "provider_billing_id": self.provider_billing_id,
+            "provider_quote_id": self.provider_quote_id,
+            "endpoint_profile_sha256": self.endpoint_profile_sha256,
+            "endpoint_id": self.endpoint_id,
+            "attempt_id": self.attempt_id,
+            "exclusive_window_sha256": self.exclusive_window_sha256,
+            "exclusive_billing_hour_starts": [
+                iso_datetime(value) for value in self.exclusive_billing_hour_starts
+            ],
+            "attempted_at": iso_datetime(self.attempted_at),
+            "billable_coverage_until": iso_datetime(self.billable_coverage_until),
+            "billing_window_from": iso_datetime(self.billing_window_from),
+            "billing_window_until": iso_datetime(self.billing_window_until),
+            "accepted_cost_ceiling_usd": decimal_text(self.accepted_cost_ceiling_usd),
+            "gpu_cost_usd": decimal_text(self.gpu_cost_usd),
+            "cpu_cost_usd": decimal_text(self.cpu_cost_usd),
+            "disk_cost_usd": decimal_text(self.disk_cost_usd),
+            "fee_cost_usd": decimal_text(self.fee_cost_usd),
+            "actual_cost_usd": decimal_text(self.actual_cost_usd),
+            "capped_cost_usd": decimal_text(self.capped_cost_usd),
+            "operator_loss_usd": decimal_text(self.operator_loss_usd),
+            "reconciled_at": iso_datetime(self.reconciled_at),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, Any]
+    ) -> ServerlessAmbiguousWindowBillingReceipt:
+        _exact_keys(
+            value,
+            _AMBIGUOUS_RECEIPT_FIELDS,
+            "Serverless ambiguous billing receipt",
+        )
+        return cls(
+            schema_version=_required_int(value, "schema_version"),
+            contract_version=_required_string(value, "contract_version"),
+            provider_billing_id=_required_string(value, "provider_billing_id"),
+            provider_quote_id=_required_string(value, "provider_quote_id"),
+            endpoint_profile_sha256=_required_string(value, "endpoint_profile_sha256"),
+            endpoint_id=_required_string(value, "endpoint_id"),
+            attempt_id=_required_string(value, "attempt_id"),
+            exclusive_window_sha256=_required_string(value, "exclusive_window_sha256"),
+            exclusive_billing_hour_starts=_required_datetime_tuple(
+                value, "exclusive_billing_hour_starts"
+            ),
+            attempted_at=parse_datetime(_required_string(value, "attempted_at")),
+            billable_coverage_until=parse_datetime(
+                _required_string(value, "billable_coverage_until")
+            ),
+            billing_window_from=parse_datetime(
+                _required_string(value, "billing_window_from")
+            ),
+            billing_window_until=parse_datetime(
+                _required_string(value, "billing_window_until")
+            ),
+            accepted_cost_ceiling_usd=_required_decimal(
+                value, "accepted_cost_ceiling_usd"
+            ),
+            gpu_cost_usd=_required_decimal(value, "gpu_cost_usd"),
+            cpu_cost_usd=_required_decimal(value, "cpu_cost_usd"),
+            disk_cost_usd=_required_decimal(value, "disk_cost_usd"),
+            fee_cost_usd=_required_decimal(value, "fee_cost_usd"),
+            actual_cost_usd=_required_decimal(value, "actual_cost_usd"),
+            capped_cost_usd=_required_decimal(value, "capped_cost_usd"),
+            operator_loss_usd=_required_decimal(value, "operator_loss_usd"),
+            reconciled_at=parse_datetime(_required_string(value, "reconciled_at")),
+        )
+
+
 def serverless_worker_cost_usd(
     hourly_rate_usd: Decimal, gpu_count: int, seconds: int
 ) -> Decimal:
@@ -1087,6 +1370,31 @@ def _required_datetime_tuple(
     return tuple(parsed)
 
 
+def _normalized_exclusive_hours(values: tuple[datetime, ...]) -> tuple[datetime, ...]:
+    if not isinstance(values, tuple) or not values:
+        raise ValueError(
+            "Serverless exclusive billing allocation must contain hour buckets"
+        )
+    normalized: list[datetime] = []
+    previous: datetime | None = None
+    for value in values:
+        require_aware(value, "exclusive_billing_hour_starts")
+        item = value.astimezone(UTC)
+        if (
+            item.minute != 0
+            or item.second != 0
+            or item.microsecond != 0
+            or (previous is not None and item != previous + timedelta(hours=1))
+        ):
+            raise ValueError(
+                "Serverless exclusive billing allocation must contain contiguous "
+                "UTC hour starts"
+            )
+        normalized.append(item)
+        previous = item
+    return tuple(normalized)
+
+
 def _required_decimal(value: Mapping[str, Any], key: str) -> Decimal:
     item = value.get(key)
     if not isinstance(item, str):
@@ -1173,10 +1481,52 @@ _RECEIPT_FIELDS = frozenset(
     }
 )
 
+_AMBIGUOUS_WINDOW_FIELDS = frozenset(
+    {
+        "attempt_id",
+        "endpoint_id",
+        "provider_quote_id",
+        "exclusive_window_sha256",
+        "exclusive_billing_hour_starts",
+        "attempted_at",
+        "billable_coverage_until",
+        "accepted_cost_ceiling_usd",
+    }
+)
+
+_AMBIGUOUS_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "contract_version",
+        "provider_billing_id",
+        "provider_quote_id",
+        "endpoint_profile_sha256",
+        "endpoint_id",
+        "attempt_id",
+        "exclusive_window_sha256",
+        "exclusive_billing_hour_starts",
+        "attempted_at",
+        "billable_coverage_until",
+        "billing_window_from",
+        "billing_window_until",
+        "accepted_cost_ceiling_usd",
+        "gpu_cost_usd",
+        "cpu_cost_usd",
+        "disk_cost_usd",
+        "fee_cost_usd",
+        "actual_cost_usd",
+        "capped_cost_usd",
+        "operator_loss_usd",
+        "reconciled_at",
+    }
+)
+
 
 __all__ = [
     "SERVERLESS_CAPACITY_CONTRACT_VERSION",
     "SERVERLESS_CAPACITY_SCHEMA_VERSION",
+    "ServerlessAmbiguousBillingWindow",
+    "ServerlessAmbiguousWindowBillingReceipt",
     "ServerlessBillingAttempt",
     "ServerlessBillingReceipt",
     "ServerlessCapacityConstraints",
