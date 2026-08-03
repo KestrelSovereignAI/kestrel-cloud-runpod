@@ -614,8 +614,22 @@ class PodBillingReceipt:
             ("reconciled_at", self.reconciled_at),
         ):
             require_aware(value, name)
-        if self.billed_until < self.billed_from or self.billed_seconds < 0:
+        if (
+            isinstance(self.billed_seconds, bool)
+            or not isinstance(self.billed_seconds, int)
+            or self.billed_seconds < 0
+            or self.billed_until < self.billed_from
+        ):
             raise ValueError("Pod billing interval is invalid")
+        expected_seconds = int((self.billed_until - self.billed_from).total_seconds())
+        if self.billed_seconds != expected_seconds:
+            raise ValueError(
+                "Pod billed seconds must equal the truncated billing interval"
+            )
+        if self.reconciled_at < self.billed_until:
+            raise ValueError(
+                "Pod billing cannot be reconciled before its interval ends"
+            )
         if (
             not self.hourly_price_usd.is_finite()
             or self.hourly_price_usd <= 0
@@ -623,6 +637,16 @@ class PodBillingReceipt:
             or self.actual_cost_usd < 0
         ):
             raise ValueError("Pod billing amount is invalid")
+        if self.actual_cost_usd > 0 and self.provider_pod_id is None:
+            raise ValueError("Nonzero Pod cost requires a provider Pod identity")
+        if self.provider_pod_id is None and (
+            self.billed_from != self.billed_until
+            or self.billed_seconds != 0
+            or self.actual_cost_usd != 0
+        ):
+            raise ValueError(
+                "Missing provider Pod identity is valid only before billable capacity"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {

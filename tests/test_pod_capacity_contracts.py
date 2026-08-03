@@ -1,6 +1,7 @@
 """Generic quote, identity, cost, environment, and persistence contracts."""
 
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -13,6 +14,7 @@ from pod_capacity_test_support import (
 )
 
 from kestrel_cloud_runpod.pod_capacity_contracts import (
+    PodBillingReceipt,
     PodCapacitySpec,
     attempt_environment_sha256,
 )
@@ -84,3 +86,72 @@ def test_changed_attempt_environment_changes_durable_identity() -> None:
     assert attempt_environment_sha256(first.attempt_environment) != (
         attempt_environment_sha256(second.attempt_environment)
     )
+
+
+def test_billing_receipt_matches_private_terminal_contract() -> None:
+    clock = MutableClock()
+    billed_from = clock() - timedelta(seconds=1, microseconds=750_000)
+    receipt = PodBillingReceipt(
+        provider_billing_id="runpod-billing:" + "a" * 64,
+        provider_pod_id="pod-catalog-1",
+        billed_from=billed_from,
+        billed_until=clock(),
+        billed_seconds=1,
+        hourly_price_usd=Decimal("0.40"),
+        actual_cost_usd=Decimal("0.001"),
+        reconciled_at=clock(),
+    )
+
+    assert receipt.billed_seconds == 1
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"billed_seconds": True}, "interval"),
+        ({"billed_seconds": 1.0}, "interval"),
+        ({"billed_seconds": 2}, "truncated"),
+        (
+            {"reconciled_at": MutableClock()() - timedelta(seconds=1)},
+            "before its interval ends",
+        ),
+        ({"provider_pod_id": None}, "provider Pod identity"),
+        (
+            {"provider_pod_id": None, "actual_cost_usd": Decimal(0)},
+            "before billable capacity",
+        ),
+    ],
+)
+def test_billing_receipt_rejects_non_authoritative_dimensions(
+    changes: dict[str, object], message: str
+) -> None:
+    clock = MutableClock()
+    receipt = PodBillingReceipt(
+        provider_billing_id="runpod-billing:" + "b" * 64,
+        provider_pod_id="pod-catalog-1",
+        billed_from=clock() - timedelta(seconds=1),
+        billed_until=clock(),
+        billed_seconds=1,
+        hourly_price_usd=Decimal("0.40"),
+        actual_cost_usd=Decimal("0.001"),
+        reconciled_at=clock(),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        replace(receipt, **changes)
+
+
+def test_zero_cost_receipt_requires_no_billed_interval_without_a_pod() -> None:
+    clock = MutableClock()
+    receipt = PodBillingReceipt(
+        provider_billing_id="runpod-no-pod:" + "c" * 64,
+        provider_pod_id=None,
+        billed_from=clock(),
+        billed_until=clock(),
+        billed_seconds=0,
+        hourly_price_usd=Decimal("0.40"),
+        actual_cost_usd=Decimal(0),
+        reconciled_at=clock(),
+    )
+
+    assert receipt.provider_pod_id is None
