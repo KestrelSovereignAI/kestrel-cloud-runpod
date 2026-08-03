@@ -2,6 +2,14 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.8.0] - 2026-08-03
+
+### Added
+
+- Versioned, provider-neutral finite Serverless capacity quotes with exact
+  endpoint/profile binding, read-only pre-submit drift validation, and complete
+  content-free v2 billing receipts for exclusive endpoint windows.
+
 ## [0.7.0] - 2026-08-02
 
 ### Added
@@ -104,6 +112,7 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 - Migrated the Runpod integration to the beta v2 REST control plane with typed clients, live catalog placement, and pinned OpenAPI validation.
 
+[0.8.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.5.0...v0.6.0

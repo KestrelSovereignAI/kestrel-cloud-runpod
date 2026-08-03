@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 87 tracked files (62 `.py`, 7 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 95 tracked files (70 `.py`, 7 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -73,6 +73,8 @@ Repo entry points and standard project files.
   - `class TrainingPodSource`; `class TrainingPodOwnership`; `class TrainingPodState`; `class TrainingPodCleanupState`; `class PodCapacityBillingState`; `class CatalogPodWorkloadState`; `class PodCapacityConstraints`; `class PodCapacityQuoteRequest`; `…`
 - **kestrel_cloud_runpod/pod_capacity_provider.py** — Runpod REST v2 adapter for the canonical durable Pod capacity lifecycle.
   - `class TrainingPodObservation`; `class CreatedTrainingPod`; `class PodCapacityCreatedMismatchError`; `class TrainingPodCapacityProvider`; `class RunpodPodCapacityProvider`
+- **kestrel_cloud_runpod/pod_capacity_quote.py** — Read-only composition for live Runpod Pod capacity quotes.
+  - `class PodCapacityQuoteProvider`; `class PodCapacityQuoteService`
 - **kestrel_cloud_runpod/pod_capacity_reconciler.py** — Installed one-shot command for externally scheduled capacity reconciliation.
   - `class PodCapacityReconcilerConfigurationError`; `class PodCapacityReconcilerBusyError`; `class PodCapacityReconcileSummary`; `async def reconcile_once(service_factory)`; `def load_service_factory(reference)`; `def run_cli(argv)`; `def main()`
 - **kestrel_cloud_runpod/pod_capacity_repository.py** — SQLite WAL persistence for restart-safe Pod capacity ownership.
@@ -83,6 +85,10 @@ Repo entry points and standard project files.
   - `class CatalogPodTransportError`; `class CatalogPodTransportConflictError`; `class CatalogPodWorkloadObservation`; `class CatalogPodWorkloadTransport`
 - **kestrel_cloud_runpod/providers.py** — Provider adapters backed by the Runpod v2 REST control plane.
   - `class GPUProvider`; `class DirectRunPodProvider`; `class ManagedRunPodProvider`
+- **kestrel_cloud_runpod/serverless_capacity_contracts.py** — Provider-neutral contracts for finite Serverless capacity and billing.
+  - `class ServerlessCapacityConstraints`; `class ServerlessEndpointProfile`; `class ServerlessCapacityQuoteRequest`; `class ServerlessCapacityQuote`; `class ServerlessBillingAttempt`; `class ServerlessBillingReceipt`; `def serverless_worker_cost_usd(hourly_rate_usd, gpu_count, seconds)`; `def decimal_text(value)`; `…`
+- **kestrel_cloud_runpod/serverless_capacity_provider.py** — Runpod REST v2 adapter for finite Serverless quotes and billing.
+  - `class RunpodServerlessCapacityProvider`
 - **kestrel_cloud_runpod/training.py** — RunPod LoRA Training Methods.
   - `class RunPodTrainingMixin`
 - **kestrel_cloud_runpod/training_contracts.py** — Compatibility names for the canonical Pod capacity contracts.
@@ -117,6 +123,8 @@ Repo entry points and standard project files.
   - `class MutableClock`; `def make_request(clock)`; `def make_decision(product)`; `class FakeOllamaProvider`; `def serverless_plan(rate)`
 - **tests/pod_capacity_test_support.py** — Deterministic doubles for generic catalog Pod capacity tests.
   - `class MutableClock`; `def constraints()`; `def quote(clock)`; `def request(clock)`; `def profile()`; `class FakeCapabilityStore`; `class FakeCapacityProvider`; `class FakeWorkloadTransport`; `…`
+- **tests/serverless_capacity_test_support.py** — Shared fixtures for finite Serverless capacity tests.
+  - `class MutableClock`; `def constraints()`; `def profile()`; `def request()`; `def offer()`; `def endpoint(endpoint_profile)`; `def quote(clock)`; `def attempt(item)`
 - **tests/test_inference_provider.py** — SDK provider boundary tests for durable private Runpod inference.
   - `def test_dedicated_entry_point_loads_sdk_provider_contract()`; `def test_capabilities_are_deterministic_and_policy_scoped(tmp_path)`; `async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path)`; `async def test_quote_expires_before_estimated_cold_start_window_closes(tmp_path)`; `async def test_catalog_refresh_cannot_consume_remaining_cold_start_window(tmp_path)`; `async def test_status_returns_only_exact_authenticated_ready_route(tmp_path)`; `async def test_restart_reconciles_same_lease_without_duplicate_capacity(tmp_path)`; `async def test_owner_isolation_precedes_status_or_release_mutation(tmp_path)`; `…`
 - **tests/test_ollama_contracts.py** — Cost selection and public-route contracts for Ollama leases.
@@ -136,13 +144,17 @@ Repo entry points and standard project files.
 - **tests/test_pod_capacity_architecture.py** — One-source-of-truth and public/private package-boundary tests.
   - `def test_training_names_are_aliases_not_a_second_writable_lifecycle()`; `def test_public_cloud_package_has_no_private_catalog_dependency()`
 - **tests/test_pod_capacity_contracts.py** — Generic quote, identity, cost, environment, and persistence contracts.
-  - `def test_request_binds_exact_parameter_digest_quote_cost_and_image()`; `def test_request_refuses_control_database_and_service_owned_environment(key)`; `def test_persisted_spec_contains_only_secret_identity_digest_and_expiry()`; `def test_changed_attempt_environment_changes_durable_identity()`
+  - `def test_request_binds_exact_parameter_digest_quote_cost_and_image()`; `def test_request_refuses_control_database_and_service_owned_environment(key)`; `def test_persisted_spec_contains_only_secret_identity_digest_and_expiry()`; `def test_changed_attempt_environment_changes_durable_identity()`; `def test_billing_receipt_matches_private_terminal_contract()`; `def test_billing_receipt_rejects_non_authoritative_dimensions(changes, message)`; `def test_zero_cost_receipt_requires_no_billed_interval_without_a_pod()`
+- **tests/test_pod_capacity_evidence.py** — Durable content-free realized Pod and worker evidence contract tests.
+  - `def worker_envelope(clock)`; `async def successful_workload(tmp_path)`; `async def test_realized_lifecycle_worker_and_billing_evidence_survive_restart(tmp_path)`; `async def test_duplicate_observations_and_cas_race_preserve_first_timestamps(tmp_path)`; `async def test_worker_evidence_binding_replay_and_strict_allowlist(tmp_path)`; `async def test_public_projection_is_content_free_and_omits_capabilities(tmp_path)`; `async def test_v2_catalog_row_migrates_with_explicit_missing_evidence(tmp_path)`; `def test_lifecycle_timestamp_order_and_worker_startup_split_are_validated()`
 - **tests/test_pod_capacity_provider.py** — Runpod v2 quote, exact recovery, termination, and billing adapter tests.
-  - `async def test_quote_binds_parameter_digest_exact_gpu_rate_and_timing()`; `async def test_create_injects_exact_image_gpu_and_attempt_environment()`; `async def test_created_metadata_mismatch_preserves_known_pod_id()`; `async def test_exact_recovery_rejects_mismatch_and_multiple_matches()`; `async def test_final_billing_waits_for_records_then_returns_content_free_receipt()`; `async def test_final_billing_waits_until_records_cover_termination()`
+  - `async def test_quote_binds_parameter_digest_exact_gpu_rate_and_timing()`; `async def test_create_injects_exact_image_gpu_and_attempt_environment()`; `async def test_created_metadata_mismatch_preserves_known_pod_id()`; `async def test_create_rejects_realized_placement_outside_quote(override, expected_message)`; `async def test_exact_recovery_rejects_mismatch_and_multiple_matches()`; `async def test_final_billing_waits_for_records_then_returns_content_free_receipt()`; `async def test_final_billing_waits_until_records_cover_termination()`
+- **tests/test_pod_capacity_quote.py** — Tests for read-only Pod capacity quote composition.
+  - `def test_quote_service_requires_an_explicit_profile_catalog()`; `async def test_quote_service_delegates_without_a_repository()`
 - **tests/test_pod_capacity_reconciler.py** — Installed, locked, content-free Pod-capacity reconciler command tests.
   - `def test_distribution_installs_capacity_reconciler_entry_point()`; `async def test_reconcile_once_constructs_service_and_runs_one_pass(tmp_path)`; `def test_cli_runs_once_without_provisioning_and_emits_content_free_json(tmp_path)`; `def test_cli_missing_factory_fails_before_loading_or_provisioning()`; `def test_cli_auth_configuration_error_never_exposes_message_or_secret()`; `def test_cli_missing_catalog_dependency_fails_before_reconcile(tmp_path)`; `def test_cli_lock_contention_is_retryable_and_never_runs_service(tmp_path)`; `def test_cli_timeout_is_retryable_and_content_free(tmp_path)`; `…`
 - **tests/test_pod_capacity_service.py** — End-to-end durable catalog Pod lifecycle tests without live resources.
-  - `async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path)`; `async def test_identical_replay_adopts_ready_lease_but_changed_env_conflicts(tmp_path)`; `async def test_ambiguous_create_never_retries_and_delayed_visibility_is_adopted(tmp_path)`; `async def test_known_created_mismatch_is_durably_terminated_and_billed(tmp_path)`; `async def test_submit_success_result_replays_until_ack_then_billing_reconciles(tmp_path)`; `async def test_result_replays_after_host_restart_until_durable_ack(tmp_path)`; `async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path)`; `async def test_cancellation_is_worker_authenticated_then_capacity_terminated(tmp_path)`; `…`
+  - `async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path)`; `async def test_identical_replay_adopts_ready_lease_but_changed_env_conflicts(tmp_path)`; `async def test_ambiguous_create_never_retries_and_delayed_visibility_is_adopted(tmp_path)`; `async def test_known_created_mismatch_is_durably_terminated_and_billed(tmp_path)`; `async def test_missing_realized_placement_is_durably_terminated_and_billed(tmp_path)`; `async def test_submit_success_result_replays_until_ack_then_billing_reconciles(tmp_path)`; `async def test_result_replays_after_host_restart_until_durable_ack(tmp_path)`; `async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path)`; `…`
 - **tests/test_pod_capacity_transport.py** — Authenticated single-attempt workload transport tests.
   - `async def test_transport_uses_anonymous_health_and_bearer_for_job_routes()`; `async def test_transport_rejects_local_hash_mismatch_before_network()`; `async def test_transport_maps_remote_conflict_without_echoing_body()`; `async def test_transport_returns_result_unchanged_but_checks_attempt_binding()`; `async def test_transport_requires_tls_and_refuses_redirects()`
 - **tests/test_release_metadata.py** — Release metadata alignment tests.
@@ -161,6 +173,10 @@ Repo entry points and standard project files.
   - `def test_direct_provider_selects_from_live_catalog_and_records_placement()`; `def test_direct_provider_fails_before_catalog_when_required_env_is_unset(monkeypatch)`; `def test_profile_rejects_persistent_volume_below_runpod_floor()`; `def test_direct_provider_lifecycle_and_v2_logs()`; `def test_private_cli_ssh_execution_has_clear_migration_error()`; `async def test_manager_get_logs_uses_provider_v2_log_stream()`; `def test_legacy_profile_fields_fail_with_migration_guidance()`; `def test_manager_maps_v2_http_runtime_port_to_pod_proxy_url()`; `…`
 - **tests/test_runpod_smoke.py** — Opt-in, read-only authenticated smoke checks for the beta v2 API.
   - `def test_live_v2_gpu_catalog_is_read_only_and_typed()`; `def test_live_v2_network_volume_inventory_is_read_only_and_typed()`
+- **tests/test_serverless_capacity_contracts.py** — Contract tests for finite Serverless quotes and billing evidence.
+  - `def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math()`; `def test_quote_rejects_unsafe_or_inconsistent_dimensions(changes, message)`; `def test_quote_deserialization_rejects_raw_or_content_bearing_fields()`; `def test_quote_serialization_is_content_free()`; `def test_endpoint_profile_requires_exact_scale_to_zero_pool_and_data_center()`; `def test_request_requires_bounded_queue_billable_and_non_worker_estimates()`; `def test_quote_expiry_and_exact_accepted_ceiling_fail_closed()`; `def test_attempt_binds_exact_endpoint_job_quote_and_authorized_interval()`; `…`
+- **tests/test_serverless_capacity_provider.py** — REST v2 adapter tests for Serverless quote and billing reconciliation.
+  - `async def test_quote_is_exact_read_only_v2_catalog_and_endpoint_observation()`; `async def test_billing_requires_a_separate_restricted_job_status_client()`; `async def test_quote_uses_existing_selector_for_mig_cuda_region_and_availability()`; `async def test_quote_rejects_endpoint_profile_mismatch(raw_change, message)`; `async def test_quote_rejects_shared_pool_and_unsafe_catalog_numbers()`; `async def test_submission_validation_rejects_rate_pool_workload_and_expiry_drift()`; `async def test_final_billing_binds_terminal_job_and_complete_endpoint_window()`; `async def test_final_billing_waits_for_closed_bucket_delayed_or_partial_records()`; `…`
 - **tests/test_training_contracts.py** — Public durable training ownership contracts.
   - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`; `def test_child_request_fingerprint_is_bound_to_its_cleanup_family()`; `def test_request_defaults_root_for_pre_family_callers()`
 - **tests/test_training_mixin.py** — Manager integration for durable training capacity and workload recovery.

@@ -119,6 +119,31 @@ the catalog supplies a canonical pool or the endpoint-create schema changes.
 
 Estimates use the live placement rate. Actual spend is reconciled from `/billing/serverless` or `/billing/pods` and attributed back to the catalog job or inference lease. A price change therefore affects a new placement decision without requiring a code release, while existing decisions remain auditable.
 
+Finite queue jobs use the versioned `ServerlessCapacityQuote` contract rather
+than the dedicated-Pod quote. The host supplies only a workload kind and the
+SHA-256 of its normalized inference parameters plus an operator-defined endpoint
+profile and benchmark. Quoting reads the Serverless catalog and reusable endpoint
+definition; it cannot create, update, delete, submit, cancel, or retry anything.
+The selected pool must resolve to one exact GPU, the endpoint must constrain
+workers to that single pool and one data center, and its immutable worker,
+autoscaling, timeout, disk, and idle-tail settings must match the profile. A
+second read-only observation immediately before dispatch rejects stale quotes or
+upward price and placement drift.
+
+Runpod documents that Serverless workers are billed from startup through
+execution and the configured idle tail, while queue delay and execution are the
+job-level metrics currently exposed by the data plane. The v2 billing route is
+coarser: it emits endpoint-level hourly buckets. Kestrel never derives a fictive
+job cost from execution time. An authoritative `ServerlessBillingReceipt` is
+available only when the exact terminal job/attempt is bound to a caller-owned
+exclusive endpoint-window proof and every closed billing bucket is complete and
+internally consistent. Startup and idle-tail measurements remain null because v2
+does not return them per job. This makes the current throughput tradeoff explicit:
+Frinz must serialize accepted attempts by endpoint billing window or provision a
+separately attributable endpoint until Runpod exposes finer billing identity.
+See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
+[job-state metrics](https://docs.runpod.io/serverless/endpoints/job-states).
+
 ## Choosing an execution mode
 
 | Mode | Use | Backpressure and lifecycle | Cost/latency posture |

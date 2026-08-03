@@ -43,6 +43,7 @@ mapping explicitly. This package does not read a `[runpod]` section from
 - Standalone API: `RunPodManager` for direct programmatic use
 - `RunpodControlPlaneClient` — typed v2 catalog, Pod, Serverless endpoint, worker/log, and billing client
 - `RunpodServerlessClient` — typed queue job run/status/cancel/retry/health client
+- `RunpodServerlessCapacityProvider` — read-only finite-job capacity quotes, pre-submit drift validation, and authoritative content-free billing receipts
 - Durable RunPod-backed private Ollama leases with readiness and cost gates
 - Provider-neutral SDK 0.34 inference leases with OpenAI-compatible host-only routes
 - Durable LoRA training Pod ownership, cleanup tokens, and restart reconciliation
@@ -80,6 +81,40 @@ jobs = RunpodServerlessClient(api_key="...")
 job = jobs.run("endpoint-id", {"prompt": "hello"})
 status = jobs.status("endpoint-id", job.id)
 ```
+
+### Finite Serverless capacity and billing
+
+`ServerlessCapacityQuoteRequest` binds a normalized inference-parameters SHA-256
+and workload kind to one configured immutable queue-endpoint profile. A quote
+performs only `GET /catalog/gpus?product=SERVERLESS&include=AVAILABILITY` and
+`GET /serverless/{id}`. It records schema/contract versions, the profile digest,
+exact GPU/pool/data center, catalog observation, live worker rate, benchmark,
+queue/startup/execution/idle timing bounds, maximum billable seconds, estimated
+cost, maximum cost, and expiry. The caller supplies explicit estimated and
+maximum non-worker amounts so disk and platform fees are included in the wallet
+reservation rather than hidden behind the GPU rate. Generated content, endpoint
+request URLs, worker configuration, credentials, and raw provider bodies are
+never serialized. Finite-job profiles reject persistent network volumes because
+their continuing cost cannot be attributed to one attempt.
+
+Call `validate_quote_for_submission()` immediately before `/run`. It repeats the
+two read-only observations and rejects expiry or endpoint, GPU, pool, data-center,
+profile, or upward-rate drift. It does not submit a job, reserve funds, or own
+catalog state; those operations remain the host application's responsibility.
+A quote-only process needs no Serverless job client. Billing reconciliation adds
+a separately restricted status client but still performs GET requests only.
+
+Runpod v2 currently reports Serverless billing in endpoint-level hourly buckets,
+not per-job records. `final_billing()` therefore returns an authoritative receipt
+only after the exact job is terminal, its complete closed billing window is
+available, the endpoint is configured as scale-to-zero with one worker, and the
+caller supplies the digest of a durable host-owned exclusivity record proving
+that no other attempt shared that endpoint window. A missing, partial, or
+still-open bucket remains pending. Any identity, interval, total, component, or
+unsupported-field mismatch fails closed.
+The receipt binds the accepted quote, profile, endpoint, job, attempt, and
+exclusive window while leaving unavailable worker-startup and idle-tail
+observations as `null`.
 
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 

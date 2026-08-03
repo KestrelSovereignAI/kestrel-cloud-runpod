@@ -1,0 +1,258 @@
+"""Contract tests for finite Serverless quotes and billing evidence."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import timedelta
+from decimal import Decimal
+
+import pytest
+from serverless_capacity_test_support import (
+    PARAMETERS_SHA256,
+    MutableClock,
+    attempt,
+    constraints,
+    profile,
+    quote,
+    request,
+)
+
+from kestrel_cloud_runpod.models import Availability, RunPodManagerError
+from kestrel_cloud_runpod.serverless_capacity_contracts import (
+    ServerlessBillingReceipt,
+    ServerlessCapacityQuote,
+    serverless_worker_cost_usd,
+)
+
+
+def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math() -> None:
+    item = quote()
+    serialized = item.to_dict()
+
+    assert item.parameters_sha256 == PARAMETERS_SHA256
+    assert item.estimated_worker_cost_usd == Decimal("0.019167")
+    assert item.maximum_worker_cost_usd == Decimal("0.034500")
+    assert item.estimated_cost_usd == Decimal("0.019667")
+    assert item.cost_ceiling_usd == Decimal("0.035500")
+    assert ServerlessCapacityQuote.from_dict(serialized).to_dict() == serialized
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"parameters_sha256": "A" * 64}, "SHA-256"),
+        ({"hourly_worker_rate_usd": Decimal("NaN")}, "finite and positive"),
+        ({"hourly_worker_rate_usd": Decimal(-1)}, "finite and positive"),
+        ({"availability": Availability.NONE}, "unavailable"),
+        ({"estimated_billable_seconds": 101}, "inconsistent"),
+        ({"cost_ceiling_usd": Decimal("0.03")}, "cost is inconsistent"),
+    ],
+)
+def test_quote_rejects_unsafe_or_inconsistent_dimensions(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(quote(), **changes)
+
+
+def test_quote_deserialization_rejects_raw_or_content_bearing_fields() -> None:
+    serialized = quote().to_dict()
+    for field in ("raw", "prompt", "response", "signed_url", "weight"):
+        with pytest.raises(RunPodManagerError, match="unsupported"):
+            ServerlessCapacityQuote.from_dict({**serialized, field: "private"})
+
+    with pytest.raises(RunPodManagerError, match="decimal string"):
+        ServerlessCapacityQuote.from_dict(
+            {**serialized, "hourly_worker_rate_usd": 0.69}
+        )
+
+
+def test_quote_serialization_is_content_free() -> None:
+    encoded = json.dumps(quote().to_dict(), sort_keys=True).lower()
+    forbidden = (
+        "http://",
+        "https://",
+        "api_key",
+        "authorization",
+        "prompt",
+        "response",
+        "signed_url",
+        "worker_reference",
+        "private_runtime_value",
+        "weight",
+        "capability",
+        '"raw"',
+    )
+    assert not any(marker in encoded for marker in forbidden)
+
+
+def test_endpoint_profile_requires_exact_scale_to_zero_pool_and_data_center() -> None:
+    with pytest.raises(ValueError, match="single-worker"):
+        profile(workers_max=2)
+    with pytest.raises(ValueError, match="exact endpoint pool"):
+        constraints(allowed_gpu_pools=("BLACKWELL_24", "ADA_24"))
+    with pytest.raises(ValueError, match="exact endpoint data center"):
+        constraints(allowed_data_center_ids=())
+    with pytest.raises(ValueError, match="idle_tail_seconds"):
+        profile(idle_tail_seconds=3_601)
+    with pytest.raises(ValueError, match="at least 0.5"):
+        profile(scaling_value=Decimal("0.4"))
+    with pytest.raises(ValueError, match="QUEUE_DELAY"):
+        profile(scaling_type="REQUEST_COUNT", scaling_value=Decimal(1))
+    with pytest.raises(ValueError, match="network volume cost"):
+        profile(network_volume_ids=("volume-private-01",))
+    with pytest.raises(ValueError, match="too large"):
+        constraints(
+            max_hourly_worker_rate_usd=Decimal("1e9999")
+        ).placement_requirements()
+
+
+def test_request_requires_bounded_queue_billable_and_non_worker_estimates() -> None:
+    with pytest.raises(ValueError, match="queue delay exceeds"):
+        request(estimated_queue_delay_seconds=121)
+    with pytest.raises(ValueError, match="maximum billable time is inconsistent"):
+        request(maximum_billable_seconds=99)
+    with pytest.raises(ValueError, match="non-worker cost exceeds"):
+        request(
+            estimated_non_worker_cost_usd=Decimal("0.002"),
+            maximum_non_worker_cost_usd=Decimal("0.001"),
+        )
+    with pytest.raises(ValueError, match="finite and positive"):
+        request(maximum_non_worker_cost_usd=Decimal(0))
+    with pytest.raises(ValueError, match="five minutes"):
+        request(quote_ttl_seconds=301)
+    with pytest.raises(ValueError, match="endpoint timeout"):
+        request(
+            estimated_execution_seconds=121,
+            maximum_execution_seconds=121,
+            maximum_worker_start_seconds=169,
+            maximum_billable_seconds=300,
+        )
+
+
+def test_quote_expiry_and_exact_accepted_ceiling_fail_closed() -> None:
+    clock = MutableClock()
+    item = quote(clock)
+    item.assert_fresh(now=clock(), accepted_cost_ceiling_usd=item.cost_ceiling_usd)
+
+    with pytest.raises(RunPodManagerError, match="does not match"):
+        item.assert_fresh(
+            now=clock(), accepted_cost_ceiling_usd=item.cost_ceiling_usd + Decimal(1)
+        )
+    with pytest.raises(RunPodManagerError, match="expired"):
+        item.assert_fresh(
+            now=item.expires_at, accepted_cost_ceiling_usd=item.cost_ceiling_usd
+        )
+
+
+def test_attempt_binds_exact_endpoint_job_quote_and_authorized_interval() -> None:
+    item = quote()
+    valid = attempt(item)
+    valid.validate_quote(item)
+
+    with pytest.raises(RunPodManagerError, match="endpoint"):
+        replace(valid, endpoint_id="endpoint-other").validate_quote(item)
+    with pytest.raises(RunPodManagerError, match="quote identity"):
+        replace(
+            valid, provider_quote_id="runpod-serverless:" + "f" * 64
+        ).validate_quote(item)
+    with pytest.raises(RunPodManagerError, match="accepted quote interval"):
+        replace(valid, submitted_at=item.expires_at).validate_quote(item)
+    with pytest.raises(RunPodManagerError, match="maximum interval"):
+        replace(
+            valid,
+            completed_at=valid.submitted_at + timedelta(seconds=301),
+        ).validate_quote(item)
+
+
+def _receipt() -> ServerlessBillingReceipt:
+    item = quote()
+    billing_attempt = attempt(item)
+    return ServerlessBillingReceipt(
+        schema_version=1,
+        contract_version="serverless-capacity-v1",
+        provider_billing_id="runpod-serverless-billing:" + "f" * 64,
+        provider_quote_id=item.provider_quote_id,
+        endpoint_profile_sha256=item.endpoint_profile_sha256,
+        endpoint_id=billing_attempt.endpoint_id,
+        job_id=billing_attempt.job_id,
+        attempt_id=billing_attempt.attempt_id,
+        exclusive_window_sha256=billing_attempt.exclusive_window_sha256,
+        attempt_started_at=billing_attempt.submitted_at,
+        attempt_completed_at=billing_attempt.completed_at,
+        billing_window_from=billing_attempt.submitted_at.replace(
+            minute=0, second=0, microsecond=0
+        ),
+        billing_window_until=billing_attempt.submitted_at.replace(
+            minute=0, second=0, microsecond=0
+        )
+        + timedelta(hours=1),
+        hourly_worker_rate_usd=item.hourly_worker_rate_usd,
+        queue_delay_ms=2_000,
+        worker_startup_ms=None,
+        execution_ms=30_000,
+        idle_tail_ms=None,
+        gpu_cost_usd=Decimal("0.02"),
+        cpu_cost_usd=Decimal(0),
+        disk_cost_usd=Decimal("0.001"),
+        fee_cost_usd=Decimal("0.002"),
+        actual_cost_usd=Decimal("0.023"),
+        reconciled_at=billing_attempt.submitted_at.replace(
+            minute=0, second=0, microsecond=0
+        )
+        + timedelta(hours=1),
+    )
+
+
+def test_receipt_round_trip_keeps_unobservable_components_null_and_content_free() -> (
+    None
+):
+    receipt = _receipt()
+    serialized = receipt.to_dict()
+    assert serialized["worker_startup_ms"] is None
+    assert serialized["idle_tail_ms"] is None
+    assert ServerlessBillingReceipt.from_dict(serialized).to_dict() == serialized
+    with pytest.raises(RunPodManagerError, match="unsupported"):
+        ServerlessBillingReceipt.from_dict(
+            {**serialized, "response": "private-provider-body"}
+        )
+
+    encoded = json.dumps(serialized, sort_keys=True).lower()
+    assert not any(
+        marker in encoded
+        for marker in (
+            "http://",
+            "https://",
+            "prompt",
+            "response",
+            "signed_url",
+            "image",
+            "weight",
+            "capability",
+            '"raw"',
+        )
+    )
+
+
+def test_receipt_rejects_nonfinite_negative_and_mismatched_components() -> None:
+    receipt = _receipt()
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        replace(receipt, fee_cost_usd=Decimal("NaN"))
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        replace(receipt, gpu_cost_usd=Decimal(-1))
+    with pytest.raises(ValueError, match="do not equal"):
+        replace(receipt, actual_cost_usd=Decimal("0.024"))
+    with pytest.raises(ValueError, match="intervals"):
+        replace(
+            receipt,
+            reconciled_at=receipt.billing_window_until - timedelta(seconds=1),
+        )
+    with pytest.raises(ValueError, match="timing exceeds"):
+        replace(receipt, execution_ms=300_000)
+
+
+def test_worker_cost_is_ceiled_and_rejects_nan() -> None:
+    assert serverless_worker_cost_usd(Decimal("0.69"), 1, 1) == Decimal("0.000192")
+    with pytest.raises(ValueError, match="finite and positive"):
+        serverless_worker_cost_usd(Decimal("NaN"), 1, 1)
