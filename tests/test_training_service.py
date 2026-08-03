@@ -22,6 +22,7 @@ from kestrel_cloud_runpod.training_contracts import (
     TrainingPodOwnership,
     TrainingPodSource,
     TrainingPodState,
+    fallback_training_cleanup_token,
 )
 from kestrel_cloud_runpod.training_repository import SQLiteTrainingPodRepository
 from kestrel_cloud_runpod.training_service import TrainingPodLeaseService
@@ -382,3 +383,225 @@ async def test_stop_pending_keeps_id_and_reconciler_retries(tmp_path: Path) -> N
     provider.stop_confirms = True
     reconciled = await service.reconcile()
     assert reconciled[0].state is TrainingPodState.RELEASED
+
+
+async def _persist_fallback_after_released_root(
+    tmp_path: Path,
+    clock: MutableClock,
+    provider: FakeTrainingProvider,
+    *,
+    legacy: bool,
+) -> tuple[TrainingPodLeaseService, str, str]:
+    profiles = {
+        "training": training_profile(),
+        "training-h100": training_profile("training-h100"),
+    }
+    service = training_service(tmp_path, clock, provider, profiles=profiles)
+    root_token = "training:fallback-family-root-0001"
+    provider.create_error = RunPodManagerError("profile unavailable")
+    with pytest.raises(TrainingPodLifecycleError):
+        await service.acquire(
+            training_request(
+                clock,
+                token=root_token,
+                source=TrainingPodSource.CREATED,
+                pod_id=None,
+            )
+        )
+    provider.create_error = None
+    provider.route = "https://pod-created-1-8888.proxy.runpod.net"
+    child_token = fallback_training_cleanup_token(root_token, "training-h100")
+    child = await service.acquire(
+        training_request(
+            clock,
+            token=child_token,
+            root_token=(None if legacy else root_token),
+            profile_id="training-h100",
+            source=TrainingPodSource.CREATED,
+            pod_id=None,
+        )
+    )
+    assert child.state is TrainingPodState.READY
+    return service, root_token, child_token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_root_token_releases_persisted_fallback_family_after_restart(
+    tmp_path: Path, legacy: bool
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    _, root_token, child_token = await _persist_fallback_after_released_root(
+        tmp_path, clock, provider, legacy=legacy
+    )
+    restarted_profiles = {"training": training_profile()}
+    if not legacy:
+        restarted_profiles["training-h100"] = training_profile("training-h100")
+    restarted = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles=restarted_profiles,
+    )
+    recovered = restarted.get_active_family_attempt(root_token)
+    assert recovered is not None and recovered.cleanup_token == child_token
+
+    released_root = await restarted.release(root_token, reason="crash recovery")
+
+    released_child = restarted.repository.get(child_token)
+    assert released_child is not None
+    assert released_child.state is TrainingPodState.RELEASED
+    assert provider.stop_calls == ["pod-created-1"]
+    assert released_root.cleanup_token == root_token
+    assert released_root.family_release_requested is True
+    assert released_root.family_release_complete is True
+
+
+@pytest.mark.asyncio
+async def test_returned_child_token_keeps_exact_release_behavior(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    service, root_token, child_token = await _persist_fallback_after_released_root(
+        tmp_path, clock, provider, legacy=False
+    )
+
+    released = await service.release(child_token, reason="returned session")
+
+    root = service.repository.get(root_token)
+    assert root is not None
+    assert released.cleanup_token == child_token
+    assert released.state is TrainingPodState.RELEASED
+    assert root.family_release_requested is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_finishes_family_release_interrupted_before_child_stop(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    service, root_token, child_token = await _persist_fallback_after_released_root(
+        tmp_path, clock, provider, legacy=True
+    )
+    root = service.repository.get(root_token)
+    assert root is not None
+    service.repository.compare_and_set(
+        root,
+        changes={
+            "family_release_requested": True,
+            "family_release_complete": False,
+        },
+    )
+    restarted = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={"training": training_profile()},
+    )
+
+    await restarted.reconcile()
+
+    child = restarted.repository.get(child_token)
+    root = restarted.repository.get(root_token)
+    assert child is not None and child.state is TrainingPodState.RELEASED
+    assert root is not None and root.family_release_complete is True
+    assert provider.stop_calls == ["pod-created-1"]
+
+
+@pytest.mark.asyncio
+async def test_status_and_error_recording_cannot_revive_released_attempt(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    service = training_service(tmp_path, clock, provider)
+    acquired = await service.acquire(training_request(clock))
+    released = await service.release(acquired.cleanup_token, reason="test")
+
+    status = service.record_status(released.cleanup_token, "failed")
+    error = service.record_operation_error(
+        released.cleanup_token, RunPodManagerError("late observer")
+    )
+
+    assert status == released
+    assert error == released
+    assert service.repository.get(released.cleanup_token) == released
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tolerates_removed_legacy_profile_until_orphan_cleanup(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    _, _, child_token = await _persist_fallback_after_released_root(
+        tmp_path, clock, provider, legacy=True
+    )
+    restarted = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={"training": training_profile()},
+    )
+
+    healthy = await restarted.reconcile()
+
+    child = restarted.repository.get(child_token)
+    assert child is not None and child in healthy
+    assert child.state is TrainingPodState.READY
+    assert child.last_provider_error is None
+    assert provider.stop_calls == []
+
+    clock.value += timedelta(seconds=31)
+    await restarted.reconcile()
+    child = restarted.repository.get(child_token)
+    assert child is not None and child.state is TrainingPodState.RELEASED
+    assert provider.stop_calls == ["pod-created-1"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_family_release_and_reconcile_are_terminal_aware(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    first_stop_started = asyncio.Event()
+    allow_stops = asyncio.Event()
+
+    class BlockingStopProvider(FakeTrainingProvider):
+        async def stop(self, pod_id):
+            self.stop_calls.append(pod_id)
+            first_stop_started.set()
+            await allow_stops.wait()
+            self.status = "EXITED"
+            return True
+
+    provider = BlockingStopProvider()
+    first, root_token, child_token = await _persist_fallback_after_released_root(
+        tmp_path, clock, provider, legacy=False
+    )
+    second = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={
+            "training": training_profile(),
+            "training-h100": training_profile("training-h100"),
+        },
+    )
+    release_task = asyncio.create_task(first.release(root_token, reason="caller"))
+    await first_stop_started.wait()
+    reconcile_task = asyncio.create_task(second.reconcile())
+    while len(provider.stop_calls) < 2:
+        await asyncio.sleep(0)
+    allow_stops.set()
+
+    released_root, _ = await asyncio.gather(release_task, reconcile_task)
+
+    child = first.repository.get(child_token)
+    assert child is not None and child.state is TrainingPodState.RELEASED
+    assert released_root.family_release_complete is True
+    assert provider.stop_calls == ["pod-created-1", "pod-created-1"]

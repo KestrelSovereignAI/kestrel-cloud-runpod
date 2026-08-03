@@ -93,7 +93,7 @@ async def test_stop_requires_v2_confirmation() -> None:
     provider.get_status.return_value = {"id": "pod-1", "status": "RUNNING"}
     adapter = RunpodTrainingPodProvider(provider)
 
-    assert await adapter.stop("pod-1", profile=training_profile()) is False
+    assert await adapter.stop("pod-1") is False
 
 
 @pytest.mark.asyncio

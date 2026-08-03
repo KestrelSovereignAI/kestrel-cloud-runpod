@@ -1,5 +1,6 @@
 """Public durable training ownership contracts."""
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -46,3 +47,26 @@ def test_request_fingerprint_changes_with_deadline() -> None:
     clock.value += timedelta(seconds=1)
     second = training_request(clock)
     assert first.fingerprint != second.fingerprint
+
+
+def test_child_request_fingerprint_is_bound_to_its_cleanup_family() -> None:
+    clock = MutableClock()
+    child = training_request(
+        clock,
+        token="training:family-child-0001",
+        root_token="training:family-root-0001",
+    )
+
+    assert child.root_cleanup_token == "training:family-root-0001"
+    assert (
+        child.fingerprint
+        != training_request(clock, token="training:family-child-0001").fingerprint
+    )
+
+
+def test_request_defaults_root_for_pre_family_callers() -> None:
+    request = training_request(MutableClock())
+    compatible = replace(request, root_cleanup_token=None)
+
+    assert compatible.cleanup_family_token == compatible.cleanup_token
+    assert compatible.fingerprint == request.fingerprint

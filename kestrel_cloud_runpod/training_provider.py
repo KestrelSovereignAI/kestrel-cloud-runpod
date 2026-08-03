@@ -68,7 +68,7 @@ class TrainingPodCapacityProvider(Protocol):
 
     async def find_by_name(self, resource_name: str) -> str | None: ...
 
-    async def stop(self, pod_id: str, *, profile: GPUProfile) -> bool: ...
+    async def stop(self, pod_id: str) -> bool: ...
 
 
 class RunpodTrainingPodProvider:
@@ -142,7 +142,7 @@ class RunpodTrainingPodProvider:
             raise RunPodManagerError("Runpod v2 Pod list item omitted its ID")
         return pod_id
 
-    async def stop(self, pod_id: str, *, profile: GPUProfile) -> bool:
+    async def stop(self, pod_id: str) -> bool:
         """Request idempotent stop and report whether v2 confirms non-billing state."""
 
         try:
@@ -159,12 +159,15 @@ class RunpodTrainingPodProvider:
         }:
             return True
         try:
-            observation = await self.observe(pod_id, profile=profile)
+            raw = await asyncio.to_thread(self.provider.get_status, pod_id)
         except RunPodAPIError as exc:
             if exc.status_code == 404:
                 return True
             raise
-        return observation.is_stopped
+        observed_status = raw.get("status") or raw.get("desiredStatus")
+        if not isinstance(observed_status, str) or not observed_status:
+            raise RunPodManagerError("Runpod v2 Pod status response omitted status")
+        return observed_status.upper() in {"EXITED", "STOPPED", "TERMINATED"}
 
 
 def _pod_base_url(

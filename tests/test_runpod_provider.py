@@ -417,7 +417,33 @@ async def test_training_uses_distinct_cleanup_token_for_safe_profile_fallback(tm
     fallback = manager.get_training_pod_lease(session.training_cleanup_token)
     assert fallback.profile_id == "training-h100"
     assert fallback.state.value == "ready"
+    public_fallback = fallback.to_public_dict()
+    assert public_fallback["root_cleanup_token"] == "training:stable-request-0001"
+    assert "backend_base_url" not in public_fallback
+    assert "proxy.runpod.net" not in repr(public_fallback)
     assert mock_provider.start_pod.call_count == 2
+
+    # Model death before the returned session reaches its caller: a fresh
+    # manager has only the original token and the durable SQLite state.
+    mock_provider.stop_pod.return_value = {
+        "id": "pod-fallback",
+        "status": "EXITED",
+    }
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        restarted = RunPodManager(config=config)
+    recovered_session = await restarted.start_training_pod(
+        "companion-123", cleanup_token="training:stable-request-0001"
+    )
+    assert recovered_session.training_cleanup_token == session.training_cleanup_token
+    assert mock_provider.start_pod.call_count == 2
+    released_root = await restarted.release_training_pod(
+        "training:stable-request-0001", reason="restart recovery"
+    )
+    released_fallback = restarted.get_training_pod_lease(session.training_cleanup_token)
+    assert released_root.family_release_complete is True
+    assert released_fallback.state.value == "released"
+    assert restarted._session is None
+    mock_provider.stop_pod.assert_called_once_with("pod-fallback")
 
 
 @pytest.mark.asyncio

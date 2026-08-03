@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 from .models import RunPodManagerError
+
+TRAINING_PROFILE_IDS = ("training", "training-h100", "training-flex")
 
 
 class TrainingPodSource(str, Enum):
@@ -107,18 +110,26 @@ class TrainingPodRequest:
     created_at: datetime
     readiness_deadline: datetime
     hard_deadline: datetime
+    root_cleanup_token: str | None = None
 
     def __post_init__(self) -> None:
+        if self.root_cleanup_token is None:
+            object.__setattr__(self, "root_cleanup_token", self.cleanup_token)
         for name, value in (
             ("cleanup_token", self.cleanup_token),
+            ("root_cleanup_token", self.root_cleanup_token),
             ("companion_id", self.companion_id),
             ("profile_id", self.profile_id),
             ("resource_name", self.resource_name),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Training Pod {name} must be a non-empty string")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", self.cleanup_token):
-            raise ValueError("Training Pod cleanup_token has an invalid format")
+        for name, value in (
+            ("cleanup_token", self.cleanup_token),
+            ("root_cleanup_token", self.root_cleanup_token),
+        ):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", value):
+                raise ValueError(f"Training Pod {name} has an invalid format")
         if self.provider_pod_id is not None and not self.provider_pod_id.strip():
             raise ValueError("Training Pod provider_pod_id cannot be empty")
         for name, value in (
@@ -158,8 +169,21 @@ class TrainingPodRequest:
             "readiness_deadline": iso_datetime(self.readiness_deadline),
             "hard_deadline": iso_datetime(self.hard_deadline),
         }
+        # Preserve fingerprints for pre-family root/exact-token rows while binding
+        # every new child attempt to its caller-owned cleanup family.
+        if self.cleanup_family_token != self.cleanup_token:
+            payload["root_cleanup_token"] = self.cleanup_family_token
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def cleanup_family_token(self) -> str:
+        """Return the validated root token after backward-compatible defaulting."""
+
+        root = self.root_cleanup_token
+        if root is None:  # pragma: no cover - guarded by frozen post-init validation
+            raise ValueError("Training Pod root_cleanup_token was not initialized")
+        return root
 
 
 @dataclass(frozen=True)
@@ -167,6 +191,7 @@ class TrainingPodLease:
     """Durable ownership, workload, and teardown state for one Pod use."""
 
     cleanup_token: str
+    root_cleanup_token: str
     request_fingerprint: str
     companion_id: str
     profile_id: str
@@ -176,6 +201,8 @@ class TrainingPodLease:
     ownership: TrainingPodOwnership
     state: TrainingPodState
     cleanup_state: TrainingPodCleanupState
+    family_release_requested: bool
+    family_release_complete: bool
     creation_uncertain: bool
     backend_base_url: str | None
     provider_job_id: str | None
@@ -212,6 +239,7 @@ class TrainingPodLease:
 
         return {
             "cleanup_token": self.cleanup_token,
+            "root_cleanup_token": self.root_cleanup_token,
             "companion_id": self.companion_id,
             "profile_id": self.profile_id,
             "source": self.source.value,
@@ -219,6 +247,8 @@ class TrainingPodLease:
             "ownership": self.ownership.value,
             "state": self.state.value,
             "cleanup_state": self.cleanup_state.value,
+            "family_release_requested": self.family_release_requested,
+            "family_release_complete": self.family_release_complete,
             "provider_job_id": self.provider_job_id,
             "creation_uncertain": self.creation_uncertain,
             "last_provider_error": self.last_provider_error,
@@ -235,6 +265,16 @@ def durable_training_name(cleanup_token: str) -> str:
 
     digest = hashlib.sha256(cleanup_token.encode()).hexdigest()[:20]
     return f"kestrel-lora-{digest}"
+
+
+def fallback_training_cleanup_token(root_cleanup_token: str, profile_id: str) -> str:
+    """Derive the legacy-compatible identity for one fallback profile attempt."""
+
+    attempt_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"kestrel-runpod-training\0{root_cleanup_token}\0{profile_id}",
+    )
+    return f"training:{attempt_id}"
 
 
 def sanitize_training_error(error: BaseException) -> str:

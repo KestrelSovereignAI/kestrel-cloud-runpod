@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -30,9 +31,9 @@ class MutableClock:
         self.value += timedelta(seconds=seconds)
 
 
-def training_profile() -> GPUProfile:
+def training_profile(profile_id: str = "training") -> GPUProfile:
     return GPUProfile(
-        id="training",
+        id=profile_id,
         name="LoRA training",
         task_type="training",
         image_name="registry/trainer@sha256:" + "a" * 64,
@@ -50,6 +51,8 @@ def training_request(
     clock: MutableClock,
     *,
     token: str = "training:test-token-0001",
+    root_token: str | None = None,
+    profile_id: str = "training",
     source: TrainingPodSource = TrainingPodSource.CONFIGURED_PERSISTENT,
     pod_id: str | None = "pod-training-1",
     readiness_seconds: int = 30,
@@ -57,8 +60,9 @@ def training_request(
 ) -> TrainingPodRequest:
     return TrainingPodRequest(
         cleanup_token=token,
+        root_cleanup_token=root_token or token,
         companion_id="companion-1",
-        profile_id="training",
+        profile_id=profile_id,
         source=source,
         resource_name=durable_training_name(token),
         provider_pod_id=(None if source is TrainingPodSource.CREATED else pod_id),
@@ -85,7 +89,7 @@ class FakeTrainingProvider:
     async def observe(
         self, pod_id: str, *, profile: GPUProfile
     ) -> TrainingPodObservation:
-        assert profile.id == "training"
+        assert profile.task_type == "training"
         if self.observe_error:
             raise self.observe_error
         return TrainingPodObservation(
@@ -105,7 +109,7 @@ class FakeTrainingProvider:
     async def create(
         self, *, profile: GPUProfile, resource_name: str, companion_id: str
     ) -> CreatedTrainingPod:
-        assert profile.id == "training"
+        assert profile.task_type == "training"
         assert companion_id == "companion-1"
         self.create_calls.append(resource_name)
         if self.create_error:
@@ -117,8 +121,7 @@ class FakeTrainingProvider:
         assert resource_name.startswith("kestrel-lora-")
         return self.find_result
 
-    async def stop(self, pod_id: str, *, profile: GPUProfile) -> bool:
-        assert profile.id == "training"
+    async def stop(self, pod_id: str) -> bool:
         self.stop_calls.append(pod_id)
         if self.stop_error:
             raise self.stop_error
@@ -131,11 +134,13 @@ def training_service(
     tmp_path: Path,
     clock: MutableClock,
     provider: FakeTrainingProvider,
+    *,
+    profiles: Mapping[str, GPUProfile] | None = None,
 ) -> TrainingPodLeaseService:
     return TrainingPodLeaseService(
         repository=SQLiteTrainingPodRepository(tmp_path / "training.sqlite3"),
         provider=provider,
-        profiles={"training": training_profile()},
+        profiles=profiles or {"training": training_profile()},
         poll_interval_seconds=10,
         orphan_timeout_seconds=30,
         clock=clock,

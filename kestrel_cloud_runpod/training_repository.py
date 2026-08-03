@@ -33,6 +33,8 @@ class SQLiteTrainingPodRepository:
             "ownership",
             "state",
             "cleanup_state",
+            "family_release_requested",
+            "family_release_complete",
             "creation_uncertain",
             "backend_base_url",
             "provider_job_id",
@@ -64,6 +66,7 @@ class SQLiteTrainingPodRepository:
                 """
                 CREATE TABLE IF NOT EXISTS training_pod_leases (
                     cleanup_token TEXT PRIMARY KEY,
+                    root_cleanup_token TEXT NOT NULL,
                     request_fingerprint TEXT NOT NULL,
                     companion_id TEXT NOT NULL,
                     profile_id TEXT NOT NULL,
@@ -73,6 +76,8 @@ class SQLiteTrainingPodRepository:
                     ownership TEXT NOT NULL,
                     state TEXT NOT NULL,
                     cleanup_state TEXT NOT NULL,
+                    family_release_requested INTEGER NOT NULL DEFAULT 0,
+                    family_release_complete INTEGER NOT NULL DEFAULT 0,
                     creation_uncertain INTEGER NOT NULL DEFAULT 0,
                     backend_base_url TEXT,
                     provider_job_id TEXT,
@@ -87,6 +92,36 @@ class SQLiteTrainingPodRepository:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(training_pod_leases)"
+                ).fetchall()
+            }
+            if "root_cleanup_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE training_pod_leases ADD COLUMN "
+                    "root_cleanup_token TEXT NOT NULL DEFAULT ''"
+                )
+            # Old fallback hashes cannot be inverted. They are initially
+            # self-rooted and are associated with a caller root at query time
+            # by recomputing deterministic fallback identities. Run this on
+            # every open so an interrupted ALTER/backfill resumes safely.
+            connection.execute(
+                "UPDATE training_pod_leases "
+                "SET root_cleanup_token = cleanup_token "
+                "WHERE root_cleanup_token IS NULL OR root_cleanup_token = ''"
+            )
+            if "family_release_requested" not in columns:
+                connection.execute(
+                    "ALTER TABLE training_pod_leases "
+                    "ADD COLUMN family_release_requested INTEGER NOT NULL DEFAULT 0"
+                )
+            if "family_release_complete" not in columns:
+                connection.execute(
+                    "ALTER TABLE training_pod_leases "
+                    "ADD COLUMN family_release_complete INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_training_active_resource_name
@@ -103,8 +138,21 @@ class SQLiteTrainingPodRepository:
             )
             connection.execute(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_training_active_cleanup_family
+                ON training_pod_leases(root_cleanup_token)
+                WHERE state != 'released'
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_training_pods_reconcile
                 ON training_pod_leases(state, hard_deadline, last_heartbeat_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_training_pods_cleanup_family
+                ON training_pod_leases(root_cleanup_token, state, created_at)
                 """
             )
 
@@ -114,6 +162,7 @@ class SQLiteTrainingPodRepository:
         now = iso_datetime(request.created_at)
         values = (
             request.cleanup_token,
+            request.cleanup_family_token,
             request.fingerprint,
             request.companion_id,
             request.profile_id,
@@ -133,16 +182,37 @@ class SQLiteTrainingPodRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                if request.cleanup_family_token != request.cleanup_token:
+                    root = connection.execute(
+                        """SELECT family_release_requested
+                           FROM training_pod_leases
+                           WHERE cleanup_token = ?
+                             AND root_cleanup_token = cleanup_token""",
+                        (request.cleanup_family_token,),
+                    ).fetchone()
+                    if root is None:
+                        connection.rollback()
+                        raise TrainingPodConflictError(
+                            "A fallback training attempt requires its persisted "
+                            "root cleanup token"
+                        )
+                    if bool(root["family_release_requested"]):
+                        connection.rollback()
+                        raise TrainingPodConflictError(
+                            f"Training cleanup family '{request.cleanup_family_token}' "
+                            "is already releasing"
+                        )
                 connection.execute(
                     """
                     INSERT INTO training_pod_leases (
-                        cleanup_token, request_fingerprint, companion_id, profile_id,
-                        source, resource_name, provider_pod_id, ownership, state,
-                        cleanup_state, created_at, updated_at, last_heartbeat_at,
-                        readiness_deadline, hard_deadline
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        cleanup_token, root_cleanup_token, request_fingerprint,
+                        companion_id, profile_id, source, resource_name,
+                        provider_pod_id, ownership, state, cleanup_state,
+                        family_release_requested, family_release_complete, created_at,
+                        updated_at, last_heartbeat_at, readiness_deadline, hard_deadline
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    values,
+                    (*values[:11], False, False, *values[11:]),
                 )
                 inserted = True
             except sqlite3.IntegrityError as exc:
@@ -178,6 +248,41 @@ class SQLiteTrainingPodRepository:
                 (cleanup_token,),
             ).fetchone()
         return _lease_from_row(row) if row is not None else None
+
+    def list_cleanup_family(
+        self,
+        root_cleanup_token: str,
+        *,
+        legacy_cleanup_tokens: tuple[str, ...] = (),
+    ) -> tuple[TrainingPodLease, ...]:
+        """Return a root family, including configured pre-migration child hashes."""
+
+        candidate_tokens = tuple(
+            dict.fromkeys((root_cleanup_token, *legacy_cleanup_tokens))
+        )
+        placeholders = ", ".join("?" for _ in candidate_tokens)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM training_pod_leases
+                    WHERE root_cleanup_token = ?
+                       OR cleanup_token IN ({placeholders})
+                    ORDER BY created_at, cleanup_token""",
+                (root_cleanup_token, *candidate_tokens),
+            ).fetchall()
+        return tuple(_lease_from_row(row) for row in rows)
+
+    def list_incomplete_family_releases(self) -> tuple[TrainingPodLease, ...]:
+        """Return durable root cleanup requests that a restart must finish."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM training_pod_leases
+                   WHERE cleanup_token = root_cleanup_token
+                     AND family_release_requested = 1
+                     AND family_release_complete = 0
+                   ORDER BY created_at, cleanup_token"""
+            ).fetchall()
+        return tuple(_lease_from_row(row) for row in rows)
 
     def compare_and_set(
         self, lease: TrainingPodLease, *, changes: Mapping[str, Any]
@@ -245,6 +350,7 @@ def training_database_path(config: Mapping[str, Any]) -> Path:
 def _lease_from_row(row: sqlite3.Row) -> TrainingPodLease:
     return TrainingPodLease(
         cleanup_token=row["cleanup_token"],
+        root_cleanup_token=row["root_cleanup_token"],
         request_fingerprint=row["request_fingerprint"],
         companion_id=row["companion_id"],
         profile_id=row["profile_id"],
@@ -254,6 +360,8 @@ def _lease_from_row(row: sqlite3.Row) -> TrainingPodLease:
         ownership=TrainingPodOwnership(row["ownership"]),
         state=TrainingPodState(row["state"]),
         cleanup_state=TrainingPodCleanupState(row["cleanup_state"]),
+        family_release_requested=bool(row["family_release_requested"]),
+        family_release_complete=bool(row["family_release_complete"]),
         creation_uncertain=bool(row["creation_uncertain"]),
         backend_base_url=row["backend_base_url"],
         provider_job_id=row["provider_job_id"],

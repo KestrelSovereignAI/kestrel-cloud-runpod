@@ -2,6 +2,17 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.6.1] - 2026-08-02
+
+### Fixed
+
+- Persist the caller cleanup token as the root identity for every LoRA training
+  fallback attempt, so root-token cleanup releases active children after a
+  process restart while returned child tokens retain exact-attempt semantics.
+- Make family release durable and terminal-aware across concurrent caller and
+  reconciler passes, and recognize deterministic fallback hashes migrated from
+  the 0.5 schema without storing credentials or private workload routes.
+
 ## [0.6.0] - 2026-08-02
 
 ### Added
@@ -60,6 +71,7 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 - Migrated the Runpod integration to the beta v2 REST control plane with typed clients, live catalog placement, and pinned OpenAPI validation.
 
+[0.6.1]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/compare/v0.3.0...v0.4.0

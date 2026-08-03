@@ -10,6 +10,7 @@ from typing import Any
 
 from .models import GPUProfile, RunPodAmbiguousResultError, RunPodManagerError
 from .training_contracts import (
+    TRAINING_PROFILE_IDS,
     TrainingPodCleanupError,
     TrainingPodCleanupState,
     TrainingPodConflictError,
@@ -19,6 +20,7 @@ from .training_contracts import (
     TrainingPodRequest,
     TrainingPodSource,
     TrainingPodState,
+    fallback_training_cleanup_token,
     sanitize_training_error,
 )
 from .training_provider import TrainingPodCapacityProvider
@@ -117,7 +119,9 @@ class TrainingPodLeaseService:
             except RunPodManagerError as exc:
                 lease = self._record_retryable_failure(lease, exc)
                 try:
-                    await self.release(lease.cleanup_token, reason="Pod start failure")
+                    await self._release_one(
+                        lease.cleanup_token, reason="Pod start failure"
+                    )
                 except TrainingPodCleanupError as cleanup_exc:
                     raise cleanup_exc from exc
                 current = self._required(lease.cleanup_token)
@@ -169,7 +173,9 @@ class TrainingPodLeaseService:
         except RunPodAmbiguousResultError as exc:
             lease = self._record_retryable_failure(lease, exc, creation_uncertain=True)
             try:
-                await self.release(lease.cleanup_token, reason="ambiguous Pod create")
+                await self._release_one(
+                    lease.cleanup_token, reason="ambiguous Pod create"
+                )
             except TrainingPodCleanupError as cleanup_exc:
                 raise cleanup_exc from exc
             raise self._lifecycle_error(
@@ -267,7 +273,7 @@ class TrainingPodLeaseService:
         cause: BaseException,
     ) -> TrainingPodLease:
         try:
-            released = await self.release(lease.cleanup_token, reason=operation)
+            released = await self._release_one(lease.cleanup_token, reason=operation)
         except TrainingPodCleanupError as cleanup_exc:
             raise cleanup_exc from cause
         raise self._lifecycle_error(operation, released, billing_risk=False) from cause
@@ -275,7 +281,9 @@ class TrainingPodLeaseService:
     async def _cleanup_cancelled_acquisition(
         self, lease: TrainingPodLease, operation: str
     ) -> None:
-        task = asyncio.create_task(self.release(lease.cleanup_token, reason=operation))
+        task = asyncio.create_task(
+            self._release_one(lease.cleanup_token, reason=operation)
+        )
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -324,7 +332,9 @@ class TrainingPodLeaseService:
         self, cleanup_token: str, error: BaseException
     ) -> TrainingPodLease:
         lease = self._required(cleanup_token)
-        return self.repository.compare_and_set(
+        if lease.is_terminal:
+            return lease
+        return self._transition_nonterminal(
             lease,
             changes={
                 "last_heartbeat_at": self._now(),
@@ -334,6 +344,8 @@ class TrainingPodLeaseService:
 
     def record_status(self, cleanup_token: str, status: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)
+        if lease.is_terminal:
+            return lease
         normalized = status.strip().lower()
         changes: dict[str, Any] = {
             "last_heartbeat_at": self._now(),
@@ -343,7 +355,7 @@ class TrainingPodLeaseService:
             changes["state"] = TrainingPodState.JOB_COMPLETED
         elif normalized in {"cancelled", "canceled", "failed"}:
             changes["state"] = TrainingPodState.CANCEL_REQUESTED
-        return self.repository.compare_and_set(lease, changes=changes)
+        return self._transition_nonterminal(lease, changes=changes)
 
     def record_result_retrieved(self, cleanup_token: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)
@@ -375,14 +387,79 @@ class TrainingPodLeaseService:
             },
         )
 
+    def get_active_family_attempt(
+        self, root_cleanup_token: str
+    ) -> TrainingPodLease | None:
+        """Resolve the single active attempt owned by a caller's root token."""
+
+        root = self.repository.get(root_cleanup_token)
+        if root is None:
+            return None
+        if root.family_release_requested:
+            raise TrainingPodConflictError(
+                f"Training cleanup family '{root_cleanup_token}' is releasing"
+            )
+        active = tuple(
+            lease
+            for lease in self._cleanup_family(root_cleanup_token)
+            if not lease.is_terminal
+        )
+        if len(active) > 1:
+            raise TrainingPodConflictError(
+                f"Training cleanup family '{root_cleanup_token}' has multiple "
+                "active attempts; reconcile it"
+            )
+        return active[0] if active else None
+
     async def release(self, cleanup_token: str, *, reason: str) -> TrainingPodLease:
-        """Stop owned capacity idempotently, retaining its Pod ID until confirmed."""
+        """Release one exact attempt or every attempt addressed by a family root."""
+
+        exact = self._required(cleanup_token)
+        if exact.root_cleanup_token != cleanup_token:
+            return await self._release_one(cleanup_token, reason=reason)
+
+        root = self._mark_family_release_requested(exact)
+        failures: list[TrainingPodCleanupError] = []
+        for member in self._cleanup_family(cleanup_token):
+            if member.is_terminal:
+                continue
+            try:
+                await self._release_one(member.cleanup_token, reason=reason)
+            except TrainingPodCleanupError as exc:
+                failures.append(exc)
+            except RunPodManagerError as exc:
+                current = self._required(member.cleanup_token)
+                failures.append(self._cleanup_error(reason, current))
+                logger.warning(
+                    "Training cleanup family %s could not release attempt %s (%s)",
+                    cleanup_token,
+                    member.cleanup_token,
+                    type(exc).__name__,
+                )
+
+        if failures:
+            failure = failures[-1]
+            raise TrainingPodCleanupError(
+                reason,
+                cleanup_token=cleanup_token,
+                pod_id=failure.pod_id,
+                cleanup_state=failure.cleanup_state,
+                billing_risk=True,
+            ) from failure
+
+        root = self._mark_family_release_complete(root)
+        return root
+
+    async def _release_one(
+        self, cleanup_token: str, *, reason: str
+    ) -> TrainingPodLease:
+        """Stop one exact attempt idempotently, retaining its ID until confirmed."""
 
         lease = self._required(cleanup_token)
         if lease.is_terminal:
             return lease
         if lease.ownership is TrainingPodOwnership.PREEXISTING_RUNNING:
-            return self.repository.compare_and_set(
+            return self._transition_nonterminal(
                 lease,
                 changes={
                     "state": TrainingPodState.RELEASED,
@@ -397,7 +474,7 @@ class TrainingPodLeaseService:
             if lease.provider_pod_id is None and lease.creation_uncertain:
                 raise self._cleanup_error(reason, lease)
         if lease.provider_pod_id is None:
-            return self.repository.compare_and_set(
+            return self._transition_nonterminal(
                 lease,
                 changes={
                     "state": TrainingPodState.RELEASED,
@@ -408,7 +485,7 @@ class TrainingPodLeaseService:
                 },
             )
         if lease.state is not TrainingPodState.RELEASING:
-            lease = self.repository.compare_and_set(
+            lease = self._transition_nonterminal(
                 lease,
                 changes={
                     "state": TrainingPodState.RELEASING,
@@ -417,18 +494,25 @@ class TrainingPodLeaseService:
                     "last_heartbeat_at": self._now(),
                 },
             )
-        lease = self.repository.compare_and_set(
-            lease, changes={"stop_attempts": lease.stop_attempts + 1}
-        )
+        while not lease.is_terminal:
+            try:
+                lease = self.repository.compare_and_set(
+                    lease, changes={"stop_attempts": lease.stop_attempts + 1}
+                )
+                break
+            except TrainingPodConflictError:
+                lease = self._required(cleanup_token)
+        if lease.is_terminal:
+            return lease
         try:
-            confirmed = await self.provider.stop(
-                self._pod_id(lease), profile=self._profile(lease.profile_id)
-            )
+            confirmed = await self.provider.stop(self._pod_id(lease))
         except RunPodManagerError as exc:
             lease = self._record_retryable_failure(lease, exc)
+            if lease.is_terminal:
+                return lease
             raise self._cleanup_error(reason, lease) from exc
         if not confirmed:
-            lease = self.repository.compare_and_set(
+            lease = self._transition_nonterminal(
                 lease,
                 changes={
                     "cleanup_state": TrainingPodCleanupState.PENDING,
@@ -436,8 +520,10 @@ class TrainingPodLeaseService:
                     "last_heartbeat_at": self._now(),
                 },
             )
+            if lease.is_terminal:
+                return lease
             raise self._cleanup_error(reason, lease)
-        return self.repository.compare_and_set(
+        return self._transition_nonterminal(
             lease,
             changes={
                 "state": TrainingPodState.RELEASED,
@@ -453,6 +539,15 @@ class TrainingPodLeaseService:
         """Run one pass suitable for a cheap external timer or webhook service."""
 
         results: list[TrainingPodLease] = []
+        for root in self.repository.list_incomplete_family_releases():
+            try:
+                result = await self.release(
+                    root.cleanup_token, reason="restart family release"
+                )
+            except (TrainingPodLifecycleError, RunPodManagerError) as exc:
+                result = self._record_reconcile_error(root.cleanup_token, exc)
+            if result is not None:
+                results.append(result)
         for initial in self.repository.list_for_reconciliation():
             try:
                 result = await self._reconcile_one(initial.cleanup_token)
@@ -498,16 +593,16 @@ class TrainingPodLeaseService:
                 return lease
             lease = await self._resolve_uncertain_creation(lease, reason="reconcile")
             if lease.provider_pod_id is not None:
-                return await self.release(cleanup_token, reason="recovered create")
+                return await self._release_one(cleanup_token, reason="recovered create")
             return lease
         if lease.state in {
             TrainingPodState.RELEASING,
             TrainingPodState.CANCEL_REQUESTED,
             TrainingPodState.RECONCILE_REQUIRED,
         }:
-            return await self.release(cleanup_token, reason="retry teardown")
+            return await self._release_one(cleanup_token, reason="retry teardown")
         if now >= lease.hard_deadline:
-            return await self.release(cleanup_token, reason="hard deadline")
+            return await self._release_one(cleanup_token, reason="hard deadline")
         if (
             lease.state is TrainingPodState.JOB_SUBMITTED
             and self._workload_status_observer is not None
@@ -519,7 +614,7 @@ class TrainingPodLeaseService:
             if status is not None:
                 lease = self.record_status(cleanup_token, status)
                 if lease.state is TrainingPodState.CANCEL_REQUESTED:
-                    return await self.release(
+                    return await self._release_one(
                         cleanup_token, reason="terminal training job"
                     )
                 return lease
@@ -531,11 +626,15 @@ class TrainingPodLeaseService:
             }
             and stale
         ):
-            return await self.release(cleanup_token, reason="orphaned acquisition")
+            return await self._release_one(cleanup_token, reason="orphaned acquisition")
         if lease.provider_pod_id and lease.state in {
             TrainingPodState.STARTING,
             TrainingPodState.READY,
         }:
+            if lease.profile_id not in self.profiles:
+                # A removed legacy fallback profile prevents route reconstruction,
+                # but it must not prevent profile-free stale/deadline teardown.
+                return lease
             observation = await self.provider.observe(
                 lease.provider_pod_id, profile=self._profile(lease.profile_id)
             )
@@ -566,7 +665,7 @@ class TrainingPodLeaseService:
         except RunPodManagerError as exc:
             return self._record_retryable_failure(lease, exc, creation_uncertain=True)
         if pod_id is not None:
-            return self.repository.compare_and_set(
+            return self._transition_nonterminal(
                 lease,
                 changes={
                     "provider_pod_id": pod_id,
@@ -578,7 +677,7 @@ class TrainingPodLeaseService:
                 },
             )
         if self._now() < lease.readiness_deadline:
-            return self.repository.compare_and_set(
+            return self._transition_nonterminal(
                 lease,
                 changes={
                     "state": TrainingPodState.RECONCILE_REQUIRED,
@@ -586,7 +685,7 @@ class TrainingPodLeaseService:
                     "last_provider_error": f"{reason}:AwaitingCreateReconciliation",
                 },
             )
-        return self.repository.compare_and_set(
+        return self._transition_nonterminal(
             lease,
             changes={
                 "state": TrainingPodState.RELEASED,
@@ -599,7 +698,7 @@ class TrainingPodLeaseService:
     def _release_unowned_claim(
         self, lease: TrainingPodLease, *, error: BaseException | None
     ) -> TrainingPodLease:
-        return self.repository.compare_and_set(
+        return self._transition_nonterminal(
             lease,
             changes={
                 "ownership": TrainingPodOwnership.PREEXISTING_RUNNING,
@@ -621,6 +720,8 @@ class TrainingPodLeaseService:
         creation_uncertain: bool | None = None,
     ) -> TrainingPodLease:
         current = self._required(lease.cleanup_token)
+        if current.is_terminal:
+            return current
         changes: dict[str, Any] = {
             "state": TrainingPodState.RECONCILE_REQUIRED,
             "cleanup_state": TrainingPodCleanupState.RETRYABLE_FAILURE,
@@ -629,7 +730,63 @@ class TrainingPodLeaseService:
         }
         if creation_uncertain is not None:
             changes["creation_uncertain"] = creation_uncertain
-        return self.repository.compare_and_set(current, changes=changes)
+        return self._transition_nonterminal(current, changes=changes)
+
+    def _cleanup_family(self, root_cleanup_token: str) -> tuple[TrainingPodLease, ...]:
+        profile_ids = dict.fromkeys((*TRAINING_PROFILE_IDS, *self.profiles))
+        legacy_tokens = tuple(
+            fallback_training_cleanup_token(root_cleanup_token, profile_id)
+            for profile_id in profile_ids
+        )
+        return self.repository.list_cleanup_family(
+            root_cleanup_token, legacy_cleanup_tokens=legacy_tokens
+        )
+
+    def _mark_family_release_requested(
+        self, root: TrainingPodLease
+    ) -> TrainingPodLease:
+        current = self._required(root.cleanup_token)
+        while not current.family_release_requested:
+            try:
+                return self.repository.compare_and_set(
+                    current,
+                    changes={
+                        "family_release_requested": True,
+                        "family_release_complete": False,
+                        "last_heartbeat_at": self._now(),
+                    },
+                )
+            except TrainingPodConflictError:
+                current = self._required(root.cleanup_token)
+        return current
+
+    def _mark_family_release_complete(self, root: TrainingPodLease) -> TrainingPodLease:
+        current = self._required(root.cleanup_token)
+        while not current.family_release_complete:
+            try:
+                return self.repository.compare_and_set(
+                    current,
+                    changes={
+                        "family_release_complete": True,
+                        "last_heartbeat_at": self._now(),
+                    },
+                )
+            except TrainingPodConflictError:
+                current = self._required(root.cleanup_token)
+        return current
+
+    def _transition_nonterminal(
+        self, lease: TrainingPodLease, *, changes: Mapping[str, Any]
+    ) -> TrainingPodLease:
+        """Apply a CAS transition without ever reviving a concurrent terminal row."""
+
+        current = lease
+        while not current.is_terminal:
+            try:
+                return self.repository.compare_and_set(current, changes=changes)
+            except TrainingPodConflictError:
+                current = self._required(lease.cleanup_token)
+        return current
 
     def _record_reconcile_error(
         self, cleanup_token: str, error: BaseException

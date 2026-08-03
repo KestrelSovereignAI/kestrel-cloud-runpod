@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-runpod"
-version = "0.6.0"
+version = "0.6.1"
 description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
