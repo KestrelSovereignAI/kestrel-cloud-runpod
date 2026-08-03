@@ -614,3 +614,30 @@ async def test_failed_model_pull_is_visible_and_retried(tmp_path):
     assert lease.model_pull_attempts == 2
     assert provider.pull_calls == 2
     assert lease.last_provider_error is None
+
+
+@pytest.mark.asyncio
+async def test_service_persists_the_placement_gpu_count_it_provisioned(tmp_path):
+    """The accrual fix is only real if the count is actually written.
+
+    accrued_cost multiplies by lease.placement_gpu_count, and nothing
+    downstream cross-checks it against the constraints, so a missing write
+    fails OPEN: every lease persists the default 1 and the runtime cost gate
+    under-counts by gpu_count.
+    """
+    clock = MutableClock()
+    plan = serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=4)
+    capacity = FakeOllamaProvider(plan)
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=capacity,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, max_authorized_cost=100.0)
+
+    lease = await service.acquire(request)
+
+    assert lease.placement_gpu_count == 4
+    assert service.repository.get(lease.lease_id).placement_gpu_count == 4

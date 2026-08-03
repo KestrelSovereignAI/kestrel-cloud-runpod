@@ -440,7 +440,14 @@ class RunpodPodCapacityProvider:
             billed_from=billed_from,
             billed_until=billed_until,
             billed_seconds=billed_seconds,
-            hourly_price_usd=capacity_spec.request.quote.hourly_cost_usd,
+            # actual_cost_usd is the whole Pod's spend, so the price beside
+            # it must be the whole Pod's hourly rate, not the per-GPU catalog
+            # price. Pairing the two units made the evidence invariant
+            # unsatisfiable for any multi-GPU Pod.
+            hourly_price_usd=(
+                capacity_spec.request.quote.hourly_cost_usd
+                * Decimal(capacity_spec.request.quote.constraints.gpu_count)
+            ),
             actual_cost_usd=actual,
             reconciled_at=self._now(),
         )
@@ -594,17 +601,21 @@ def _realized_placement(
     raw_rate = payload.get("cost")
     rate = _provider_decimal(raw_rate, "Pod hourly rate")
     quote = capacity_spec.request.quote
-    realized = PodRealizedPlacement(
-        provider_pod_id=pod_id,
-        gpu_type_id=str(gpu.get("id", "")),
-        gpu_display_name=quote.gpu_display_name,
-        gpu_count=gpu_count,
-        cloud=cloud,
-        data_center_id=raw_data_center,
-        hourly_rate_usd=rate,
-        observed_at=observed_at,
-    )
     try:
+        # Construction validates too, so it belongs inside the converter. A
+        # bare ValueError here escaped every handler in the reconcile chain
+        # and exited the process, permanently skipping every other lease in
+        # the pass - the same failure mode already closed on the Ollama side.
+        realized = PodRealizedPlacement(
+            provider_pod_id=pod_id,
+            gpu_type_id=str(gpu.get("id", "")),
+            gpu_display_name=quote.gpu_display_name,
+            gpu_count=gpu_count,
+            cloud=cloud,
+            data_center_id=raw_data_center,
+            hourly_rate_usd=rate,
+            observed_at=observed_at,
+        )
         realized.validate_against(quote)
     except ValueError as exc:
         raise RunPodManagerError(

@@ -685,3 +685,33 @@ async def test_sdk_quote_rejects_a_multi_gpu_placement_over_the_hourly_cap(
 
     with pytest.raises(InferenceLeaseConstraintError, match="hourly"):
         quote.validate_for(_request(clock, max_hourly_cost_usd=Decimal("1.00")))
+
+
+@pytest.mark.parametrize(
+    "price, gpu_count",
+    [(0.99, 3), (0.39, 3), (0.70, 3), (1.99, 5), (0.49, 7), (3.99, 7)],
+)
+@pytest.mark.asyncio
+async def test_multi_gpu_quote_round_trips_exactly_and_stays_acquirable(
+    tmp_path, price, gpu_count
+):
+    """The whole-placement rate must divide back to the exact per-GPU price.
+
+    Multiplying in binary float made 0.99 x 3 == 2.9699999999999998, so the
+    per-GPU budget derived on acquire fell just under the catalog price and
+    select_gpu rejected it — a valid quote, deterministically unacquirable.
+    """
+    from decimal import Decimal as D
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=price, estimated_cost=0.1, gpu_count=gpu_count)
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    cap = D(str(price)) * D(gpu_count)
+
+    quote = await adapter.quote(_request(clock, max_hourly_cost_usd=cap))
+
+    assert quote.hourly_cost_usd == cap
+    # The per-GPU budget acquire derives must still admit the quoted GPU.
+    assert float(quote.hourly_cost_usd / D(gpu_count)) >= price

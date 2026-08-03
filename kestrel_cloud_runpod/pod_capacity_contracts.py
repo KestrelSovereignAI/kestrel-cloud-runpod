@@ -706,8 +706,8 @@ class PodRealizedPlacement:
             raise ValueError("Realized Pod GPU count must be positive")
         if not isinstance(self.cloud, CloudType):
             raise TypeError("Realized Pod cloud must be a CloudType")
-        if not self.hourly_rate_usd.is_finite() or self.hourly_rate_usd <= 0:
-            raise ValueError("Realized Pod hourly rate must be positive")
+        if not self.hourly_rate_usd.is_finite() or self.hourly_rate_usd < 0:
+            raise ValueError("Realized Pod hourly rate must be nonnegative")
         require_aware(self.observed_at, "realized placement observed_at")
 
     def validate_against(self, quote: PodCapacityQuote) -> None:
@@ -718,7 +718,14 @@ class PodRealizedPlacement:
             or self.gpu_display_name != quote.gpu_display_name
             or self.gpu_count != quote.constraints.gpu_count
             or self.cloud is not quote.constraints.cloud
-            or self.hourly_rate_usd > quote.hourly_cost_usd
+            # Pod.cost is the whole Pod's hourly burn (v2 spec: "Current cost
+            # in USD per hour"), while quote.hourly_cost_usd is the catalog's
+            # PER-GPU price. Comparing them directly rejected every conforming
+            # multi-GPU Pod - and in the ambiguous-create recovery path that
+            # left a running, billing Pod unadoptable and therefore never
+            # terminated.
+            or self.hourly_rate_usd
+            > quote.hourly_cost_usd * Decimal(quote.constraints.gpu_count)
             or (
                 quote.constraints.allowed_data_center_ids
                 and self.data_center_id not in quote.constraints.allowed_data_center_ids
@@ -1100,7 +1107,11 @@ class PodCapacityEvidence:
             accepted_gpu_display_name=quote.gpu_display_name,
             accepted_gpu_count=quote.constraints.gpu_count,
             accepted_cloud=quote.constraints.cloud,
-            accepted_hourly_rate_usd=quote.hourly_cost_usd,
+            # Compared against the realized whole-Pod rate, so record it in
+            # the same unit.
+            accepted_hourly_rate_usd=(
+                quote.hourly_cost_usd * Decimal(quote.constraints.gpu_count)
+            ),
             lifecycle=PodCapacityLifecycleEvidence(reservation_at=request.created_at),
         )
 

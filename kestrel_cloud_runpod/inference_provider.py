@@ -176,7 +176,12 @@ class RunpodInferenceLeaseProvider:
         # be what the lease actually burns per hour. /catalog/gpus prices per
         # GPU, so a multi-GPU placement burns that multiple - reporting the
         # per-unit price let a 2-GPU placement pass a cap it exceeds outright.
-        hourly = _money(plan.placement.offered_cost_per_hr * plan.placement.gpu_count)
+        # Multiply in Decimal, not float: 0.99 * 3 is 2.9699999999999998 in
+        # binary, and dividing that back on acquire yields a per-GPU budget
+        # just under the catalog price, making a valid quote unacquirable.
+        hourly = _money(plan.placement.offered_cost_per_hr) * Decimal(
+            plan.placement.gpu_count
+        )
         total = _money(plan.estimated_cost)
         readiness_deadline = request.requested_at + timedelta(
             seconds=request.ready_deadline_seconds
@@ -506,8 +511,15 @@ class RunpodInferenceLeaseProvider:
         # PER-GPU price, so convert the caller's whole-lease cap into a per-GPU
         # budget. Comparing a lease cap against a unit price authorized
         # gpu_count times the intended spend.
+        # Divide in Decimal and round DOWN. On acquire the numerator is the
+        # quote's whole-placement rate, itself Decimal(str(per_gpu * count)),
+        # and a binary float round trip is exact only for gpu_count in
+        # {1,2,4,8}: for count 3 at $0.99/GPU it yielded 0.9899999999999999,
+        # which select_gpu then rejected as over budget, making a valid quote
+        # deterministically unacquirable. Rounding down keeps the conversion
+        # conservative - it can never authorize more than the caller allowed.
         gpu_count = max(1, int(policy.profile.gpu_count))
-        hourly_limit = float(max_hourly_cost) / gpu_count
+        hourly_limit = float(max_hourly_cost / Decimal(gpu_count))
         if policy.profile.max_cost_per_hr is not None:
             hourly_limit = min(hourly_limit, policy.profile.max_cost_per_hr)
         return OllamaLeaseRequest(
@@ -862,7 +874,7 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
     hourly = (
         None
         if lease.offered_rate_per_hr is None
-        else lease.offered_rate_per_hr * lease.placement_gpu_count
+        else _money(lease.offered_rate_per_hr) * Decimal(lease.placement_gpu_count)
     )
     if hourly is None:
         raw_hourly = constraints.get("max_hourly_rate")

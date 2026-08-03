@@ -226,6 +226,17 @@ def serverless_plan(
     maximum_billable_seconds = round(
         Decimal(str(compute_ceiling)) * Decimal(3600) / unit_rate
     )
+
+    # Re-derive the costs FROM the rounded seconds, in the same direction and
+    # with the same formula the plan's own consistency check uses, so a rate
+    # that does not divide evenly cannot make the fixture self-inconsistent.
+    def _rate(seconds: int) -> float:
+        return float(
+            Decimal(str(rate)) * Decimal(seconds) * Decimal(gpu_count) / Decimal(3600)
+        )
+
+    estimated_cost = _rate(estimated_billable_seconds)
+    compute_ceiling = _rate(maximum_billable_seconds)
     estimated_total = float(
         Decimal(str(estimated_cost)) + Decimal(str(estimated_non_compute_cost))
     )
