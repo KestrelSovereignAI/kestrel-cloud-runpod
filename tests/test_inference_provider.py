@@ -839,17 +839,35 @@ async def test_catalog_drift_above_the_accepted_quote_is_rejected_on_acquire(
     assert capacity.provision_calls == 0
 
 
-def test_live_hourly_guard_compares_whole_lease_against_whole_lease() -> None:
-    """Unit-level assertion for the guard the test above cannot isolate.
+@pytest.mark.asyncio
+async def test_live_plan_widening_its_gpu_count_is_rejected_on_acquire(tmp_path):
+    """Pins _validate_realized_plan's whole-lease comparison end to end.
 
-    quote.hourly_cost_usd is built as per_gpu x gpu_count, so the live rate
-    must be scaled identically. Comparing the bare per-GPU price let a 2-GPU
-    placement at 0.90/GPU (1.80/hr) sit under a 1.00/hr quote.
+    The two acceptance guards do NOT use the same GPU count: _internal_request
+    divides the caller's whole-lease cap by the PROFILE's gpu_count, while
+    _validate_realized_plan multiplies by the live PLACEMENT's gpu_count. When
+    the live plan widens the count at the same per-GPU rate, the per-GPU bound
+    is not exceeded and validate_plan passes — so this guard is the only thing
+    standing between the caller and a lease burning twice the accepted quote.
     """
     from decimal import Decimal as D
 
-    quoted_hourly = D("1.00")  # whole-lease, 2 GPUs
-    live_per_gpu, gpu_count = D("0.90"), 2
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, _service, _c = _adapter(tmp_path, clock, capacity=capacity, gpu_count=2)
+    request = _request(clock, max_hourly_cost_usd=D("1.00"))
 
-    assert live_per_gpu <= quoted_hourly  # the old, wrong comparison passed
-    assert live_per_gpu * D(gpu_count) > quoted_hourly  # the correct one rejects
+    quote = await adapter.quote(request)
+    assert quote.hourly_cost_usd == D("1.0")  # 0.50/GPU x 2 GPUs
+
+    # Same per-GPU price, but the live placement widens to 4 GPUs: $2.00/hr.
+    capacity.drift_plan = serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=4)
+
+    with pytest.raises(
+        (InferenceLeaseConstraintError, InferenceLeaseProvisioningError),
+        match="hourly cost exceeds the accepted quote",
+    ):
+        await adapter.acquire(request, quote)
+    assert capacity.provision_calls == 0
