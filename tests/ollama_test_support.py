@@ -134,7 +134,6 @@ class FakeOllamaProvider:
     def __init__(self, plan: OllamaPlacementPlan) -> None:
         self.selected_plan = plan
         self.provision_calls = 0
-        self.plan_calls = 0
         self.drift_plan: OllamaPlacementPlan | None = None
         self.pull_calls = 0
         self.teardown_calls = 0
@@ -152,11 +151,18 @@ class FakeOllamaProvider:
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         del request
-        self.plan_calls += 1
         # The live catalog can move between quoting and acquiring. Returning
         # the identical plan for both hides every acceptance guard that exists
         # to catch that drift, so tests can supply a second plan.
-        if self.drift_plan is not None and self.plan_calls > 1:
+        #
+        # Drift applies from the moment the test assigns it, which is the
+        # phase boundary the test already expresses by assigning it after
+        # quoting. It is deliberately NOT keyed off the call count: quote()
+        # calls plan() once per candidate mode, so a `plan_calls > 1` rule
+        # would also mean "the POD candidate inside this same quote()" and
+        # would silently drift it — quietly changing which candidate min()
+        # selects, with no error anywhere.
+        if self.drift_plan is not None:
             return self.drift_plan
         return self.selected_plan
 

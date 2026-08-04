@@ -755,6 +755,21 @@ def authorized_cost_exposure(lease: OllamaLease, now: datetime) -> float:
     return _cost_sum(accrued_cost(lease, now), overhead)
 
 
+def over_authorized_cost(lease: OllamaLease, now: datetime) -> bool:
+    """Return whether a lease has burned through its authorized spend.
+
+    This is the single source of truth for the cost half of every lifecycle
+    release gate.  It is one function rather than one comparison per call site
+    on purpose: the rule was previously written out five times, and a rule
+    duplicated across lifecycle sites cannot be pinned by a test, because
+    deleting any single copy leaves the remaining copies to mask it.  The
+    deadline halves stay at the call sites, because they genuinely differ
+    (only a READY lease has a meaningful idle deadline).
+    """
+
+    return authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+
+
 def _rated_cost(hourly_rate: float, seconds: int, gpu_count: int = 1) -> float:
     """Rate billable seconds against a catalog offer.
 

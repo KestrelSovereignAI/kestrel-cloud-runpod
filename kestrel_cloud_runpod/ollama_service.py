@@ -30,7 +30,7 @@ from .ollama_contracts import (
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
-    authorized_cost_exposure,
+    over_authorized_cost,
     provision_attempt_id,
     require_aware,
     resource_from_lease,
@@ -255,7 +255,7 @@ class OllamaLeaseService:
         accrued = accrued_cost(lease, now)
         if (
             now >= lease.hard_deadline
-            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+            or over_authorized_cost(lease, now)
         ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         touched = self.repository.compare_and_set(
@@ -336,7 +336,7 @@ class OllamaLeaseService:
         idle_expired = (
             lease.state is OllamaLeaseState.READY and now >= lease.idle_deadline
         )
-        over_cost = authorized_cost_exposure(lease, now) >= (lease.max_authorized_cost)
+        over_cost = over_authorized_cost(lease, now)
         readiness_expired = (
             lease.state
             in {
@@ -389,7 +389,7 @@ class OllamaLeaseService:
             now = self._now()
             if lease.state is OllamaLeaseState.WAITING_FOR_MODEL and (
                 now >= lease.hard_deadline
-                or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+                or over_authorized_cost(lease, now)
             ):
                 return await self._release(lease, reason="deadline_or_cost_cap")
             if now >= lease.readiness_deadline:
@@ -423,7 +423,7 @@ class OllamaLeaseService:
         )
         if (
             now >= lease.hard_deadline
-            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+            or over_authorized_cost(lease, now)
         ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         if not observation.provider_ready or not observation.route_url:
@@ -474,7 +474,7 @@ class OllamaLeaseService:
         if (
             now >= lease.hard_deadline
             or now >= lease.idle_deadline
-            or authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+            or over_authorized_cost(lease, now)
         ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         try:

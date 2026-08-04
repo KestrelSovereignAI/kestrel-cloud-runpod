@@ -809,13 +809,16 @@ async def test_catalog_drift_above_the_accepted_quote_is_rejected_on_acquire(
 ):
     """A live rate above what was quoted must never be provisioned.
 
-    Acceptance is defended twice: validate_plan measures the live PER-GPU
-    price against the per-GPU budget, and _validate_realized_plan measures the
-    live WHOLE-LEASE rate against the accepted quote. The first bound is
-    strictly tighter, so it always fires first and the second cannot be
-    isolated by a black-box test — its unit correctness is asserted directly
-    below instead. What this test pins is the outcome that matters: drift
-    above the quote does not provision.
+    Acceptance is defended twice: validate_plan measures the live PER-GPU price
+    against the per-GPU budget, and _validate_realized_plan measures the live
+    WHOLE-LEASE rate against the accepted quote. This test is a JOINT pin on
+    the pair — it fails only if both are removed, because either one alone
+    rejects this input. It deliberately does not assert which guard fires, so
+    it must not be counted as coverage for either one individually.
+
+    _validate_realized_plan is pinned on its own by
+    test_live_plan_widening_its_gpu_count_is_rejected_on_acquire below, which
+    constructs the input where the two guards disagree.
     """
     from decimal import Decimal as D
 

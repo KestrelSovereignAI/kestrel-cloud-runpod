@@ -692,3 +692,116 @@ async def test_touch_releases_a_ready_lease_that_passed_its_cost_cap(tmp_path):
     }
     assert touched.termination_reason == "deadline_or_cost_cap"
     assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_releases_a_ready_lease_that_passed_its_cost_cap(tmp_path):
+    """The cost gate inside ``_ready_with_route``, isolated on its own surface.
+
+    ``get`` is a live public surface (``RunPodManagerMixin.get_ollama_lease``)
+    and, unlike ``touch``, it has no second cost gate after
+    ``_ready_with_route`` returns. So this is the only test that fails if that
+    gate's cost clause is deleted. Without it, a READY lease polled through
+    ``get`` keeps being handed back its route after passing
+    ``max_authorized_cost``, billing past its authorization until a deadline
+    finally fires.
+    """
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(serverless_plan(rate=1.0, estimated_cost=0.1))
+    service = _service(tmp_path, clock, capacity)
+    # Both deadlines stay far in the future so the cost clause is the only one
+    # that can fire.
+    request = make_request(
+        clock,
+        max_authorized_cost=0.5,
+        idle_timeout_seconds=7200,
+        hard_deadline=clock() + timedelta(hours=6),
+    )
+    lease = await service.acquire(request)
+    assert lease.state is OllamaLeaseState.READY
+
+    clock.advance(3600)
+    assert clock() < lease.hard_deadline
+    assert clock() < lease.idle_deadline
+    assert accrued_cost(lease, clock()) > request.max_authorized_cost
+
+    fetched = await service.get(
+        lease.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    assert fetched.state in {
+        OllamaLeaseState.RELEASING,
+        OllamaLeaseState.TERMINATED,
+    }
+    assert fetched.termination_reason == "deadline_or_cost_cap"
+    assert fetched.route_url is None
+    assert capacity.teardown_calls == 1
+
+
+class _ObserveAdvancingProvider(FakeOllamaProvider):
+    """Burn authorized budget during the provider observation round-trip."""
+
+    def __init__(self, plan, *, clock, advance_seconds):
+        super().__init__(plan)
+        self._clock = clock
+        self._advance_seconds = advance_seconds
+        self.advance_enabled = False
+
+    async def observe(self, resource):
+        observation = await super().observe(resource)
+        if self.advance_enabled:
+            self._clock.advance(self._advance_seconds)
+        return observation
+
+
+@pytest.mark.asyncio
+async def test_touch_releases_a_lease_that_passes_its_cost_cap_while_observing(
+    tmp_path,
+):
+    """``touch``'s own cost gate, isolated from the one in ``_ready_with_route``.
+
+    ``touch`` re-reads the clock *after* the awaited ``provider.observe``, so
+    its gate is the only thing that catches a lease whose accrual crosses the
+    authorization during that round-trip. Here ``_ready_with_route``'s gate is
+    evaluated before ``observe`` and legitimately passes; only ``touch``'s
+    post-observation gate can fire. This is the test that fails if ``touch``'s
+    gate is deleted while ``_ready_with_route``'s is left in place.
+    """
+    clock = MutableClock()
+    capacity = _ObserveAdvancingProvider(
+        serverless_plan(rate=1.0, estimated_cost=0.1),
+        clock=clock,
+        advance_seconds=1800,
+    )
+    service = _service(tmp_path, clock, capacity)
+    request = make_request(
+        clock,
+        max_authorized_cost=0.5,
+        idle_timeout_seconds=7200,
+        hard_deadline=clock() + timedelta(hours=6),
+    )
+    lease = await service.acquire(request)
+    assert lease.state is OllamaLeaseState.READY
+
+    # Sit just under the authorization, so the pre-observation gate passes...
+    clock.advance(1200)
+    assert accrued_cost(lease, clock()) < request.max_authorized_cost
+    # ...and cross it during the observation itself.
+    capacity.advance_enabled = True
+
+    touched = await service.touch(
+        lease.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    assert clock() < lease.hard_deadline
+    assert clock() < lease.idle_deadline
+    assert touched.state in {
+        OllamaLeaseState.RELEASING,
+        OllamaLeaseState.TERMINATED,
+    }
+    assert touched.termination_reason == "deadline_or_cost_cap"
+    assert capacity.teardown_calls == 1
