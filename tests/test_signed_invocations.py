@@ -1075,3 +1075,82 @@ def test_base64url_encode_requires_bytes():
 def test_attested_request_requires_non_empty_input():
     with pytest.raises(SignedInvocationError):
         replace(_request(), input="")
+
+
+@pytest.mark.parametrize("field", ["model", "provider", "session_id"])
+def test_receipt_refuses_a_content_bearing_optional_identifier(field):
+    """`_optional_identifier` is the SOLE enforcement that these are
+    content-free inside a *signed* receipt.
+
+    Matched by exact message, because `_optional_payload_string` ("must be a
+    string or null") shadows it on the from_payload path: a bare
+    `pytest.raises(SignedInvocationError)` is satisfied by whichever fires
+    first, so neither guard ends up pinned. With this one removed the suite
+    stayed green while `sign()` produced a valid signature over
+    `"model": "https://private.example/leak?token=abc"`.
+    """
+
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(
+        SignedInvocationError, match=f"invocation receipt {field} must be a safe"
+    ):
+        replace(
+            response.invocation_receipt,
+            **{field: "https://private.example/leak?token=abc"},
+        )
+
+
+@pytest.mark.parametrize("field", ["model", "provider", "session_id"])
+def test_receipt_payload_refuses_a_non_string_optional_field(field):
+    """The `_optional_payload_string` half of that shadowed pair."""
+
+    _request_value, response, _trust = _signed_response()
+    payload = response.invocation_receipt.to_payload()
+    payload["payload"][field] = 7
+    with pytest.raises(SignedInvocationError, match="must be a string or null"):
+        ServerInvokeReceipt.from_payload(payload)
+
+
+@pytest.mark.parametrize("field", ["model", "provider", "session_id"])
+def test_receipt_admits_a_null_optional_identifier(field):
+    """None is legitimate for all three - the guard is optional-aware."""
+
+    signer, trust = _authority()
+    request = _request()
+    evidence = {"phase": request.phase, "state_transitions": ["queued"],
+                "timings_ms": {"total": 1}}
+    payload = _receipt_payload(request, trust, "r", evidence)
+    payload[field] = None
+    assert signer.sign(payload) is not None
+
+
+# The isinstance guards in signed_invocations' own helpers, which had no
+# constructor-path equivalent of dogfood_contracts' NON_STRING_DIGESTS sweep.
+@pytest.mark.parametrize("bad", [7, b"bytes", None, ["list"], {"k": "v"}, 3.14])
+def test_safe_identifier_helper_rejects_every_non_string(bad):
+    from kestrel_cloud_runpod import signed_invocations as si
+
+    with pytest.raises(SignedInvocationError, match="must be a safe identifier"):
+        si._safe_identifier("field", bad)
+
+
+@pytest.mark.parametrize("bad", [7, b"/api/x", None, ["/api/x"]])
+def test_relative_route_helper_rejects_every_non_string(bad):
+    from kestrel_cloud_runpod import signed_invocations as si
+
+    with pytest.raises(SignedInvocationError, match="strict relative HTTP route"):
+        si._relative_route("route", bad)
+
+
+@pytest.mark.parametrize("bad", [7, b"YWJj", None, ["YWJj"]])
+def test_base64url_decode_rejects_every_non_string(bad):
+    with pytest.raises(SignedInvocationError, match="unpadded base64url"):
+        base64url_decode(bad, "value")
+
+
+@pytest.mark.parametrize("bad", [7, b"sha256:x", None, ["sha256:x"]])
+def test_sha256_helper_rejects_every_non_string(bad):
+    from kestrel_cloud_runpod import signed_invocations as si
+
+    with pytest.raises(SignedInvocationError, match="prefixed SHA-256 digest"):
+        si._sha256("digest", bad)

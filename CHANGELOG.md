@@ -52,7 +52,19 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   signature-bound. Appending to the caller's list after construction put
   unvalidated content into `binding_payload()` — the projection Frinz feeds to
   `phase_evidence_sha256` — and changed `ResourcePlan.digest`, which
-  `ProviderAttemptIdentity.plan_digest` pins against a billable attempt.
+  `ProviderAttemptIdentity.plan_digest` pins against a billable attempt. Both
+  now materialize their sequence fields BEFORE validating rather than after,
+  which additionally fixes a one-shot iterable silently emptying itself: a
+  generator passed as `state_transitions` validated on the first pass and was
+  copied from an exhausted iterator on the second, so the signed projection
+  carried `[]` while the emptiness guard was bypassed (a generator is always
+  truthy).
+- `ResourcePlan.phase` and `ProviderAttemptIdentity.phase` were checked for
+  membership in the mutating-phase tuple but never for type. `DogfoodPhase` is
+  a `StrEnum`, so a raw `"lora_submit"` satisfies the membership test, then
+  reaches `.value` in `to_payload`/`digest` and raises `AttributeError` — the
+  same escape from `DogfoodSafetyError` as above, on the signature-bound path,
+  reachable by direct construction (the harness's own route).
 
 ## [0.8.0] - 2026-08-03
 

@@ -914,8 +914,11 @@ def test_resource_plan_digest_is_stable_after_construction():
     checks AND changed the digest recorded against a billable attempt.
     """
 
+    # Pass the LIST, not tuple(list). Converting first means the append below
+    # was never connected to anything - the same mistake that made the
+    # artifact_digests aliasing test vacuous.
     resources = [_expected()]
-    plan = _plan(expected_resources=tuple(resources))
+    plan = _plan(expected_resources=resources)
     before = plan.digest
     resources.append(
         dc.ExpectedResource(
@@ -932,3 +935,97 @@ def test_resource_plan_accepts_a_list_and_stores_a_tuple():
     plan = _plan(expected_resources=[_expected()])
     assert isinstance(plan.expected_resources, tuple)
     assert isinstance(plan.initial_resources, tuple)
+
+
+# --------------------------------------------------------------------------
+# Enum fields must be type-guarded, not just membership-checked
+# --------------------------------------------------------------------------
+
+
+def test_resource_plan_refuses_an_untyped_phase():
+    """`DogfoodPhase` is a StrEnum, so membership alone admits a raw str.
+
+    `"lora_submit" in _RESOURCE_MUTATING_PHASES` is True, so the plan
+    constructed, and `.digest` then raised AttributeError ('str' has no
+    attribute 'value') — escaping DogfoodSafetyError on the signed path.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError, match="phase is invalid"):
+        _plan(phase="lora_submit")
+
+
+def test_provider_attempt_refuses_an_untyped_phase():
+    with pytest.raises(dc.DogfoodSafetyError, match="phase is invalid"):
+        _attempt(phase="lora_submit")
+
+
+def test_an_untyped_phase_never_reaches_the_signed_projection():
+    """The end-to-end consequence: binding_payload() is what gets signed."""
+
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(provider_attempts=(_attempt(phase="lora_submit"),))
+
+
+@pytest.mark.parametrize(
+    ("factory", "field", "bad", "message"),
+    [
+        # Exact messages, because these guards shadow each other. A raw "lora"
+        # lane also trips ResourcePlan's same-lane check on expected_resources
+        # (`item.lane is not self.lane`), so a bare `raises` is satisfied by
+        # whichever fires first and pins neither.
+        (lambda **k: _plan(**k), "lane", "lora", "resource plan lane is invalid"),
+        (lambda **k: _attempt(**k), "lane", "lora", "provider attempt lane is invalid"),
+        (lambda **k: _quote(**k), "lane", "lora", "spend quote lane is invalid"),
+        (
+            lambda **k: _observation(**k),
+            "phase",
+            "lora_submit",
+            "phase observation has an invalid phase",
+        ),
+    ],
+)
+def test_enum_fields_reject_the_equal_string(factory, field, bad, message):
+    """Each of these guards was individually removable with the suite green."""
+
+    with pytest.raises(dc.DogfoodSafetyError, match=message):
+        factory(**{field: bad})
+
+
+# --------------------------------------------------------------------------
+# Validate-then-recopy: a one-shot iterable must not empty itself
+# --------------------------------------------------------------------------
+
+
+def test_observation_accepts_a_generator_of_state_transitions():
+    """Validating first and copying afterwards emptied the signed projection.
+
+    A generator is always truthy, so the "requires live state transitions"
+    guard passed, then the second iteration saw an exhausted iterator and the
+    projection silently carried `[]`. `(t.name for t in log)` is ordinary
+    Python.
+    """
+
+    observation = _observation(state_transitions=(t for t in ["queued", "running"]))
+    assert observation.state_transitions == ("queued", "running")
+    assert observation.binding_payload()["state_transitions"] == ["queued", "running"]
+
+
+def test_observation_still_rejects_an_empty_generator():
+    with pytest.raises(dc.DogfoodSafetyError, match="live state transitions"):
+        _observation(state_transitions=(t for t in []))
+
+
+def test_observation_validates_a_generator_element():
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(state_transitions=(t for t in ["https://private.example/x"]))
+
+
+def test_observation_accepts_a_generator_of_artifact_digests():
+    observation = _observation(artifact_digests=(d for d in [SHA]))
+    assert observation.artifact_digests == (SHA,)
+
+
+def test_resource_plan_accepts_a_generator_of_expected_resources():
+    plan = _plan(expected_resources=(r for r in [_expected()]))
+    assert len(plan.expected_resources) == 1
+    assert plan.digest.startswith("sha256:")

@@ -335,7 +335,21 @@ class ResourcePlan:
     initial_resources: tuple[ExpectedResource, ...] | None = None
 
     def __post_init__(self) -> None:
+        # Materialize before validating - see the note in PhaseObservation.
+        object.__setattr__(self, "expected_resources", tuple(self.expected_resources))
+        if self.initial_resources is not None:
+            object.__setattr__(
+                self, "initial_resources", tuple(self.initial_resources)
+            )
         _safe_identifier("resource plan run_id", self.run_id)
+        # isinstance FIRST. DogfoodPhase is a StrEnum, so
+        # `"lora_submit" in _RESOURCE_MUTATING_PHASES` is True for a raw str
+        # and membership alone lets an untyped phase through. It then reaches
+        # `self.phase.value` in to_payload/digest and raises AttributeError -
+        # escaping DogfoodSafetyError, this module's whole contract, on the
+        # signature-bound path. `lane` below has always had this guard.
+        if not isinstance(self.phase, DogfoodPhase):
+            raise DogfoodSafetyError("resource plan phase is invalid")
         if self.phase not in _RESOURCE_MUTATING_PHASES:
             raise DogfoodSafetyError("resource plan phase is not mutating")
         if not isinstance(self.lane, DogfoodLane):
@@ -372,7 +386,6 @@ class ResourcePlan:
         # the same-lane and uniqueness checks above AND changed `digest` -
         # which `ProviderAttemptIdentity.plan_digest` pins against a billable
         # attempt, so the recorded plan digest was not stable.
-        object.__setattr__(self, "expected_resources", tuple(self.expected_resources))
         object.__setattr__(self, "initial_resources", tuple(initial))
 
     def to_payload(self) -> dict[str, Any]:
@@ -464,6 +477,9 @@ class ProviderAttemptIdentity:
         _safe_identifier(
             "provider attempt provider_operation_id", self.provider_operation_id
         )
+        # isinstance FIRST - see the note in ResourcePlan.
+        if not isinstance(self.phase, DogfoodPhase):
+            raise DogfoodSafetyError("provider attempt phase is invalid")
         if self.phase not in _RESOURCE_MUTATING_PHASES:
             raise DogfoodSafetyError("provider attempt phase is not resource mutating")
         if not isinstance(self.lane, DogfoodLane):
@@ -653,6 +669,20 @@ class PhaseObservation:
     provider_attempts: tuple[ProviderAttemptIdentity, ...] = ()
 
     def __post_init__(self) -> None:
+        # Materialize BEFORE validating, not after. Validating first and
+        # copying afterwards means the content that gets copied is not the
+        # content that was validated: for a one-shot iterable the second pass
+        # sees an exhausted iterator, so
+        #
+        #   state_transitions=(t.name for t in log)   # ordinary Python
+        #
+        # silently became `()` in the signature-bound projection, and the
+        # emptiness guard below was bypassed because a generator is always
+        # truthy. Detaching here also closes the aliasing case: the caller
+        # cannot mutate a validated container afterwards.
+        object.__setattr__(self, "state_transitions", tuple(self.state_transitions))
+        object.__setattr__(self, "timings_ms", dict(self.timings_ms))
+        object.__setattr__(self, "artifact_digests", tuple(self.artifact_digests))
         if not isinstance(self.phase, DogfoodPhase):
             raise DogfoodSafetyError("phase observation has an invalid phase")
         if not self.state_transitions:
@@ -724,24 +754,9 @@ class PhaseObservation:
             raise DogfoodSafetyError(
                 "phase observation contains duplicate provider attempts"
             )
-        # Detach from the caller's containers. This is frozen and its
-        # projection is signature-bound, so keeping the caller's live list or
-        # dict lets validated content change AFTER validation:
-        #
-        #   st = ["queued"]; obs = PhaseObservation(state_transitions=st, ...)
-        #   st.append("https://private.example/leak")
-        #   obs.binding_payload()["state_transitions"]  -> the URL is in it
-        #
-        # `_safe_identifier` passed over every element at construction, and
-        # `binding_payload()` is what Frinz feeds to `phase_evidence_sha256`
-        # for the server to sign. Same for a timing mutated to -1 after its
-        # bounds check. `AttestedInvokeResponse` already does this for
-        # `phase_evidence`; these are the sibling fields that did not.
-        object.__setattr__(self, "state_transitions", tuple(self.state_transitions))
-        object.__setattr__(self, "timings_ms", dict(self.timings_ms))
         # `provider_attempts` needs no detaching: the isinstance check above
-        # already requires a tuple, and tuples cannot alias.
-        object.__setattr__(self, "artifact_digests", tuple(self.artifact_digests))
+        # already requires a tuple, and tuples cannot alias. The other three
+        # were materialized at the TOP of this method, before validation.
 
     def binding_payload(self) -> dict[str, Any]:
         """Canonical content-free projection bound by the server receipt."""
