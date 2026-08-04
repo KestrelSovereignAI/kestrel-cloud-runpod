@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Protocol
 
@@ -58,6 +59,15 @@ class OllamaTeardownState(str, Enum):
     COMPLETE = "complete"
 
 
+class OllamaNonComputeCostComponent(str, Enum):
+    """Operator-priced billable exposure outside GPU worker execution."""
+
+    CONTAINER_DISK = "container_disk"
+    NETWORK_VOLUME = "network_volume"
+    MODEL_TRANSFER = "model_transfer"
+    RETRY_ALLOWANCE = "retry_allowance"
+
+
 class OllamaLeaseConflictError(RunPodManagerError):
     """A stable lease ID was reused for a different request."""
 
@@ -72,6 +82,51 @@ class OllamaLeaseReadinessError(RunPodManagerError):
 
 class OllamaLeaseTeardownError(RunPodManagerError):
     """Provider teardown failed and remains durable/retryable."""
+
+
+@dataclass(frozen=True)
+class OllamaNonComputeCostPolicy:
+    """Conservative deployment-owned non-compute authorization policy.
+
+    Values are explicit per-session amounts, not live provider rates and not
+    observed billing.  Operators derive them from the deployment's container
+    disk, optional network volume, model transfer/egress, and retry exposure.
+    """
+
+    estimated_cost_usd: float
+    maximum_cost_usd: float
+    covered_components: tuple[OllamaNonComputeCostComponent, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("estimated_cost_usd", self.estimated_cost_usd),
+            ("maximum_cost_usd", self.maximum_cost_usd),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"Ollama {name} must be finite and nonnegative")
+        if self.maximum_cost_usd < self.estimated_cost_usd:
+            raise ValueError("Ollama maximum non-compute cost must cover its estimate")
+        if (
+            not isinstance(self.covered_components, tuple)
+            or not self.covered_components
+            or any(
+                not isinstance(item, OllamaNonComputeCostComponent)
+                for item in self.covered_components
+            )
+            or len(set(self.covered_components)) != len(self.covered_components)
+        ):
+            raise ValueError(
+                "Ollama non-compute cost components must be a unique nonempty tuple"
+            )
+        if tuple(sorted(self.covered_components, key=lambda item: item.value)) != (
+            self.covered_components
+        ):
+            raise ValueError("Ollama non-compute cost components must be sorted")
 
 
 @dataclass(frozen=True)
@@ -140,6 +195,7 @@ class OllamaLeaseRequest:
     hard_deadline: datetime
     max_authorized_cost: float
     mode: OllamaLeaseMode = OllamaLeaseMode.AUTO
+    requested_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, OllamaLeaseMode):
@@ -148,6 +204,10 @@ class OllamaLeaseRequest:
             raise TypeError("Ollama constraints must be OllamaResourceConstraints")
         if not isinstance(self.hard_deadline, datetime):
             raise TypeError("Ollama hard_deadline must be a datetime")
+        if self.requested_at is not None and not isinstance(
+            self.requested_at, datetime
+        ):
+            raise TypeError("Ollama requested_at must be a datetime when provided")
         for name, value in (
             ("lease_id", self.lease_id),
             ("owner_id", self.owner_id),
@@ -188,6 +248,10 @@ class OllamaLeaseRequest:
         ):
             raise ValueError("max_authorized_cost must be positive")
         require_aware(self.hard_deadline, "hard_deadline")
+        if self.requested_at is not None:
+            require_aware(self.requested_at, "requested_at")
+            if self.requested_at >= self.hard_deadline:
+                raise ValueError("Ollama requested_at must precede hard_deadline")
 
     @property
     def fingerprint(self) -> str:
@@ -209,6 +273,9 @@ class OllamaLeaseRequest:
             "hard_deadline": iso_datetime(self.hard_deadline),
             "max_authorized_cost": self.max_authorized_cost,
             "mode": self.mode.value,
+            "requested_at": (
+                iso_datetime(self.requested_at) if self.requested_at else None
+            ),
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
@@ -219,8 +286,102 @@ class OllamaPlacementPlan:
     mode: OllamaLeaseMode
     resource_type: OllamaResourceType
     placement: PlacementDecision
+    estimated_compute_cost: float
+    maximum_compute_cost: float
+    estimated_non_compute_cost: float
+    maximum_non_compute_cost: float
     estimated_cost: float
+    cost_ceiling: float
     estimated_billable_seconds: int
+    maximum_billable_seconds: int
+    maximum_concurrent_workers: int
+    non_compute_components: tuple[OllamaNonComputeCostComponent, ...]
+    maximum_serverless_cold_starts: int = 0
+
+    def __post_init__(self) -> None:
+        maximum = self.maximum_serverless_cold_starts
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+            raise ValueError("Ollama Serverless cold-start bound must be nonnegative")
+        if self.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT and maximum < 1:
+            raise ValueError("Ollama Serverless plans require a cold-start bound")
+        if self.resource_type is OllamaResourceType.POD and maximum != 0:
+            raise ValueError("Ollama Pod plans cannot declare Serverless cold starts")
+        for name, value in (
+            ("estimated_compute_cost", self.estimated_compute_cost),
+            ("maximum_compute_cost", self.maximum_compute_cost),
+            ("estimated_non_compute_cost", self.estimated_non_compute_cost),
+            ("maximum_non_compute_cost", self.maximum_non_compute_cost),
+            ("estimated_cost", self.estimated_cost),
+            ("cost_ceiling", self.cost_ceiling),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"Ollama plan {name} must be finite and nonnegative")
+        for name, value in (
+            ("estimated_billable_seconds", self.estimated_billable_seconds),
+            ("maximum_billable_seconds", self.maximum_billable_seconds),
+            ("maximum_concurrent_workers", self.maximum_concurrent_workers),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"Ollama plan {name} must be a positive integer")
+        if self.maximum_compute_cost < self.estimated_compute_cost:
+            raise ValueError("Ollama maximum compute cost must cover its estimate")
+        if self.maximum_billable_seconds < self.estimated_billable_seconds:
+            raise ValueError("Ollama maximum billable time must cover its estimate")
+        if self.maximum_non_compute_cost < self.estimated_non_compute_cost:
+            raise ValueError("Ollama maximum non-compute cost must cover its estimate")
+        expected_compute = _rated_cost(
+            self.placement.offered_cost_per_hr,
+            self.estimated_billable_seconds,
+            self.placement.gpu_count,
+        )
+        expected_maximum_compute = _rated_cost(
+            self.placement.offered_cost_per_hr,
+            self.maximum_billable_seconds,
+            self.placement.gpu_count,
+        )
+        if not math.isclose(
+            self.estimated_compute_cost,
+            expected_compute,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ) or not math.isclose(
+            self.maximum_compute_cost,
+            expected_maximum_compute,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Ollama compute costs are not derived from live rate")
+        if (
+            self.resource_type is OllamaResourceType.POD
+            and self.maximum_concurrent_workers != 1
+        ):
+            raise ValueError("Ollama Pod plans require exactly one billable worker")
+        if not math.isclose(
+            self.estimated_cost,
+            self.estimated_compute_cost + self.estimated_non_compute_cost,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Ollama estimated total cost is not derived")
+        if not math.isclose(
+            self.cost_ceiling,
+            self.maximum_compute_cost + self.maximum_non_compute_cost,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Ollama total cost ceiling is not derived")
+        if self.estimated_cost > self.cost_ceiling:
+            raise ValueError("Ollama estimated total cost exceeds its ceiling")
+        OllamaNonComputeCostPolicy(
+            estimated_cost_usd=self.estimated_non_compute_cost,
+            maximum_cost_usd=self.maximum_non_compute_cost,
+            covered_components=self.non_compute_components,
+        )
 
 
 @dataclass(frozen=True)
@@ -279,7 +440,15 @@ class OllamaLease:
     idle_timeout_seconds: int
     offered_rate_per_hr: float | None
     estimated_cost: float | None
+    estimated_compute_cost: float | None
+    maximum_compute_cost: float | None
+    estimated_non_compute_cost: float | None
+    maximum_non_compute_cost: float | None
+    cost_ceiling: float | None
+    cost_policy_components: tuple[OllamaNonComputeCostComponent, ...]
+    maximum_concurrent_workers: int | None
     estimated_billable_seconds: int | None
+    maximum_billable_seconds: int | None
     accrued_estimated_cost: float
     max_authorized_cost: float
     cold_start_seconds: float | None
@@ -288,8 +457,15 @@ class OllamaLease:
     selected_gpu_name: str | None
     catalog_observed_at: datetime | None
     last_provider_error: str | None
+    termination_reason: str | None
     teardown_attempts: int
     revision: int
+    # How many GPUs the placement attaches. ``offered_rate_per_hr`` stays the
+    # catalog's PER-GPU price, exactly as /catalog/gpus reported it, so the
+    # count is carried alongside rather than folded in - a stored rate that
+    # silently meant something new would misread every existing row. Defaults
+    # to a single GPU, which is what every pre-existing lease had.
+    placement_gpu_count: int = 1
 
     @property
     def public_route_url(self) -> str | None:
@@ -308,7 +484,6 @@ class OllamaLease:
             "provider_resource_id": self.provider_resource_id,
             "provision_attempt_id": self.provision_attempt_id,
             "creation_uncertain": self.creation_uncertain,
-            "route_url": self.public_route_url,
             "state": self.state.value,
             "teardown_state": self.teardown_state.value,
             "created_at": iso_datetime(self.created_at),
@@ -322,7 +497,17 @@ class OllamaLease:
             "hard_deadline": iso_datetime(self.hard_deadline),
             "offered_rate_per_hr": self.offered_rate_per_hr,
             "estimated_cost": self.estimated_cost,
+            "estimated_compute_cost": self.estimated_compute_cost,
+            "maximum_compute_cost": self.maximum_compute_cost,
+            "estimated_non_compute_cost": self.estimated_non_compute_cost,
+            "maximum_non_compute_cost": self.maximum_non_compute_cost,
+            "cost_ceiling": self.cost_ceiling,
+            "cost_policy_components": tuple(
+                item.value for item in self.cost_policy_components
+            ),
+            "maximum_concurrent_workers": self.maximum_concurrent_workers,
             "estimated_billable_seconds": self.estimated_billable_seconds,
+            "maximum_billable_seconds": self.maximum_billable_seconds,
             "expected_session_seconds": self.expected_session_seconds,
             "expected_active_seconds": self.expected_active_seconds,
             "serverless_initialization_seconds": (
@@ -342,6 +527,7 @@ class OllamaLease:
             "selected_gpu_name": self.selected_gpu_name,
             "catalog_observed_at": optional_iso_datetime(self.catalog_observed_at),
             "last_provider_error": self.last_provider_error,
+            "termination_reason": self.termination_reason,
         }
 
 
@@ -375,9 +561,23 @@ def select_ollama_plan(
     request: OllamaLeaseRequest,
     decisions: Mapping[ComputeProduct, PlacementDecision],
     *,
+    non_compute_cost_policies: Mapping[OllamaLeaseMode, OllamaNonComputeCostPolicy],
+    planned_at: datetime,
+    serverless_max_workers: int,
     failures: Sequence[str] = (),
 ) -> OllamaPlacementPlan:
-    """Choose the lower live-cost feasible interactive mode without thresholds."""
+    """Choose the lower all-in feasible mode from one conservative cost plan."""
+
+    require_aware(planned_at, "planned_at")
+    if (
+        not isinstance(serverless_max_workers, int)
+        or isinstance(serverless_max_workers, bool)
+        or serverless_max_workers < 1
+    ):
+        raise ValueError("Ollama Serverless maximum workers must be positive")
+    remaining_seconds = math.ceil((request.hard_deadline - planned_at).total_seconds())
+    if remaining_seconds < 1:
+        raise RunPodManagerError("Ollama cost plan has no remaining lease runtime")
 
     candidates: list[OllamaPlacementPlan] = []
     serverless = decisions.get(ComputeProduct.SERVERLESS)
@@ -385,45 +585,102 @@ def select_ollama_plan(
         OllamaLeaseMode.AUTO,
         OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
     }:
-        billable = (
-            request.serverless_initialization_seconds
-            + request.expected_active_seconds
-            + request.serverless_idle_tail_seconds
+        maximum_cold_starts = maximum_serverless_cold_starts(
+            expected_session_seconds=request.expected_session_seconds,
+            idle_tail_seconds=request.serverless_idle_tail_seconds,
         )
-        candidates.append(
-            OllamaPlacementPlan(
-                mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-                resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
-                placement=serverless,
-                estimated_cost=serverless.offered_cost_per_hr * billable / 3600,
-                estimated_billable_seconds=billable,
+        if maximum_cold_starts is not None:
+            policy = _required_non_compute_cost_policy(
+                non_compute_cost_policies,
+                OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
             )
-        )
+            billable = request.expected_active_seconds + maximum_cold_starts * (
+                request.serverless_initialization_seconds
+                + request.serverless_idle_tail_seconds
+            )
+            maximum_billable = max(billable, remaining_seconds * serverless_max_workers)
+            estimated_compute = _rated_cost(
+                serverless.offered_cost_per_hr, billable, serverless.gpu_count
+            )
+            maximum_compute = _rated_cost(
+                serverless.offered_cost_per_hr, maximum_billable, serverless.gpu_count
+            )
+            candidates.append(
+                OllamaPlacementPlan(
+                    mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+                    resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+                    placement=serverless,
+                    estimated_compute_cost=estimated_compute,
+                    maximum_compute_cost=maximum_compute,
+                    estimated_non_compute_cost=policy.estimated_cost_usd,
+                    maximum_non_compute_cost=policy.maximum_cost_usd,
+                    estimated_cost=_cost_sum(
+                        estimated_compute, policy.estimated_cost_usd
+                    ),
+                    cost_ceiling=_cost_sum(maximum_compute, policy.maximum_cost_usd),
+                    estimated_billable_seconds=billable,
+                    maximum_billable_seconds=maximum_billable,
+                    maximum_concurrent_workers=serverless_max_workers,
+                    non_compute_components=policy.covered_components,
+                    maximum_serverless_cold_starts=maximum_cold_starts,
+                )
+            )
     pod = decisions.get(ComputeProduct.POD)
-    if pod is not None and request.mode in {
-        OllamaLeaseMode.AUTO,
-        OllamaLeaseMode.DEDICATED_POD,
-    }:
+    # A Pod bills continuously from provisioning to its hard deadline, so its
+    # estimate is the expected session and its ceiling is the time actually
+    # left. Once less time remains than the session needs, no honest Pod plan
+    # exists: constructing one would trip the plan's own
+    # maximum >= estimate invariant and raise out of select_ollama_plan. That
+    # escapes _provision_requested and reconcile(), which both catch only
+    # RunPodManagerError, poisoning the whole reconcile pass and stranding
+    # every later lease - including READY ones holding a running Pod past its
+    # deadline. Decline the candidate instead; Serverless may still be viable.
+    if (
+        pod is not None
+        and remaining_seconds >= request.expected_session_seconds
+        and request.mode
+        in {
+            OllamaLeaseMode.AUTO,
+            OllamaLeaseMode.DEDICATED_POD,
+        }
+    ):
+        policy = _required_non_compute_cost_policy(
+            non_compute_cost_policies,
+            OllamaLeaseMode.DEDICATED_POD,
+        )
+        estimated_compute = _rated_cost(
+            pod.offered_cost_per_hr, request.expected_session_seconds, pod.gpu_count
+        )
+        maximum_compute = _rated_cost(
+            pod.offered_cost_per_hr, remaining_seconds, pod.gpu_count
+        )
         candidates.append(
             OllamaPlacementPlan(
                 mode=OllamaLeaseMode.DEDICATED_POD,
                 resource_type=OllamaResourceType.POD,
                 placement=pod,
-                estimated_cost=(
-                    pod.offered_cost_per_hr * request.expected_session_seconds / 3600
-                ),
+                estimated_compute_cost=estimated_compute,
+                maximum_compute_cost=maximum_compute,
+                estimated_non_compute_cost=policy.estimated_cost_usd,
+                maximum_non_compute_cost=policy.maximum_cost_usd,
+                estimated_cost=_cost_sum(estimated_compute, policy.estimated_cost_usd),
+                cost_ceiling=_cost_sum(maximum_compute, policy.maximum_cost_usd),
                 estimated_billable_seconds=request.expected_session_seconds,
+                maximum_billable_seconds=remaining_seconds,
+                maximum_concurrent_workers=1,
+                non_compute_components=policy.covered_components,
+                maximum_serverless_cold_starts=0,
             )
         )
     affordable = [
         candidate
         for candidate in candidates
-        if candidate.estimated_cost <= request.max_authorized_cost
+        if candidate.cost_ceiling <= request.max_authorized_cost
     ]
     if not affordable:
         context = "; ".join(failures)
         estimates = ", ".join(
-            f"{item.mode.value}=${item.estimated_cost:.6f}" for item in candidates
+            f"{item.mode.value} ceiling=${item.cost_ceiling:.6f}" for item in candidates
         )
         details = "; ".join(part for part in (estimates, context) if part)
         raise RunPodManagerError(
@@ -431,6 +688,34 @@ def select_ollama_plan(
             + (f": {details}" if details else "")
         )
     return min(affordable, key=lambda candidate: candidate.estimated_cost)
+
+
+def _required_non_compute_cost_policy(
+    policies: Mapping[OllamaLeaseMode, OllamaNonComputeCostPolicy],
+    mode: OllamaLeaseMode,
+) -> OllamaNonComputeCostPolicy:
+    policy = policies.get(mode)
+    if not isinstance(policy, OllamaNonComputeCostPolicy):
+        raise RunPodManagerError(
+            f"Ollama {mode.value} non-compute cost policy is not configured"
+        )
+    return policy
+
+
+def maximum_serverless_cold_starts(
+    *, expected_session_seconds: int, idle_tail_seconds: int
+) -> int | None:
+    """Return a conservative cold-start bound for a scale-to-zero session.
+
+    A new worker may be required after every complete idle-tail interval.  The
+    extra initial start covers the inclusive session boundary.  A zero idle
+    tail cannot provide a finite invocation-independent bound, so callers must
+    omit Serverless rather than quote a knowingly incomplete cost.
+    """
+
+    if idle_tail_seconds <= 0:
+        return None
+    return 1 + expected_session_seconds // idle_tail_seconds
 
 
 def accrued_cost(lease: OllamaLease, now: datetime) -> float:
@@ -446,7 +731,64 @@ def accrued_cost(lease: OllamaLease, now: datetime) -> float:
         return lease.accrued_estimated_cost
     end = min(now, lease.hard_deadline)
     elapsed = max(0.0, (end - lease.provisioning_started_at).total_seconds())
-    return lease.offered_rate_per_hr * elapsed / 3600
+    multiplier = lease.maximum_concurrent_workers
+    if multiplier is None or multiplier < 1:
+        return lease.max_authorized_cost
+    return float(
+        Decimal(str(lease.offered_rate_per_hr))
+        * Decimal(str(elapsed))
+        * Decimal(multiplier)
+        * Decimal(lease.placement_gpu_count)
+        / Decimal(3600)
+    )
+
+
+def authorized_cost_exposure(lease: OllamaLease, now: datetime) -> float:
+    """Return accrued compute plus reserved maximum non-compute authorization."""
+
+    overhead = lease.maximum_non_compute_cost
+    if overhead is None:
+        # A legacy compute-only row has no proof that storage/transfer exposure
+        # was reserved.  Fail closed on its next lifecycle gate while keeping
+        # teardown and state inspection available.
+        return lease.max_authorized_cost
+    return _cost_sum(accrued_cost(lease, now), overhead)
+
+
+def over_authorized_cost(lease: OllamaLease, now: datetime) -> bool:
+    """Return whether a lease has burned through its authorized spend.
+
+    This is the single source of truth for the cost half of every lifecycle
+    release gate.  It is one function rather than one comparison per call site
+    on purpose: the rule was previously written out five times, and a rule
+    duplicated across lifecycle sites cannot be pinned by a test, because
+    deleting any single copy leaves the remaining copies to mask it.  The
+    deadline halves stay at the call sites, because they genuinely differ
+    (only a READY lease has a meaningful idle deadline).
+    """
+
+    return authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+
+
+def _rated_cost(hourly_rate: float, seconds: int, gpu_count: int = 1) -> float:
+    """Rate billable seconds against a catalog offer.
+
+    ``/catalog/gpus`` prices ``price.secure``/``price.community`` **per GPU**
+    (``maxCount`` is a separate attachment limit), so a placement that asks
+    for more than one GPU bills that multiple of the offered rate.  This is
+    orthogonal to Serverless worker scaling, which multiplies billable
+    *seconds* rather than the rate.
+    """
+    return float(
+        Decimal(str(hourly_rate))
+        * Decimal(seconds)
+        * Decimal(gpu_count)
+        / Decimal(3600)
+    )
+
+
+def _cost_sum(*values: float) -> float:
+    return float(sum((Decimal(str(value)) for value in values), Decimal(0)))
 
 
 def resource_from_lease(lease: OllamaLease) -> ProvisionedOllamaResource:

@@ -39,10 +39,11 @@ const (
 )
 
 var (
-	runtimeVersion = "development"
-	ollamaVersion  = "unknown"
-	pinnedModelRE  = regexp.MustCompile(`^([a-z0-9][a-z0-9._/-]*:[a-z0-9][a-z0-9._-]*)@sha256:([a-f0-9]{64})$`)
-	modelDigestRE  = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	runtimeVersion            = "development"
+	ollamaVersion             = "unknown"
+	pinnedModelRE             = regexp.MustCompile(`^([a-z0-9][a-z0-9._/-]*:[a-z0-9][a-z0-9._-]*)@sha256:([a-f0-9]{64})$`)
+	modelDigestRE             = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	requiredModelCapabilities = []string{"completion", "tools"}
 )
 
 type modelPin struct {
@@ -501,7 +502,7 @@ func bootstrap(parent context.Context, config runtimeConfig, state *startupState
 	if err := waitForOllama(ctx, config, state, client); err != nil {
 		return err
 	}
-	present, err := exactModelPresent(ctx, client, config.Upstream, config.RequiredModel)
+	present, err := exactModelReady(ctx, client, config.Upstream, config.RequiredModel)
 	if err != nil {
 		return err
 	}
@@ -516,7 +517,7 @@ func bootstrap(parent context.Context, config runtimeConfig, state *startupState
 			return fmt.Errorf("pull pinned model: %w", err)
 		}
 		state.markPullCompleted()
-		present, err = exactModelPresent(ctx, client, config.Upstream, config.RequiredModel)
+		present, err = exactModelReady(ctx, client, config.Upstream, config.RequiredModel)
 		if err != nil {
 			return err
 		}
@@ -559,7 +560,7 @@ func waitForOllama(ctx context.Context, config runtimeConfig, state *startupStat
 	}
 }
 
-func exactModelPresent(ctx context.Context, client *http.Client, upstream *url.URL, pin modelPin) (bool, error) {
+func exactModelReady(ctx context.Context, client *http.Client, upstream *url.URL, pin modelPin) (bool, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstream.String()+"/api/tags", nil)
 	response, err := client.Do(req)
 	if err != nil {
@@ -571,9 +572,10 @@ func exactModelPresent(ctx context.Context, client *http.Client, upstream *url.U
 	}
 	var payload struct {
 		Models []struct {
-			Name   string `json:"name"`
-			Model  string `json:"model"`
-			Digest string `json:"digest"`
+			Name         string   `json:"name"`
+			Model        string   `json:"model"`
+			Digest       string   `json:"digest"`
+			Capabilities []string `json:"capabilities"`
 		} `json:"models"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
@@ -588,7 +590,19 @@ func exactModelPresent(ctx context.Context, client *http.Client, upstream *url.U
 		if name == pin.Name {
 			actual, validActual := normalizedModelDigest(item.Digest)
 			expected, validExpected := normalizedModelDigest(pin.Digest)
-			return validActual && validExpected && subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1, nil
+			if !validActual || !validExpected || subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+				return false, nil
+			}
+			available := make(map[string]bool, len(item.Capabilities))
+			for _, capability := range item.Capabilities {
+				available[capability] = true
+			}
+			for _, capability := range requiredModelCapabilities {
+				if !available[capability] {
+					return false, fmt.Errorf("configured model lacks required Ollama capability %q", capability)
+				}
+			}
+			return true, nil
 		}
 	}
 	return false, nil
@@ -714,7 +728,7 @@ func (runtime *runtimeProxy) serveHealth(writer http.ResponseWriter, request *ht
 		}
 		ctx, cancel := context.WithTimeout(request.Context(), defaultHealthTimeout)
 		defer cancel()
-		present, err := exactModelPresent(
+		present, err := exactModelReady(
 			ctx,
 			&http.Client{Timeout: defaultHealthTimeout},
 			runtime.config.Upstream,

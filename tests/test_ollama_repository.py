@@ -1,5 +1,6 @@
 """Persistence, idempotency, and restart tests for Ollama leases."""
 
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -33,6 +34,32 @@ def test_insert_is_idempotent_and_survives_repository_restart(tmp_path):
     assert duplicate == first
     assert duplicate.state is OllamaLeaseState.REQUESTED
     assert request_from_lease(duplicate) == make_request(clock)
+
+
+def test_repository_additively_upgrades_compute_only_lease_schema(tmp_path):
+    database = tmp_path / "leases.sqlite3"
+    SQLiteOllamaLeaseRepository(database)
+    added = (
+        "estimated_compute_cost",
+        "maximum_compute_cost",
+        "estimated_non_compute_cost",
+        "maximum_non_compute_cost",
+        "cost_ceiling",
+        "cost_policy_components_json",
+        "maximum_concurrent_workers",
+        "maximum_billable_seconds",
+    )
+    with sqlite3.connect(database) as connection:
+        for name in added:
+            connection.execute(f"ALTER TABLE ollama_leases DROP COLUMN {name}")
+
+    SQLiteOllamaLeaseRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ollama_leases)")
+        }
+    assert set(added).issubset(columns)
 
 
 def test_reused_lease_id_with_changed_request_is_rejected(tmp_path):

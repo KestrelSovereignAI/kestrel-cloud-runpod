@@ -31,29 +31,22 @@ from .models import (
 )
 from .providers import DirectRunPodProvider
 from .training_contracts import (
+    TRAINING_PROFILE_IDS,
     TrainingPodCleanupError,
     TrainingPodCleanupState,
     TrainingPodLease,
     TrainingPodLifecycleError,
     TrainingPodRequest,
     TrainingPodSource,
+    TrainingPodState,
     durable_training_name,
+    fallback_training_cleanup_token,
 )
 from .training_provider import RunpodTrainingPodProvider
 from .training_repository import SQLiteTrainingPodRepository, training_database_path
 from .training_service import TrainingPodLeaseService
 
 logger = logging.getLogger(__name__)
-
-
-def _fallback_training_cleanup_token(cleanup_token: str, profile_name: str) -> str:
-    """Derive a bounded, deterministic identity for a fallback GPU attempt."""
-
-    attempt_id = uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"kestrel-runpod-training\0{cleanup_token}\0{profile_name}",
-    )
-    return f"training:{attempt_id}"
 
 
 class RunPodTrainingMixin:
@@ -115,13 +108,23 @@ class RunPodTrainingMixin:
     ) -> TrainingPodLease:
         """Stop owned training capacity or keep a retryable cleanup record."""
 
-        lease = await self._get_training_pod_lease_service().release(
-            cleanup_token, reason=reason
-        )
+        service = self._get_training_pod_lease_service()
+        lease = await service.release(cleanup_token, reason=reason)
         async with self._lock:
-            if (
-                self._session is not None
-                and self._session.training_cleanup_token == cleanup_token
+            session_token = (
+                self._session.training_cleanup_token
+                if self._session is not None
+                else None
+            )
+            session_lease = (
+                service.repository.get(session_token) if session_token else None
+            )
+            if self._session is not None and (
+                session_token == cleanup_token
+                or (
+                    session_lease is not None
+                    and session_lease.root_cleanup_token == cleanup_token
+                )
             ):
                 self._session.status = self._map_status("EXITED")
                 self._session = None
@@ -312,9 +315,29 @@ class RunPodTrainingMixin:
             A route-ready session carrying its durable cleanup token.
         """
         ttl_seconds = self._validate_ttl(3600)  # 1 hour requested training cap
-        profiles_to_try = ["training", "training-h100", "training-flex"]
+        root_cleanup_token = cleanup_token or f"training:{uuid.uuid4()}"
 
         service = self._get_training_pod_lease_service()
+        active_attempt = service.get_active_family_attempt(root_cleanup_token)
+        if active_attempt is not None:
+            if active_attempt.companion_id != companion_id:
+                raise RunPodManagerError(
+                    f"Training cleanup token '{root_cleanup_token}' already belongs "
+                    "to another companion"
+                )
+            if active_attempt.state is not TrainingPodState.READY:
+                raise RunPodManagerError(
+                    f"Training cleanup token '{root_cleanup_token}' has an active "
+                    f"attempt in state {active_attempt.state.value}; reconcile it"
+                )
+            active_attempt = service.heartbeat(active_attempt.cleanup_token)
+            profile = self._select_profile(active_attempt.profile_id)
+            return await self._record_training_session(
+                lease=active_attempt,
+                profile=profile,
+                companion_id=companion_id,
+                ttl_seconds=ttl_seconds,
+            )
 
         # Check if training profile has a persistent pod configured.
         if "training" in self.profiles:
@@ -330,7 +353,8 @@ class RunPodTrainingMixin:
                     ttl_seconds=ttl_seconds,
                     source=TrainingPodSource.CONFIGURED_PERSISTENT,
                     provider_pod_id=persistent_pod_id,
-                    cleanup_token=cleanup_token,
+                    cleanup_token=root_cleanup_token,
+                    root_cleanup_token=root_cleanup_token,
                 )
 
         # Reuse an explicitly stopped Pod when the workload's storage policy permits it.
@@ -349,7 +373,8 @@ class RunPodTrainingMixin:
                     ttl_seconds=ttl_seconds,
                     source=TrainingPodSource.STOPPED_REUSE,
                     provider_pod_id=pod_id,
-                    cleanup_token=cleanup_token,
+                    cleanup_token=root_cleanup_token,
+                    root_cleanup_token=root_cleanup_token,
                 )
             except RunPodManagerError as e:
                 logger.warning(f"Failed to resume stopped pod: {e}")
@@ -358,18 +383,18 @@ class RunPodTrainingMixin:
         # Try each profile in order
         last_error = None
         attempted_profiles = 0
-        for profile_name in profiles_to_try:
+        for profile_name in TRAINING_PROFILE_IDS:
             if profile_name not in self.profiles:
                 continue
 
-            profile_cleanup_token = cleanup_token
-            if cleanup_token is not None and attempted_profiles > 0:
+            profile_cleanup_token = root_cleanup_token
+            if attempted_profiles > 0:
                 # One logical request may make several confirmed-safe capacity
                 # attempts.  Each attempt needs its own durable primary key so
                 # a released first profile cannot collide with the fallback,
                 # while the first attempt retains the caller's stable token.
-                profile_cleanup_token = _fallback_training_cleanup_token(
-                    cleanup_token, profile_name
+                profile_cleanup_token = fallback_training_cleanup_token(
+                    root_cleanup_token, profile_name
                 )
             attempted_profiles += 1
             try:
@@ -382,6 +407,7 @@ class RunPodTrainingMixin:
                     source=TrainingPodSource.CREATED,
                     provider_pod_id=None,
                     cleanup_token=profile_cleanup_token,
+                    root_cleanup_token=root_cleanup_token,
                 )
             except TrainingPodLifecycleError as e:
                 logger.warning(f"Profile {profile_name} failed: {e}")
@@ -410,7 +436,8 @@ class RunPodTrainingMixin:
         ttl_seconds: int,
         source: TrainingPodSource,
         provider_pod_id: str | None,
-        cleanup_token: str | None,
+        cleanup_token: str,
+        root_cleanup_token: str,
     ) -> RunPodSession:
         if self._training_admission_lock is None:
             self._training_admission_lock = asyncio.Lock()
@@ -419,15 +446,15 @@ class RunPodTrainingMixin:
                 if self._session and self._session.is_active:
                     raise RunPodManagerError("A RunPod session is already active")
             now = datetime.now(timezone.utc)
-            token = cleanup_token or f"training:{uuid.uuid4()}"
             readiness_seconds = profile.readiness_timeout_seconds or POD_READY_TIMEOUT
             readiness_seconds = min(readiness_seconds, ttl_seconds - 1)
             request = TrainingPodRequest(
-                cleanup_token=token,
+                cleanup_token=cleanup_token,
+                root_cleanup_token=root_cleanup_token,
                 companion_id=companion_id,
                 profile_id=profile.id,
                 source=source,
-                resource_name=durable_training_name(token),
+                resource_name=durable_training_name(cleanup_token),
                 provider_pod_id=provider_pod_id,
                 created_at=now,
                 readiness_deadline=now + timedelta(seconds=readiness_seconds),
@@ -438,23 +465,40 @@ class RunPodTrainingMixin:
                 raise RunPodManagerError(
                     "Durable training acquisition returned no route"
                 )
-            session = RunPodSession(
-                pod_id=lease.provider_pod_id,
+            return await self._record_training_session(
+                lease=lease,
                 profile=profile,
-                task_profile="training",
-                model_name="flux-lora-trainer",
-                pod_type=profile.pod_type,
-                status=self._map_status("RUNNING"),
-                ttl_seconds=ttl_seconds,
-                started_at=lease.created_at,
-                expires_at=lease.hard_deadline,
-                backend_base_url=lease.backend_base_url,
                 companion_id=companion_id,
-                training_cleanup_token=lease.cleanup_token,
+                ttl_seconds=ttl_seconds,
             )
-            async with self._lock:
-                self._session = session
-            return session
+
+    async def _record_training_session(
+        self,
+        *,
+        lease: TrainingPodLease,
+        profile: GPUProfile,
+        companion_id: str,
+        ttl_seconds: int,
+    ) -> RunPodSession:
+        if not lease.provider_pod_id or not lease.backend_base_url:
+            raise RunPodManagerError("Durable training lease has no route")
+        session = RunPodSession(
+            pod_id=lease.provider_pod_id,
+            profile=profile,
+            task_profile="training",
+            model_name="flux-lora-trainer",
+            pod_type=profile.pod_type,
+            status=self._map_status("RUNNING"),
+            ttl_seconds=ttl_seconds,
+            started_at=lease.created_at,
+            expires_at=lease.hard_deadline,
+            backend_base_url=lease.backend_base_url,
+            companion_id=companion_id,
+            training_cleanup_token=lease.cleanup_token,
+        )
+        async with self._lock:
+            self._session = session
+        return session
 
     async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
         """

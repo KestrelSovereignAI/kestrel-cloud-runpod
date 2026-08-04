@@ -21,6 +21,7 @@ from .ollama_contracts import (
     OllamaLeaseMode,
     OllamaLeaseRequest,
     OllamaLeaseState,
+    OllamaNonComputeCostComponent,
     OllamaResourceConstraints,
     OllamaResourceType,
     OllamaTeardownState,
@@ -54,8 +55,17 @@ class SQLiteOllamaLeaseRepository:
             "model_pull_attempts",
             "model_ready_at",
             "offered_rate_per_hr",
+            "placement_gpu_count",
             "estimated_cost",
+            "estimated_compute_cost",
+            "maximum_compute_cost",
+            "estimated_non_compute_cost",
+            "maximum_non_compute_cost",
+            "cost_ceiling",
+            "cost_policy_components_json",
+            "maximum_concurrent_workers",
             "estimated_billable_seconds",
+            "maximum_billable_seconds",
             "accrued_estimated_cost",
             "cold_start_seconds",
             "selected_gpu_id",
@@ -63,6 +73,7 @@ class SQLiteOllamaLeaseRepository:
             "selected_gpu_name",
             "catalog_observed_at",
             "last_provider_error",
+            "termination_reason",
             "teardown_attempts",
         }
     )
@@ -121,8 +132,17 @@ class SQLiteOllamaLeaseRepository:
                     serverless_idle_tail_seconds INTEGER NOT NULL,
                     idle_timeout_seconds INTEGER NOT NULL,
                     offered_rate_per_hr REAL,
+                    placement_gpu_count INTEGER NOT NULL DEFAULT 1,
                     estimated_cost REAL,
+                    estimated_compute_cost REAL,
+                    maximum_compute_cost REAL,
+                    estimated_non_compute_cost REAL,
+                    maximum_non_compute_cost REAL,
+                    cost_ceiling REAL,
+                    cost_policy_components_json TEXT,
+                    maximum_concurrent_workers INTEGER,
                     estimated_billable_seconds INTEGER,
+                    maximum_billable_seconds INTEGER,
                     accrued_estimated_cost REAL NOT NULL DEFAULT 0,
                     max_authorized_cost REAL NOT NULL,
                     cold_start_seconds REAL,
@@ -131,6 +151,7 @@ class SQLiteOllamaLeaseRepository:
                     selected_gpu_name TEXT,
                     catalog_observed_at TEXT,
                     last_provider_error TEXT,
+                    termination_reason TEXT,
                     teardown_attempts INTEGER NOT NULL DEFAULT 0,
                     revision INTEGER NOT NULL DEFAULT 0
                 )
@@ -142,10 +163,49 @@ class SQLiteOllamaLeaseRepository:
                 ON ollama_leases(state, idle_deadline, hard_deadline)
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(ollama_leases)"
+                ).fetchall()
+            }
+            if "termination_reason" not in columns:
+                connection.execute(
+                    "ALTER TABLE ollama_leases ADD COLUMN termination_reason TEXT"
+                )
+            additive_columns = {
+                "estimated_compute_cost": "REAL",
+                "maximum_compute_cost": "REAL",
+                "estimated_non_compute_cost": "REAL",
+                "maximum_non_compute_cost": "REAL",
+                "cost_ceiling": "REAL",
+                "cost_policy_components_json": "TEXT",
+                "maximum_concurrent_workers": "INTEGER",
+                "maximum_billable_seconds": "INTEGER",
+                # Existing rows predate multi-GPU rating and were all single
+                # GPU, so the default is both correct and conservative.
+                "placement_gpu_count": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for name, column_type in additive_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE ollama_leases ADD COLUMN {name} {column_type}"
+                    )
+            # Routes are re-observed from Runpod and exist only in the host
+            # process.  Clear values written by releases before the SDK
+            # inference boundary made addressable endpoints host-only.
+            connection.execute(
+                """
+                UPDATE ollama_leases
+                SET route_url = NULL, provider_health_url = NULL
+                WHERE route_url IS NOT NULL OR provider_health_url IS NOT NULL
+                """
+            )
 
     def insert_request(
         self, request: OllamaLeaseRequest, *, now: datetime
     ) -> tuple[OllamaLease, bool]:
+        request_started_at = request.requested_at or now
         constraints = asdict(request.constraints)
         constraints["cloud"] = request.constraints.cloud.value
         values = (
@@ -170,7 +230,8 @@ class SQLiteOllamaLeaseRepository:
             iso_datetime(request.hard_deadline),
             iso_datetime(
                 min(
-                    now + timedelta(seconds=request.readiness_timeout_seconds),
+                    request_started_at
+                    + timedelta(seconds=request.readiness_timeout_seconds),
                     request.hard_deadline,
                 )
             ),
@@ -370,8 +431,24 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         serverless_idle_tail_seconds=row["serverless_idle_tail_seconds"],
         idle_timeout_seconds=row["idle_timeout_seconds"],
         offered_rate_per_hr=row["offered_rate_per_hr"],
+        placement_gpu_count=(
+            row["placement_gpu_count"]
+            if "placement_gpu_count" in row.keys()
+            and row["placement_gpu_count"] is not None
+            else 1
+        ),
         estimated_cost=row["estimated_cost"],
+        estimated_compute_cost=row["estimated_compute_cost"],
+        maximum_compute_cost=row["maximum_compute_cost"],
+        estimated_non_compute_cost=row["estimated_non_compute_cost"],
+        maximum_non_compute_cost=row["maximum_non_compute_cost"],
+        cost_ceiling=row["cost_ceiling"],
+        cost_policy_components=_stored_cost_components(
+            row["cost_policy_components_json"]
+        ),
+        maximum_concurrent_workers=row["maximum_concurrent_workers"],
         estimated_billable_seconds=row["estimated_billable_seconds"],
+        maximum_billable_seconds=row["maximum_billable_seconds"],
         accrued_estimated_cost=row["accrued_estimated_cost"],
         max_authorized_cost=row["max_authorized_cost"],
         cold_start_seconds=row["cold_start_seconds"],
@@ -380,6 +457,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         selected_gpu_name=row["selected_gpu_name"],
         catalog_observed_at=_optional_datetime(row["catalog_observed_at"]),
         last_provider_error=row["last_provider_error"],
+        termination_reason=row["termination_reason"],
         teardown_attempts=row["teardown_attempts"],
         revision=row["revision"],
     )
@@ -460,3 +538,24 @@ def _optional_stored_float(value: Mapping[str, Any], name: str) -> float | None:
     if not math.isfinite(item):
         raise ValueError(f"Stored Ollama {name} must be a finite number or null")
     return float(item)
+
+
+def _stored_cost_components(
+    value: str | None,
+) -> tuple[OllamaNonComputeCostComponent, ...]:
+    if value is None:
+        return ()
+    try:
+        raw: object = json.loads(value)
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            raise TypeError
+        components = tuple(OllamaNonComputeCostComponent(item) for item in raw)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RunPodManagerError(
+            "Stored Ollama non-compute cost components are corrupt"
+        ) from exc
+    if len(set(components)) != len(components):
+        raise RunPodManagerError(
+            "Stored Ollama non-compute cost components are corrupt"
+        )
+    return components

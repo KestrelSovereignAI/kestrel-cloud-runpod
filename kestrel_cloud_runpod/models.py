@@ -87,6 +87,13 @@ class FlashBoot(str, Enum):
     PRIORITY_FLASHBOOT = "PRIORITY_FLASHBOOT"
 
 
+class VolumeType(str, Enum):
+    """Runpod network-volume storage tier."""
+
+    STANDARD = "STANDARD"
+    HIGH_PERFORMANCE = "HIGH_PERFORMANCE"
+
+
 @dataclass(frozen=True)
 class PlacementRequirements:
     """Stable workload constraints used to select a live catalog offer."""
@@ -438,6 +445,37 @@ class EndpointResource:
             endpoint_type=_optional_string(value.get("type"), "Endpoint.type"),
             request_urls=dict(urls),
             raw=sanitize_resource_payload(value),
+        )
+
+
+@dataclass(frozen=True)
+class NetworkVolume:
+    """Read-only network-volume inventory used by cleanup verification."""
+
+    id: str
+    name: str
+    size_gb: int
+    data_center: str
+    volume_type: VolumeType
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "NetworkVolume":
+        raw_type = _string(value, "type", "Network volume")
+        try:
+            volume_type = VolumeType(raw_type)
+        except ValueError as exc:
+            raise RunPodManagerError(
+                f"Invalid network volume type: {raw_type}"
+            ) from exc
+        size_gb = _integer(value, "size", "Network volume")
+        if not 10 <= size_gb <= 4096:
+            raise RunPodManagerError("Invalid network volume size")
+        return cls(
+            id=_string(value, "id", "Network volume"),
+            name=_string(value, "name", "Network volume"),
+            size_gb=size_gb,
+            data_center=_string(value, "dataCenter", "Network volume"),
+            volume_type=volume_type,
         )
 
 

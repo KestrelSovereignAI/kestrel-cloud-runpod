@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,6 +30,7 @@ from .ollama_contracts import (
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
+    over_authorized_cost,
     provision_attempt_id,
     require_aware,
     resource_from_lease,
@@ -97,41 +100,61 @@ class OllamaLeaseService:
         self._clock = clock
         self._sleep = sleep
 
-    async def acquire(self, request: OllamaLeaseRequest) -> OllamaLease:
+    async def acquire(
+        self,
+        request: OllamaLeaseRequest,
+        *,
+        wait_until_ready: bool = True,
+        plan: OllamaPlacementPlan | None = None,
+    ) -> OllamaLease:
         now = self._now()
-        if request.hard_deadline <= now:
-            raise ValueError("Ollama lease hard_deadline must be in the future")
-        if (
-            request.expected_session_seconds
-            > (request.hard_deadline - now).total_seconds()
-        ):
-            raise ValueError("Expected Ollama session exceeds its hard deadline")
+        existing = self.repository.get(request.lease_id)
+        if existing is None:
+            if request.hard_deadline <= now:
+                raise ValueError("Ollama lease hard_deadline must be in the future")
+            if (
+                request.expected_session_seconds
+                > (request.hard_deadline - now).total_seconds()
+            ):
+                raise ValueError("Expected Ollama session exceeds its hard deadline")
+            requested_at = request.requested_at or now
+            if now >= min(
+                requested_at + timedelta(seconds=request.readiness_timeout_seconds),
+                request.hard_deadline,
+            ):
+                raise ValueError("Ollama readiness deadline has already elapsed")
         lease, inserted = self.repository.insert_request(request, now=now)
         if not inserted:
             self._authorize(lease, request.owner_id, request.workload_id)
         if lease.state is OllamaLeaseState.READY:
-            return lease
+            return await self._ready_with_route(lease)
         if lease.state is OllamaLeaseState.REQUESTED:
-            lease = await self._provision_requested(lease, request)
+            if now >= min(lease.readiness_deadline, lease.hard_deadline):
+                return await self._release(lease, reason="expired")
+            lease = await self._provision_requested(lease, request, plan=plan)
         elif lease.state in {
             OllamaLeaseState.PROVISIONING,
             OllamaLeaseState.RECONCILE_REQUIRED,
         }:
             lease = await self._reconcile_creation(lease)
-        if lease.state is OllamaLeaseState.WAITING_FOR_MODEL:
+        if lease.state is OllamaLeaseState.WAITING_FOR_MODEL and wait_until_ready:
             return await self._wait_until_ready(lease)
         return lease
 
     async def _provision_requested(
-        self, lease: OllamaLease, request: OllamaLeaseRequest
+        self,
+        lease: OllamaLease,
+        request: OllamaLeaseRequest,
+        *,
+        plan: OllamaPlacementPlan | None = None,
     ) -> OllamaLease:
         if lease.state is not OllamaLeaseState.REQUESTED:
             raise RunPodManagerError(
                 f"Ollama lease '{lease.lease_id}' is no longer awaiting provisioning"
             )
         try:
-            plan = await self.provider.plan(request)
-            self._validate_plan(request, plan)
+            plan = plan or await self.provider.plan(request)
+            self.validate_plan(request, plan)
         except RunPodManagerError as exc:
             self._transition(
                 lease,
@@ -152,8 +175,20 @@ class OllamaLeaseService:
             provision_attempts=lease.provision_attempts + 1,
             provisioning_started_at=now,
             offered_rate_per_hr=plan.placement.offered_cost_per_hr,
+            placement_gpu_count=plan.placement.gpu_count,
             estimated_cost=plan.estimated_cost,
+            estimated_compute_cost=plan.estimated_compute_cost,
+            maximum_compute_cost=plan.maximum_compute_cost,
+            estimated_non_compute_cost=plan.estimated_non_compute_cost,
+            maximum_non_compute_cost=plan.maximum_non_compute_cost,
+            cost_ceiling=plan.cost_ceiling,
+            cost_policy_components_json=json.dumps(
+                [item.value for item in plan.non_compute_components],
+                separators=(",", ":"),
+            ),
+            maximum_concurrent_workers=plan.maximum_concurrent_workers,
             estimated_billable_seconds=plan.estimated_billable_seconds,
+            maximum_billable_seconds=plan.maximum_billable_seconds,
             selected_gpu_id=plan.placement.gpu_id,
             selected_gpu_pool=plan.placement.gpu_pool,
             selected_gpu_name=plan.placement.gpu_name,
@@ -192,6 +227,8 @@ class OllamaLeaseService:
     ) -> OllamaLease:
         lease = self._required(lease_id)
         self._authorize(lease, owner_id, workload_id)
+        if lease.state is OllamaLeaseState.READY:
+            return await self._ready_with_route(lease)
         return lease
 
     async def touch(
@@ -199,13 +236,29 @@ class OllamaLeaseService:
     ) -> OllamaLease:
         lease = self._required(lease_id)
         self._authorize(lease, owner_id, workload_id)
+        if lease.state in {
+            OllamaLeaseState.FAILED,
+            OllamaLeaseState.RELEASING,
+            OllamaLeaseState.TERMINATED,
+        }:
+            # A lost touch response or an external reconciler may have already
+            # moved the exact authorized lease to a route-less terminal path.
+            # Return that durable truth idempotently so Core can detach its
+            # route; renewal must never recreate capacity or retry teardown.
+            return lease
         if lease.state is not OllamaLeaseState.READY:
             raise RunPodManagerError("Only a ready Ollama lease can be marked used")
+        lease = await self._ready_with_route(lease)
+        if lease.state is not OllamaLeaseState.READY:
+            return lease
         now = self._now()
         accrued = accrued_cost(lease, now)
-        if now >= lease.hard_deadline or accrued >= lease.max_authorized_cost:
+        if (
+            now >= lease.hard_deadline
+            or over_authorized_cost(lease, now)
+        ):
             return await self._release(lease, reason="deadline_or_cost_cap")
-        return self.repository.compare_and_set(
+        touched = self.repository.compare_and_set(
             lease,
             changes={
                 "last_used_at": now,
@@ -215,6 +268,11 @@ class OllamaLeaseService:
                 ),
                 "accrued_estimated_cost": accrued,
             },
+        )
+        return replace(
+            touched,
+            route_url=lease.route_url,
+            provider_health_url=lease.provider_health_url,
         )
 
     async def release(
@@ -237,6 +295,24 @@ class OllamaLeaseService:
                 results.append(lease)
         return tuple(results)
 
+    async def reconcile_lease(
+        self, lease_id: str, *, owner_id: str, workload_id: str
+    ) -> OllamaLease:
+        """Reconcile one owner-scoped lease without exposing other tenants."""
+
+        lease = self._required(lease_id)
+        self._authorize(lease, owner_id, workload_id)
+        try:
+            reconciled = await self._reconcile_one(lease_id)
+        except RunPodManagerError as exc:
+            recorded = self._record_reconcile_error(lease_id, exc)
+            if recorded is None:
+                raise
+            return recorded
+        if reconciled is None:
+            raise RunPodManagerError(f"Ollama lease '{lease_id}' was not found")
+        return reconciled
+
     async def _reconcile_one(self, lease_id: str) -> OllamaLease | None:
         lease = self.repository.get(lease_id)
         if lease is None or lease.state is OllamaLeaseState.TERMINATED:
@@ -256,12 +332,11 @@ class OllamaLeaseService:
             OllamaLeaseState.RECONCILE_REQUIRED,
         }:
             lease = await self._reconcile_creation(lease)
-        accrued = accrued_cost(lease, now)
         hard_expired = now >= lease.hard_deadline
         idle_expired = (
             lease.state is OllamaLeaseState.READY and now >= lease.idle_deadline
         )
-        over_cost = accrued >= lease.max_authorized_cost
+        over_cost = over_authorized_cost(lease, now)
         readiness_expired = (
             lease.state
             in {
@@ -279,9 +354,7 @@ class OllamaLeaseService:
         if lease.state is OllamaLeaseState.WAITING_FOR_MODEL:
             return await self._check_readiness_once(lease)
         if lease.state is OllamaLeaseState.READY:
-            return self.repository.compare_and_set(
-                lease, changes={"accrued_estimated_cost": accrued}
-            )
+            return await self._ready_with_route(lease)
         return lease
 
     def _record_reconcile_error(
@@ -316,7 +389,7 @@ class OllamaLeaseService:
             now = self._now()
             if lease.state is OllamaLeaseState.WAITING_FOR_MODEL and (
                 now >= lease.hard_deadline
-                or accrued_cost(lease, now) >= lease.max_authorized_cost
+                or over_authorized_cost(lease, now)
             ):
                 return await self._release(lease, reason="deadline_or_cost_cap")
             if now >= lease.readiness_deadline:
@@ -346,13 +419,12 @@ class OllamaLeaseService:
             )
         lease = self.repository.compare_and_set(
             lease,
-            changes={
-                "route_url": observation.route_url,
-                "provider_health_url": observation.provider_health_url,
-                "accrued_estimated_cost": accrued,
-            },
+            changes={"accrued_estimated_cost": accrued},
         )
-        if now >= lease.hard_deadline or accrued >= lease.max_authorized_cost:
+        if (
+            now >= lease.hard_deadline
+            or over_authorized_cost(lease, now)
+        ):
             return await self._release(lease, reason="deadline_or_cost_cap")
         if not observation.provider_ready or not observation.route_url:
             return lease
@@ -375,7 +447,7 @@ class OllamaLeaseService:
                 )
             return lease
         provisioning_started = lease.provisioning_started_at or lease.created_at
-        return self._transition(
+        ready = self._transition(
             lease,
             OllamaLeaseState.READY,
             ready_at=now,
@@ -387,6 +459,63 @@ class OllamaLeaseService:
             ),
             cold_start_seconds=(now - provisioning_started).total_seconds(),
             last_provider_error=None,
+        )
+        return replace(
+            ready,
+            route_url=observation.route_url,
+            provider_health_url=observation.provider_health_url,
+        )
+
+    async def _ready_with_route(self, lease: OllamaLease) -> OllamaLease:
+        """Re-observe a ready lease and attach its route only in host memory."""
+
+        now = self._now()
+        accrued = accrued_cost(lease, now)
+        if (
+            now >= lease.hard_deadline
+            or now >= lease.idle_deadline
+            or over_authorized_cost(lease, now)
+        ):
+            return await self._release(lease, reason="deadline_or_cost_cap")
+        try:
+            observation = await self.provider.observe(resource_from_lease(lease))
+        except RunPodManagerError as exc:
+            self.repository.compare_and_set(
+                lease,
+                changes={
+                    "last_provider_error": sanitize_provider_error(exc),
+                    "accrued_estimated_cost": accrued,
+                },
+            )
+            raise OllamaLeaseReadinessError(
+                f"Ollama lease '{lease.lease_id}' ready route could not be observed"
+            ) from exc
+        if (
+            not observation.provider_ready
+            or not observation.route_url
+            or not observation.has_model(lease.model)
+        ):
+            self.repository.compare_and_set(
+                lease,
+                changes={
+                    "last_provider_error": "ready route did not pass exact-model readiness",
+                    "accrued_estimated_cost": accrued,
+                },
+            )
+            raise OllamaLeaseReadinessError(
+                f"Ollama lease '{lease.lease_id}' ready route is temporarily unavailable"
+            )
+        durable = self.repository.compare_and_set(
+            lease,
+            changes={
+                "accrued_estimated_cost": accrued,
+                "last_provider_error": None,
+            },
+        )
+        return replace(
+            durable,
+            route_url=observation.route_url,
+            provider_health_url=observation.provider_health_url,
         )
 
     async def _reconcile_creation(self, lease: OllamaLease) -> OllamaLease:
@@ -427,6 +556,7 @@ class OllamaLeaseService:
                 teardown_state=OllamaTeardownState.COMPLETE,
                 accrued_estimated_cost=accrued_cost(lease, now),
                 last_provider_error=None,
+                termination_reason=lease.termination_reason or reason,
             )
         if lease.state is not OllamaLeaseState.RELEASING:
             lease = self._transition(
@@ -436,6 +566,7 @@ class OllamaLeaseService:
                 route_url=None,
                 accrued_estimated_cost=accrued_cost(lease, now),
                 last_provider_error=None,
+                termination_reason=lease.termination_reason or reason,
             )
         if not lease.provider_resource_id:
             if lease.creation_uncertain:
@@ -450,6 +581,7 @@ class OllamaLeaseService:
                         OllamaLeaseState.TERMINATED,
                         teardown_state=OllamaTeardownState.COMPLETE,
                         last_provider_error=None,
+                        termination_reason=lease.termination_reason or reason,
                     )
             else:
                 return self._transition(
@@ -457,6 +589,7 @@ class OllamaLeaseService:
                     OllamaLeaseState.TERMINATED,
                     teardown_state=OllamaTeardownState.COMPLETE,
                     last_provider_error=None,
+                    termination_reason=lease.termination_reason or reason,
                 )
         lease = self.repository.compare_and_set(
             lease,
@@ -484,6 +617,7 @@ class OllamaLeaseService:
             teardown_state=OllamaTeardownState.COMPLETE,
             last_provider_error=None,
             accrued_estimated_cost=accrued_cost(lease, self._now()),
+            termination_reason=lease.termination_reason or reason,
         )
 
     async def _resolve_uncertain_release(
@@ -571,7 +705,9 @@ class OllamaLeaseService:
             raise OllamaLeaseAuthorizationError("Ollama lease ownership mismatch")
 
     @staticmethod
-    def _validate_plan(request: OllamaLeaseRequest, plan: OllamaPlacementPlan) -> None:
+    def validate_plan(request: OllamaLeaseRequest, plan: OllamaPlacementPlan) -> None:
+        """Validate a capacity plan against the caller's durable cost policy."""
+
         allowed_modes = (
             {request.mode}
             if request.mode is not OllamaLeaseMode.AUTO
@@ -602,6 +738,8 @@ class OllamaLeaseService:
         if (
             not math.isfinite(plan.estimated_cost)
             or plan.estimated_cost < 0
+            or not math.isfinite(plan.cost_ceiling)
+            or plan.cost_ceiling < plan.estimated_cost
             or not math.isfinite(plan.placement.offered_cost_per_hr)
             or plan.placement.offered_cost_per_hr <= 0
             or not isinstance(plan.estimated_billable_seconds, int)
@@ -609,9 +747,9 @@ class OllamaLeaseService:
             or plan.estimated_billable_seconds <= 0
         ):
             raise RunPodManagerError("Provider returned an invalid Ollama cost plan")
-        if plan.estimated_cost > request.max_authorized_cost:
+        if plan.cost_ceiling > request.max_authorized_cost:
             raise RunPodManagerError(
-                "Provider Ollama plan exceeds the maximum authorized cost"
+                "Provider Ollama all-in cost ceiling exceeds the maximum authorized cost"
             )
         if (
             request.constraints.max_hourly_rate is not None

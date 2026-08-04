@@ -108,7 +108,66 @@ The client queries `/catalog/gpus` with the availability expansion and product c
 
 Marketing SKU names are useful benchmark labels, not durable API identifiers. The initial benchmark matrix includes PRO 6000 MIG 1g.24gb, PRO 6000 MIG 2g.48gb, RTX PRO 4500, and RTX PRO 4000 Blackwell, but production configuration will use identifiers/pools returned by v2 and validated by the pinned schema.
 
+As of 2026-08-02, the live beta catalog returns `availability=HIGH` but
+`pool=null` for both PRO 6000 MIG Serverless products. The current v2
+`CreateEndpointRequest` requires at least one catalog-provided pool ID, so this
+is availability evidence but not actionable placement authority. The selector
+fails clearly before any create call and does not derive or hardcode a pool
+from the SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)
+tracks the vendor-contract gap; a Serverless benchmark remains blocked until
+the catalog supplies a canonical pool or the endpoint-create schema changes.
+
 Estimates use the live placement rate. Actual spend is reconciled from `/billing/serverless` or `/billing/pods` and attributed back to the catalog job or inference lease. A price change therefore affects a new placement decision without requiring a code release, while existing decisions remain auditable.
+
+Finite queue jobs use the versioned `ServerlessCapacityQuote` contract rather
+than the dedicated-Pod quote. The host supplies only a workload kind and the
+SHA-256 of its normalized inference parameters plus an operator-defined endpoint
+profile and benchmark. Quoting reads the Serverless catalog and reusable endpoint
+definition; it cannot create, update, delete, submit, cancel, or retry anything.
+The selected pool must resolve to one exact GPU, the endpoint must constrain
+workers to that single pool and one data center, and its immutable worker,
+autoscaling, timeout, disk, and idle-tail settings must match the profile. A
+second read-only observation immediately before dispatch rejects stale quotes or
+upward price and placement drift. The quote also binds the exact `/run` policy:
+execution timeout must be between 5 seconds and 7 days, while queue TTL must be
+between 10 seconds and 7 days. Because initialization is a distinct billable
+phase in this contract, the TTL must cover maximum queue delay, worker startup,
+and execution rather than treating startup as free or outside job lifespan.
+
+Runpod documents that Serverless workers are billed from startup through
+execution and the configured idle tail. The data plane's job-level `delayTime`
+combines queue wait and worker cold start, so the receipt names it
+`pre_execution_delay_ms` and validates it against both accepted bounds; only
+execution is separately observed. The v2 billing route is
+coarser: it emits endpoint-level hourly buckets. Kestrel never derives a fictive
+job cost from execution time. An authoritative `ServerlessBillingReceipt` is
+available only when the exact terminal job/attempt is bound to a caller-owned
+exclusive endpoint-window proof that allocates every touched UTC hour and every
+closed billing bucket is complete and internally consistent. Billable coverage
+ends at completion plus the accepted endpoint idle tail, not at job completion;
+the host's canonical allocation may conservatively include earlier/later hours
+reserved through quote expiry and worst-case execution. Cloud requires that
+ordered contiguous allocation to cover the exact job interval, queries every
+reserved hour, and waits for the final allocated hour to close. The receipt
+binds the exact coverage end and accepted tail while startup and observed
+idle-tail measurements remain null because v2 does not return them per job. This makes the current throughput tradeoff explicit:
+Frinz must serialize accepted attempts by endpoint billing window or provision a
+separately attributable endpoint until Runpod exposes finer billing identity.
+An ambiguous `/run` acceptance has no provider job ID to query. The host still
+retains its exact worst-case exclusive endpoint/hour allocation, accepted quote,
+and cost ceiling. Cloud's `final_ambiguous_window_billing()` waits for all of
+those hours to close and maps strict REST-v2 endpoint aggregates to a typed
+receipt with actual cost, consumer-capped cost, and operator loss. An empty or
+partial response remains pending because v2 does not attest that billing is
+final. The canonical receipt evidence is the ordered sequence of endpoint-hour
+costs. Each item preserves the v2 record's UTC hour bounds, endpoint identity,
+all component amounts, total, and a deterministic provider-observation ID over
+the complete normalized source record; aggregate receipt amounts are validated
+as sums of that sequence. Frinz can therefore map the evidence losslessly to its
+provider-neutral ambiguous-window receipt and never reaches through Cloud to the
+Runpod control client.
+See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
+[job-state metrics](https://docs.runpod.io/serverless/endpoints/job-states).
 
 ## Choosing an execution mode
 
@@ -169,7 +228,16 @@ A lease records at least:
 
 Creation, readiness, use, release, expiry, and teardown are explicit state transitions. Teardown never clears the provider ID before Runpod confirms termination. A periodic process outside the requesting agent terminates expired or orphaned Pods and keeps failures visible and retryable across restarts.
 
-Training Pod acquisition distinguishes capacity this invocation created/resumed from a Pod that was already running. The former is stopped on every readiness, route, submission, or cancellation failure; a failed stop retains the Pod ID and cleanup token for the external reconciler. The latter may be used when explicitly configured, but the invocation does not gain authority to stop shared pre-existing capacity. Provider job ID and result-recovery state remain attached to the same durable record through LoRA publication.
+Disposable catalog Pods also retain one immutable, versioned, content-free
+evidence projection on that same lease row. It binds accepted catalog identity
+to realized GPU/cloud/data-center/rate, first-observed lifecycle timestamps,
+strict allowlisted worker timings/resources, confirmed stop, and authoritative
+billing. The projection never contains routes, credentials, private payloads,
+artifact capabilities, images, signed URLs, weights, or raw mappings. Success
+evidence remains incomplete until the Pod is stopped and billing covers the
+full interval; migrated rows report explicit missing evidence.
+
+Training Pod acquisition distinguishes capacity this invocation created/resumed from a Pod that was already running. The former is stopped on every readiness, route, submission, or cancellation failure; a failed stop retains the Pod ID and cleanup token for the external reconciler. The latter may be used when explicitly configured, but the invocation does not gain authority to stop shared pre-existing capacity. Hardware fallback attempts retain exact attempt tokens and share the caller's persisted root cleanup identity. Root cleanup is a durable closed-family transition: it blocks later child reservations, releases every active child, and is resumed after a crash. The SQLite migration recognizes deterministic pre-family child hashes by recomputing them for configured profile IDs because those UUID hashes cannot be inverted. Provider job ID and result-recovery state remain attached to the same durable record through LoRA publication.
 
 Runpod notes that Pods with network volumes cannot be stopped, only terminated, and that a restarted Pod may receive zero GPUs when capacity changes. The provider therefore does not promise cheap resume as an availability strategy; it follows the current [Pod lifecycle contract](https://docs.runpod.io/pods/manage-pods).
 
@@ -179,14 +247,50 @@ Private Ollama is a separate workload contract from the catalog worker.
 
 The model feature selects a model. A provider-neutral inference-lease service acquires private capacity and returns a bounded route only after readiness. `kestrel-cloud-runpod` implements that provider contract without exposing Runpod concepts in Kestrel core.
 
+The package registers `runpod` in the SDK's dedicated inference-provider entry
+point group. Capability matching is deterministic (`ollama`, authenticated
+endpoint, OpenAI chat/completions/embeddings/streaming/tools, one expected
+concurrent request, and explicitly configured Runpod data-center IDs). The
+runtime requires the exact digest-pinned model to report Ollama `completion`
+and `tools` capabilities before readiness, so the default full-agent route
+never degrades to a tool-free lane. This matches Ollama's documented
+[OpenAI-compatible tools support](https://docs.ollama.com/api/openai-compatibility)
+and [Qwen3 tool-calling contract](https://docs.ollama.com/capabilities/tool-calling).
+A quote is a
+read-only v2 catalog operation. The selected mode, observed price, configured
+cold-start estimate, full expected session, and Serverless idle tail must fit
+the caller's hourly, total, region, privacy, and readiness limits before the
+first create request.
+
+Acquisition returns `PENDING`; later status calls drive the durable provider
+state. `READY` is emitted only after an authenticated observation proves both
+runtime health and the exact requested model. The OpenAI `/v1` endpoint and
+workload bearer exist only in the host's SDK route object. SQLite retains the
+resource identity and cost/expiry policy, never the addressable endpoint or
+credential. A restarted adapter re-observes that same deterministic resource,
+so it can reconstruct the route without provisioning a duplicate.
+
+Legacy `manage_gpu` commands are operator-only Pod controls. They do not mutate
+or report LLM routing; the provider-neutral coordinator owns the sole active
+route and drains it before provider release.
+
 For bursty interactive sessions, the default candidate is load-balanced Serverless because Ollama's native HTTP and streaming contract requires direct routing. The endpoint must report healthy and `/api/tags` must show the requested model before Kestrel switches `LLMService` to the route. The caller handles load-balancer no-worker/initialization responses with bounded retry and never treats them as queued work. Runpod provides separate examples for [Ollama on Serverless](https://docs.runpod.io/tutorials/serverless/run-ollama-inference) and [Ollama on a Pod](https://docs.runpod.io/tutorials/pods/run-ollama).
 
 For long or continuously active sessions, a dedicated Pod is considered using live catalog data. The decision compares expected utilization against both alternatives:
 
 ```text
-serverless_estimate = serverless_rate * (initialization + execution + idle_tail)
+maximum_cold_starts = 1 + floor(expected_session / idle_tail)
+serverless_estimate = serverless_rate *
+    (execution + maximum_cold_starts * (initialization + idle_tail))
 pod_estimate        = pod_rate * lease_duration
 ```
+
+The Serverless estimate is an invocation-independent upper bound for the
+accepted session window: every complete idle interval may scale the worker to
+zero and force another billable initialization. A zero idle tail has no finite
+cold-start bound and is therefore ineligible for interactive Serverless. The
+accepted maximum is included in SDK quote metadata and revalidated immediately
+before acquisition.
 
 Storage, model transfer, and failure/retry costs are added to both estimates. A Pod is selected only when it fits the cost cap and measured readiness target. Model pull and model-to-VRAM load are part of cold-start time and billable session cost.
 
@@ -216,7 +320,7 @@ Runpod bills Serverless workers from start until full stop, including initializa
 Each catalog job and inference lease records:
 
 - dispatch/provisioning duration;
-- Runpod queue `delayTime` and worker cold-start metrics;
+- Runpod aggregate pre-execution `delayTime` (queue plus worker cold start);
 - image pull, model availability/download, and model-to-RAM/VRAM load durations;
 - execution and artifact upload duration;
 - warm reuse and idle-tail seconds;
@@ -239,7 +343,7 @@ Work is staged so each repository changes only the behavior it owns:
 4. [frinz#688](https://github.com/KestrelSovereignAI/frinz/issues/688) — add durable Serverless dispatch, webhook verification-by-refetch, reconciliation, cancellation, and artifact publication.
 5. [frinz-catalog#88](https://github.com/KestrelSovereignAI/frinz-catalog/issues/88) — benchmark cold start, VRAM, quality, reliability, and actual cost before cutover.
 6. [kestrel-sovereign#2844](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2844) — define the provider-neutral remote inference lease and readiness-gated route integration.
-7. [kestrel-cloud-runpod#9](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/9) — implement that contract with durable private Ollama leases and Serverless-versus-Pod selection.
+7. [kestrel-cloud-runpod#17](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/17) — implement that contract with durable private Ollama leases and Serverless-versus-Pod selection.
 8. [kestrel-feature-lora#4](https://github.com/KestrelSovereignAI/kestrel-feature-lora/issues/4) — migrate the LoRA package's stale adapter onto the canonical v2 provider without duplicating lifecycle code.
 9. [kestrel-cloud-runpod#14](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/14) — persist ownership before training Pod create/resume, reconcile cleanup after crashes, and preserve provider IDs through workload failures.
 
@@ -251,7 +355,7 @@ flowchart TD
     Extract["frinz-catalog #76\nexecutor boundary"] --> CUDA
     CUDA --> Dispatch["frinz #688\ndurable dispatch"]
     Dispatch --> Bench["frinz-catalog #88\nlaunch gate"]
-    V2 --> Ollama["cloud-runpod #9\nOllama leases"]
+    V2 --> Ollama["cloud-runpod #17\nOllama leases"]
     LeaseAPI["kestrel-sovereign #2844\nprovider-neutral lease"] --> Ollama
     V2 --> Cleanup["kestrel-feature-lora #4\nprovider consolidation"]
     LeaseAPI --> Cleanup
@@ -266,11 +370,14 @@ The platform is not production-ready until all applicable gates pass:
 - no production infrastructure call uses v1 or GraphQL;
 - pinned-schema contract and drift tests pass;
 - every billable resource is attributable and externally reclaimable after process failure;
+- pre/post live-run v2 inventories account for Pods, Serverless endpoints, and
+  network volumes, with no unexpected resource remaining after cleanup;
 - ambiguous create, duplicate callback, webhook loss, cancellation, late completion, and teardown failure paths are tested;
 - catalog artifacts publish exactly once and workers have no database credential;
 - private Ollama routes activate only after the requested model is ready;
 - restricted credentials and privacy/cost constraints are verified;
-- cold-start p50/p95, execution p50/p95, VRAM, success rate, quality, and cost are inside approved thresholds; and
+- cold-start p50/p95, execution p50/p95, peak VRAM, peak host RAM, success
+  rate, quality, and cost are inside predeclared approved thresholds; and
 - actual v2 billing reconciles with estimates closely enough to enforce budget limits.
 
 ## Consequences

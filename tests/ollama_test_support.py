@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from kestrel_cloud_runpod.models import (
     Availability,
@@ -14,6 +15,8 @@ from kestrel_cloud_runpod.models import (
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
     OllamaLeaseRequest,
+    OllamaNonComputeCostComponent,
+    OllamaNonComputeCostPolicy,
     OllamaPlacementPlan,
     OllamaReadinessObservation,
     OllamaResourceConstraints,
@@ -61,15 +64,24 @@ def make_decision(
     rate: float,
     gpu_id: str,
     pool: str | None,
+    gpu_count: int = 1,
 ) -> PlacementDecision:
-    requirements = OllamaResourceConstraints(min_vram_gb=24).requirements(product)
+    """Build a placement decision.
+
+    ``rate`` is the catalog's **per-GPU** hourly price, matching
+    ``/catalog/gpus`` ``price.secure``/``price.community``; ``gpu_count`` is
+    how many of them the placement attaches.
+    """
+    requirements = OllamaResourceConstraints(
+        min_vram_gb=24, gpu_count=gpu_count
+    ).requirements(product)
     return PlacementDecision(
         gpu_id=gpu_id,
         gpu_pool=pool,
         gpu_name=gpu_id,
         memory_gb=24,
         cloud=CloudType.SECURE,
-        gpu_count=1,
+        gpu_count=gpu_count,
         offered_cost_per_hr=rate,
         availability=Availability.HIGH,
         catalog_observed_at=datetime(2026, 8, 1, tzinfo=UTC),
@@ -77,10 +89,52 @@ def make_decision(
     )
 
 
+_BASE_COST_COMPONENTS = (
+    OllamaNonComputeCostComponent.CONTAINER_DISK,
+    OllamaNonComputeCostComponent.MODEL_TRANSFER,
+    OllamaNonComputeCostComponent.RETRY_ALLOWANCE,
+)
+
+
+def non_compute_cost_policy(
+    *,
+    estimated: float = 0.0,
+    maximum: float = 0.0,
+    include_network_volume: bool = False,
+) -> OllamaNonComputeCostPolicy:
+    components = _BASE_COST_COMPONENTS
+    if include_network_volume:
+        components = tuple(
+            sorted(
+                (*components, OllamaNonComputeCostComponent.NETWORK_VOLUME),
+                key=lambda item: item.value,
+            )
+        )
+    return OllamaNonComputeCostPolicy(
+        estimated_cost_usd=estimated,
+        maximum_cost_usd=maximum,
+        covered_components=components,
+    )
+
+
+def non_compute_cost_policies(
+    *, estimated: float = 0.0, maximum: float = 0.0
+) -> dict[OllamaLeaseMode, OllamaNonComputeCostPolicy]:
+    return {
+        OllamaLeaseMode.SERVERLESS_LOAD_BALANCER: non_compute_cost_policy(
+            estimated=estimated, maximum=maximum
+        ),
+        OllamaLeaseMode.DEDICATED_POD: non_compute_cost_policy(
+            estimated=estimated, maximum=maximum
+        ),
+    }
+
+
 class FakeOllamaProvider:
     def __init__(self, plan: OllamaPlacementPlan) -> None:
         self.selected_plan = plan
         self.provision_calls = 0
+        self.drift_plan: OllamaPlacementPlan | None = None
         self.pull_calls = 0
         self.teardown_calls = 0
         self.teardown_failures = 0
@@ -97,6 +151,19 @@ class FakeOllamaProvider:
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         del request
+        # The live catalog can move between quoting and acquiring. Returning
+        # the identical plan for both hides every acceptance guard that exists
+        # to catch that drift, so tests can supply a second plan.
+        #
+        # Drift applies from the moment the test assigns it, which is the
+        # phase boundary the test already expresses by assigning it after
+        # quoting. It is deliberately NOT keyed off the call count: quote()
+        # calls plan() once per candidate mode, so a `plan_calls > 1` rule
+        # would also mean "the POD candidate inside this same quote()" and
+        # would silently drift it — quietly changing which candidate min()
+        # selects, with no error anywhere.
+        if self.drift_plan is not None:
+            return self.drift_plan
         return self.selected_plan
 
     async def provision(
@@ -146,18 +213,63 @@ class FakeOllamaProvider:
 
 
 def serverless_plan(
-    rate: float = 0.9, *, estimated_cost: float = 0.1
+    rate: float = 0.9,
+    *,
+    estimated_cost: float = 0.1,
+    maximum_compute_cost: float | None = None,
+    estimated_non_compute_cost: float = 0.0,
+    maximum_non_compute_cost: float = 0.0,
+    gpu_count: int = 1,
 ) -> OllamaPlacementPlan:
     decision = make_decision(
         ComputeProduct.SERVERLESS,
         rate=rate,
         gpu_id="gpu-serverless",
         pool="pool-24",
+        gpu_count=gpu_count,
+    )
+    compute_ceiling = (
+        estimated_cost if maximum_compute_cost is None else maximum_compute_cost
+    )
+    # Costs are rated as rate x seconds x gpu_count / 3600, so the seconds that
+    # produce a given cost shrink as GPUs are added.
+    unit_rate = Decimal(str(rate)) * Decimal(gpu_count)
+    estimated_billable_seconds = round(
+        Decimal(str(estimated_cost)) * Decimal(3600) / unit_rate
+    )
+    maximum_billable_seconds = round(
+        Decimal(str(compute_ceiling)) * Decimal(3600) / unit_rate
+    )
+
+    # Re-derive the costs FROM the rounded seconds, in the same direction and
+    # with the same formula the plan's own consistency check uses, so a rate
+    # that does not divide evenly cannot make the fixture self-inconsistent.
+    def _rate(seconds: int) -> float:
+        return float(
+            Decimal(str(rate)) * Decimal(seconds) * Decimal(gpu_count) / Decimal(3600)
+        )
+
+    estimated_cost = _rate(estimated_billable_seconds)
+    compute_ceiling = _rate(maximum_billable_seconds)
+    estimated_total = float(
+        Decimal(str(estimated_cost)) + Decimal(str(estimated_non_compute_cost))
+    )
+    total_ceiling = float(
+        Decimal(str(compute_ceiling)) + Decimal(str(maximum_non_compute_cost))
     )
     return OllamaPlacementPlan(
         mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
         resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
         placement=decision,
-        estimated_cost=estimated_cost,
-        estimated_billable_seconds=390,
+        estimated_compute_cost=estimated_cost,
+        maximum_compute_cost=compute_ceiling,
+        estimated_non_compute_cost=estimated_non_compute_cost,
+        maximum_non_compute_cost=maximum_non_compute_cost,
+        estimated_cost=estimated_total,
+        cost_ceiling=total_ceiling,
+        estimated_billable_seconds=estimated_billable_seconds,
+        maximum_billable_seconds=maximum_billable_seconds,
+        maximum_concurrent_workers=1,
+        non_compute_components=_BASE_COST_COMPONENTS,
+        maximum_serverless_cold_starts=1,
     )

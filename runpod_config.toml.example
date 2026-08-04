@@ -23,6 +23,27 @@ serverless_request_count = 1
 serverless_execution_timeout_ms = 300000
 serverless_flashboot = "FLASHBOOT"
 http_timeout_seconds = 300
+quote_ttl_seconds = 60
+# Operator estimates must come from measured cold-start telemetry. They are
+# quote inputs and a request with a tighter readiness deadline is refused.
+serverless_estimated_ready_seconds = 180
+pod_estimated_ready_seconds = 300
+
+# Per-session authorization amounts supplied by deployment policy. These are
+# conservative non-compute estimates/ceilings, never observed billing or live
+# provider rates. They must cover container disk, model transfer/egress, and
+# retries; add "network_volume" only when the Ollama profile sets
+# network_volume_id. A profile's volume_gb is persistent container storage
+# priced under "container_disk", not a network volume.
+[ollama_leases.serverless_non_compute_cost]
+estimated_cost_usd = "${RUNPOD_OLLAMA_SERVERLESS_NON_COMPUTE_ESTIMATED_USD}"
+maximum_cost_usd = "${RUNPOD_OLLAMA_SERVERLESS_NON_COMPUTE_MAXIMUM_USD}"
+covered_components = ["container_disk", "model_transfer", "retry_allowance"]
+
+[ollama_leases.pod_non_compute_cost]
+estimated_cost_usd = "${RUNPOD_OLLAMA_POD_NON_COMPUTE_ESTIMATED_USD}"
+maximum_cost_usd = "${RUNPOD_OLLAMA_POD_NON_COMPUTE_MAXIMUM_USD}"
+covered_components = ["container_disk", "model_transfer", "retry_allowance"]
 
 [profiles.ollama]
 name = "Private Ollama"
@@ -38,10 +59,16 @@ pod_type = "private-ollama"
 min_vram_gb = 24
 min_cuda_version = "12.8"
 gpu_count = 1
+# Inference quotes require an exact region. List only data centers approved for
+# the workload's residency/privacy policy.
+allowed_data_center_ids = ["US-TX-3"]
+max_context_window = 32768
 
 [profiles.ollama.env]
   # Comma-separated name:tag@sha256:<64 lowercase hex> entries. This trusted
   # operator policy is required and request data cannot expand or override it.
+  # Every listed model must support Ollama completion and tools; runtime
+  # readiness verifies both before exposing a full-agent route.
   KESTREL_OLLAMA_ALLOWED_MODELS = "${RUNPOD_OLLAMA_ALLOWED_MODELS}"
   # The provider owns PORT, health, requested-model, bearer, expiry, and mode.
 
