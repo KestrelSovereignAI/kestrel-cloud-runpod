@@ -122,10 +122,16 @@ jobs:
           # signed_invocations imports it directly; today it resolves only
           # because kestrel-sovereign happens to pull it in, and the SDK
           # already proves that is revocable by putting it behind an extra.
+          # Requires-Dist mixes unconditional deps with extras-conditional
+          # ones ('pytest>=8.0.0; extra == \"test\"'). Demoting cryptography to
+          # an extra is the precise failure mode cited above, so drop every
+          # conditional entry before checking - otherwise the assertion would
+          # still pass on exactly the regression it guards against.
           import re
           reqs = md.requires('kestrel-cloud-runpod') or []
-          names = {re.split(r'[<>=!~;\[ ]', r, maxsplit=1)[0].strip().lower().replace('_', '-') for r in reqs}
-          assert 'cryptography' in names, f'cryptography is imported but not declared: {reqs}'
+          unconditional = [r for r in reqs if 'extra ==' not in r]
+          dep_names = {re.split(r'[<>=!~;\[ ]', r, maxsplit=1)[0].strip().lower().replace('_', '-') for r in unconditional}
+          assert 'cryptography' in dep_names, f'cryptography is imported but not an unconditional dependency: {reqs}'
           eps = md.entry_points(group='kestrel_sovereign.features')
           names = [e.name for e in eps]
           assert 'RunPodFeature' in names, f'Entry-point not registered: {names}'

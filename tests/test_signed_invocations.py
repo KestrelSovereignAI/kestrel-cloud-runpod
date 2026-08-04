@@ -21,6 +21,8 @@ from kestrel_cloud_runpod.signed_invocations import (
     ReceiptTrust,
     ServerInvokeReceipt,
     SignedInvocationError,
+    base64url_decode,
+    base64url_encode,
     canonical_json,
     canonical_sha256,
     phase_evidence_sha256,
@@ -624,3 +626,203 @@ def test_verifier_rejects_duplicate_targets_and_an_empty_trust_set():
         InvokeReceiptVerifier(())
     with pytest.raises(SignedInvocationError, match="targets must be unique"):
         InvokeReceiptVerifier((trust, replace(trust, key_id="other-key-id")))
+
+
+# ---------------------------------------------------------------------------
+# The five identity pins the module docstring advertises
+#
+# "an external verifier can pin the exact route, owner, companion, agent, and
+# public key that identify one execution target."  All five are matched in
+# `verify()`, and each needs its own test: a trust that differs only by key
+# material collapses onto the `public_key_sha256` clause and proves nothing
+# about the other four.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("route", ROUTE.replace("invoke/attested", "invoke/other")),
+        ("owner_binding_sha256", "sha256:" + "9" * 64),
+        ("companion_id", "00000000-0000-4000-8000-00000000dead"),
+        ("agent_id", "not-kite"),
+        ("key_id", "another-key-id"),
+    ],
+)
+def test_verifier_refuses_a_receipt_whose_identity_differs_in_one_field(field, value):
+    """One differing pin is enough to refuse; each is matched independently.
+
+    `owner_binding_sha256` is the cross-owner case: without that clause a
+    receipt legitimately issued for owner A verifies against a trust pinned to
+    owner B (same route, companion, agent and key) and `verify()` hands back
+    B's target.
+    """
+
+    request, response, trust = _signed_response()
+    verifier = InvokeReceiptVerifier((replace(trust, **{field: value}),))
+    with pytest.raises(SignedInvocationError, match="one pinned execution target"):
+        _verify(verifier, response.invocation_receipt, request)
+
+
+# ---------------------------------------------------------------------------
+# Transport: the authenticated-transport guarantee
+# ---------------------------------------------------------------------------
+
+
+def test_receipt_refuses_an_unauthenticated_transport():
+    """`__post_init__` is the ONLY enforcement of the transport constant.
+
+    `verify()` never reads `receipt.transport`, so if this check goes, a
+    receipt carrying `transport: "public_http"` signed by the pinned key
+    verifies cleanly and returns the target. The constant is exported in
+    `__all__` and advertised in the CHANGELOG as the authenticated-transport
+    guarantee, so it needs a test of its own.
+    """
+
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="authenticated Frinz HTTP"):
+        replace(response.invocation_receipt, transport="public_http")
+
+
+def test_receipt_refuses_a_foreign_contract_or_signature_algorithm():
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="contract differs"):
+        replace(response.invocation_receipt, contract="some-other-contract-v1")
+    with pytest.raises(SignedInvocationError, match="signature algorithm differs"):
+        replace(response.invocation_receipt, signature_algorithm="ES256")
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["/api//kestrel/invoke", "/api/../admin/invoke", "/api/./invoke", "relative/path"],
+)
+def test_receipt_refuses_a_non_strict_route(route):
+    """`ServerInvokeReceipt` calls `_relative_route` too, not just `ReceiptTrust`."""
+
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="strict relative HTTP route"):
+        replace(response.invocation_receipt, route=route)
+
+
+# ---------------------------------------------------------------------------
+# Binding: every field verify() compares
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["run_id", "phase", "request_id", "operation_digest", "quote_digest",
+     "resource_plan_digest"],
+)
+def test_verifier_refuses_a_receipt_not_bound_to_the_exact_request(field):
+    """Each equality in the binding check is load-bearing and independent."""
+
+    request, response, trust = _signed_response()
+    verifier = InvokeReceiptVerifier((trust,))
+    kwargs = {
+        "run_id": request.run_id,
+        "phase": request.phase,
+        "request_id": request.request_id,
+        "input_text": request.input,
+        "operation_digest": request.operation_digest,
+        "quote_digest": request.quote_digest,
+        "resource_plan_digest": request.resource_plan_digest,
+    }
+    kwargs[field] = (
+        "sha256:" + "7" * 64 if field.endswith("_digest") else "something-else"
+    )
+    with pytest.raises(SignedInvocationError, match="exact run, route, or request"):
+        verifier.verify(response.invocation_receipt, **kwargs)
+
+
+def test_verifier_refuses_a_receipt_whose_key_is_not_ed25519():
+    """The isinstance guard inside verify(), distinct from ReceiptTrust's."""
+
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    request, response, trust = _signed_response()
+    der = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    # ReceiptTrust rejects a non-Ed25519 key at construction, so reach the
+    # verify()-side guard by swapping the key material in afterwards.
+    impostor = replace(trust)
+    object.__setattr__(impostor, "public_key_spki_b64", _b64url(der))
+    object.__setattr__(
+        impostor, "public_key_sha256", "sha256:" + hashlib.sha256(der).hexdigest()
+    )
+    receipt = replace(
+        response.invocation_receipt, public_key_sha256=impostor.public_key_sha256
+    )
+    verifier = InvokeReceiptVerifier((impostor,))
+    with pytest.raises(SignedInvocationError, match="Ed25519"):
+        _verify(verifier, receipt, request)
+
+
+def test_to_payload_does_not_expose_the_internal_phase_evidence_mapping():
+    """`to_payload()` handed out its own dict on a frozen dataclass.
+
+    Mutating the returned payload rewrote `response.phase_evidence` in place,
+    after which `verify_phase_evidence` failed against the signed digest.
+    `ServerInvokeReceipt.to_payload()` already builds fresh dicts.
+    """
+
+    _request_value, response, _trust = _signed_response()
+    payload = response.to_payload()
+    payload["phase_evidence"]["timings_ms"]["total"] = 999
+    assert response.phase_evidence["timings_ms"]["total"] == 1
+
+
+def test_base64url_alphabet_is_what_rejects_padding():
+    """Pins the clause that does the work, not the one that reads like it does.
+
+    `base64url_decode` also tests `"=" in value`, but that branch is
+    unreachable: `[A-Za-z0-9_-]+` excludes `=`, so nothing that fullmatches can
+    contain one. Deleting the `=` clause breaks no test and never could. The
+    character class is the real guard; widen it and padded or
+    standard-alphabet base64 starts being accepted.
+    """
+
+    for padded in ("YWJj=", "YWJ=jZA", "==", "YWJjZA=="):
+        with pytest.raises(SignedInvocationError, match="unpadded base64url"):
+            base64url_decode(padded, "test value")
+    # Standard-alphabet base64 uses "+" and "/"; base64url must reject both.
+    for standard in ("ab+cd", "ab/cd"):
+        with pytest.raises(SignedInvocationError, match="unpadded base64url"):
+            base64url_decode(standard, "test value")
+    # Empty is rejected by the `+` quantifier, not by the `=` clause.
+    with pytest.raises(SignedInvocationError, match="unpadded base64url"):
+        base64url_decode("", "test value")
+    assert base64url_decode(base64url_encode(b"\x00\xff round trip")) == (
+        b"\x00\xff round trip"
+    )
+
+
+def test_signer_rejects_malformed_der_before_the_ed25519_check():
+    """The reachable arms of the signer's except tuple.
+
+    The `TypeError` arm is NOT tested here because it is unreachable, for the
+    same structural reason as the `"://"` and `"="` clauses: `base64url_decode`
+    runs first and guarantees `bytes`, and `password` is hardcoded `None`, so
+    `load_der_private_key` has no way to raise `TypeError`. Verified by sweep
+    over 3017 byte inputs — empty, truncated, over-long, random, and every
+    seventh byte of a real PKCS8 key flipped — all of which raise `ValueError`.
+    It is kept for defence in depth should `base64url_decode` stop guaranteeing
+    bytes.
+    """
+
+    # Valid base64url, not valid DER -> the ValueError arm.
+    with pytest.raises(SignedInvocationError, match="invalid DER"):
+        InvokeReceiptSigner(
+            private_key_pkcs8_b64=_b64url(b"\x30\x82\xff\xffnot-a-key"),
+            key_id="frinz-test-key",
+        )
+    # Not valid base64url at all -> rejected before load_der_private_key runs,
+    # which is what makes the TypeError arm unreachable.
+    with pytest.raises(SignedInvocationError, match="unpadded base64url"):
+        InvokeReceiptSigner(private_key_pkcs8_b64="", key_id="frinz-test-key")

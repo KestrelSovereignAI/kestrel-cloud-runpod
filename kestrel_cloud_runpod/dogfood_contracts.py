@@ -729,6 +729,13 @@ class PhaseObservation:
         }
 
     def to_evidence(self, *, run_id: str, observed_at: datetime) -> dict[str, Any]:
+        # ``run_id`` is caller-supplied and was the one run_id in either module
+        # that reached a persisted record without passing through
+        # ``_safe_identifier`` — every other one is validated at construction.
+        # ``_assert_content_free`` below does catch a URL, but as the record's
+        # last line of defence rather than as a field validator; validate here
+        # too so a malformed run_id is rejected by the same rule everywhere.
+        _safe_identifier("evidence run_id", run_id)
         payload: dict[str, Any] = {
             "contract": DOGFOOD_CONTRACT,
             "event": "phase_observation",

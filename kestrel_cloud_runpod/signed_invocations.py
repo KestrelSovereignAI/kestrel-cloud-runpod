@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -85,6 +86,13 @@ def base64url_encode(value: bytes) -> str:
 
 
 def base64url_decode(value: str, name: str = "signed value") -> bytes:
+    # The `"=" in value` clause is unreachable for the same reason as the
+    # `"://"` clause in dogfood_contracts._safe_identifier: the preceding
+    # character class excludes "=", so nothing that fullmatches can contain
+    # one. Kept as a second line of defence should the class ever be widened
+    # to admit padding. What actually rejects padded input is the class, and
+    # that is what the tests pin - see
+    # test_base64url_alphabet_is_what_rejects_padding.
     if (
         not isinstance(value, str)
         or not re.fullmatch(r"[A-Za-z0-9_-]+", value)
@@ -619,7 +627,13 @@ class AttestedInvokeResponse:
             "model": self.model,
             "provider": self.provider,
             "session_id": self.session_id,
-            "phase_evidence": self.phase_evidence,
+            # Deep-copied, not aliased. This is a frozen dataclass whose
+            # evidence is bound by the receipt's signed digest; handing out the
+            # live mapping let a caller mutate `phase_evidence` in place
+            # through the returned payload, after which `verify_phase_evidence`
+            # failed against the signature. `ServerInvokeReceipt.to_payload()`
+            # already builds fresh dicts.
+            "phase_evidence": deepcopy(dict(self.phase_evidence)),
             "invocation_receipt": self.invocation_receipt.to_payload(),
         }
 

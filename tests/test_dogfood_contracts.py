@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import ast
 import inspect
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -52,10 +52,10 @@ def test_frinz_facing_surface_is_present(name):
 # --------------------------------------------------------------------------
 
 
-def _declared_imports() -> set[str]:
-    """Every module this file imports, from its AST rather than its text."""
+def _imports_of(source: str) -> set[str]:
+    """Every module `source` imports, from its AST rather than its text."""
 
-    tree = ast.parse(inspect.getsource(dc))
+    tree = ast.parse(source)
     modules: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -75,6 +75,21 @@ def _declared_imports() -> set[str]:
     return modules
 
 
+def _declared_imports() -> set[str]:
+    return _imports_of(inspect.getsource(dc))
+
+
+FORBIDDEN_EDGES = {
+    "kestrel_cloud_runpod.dogfood",
+    "kestrel_cloud_runpod.clients",
+    "kestrel_cloud_runpod.manager",
+    "kestrel_cloud_runpod.core",
+    "kestrel_cloud_runpod.feature",
+    "httpx",
+    "subprocess",
+}
+
+
 def test_module_does_not_import_the_harness_or_the_transport():
     """The whole point: contracts must not drag in the orchestrator.
 
@@ -88,46 +103,35 @@ def test_module_does_not_import_the_harness_or_the_transport():
     defeat it while regressing exactly what the docstring promises.
     """
 
-    forbidden = {
-        "kestrel_cloud_runpod.dogfood",
-        "kestrel_cloud_runpod.clients",
-        "kestrel_cloud_runpod.manager",
-        "kestrel_cloud_runpod.core",
-        "kestrel_cloud_runpod.feature",
-        "httpx",
-        "subprocess",
-    }
-    assert not (_declared_imports() & forbidden)
+    declared = _declared_imports()
+    # A blind extractor would satisfy the line below vacuously, so assert it
+    # actually saw this module before trusting the intersection.
+    assert "re" in declared and "dataclasses" in declared
+    assert not (declared & FORBIDDEN_EDGES)
 
 
-def test_the_import_guard_catches_every_spelling():
-    """Pins the guard itself: a text search would miss these."""
-
-    for source in (
+@pytest.mark.parametrize(
+    "source",
+    [
         "from . import dogfood\n",
         "import kestrel_cloud_runpod.dogfood as _h\n",
         "from .dogfood import DogfoodPhase\n",
         "from kestrel_cloud_runpod.dogfood import DogfoodPhase\n",
         "from .clients import RunpodControlPlaneClient\n",
-    ):
-        tree = ast.parse(source)
-        modules: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                modules.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                if node.level:
-                    modules.add(f"kestrel_cloud_runpod.{node.module or ''}".rstrip("."))
-                    if node.module is None:
-                        modules.update(
-                            f"kestrel_cloud_runpod.{alias.name}" for alias in node.names
-                        )
-                elif node.module:
-                    modules.add(node.module)
-        assert modules & {
-            "kestrel_cloud_runpod.dogfood",
-            "kestrel_cloud_runpod.clients",
-        }, f"regression spelling not caught: {source!r}"
+        "import kestrel_cloud_runpod.clients\n",
+        "import httpx\n",
+        "import subprocess\n",
+    ],
+)
+def test_the_import_guard_catches_every_spelling(source):
+    """Pins the extractor itself, by CALLING it rather than re-implementing it.
+
+    An inline copy of the AST walk would pass even if `_imports_of` were made
+    structurally blind (`ast.parse("")`), which would also make the guard above
+    pass vacuously — the regression the guard exists to catch.
+    """
+
+    assert _imports_of(source) & FORBIDDEN_EDGES, f"not caught: {source!r}"
 
 
 # --------------------------------------------------------------------------
@@ -586,8 +590,7 @@ def test_observation_rejects_a_negative_cost():
         _observation(actual_cost_usd=Decimal("-0.01"))
 
 
-def test_to_evidence_applies_the_content_free_guard():
-    """`to_evidence` is the only caller of `_assert_content_free`."""
+def test_to_evidence_shape():
     payload = _observation().to_evidence(run_id="run-0001", observed_at=NOW)
     assert payload["contract"] == dc.DOGFOOD_CONTRACT
     assert payload["run_id"] == "run-0001"
@@ -599,8 +602,141 @@ def test_to_evidence_applies_the_content_free_guard():
     }
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "https://private.example/secret-run",
+        "Bearer sk-live-0123456789",
+        "run id with spaces",
+        "",
+    ],
+)
+def test_to_evidence_rejects_a_content_bearing_run_id(run_id):
+    """`run_id` is caller-supplied and lands verbatim in persisted evidence.
+
+    Asserting on the returned payload's shape does not test this: removing
+    either `_safe_identifier` or `_assert_content_free` from `to_evidence`
+    leaves every shape assertion green while a signed URL or bearer token is
+    written straight into the attestation record.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation().to_evidence(run_id=run_id, observed_at=NOW)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://private.example/artifact.jpg",
+        "http://10.0.0.1/internal",
+        "Bearer sk-live-0123456789",
+        "api_key=hunter2",
+        "api-key: hunter2",
+        "token=abcdef",
+        "password=hunter2",
+        "secret: shhh",
+        "signature=deadbeef",
+    ],
+)
+def test_content_free_guard_rejects_a_sensitive_value_under_a_benign_key(value):
+    """Pins the VALUE regex, which the key rule otherwise masks.
+
+    `{"image_url": "https://..."}` is rejected for its key ("url" is in
+    `_SENSITIVE_KEY_PARTS`), so it proves nothing about `_SENSITIVE_VALUE`.
+    Under a benign key the value branch is the only thing that can fire.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError, match="URL or credential-like"):
+        dc._assert_content_free({"note": value})
+
+
+def test_content_free_guard_admits_a_benign_value_under_a_benign_key():
+    dc._assert_content_free({"note": "queued then running", "count": 3})
+
+
+def test_to_evidence_rejects_unvalidated_content_from_binding_payload(monkeypatch):
+    """Pins `to_evidence`'s `_assert_content_free` call, which nothing else can.
+
+    Every field `binding_payload()` emits is validated at construction, and
+    `run_id` is now validated by `_safe_identifier` directly above the guard.
+    So no input through the public API reaches this call first — meaning a
+    test built from valid objects cannot detect its removal, which is exactly
+    how it went unpinned.
+
+    What the call actually defends is the case the validators do not cover: a
+    future field added to `binding_payload()` without one. Simulating that is
+    the only way to exercise it, and it tests the real contract — whatever the
+    projection emits must be content-free before it becomes evidence.
+    """
+
+    observation = _observation()
+    monkeypatch.setattr(
+        type(observation),
+        "binding_payload",
+        lambda self: {"phase": self.phase.value, "prompt": "a private prompt"},
+    )
+    with pytest.raises(dc.DogfoodSafetyError):
+        observation.to_evidence(run_id="run-0001", observed_at=NOW)
+
+
 def test_to_evidence_rejects_a_naive_observed_at():
     with pytest.raises(dc.DogfoodSafetyError):
         _observation().to_evidence(
             run_id="run-0001", observed_at=datetime(2026, 8, 3, 12, 0)
         )
+
+
+# --------------------------------------------------------------------------
+# Cross-module agreement
+# --------------------------------------------------------------------------
+
+
+def test_shared_validators_agree_with_signed_invocations():
+    """These helpers are deliberately parallel, not shared — so pin the drift.
+
+    ``dogfood_contracts`` and ``signed_invocations`` each define ``_SHA256``,
+    ``_required_payload_string``, ``_iso`` and ``_parse_time``. They are NOT
+    deduplicated on purpose: the two modules raise different exception types
+    (``DogfoodSafetyError`` vs ``SignedInvocationError``), and that type IS the
+    contract each module advertises to its callers. Sharing one implementation
+    would either force one error contract on both or add an exception-type
+    parameter that buys nothing.
+
+    What the duplication does risk is the copies drifting apart, so this
+    asserts they still agree on everything except the exception type. Both are
+    consumed by the same Frinz projector, and a divergent digest or timestamp
+    rule between them is a cross-repo bug that neither module's own tests would
+    see.
+    """
+
+    from kestrel_cloud_runpod import signed_invocations as si
+
+    assert dc._SHA256.pattern == si._SHA256.pattern
+
+    aware = datetime(2026, 8, 3, 12, 0, 30, tzinfo=UTC)
+    assert dc._iso(aware) == si._iso(aware) == "2026-08-03T12:00:30Z"
+    # Both normalize a non-UTC offset to the same Z-suffixed instant.
+    offset = datetime(2026, 8, 3, 7, 0, 30, tzinfo=timezone(timedelta(hours=-5)))
+    assert dc._iso(offset) == si._iso(offset) == "2026-08-03T12:00:30Z"
+
+    assert dc._parse_time("2026-08-03T12:00:30Z", "t") == si._parse_time(
+        "2026-08-03T12:00:30Z", "t"
+    )
+    assert dc._required_payload_string("v", "n") == si._required_payload_string("v", "n")
+
+    # Same rejections, different exception types — the contract boundary.
+    for bad in (None, 12, b"bytes"):
+        with pytest.raises(dc.DogfoodSafetyError):
+            dc._required_payload_string(bad, "n")
+        with pytest.raises(si.SignedInvocationError):
+            si._required_payload_string(bad, "n")
+    for bad in ("not-a-timestamp", "2026-08-03T12:00:30", None):
+        with pytest.raises(dc.DogfoodSafetyError):
+            dc._parse_time(bad, "t")
+        with pytest.raises(si.SignedInvocationError):
+            si._parse_time(bad, "t")
+    naive = datetime(2026, 8, 3, 12, 0)
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc._iso(naive)
+    with pytest.raises(si.SignedInvocationError):
+        si._iso(naive)
