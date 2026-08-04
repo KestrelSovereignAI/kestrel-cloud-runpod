@@ -32,6 +32,16 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   the `isinstance(..., Ed25519…)` check entirely. A consumer wrapping signer
   construction in `except ValueError` died with an unhandled traceback instead
   of its intended configuration error.
+- `PhaseObservation.to_evidence` now validates both of its caller-supplied
+  arguments. `run_id` reached the persisted evidence record without passing
+  through `_safe_identifier` — the only run_id in either module that did not —
+  and `observed_at` raised `AttributeError` rather than `DogfoodSafetyError`
+  when handed a deserialized ISO string, because `dogfood_contracts._iso`
+  lacked the `isinstance` check its `signed_invocations` twin has. Both are
+  the same escape class as the `UnsupportedAlgorithm` leak above.
+- `AttestedInvokeResponse.to_payload()` returned the live `phase_evidence`
+  mapping on a frozen dataclass, so a caller could mutate signed evidence in
+  place through the returned payload and break `verify_phase_evidence`.
 
 ## [0.8.0] - 2026-08-03
 

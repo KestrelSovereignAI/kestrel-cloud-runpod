@@ -145,7 +145,17 @@ _RESOURCE_MUTATING_PHASES = (
 
 
 def _iso(value: datetime) -> str:
-    if value.tzinfo is None or value.utcoffset() is None:
+    # The isinstance check matters as much as the tz one: `observed_at` reaches
+    # here straight from `to_evidence`'s caller, so a deserialized ISO *string*
+    # used to raise AttributeError ('str' object has no attribute 'tzinfo') out
+    # of a module whose advertised contract is DogfoodSafetyError. That is the
+    # same escape class as the UnsupportedAlgorithm leak in signed_invocations.
+    # This now matches si._iso exactly, modulo the exception type.
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
         raise DogfoodSafetyError("dogfood timestamps must be timezone-aware")
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 

@@ -783,10 +783,18 @@ class InvokeReceiptSigner:
         try:
             key = serialization.load_der_private_key(encoded, password=None)
         except (TypeError, UnsupportedAlgorithm, ValueError) as exc:
-            # See the matching note in ReceiptTrust: UnsupportedAlgorithm sits
-            # outside the ValueError hierarchy, and app_lifecycle wraps signer
-            # construction in `except ValueError` because SignedInvocationError
-            # is this module's whole error contract.
+            # All three arms are reachable and none is a ValueError subclass
+            # except the last, while app_lifecycle wraps signer construction in
+            # `except ValueError` because SignedInvocationError is this
+            # module's whole error contract:
+            #   TypeError            - an ENCRYPTED PKCS8 key with
+            #     password=None ("Password was not given but private key is
+            #     encrypted"). `openssl pkcs8 -topk8` produces encrypted output
+            #     by default, so an operator exporting a passphrase-protected
+            #     key hits this. base64url_decode accepts the blob, so nothing
+            #     rejects it earlier.
+            #   UnsupportedAlgorithm - well-formed DER, unrecognized OID.
+            #   ValueError           - malformed DER.
             raise SignedInvocationError(
                 "invocation receipt signer private key is invalid DER"
             ) from exc

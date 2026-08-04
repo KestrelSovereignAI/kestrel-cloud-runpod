@@ -61,17 +61,20 @@ def _imports_of(source: str) -> set[str]:
         if isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            # level>0 is a relative import; resolve it against this package so
-            # `from . import dogfood` and `from .dogfood import x` both land on
-            # the same name as the absolute form.
-            if node.level:
-                modules.add(f"kestrel_cloud_runpod.{node.module or ''}".rstrip("."))
-                if node.module is None:
-                    modules.update(
-                        f"kestrel_cloud_runpod.{alias.name}" for alias in node.names
-                    )
-            elif node.module:
-                modules.add(node.module)
+            # `from X import y` is ambiguous in the AST: `y` may be a submodule
+            # or just a name inside X. Record BOTH `X` and `X.y`, so a package
+            # import of a forbidden submodule is caught whichever it turns out
+            # to be. Missing this is how `from kestrel_cloud_runpod import
+            # clients` slipped past an earlier version of this guard - the very
+            # spelling used at the top of this file.
+            base = (
+                f"kestrel_cloud_runpod.{node.module or ''}".rstrip(".")
+                if node.level  # relative: resolve against this package
+                else node.module
+            )
+            if base:
+                modules.add(base)
+                modules.update(f"{base}.{alias.name}" for alias in node.names)
     return modules
 
 
@@ -119,6 +122,13 @@ def test_module_does_not_import_the_harness_or_the_transport():
         "from kestrel_cloud_runpod.dogfood import DogfoodPhase\n",
         "from .clients import RunpodControlPlaneClient\n",
         "import kestrel_cloud_runpod.clients\n",
+        # The bare-package spelling. This is the one this file itself uses to
+        # import the module under test, and an earlier version of the guard
+        # recorded only "kestrel_cloud_runpod" for it - so a real edge to the
+        # live control-plane transport passed the whole suite.
+        "from kestrel_cloud_runpod import dogfood\n",
+        "from kestrel_cloud_runpod import clients as _transport\n",
+        "from kestrel_cloud_runpod import clients, models\n",
         "import httpx\n",
         "import subprocess\n",
     ],
@@ -740,3 +750,23 @@ def test_shared_validators_agree_with_signed_invocations():
         dc._iso(naive)
     with pytest.raises(si.SignedInvocationError):
         si._iso(naive)
+    # Non-datetime input is where the two used to diverge: dc._iso lacked the
+    # isinstance check and raised AttributeError instead of its own error type.
+    for bad in ("2026-08-03T12:00:00Z", None, 1754308800, object()):
+        with pytest.raises(dc.DogfoodSafetyError):
+            dc._iso(bad)
+        with pytest.raises(si.SignedInvocationError):
+            si._iso(bad)
+
+
+def test_to_evidence_rejects_a_non_datetime_observed_at():
+    """`observed_at` is caller-supplied and had no validator of its own.
+
+    A deserialized ISO string is the realistic input: it produced
+    `AttributeError: 'str' object has no attribute 'tzinfo'` out of a module
+    whose contract is `DogfoodSafetyError`.
+    """
+
+    for bad in ("2026-08-03T12:00:00Z", None, 1754308800):
+        with pytest.raises(dc.DogfoodSafetyError):
+            _observation().to_evidence(run_id="run-0001", observed_at=bad)

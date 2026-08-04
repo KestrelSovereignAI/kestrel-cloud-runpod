@@ -804,17 +804,7 @@ def test_base64url_alphabet_is_what_rejects_padding():
 
 
 def test_signer_rejects_malformed_der_before_the_ed25519_check():
-    """The reachable arms of the signer's except tuple.
-
-    The `TypeError` arm is NOT tested here because it is unreachable, for the
-    same structural reason as the `"://"` and `"="` clauses: `base64url_decode`
-    runs first and guarantees `bytes`, and `password` is hardcoded `None`, so
-    `load_der_private_key` has no way to raise `TypeError`. Verified by sweep
-    over 3017 byte inputs — empty, truncated, over-long, random, and every
-    seventh byte of a real PKCS8 key flipped — all of which raise `ValueError`.
-    It is kept for defence in depth should `base64url_decode` stop guaranteeing
-    bytes.
-    """
+    """The ValueError arm, plus the base64url rejection that precedes it."""
 
     # Valid base64url, not valid DER -> the ValueError arm.
     with pytest.raises(SignedInvocationError, match="invalid DER"):
@@ -822,7 +812,176 @@ def test_signer_rejects_malformed_der_before_the_ed25519_check():
             private_key_pkcs8_b64=_b64url(b"\x30\x82\xff\xffnot-a-key"),
             key_id="frinz-test-key",
         )
-    # Not valid base64url at all -> rejected before load_der_private_key runs,
-    # which is what makes the TypeError arm unreachable.
+    # Not valid base64url at all -> rejected before load_der_private_key runs.
     with pytest.raises(SignedInvocationError, match="unpadded base64url"):
         InvokeReceiptSigner(private_key_pkcs8_b64="", key_id="frinz-test-key")
+
+
+def test_signer_contains_an_encrypted_private_key():
+    """The `TypeError` arm — reachable, and by a realistic operator mistake.
+
+    `load_der_private_key(<encrypted PKCS8>, password=None)` raises TypeError,
+    which is not a ValueError, so without this arm the blob escapes
+    `SignedInvocationError` — the module's whole error contract — and bypasses
+    the `except ValueError` in `frinz/app_lifecycle.py` that reads this key
+    from the environment.
+
+    `openssl pkcs8 -topk8` produces ENCRYPTED output by default, so an operator
+    exporting a passphrase-protected key hits exactly this. `base64url_decode`
+    accepts the blob byte-for-byte, so nothing rejects it earlier.
+    """
+
+    encrypted_der = Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(b"a-passphrase"),
+    )
+    with pytest.raises(SignedInvocationError, match="invalid DER"):
+        InvokeReceiptSigner(
+            private_key_pkcs8_b64=_b64url(encrypted_der), key_id="frinz-test-key"
+        )
+
+
+def test_signer_refuses_a_valid_non_ed25519_private_key():
+    """The signer's own Ed25519 isinstance guard — a third such guard."""
+
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    der = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    ).private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    with pytest.raises(SignedInvocationError, match="must be Ed25519"):
+        InvokeReceiptSigner(private_key_pkcs8_b64=_b64url(der), key_id="frinz-test-key")
+
+
+# ---------------------------------------------------------------------------
+# The response envelope's own bindings
+#
+# `verify()` compares run_id, phase, request_id, input_sha256 and the three
+# digests — never model, provider or session_id. `__post_init__` is the sole
+# enforcement for those three, structurally identical to `transport`, so each
+# needs its own test. Without them a consumer reading `response.model` gets a
+# field no signature covers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "gpt-4o-mystery"),
+        ("provider", "openai"),
+        ("session_id", "attacker-session"),
+        ("response", "a substituted response body"),
+    ],
+)
+def test_response_envelope_must_match_its_signed_receipt(field, value):
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="signed invocation result"):
+        replace(response, **{field: value})
+
+
+def test_response_rejects_an_untyped_receipt_and_a_non_string_body():
+    _request_value, response, _trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="receipt is not typed"):
+        replace(response, invocation_receipt={"not": "a receipt"})
+    # Match the EXACT message. `utf8_sha256` has its own "signed text must be a
+    # string" guard two lines later, so a loose "must be a string" pattern is
+    # satisfied by either and pins neither.
+    with pytest.raises(
+        SignedInvocationError, match="attested invoke response must be a string"
+    ):
+        replace(response, response=b"bytes are not a response body")
+
+
+def test_utf8_sha256_rejects_non_string_input():
+    """The inner guard that shadows the one above; both need their own test."""
+
+    for bad in (b"bytes", None, 7, ["list"]):
+        with pytest.raises(SignedInvocationError, match="signed text must be a string"):
+            utf8_sha256(bad)
+
+
+def test_verifier_rejects_an_untyped_receipt():
+    request, _response, trust = _signed_response()
+    verifier = InvokeReceiptVerifier((trust,))
+    with pytest.raises(SignedInvocationError, match="not typed"):
+        _verify(verifier, {"not": "a receipt"}, request)
+
+
+# ---------------------------------------------------------------------------
+# Identifier alphabet and signature shape
+# ---------------------------------------------------------------------------
+
+
+def test_safe_identifier_alphabet_is_what_keeps_routes_out_of_receipts():
+    """Widening this class makes `https://…` a legal run_id in a SIGNED receipt.
+
+    `dogfood_contracts` pins its twin; this one was unpinned, so admitting "/"
+    survived the whole suite. These identifiers are persisted into attestation
+    evidence and bound by the signature, so the alphabet is security-relevant.
+    """
+
+    from kestrel_cloud_runpod import signed_invocations as si
+
+    assert si._SAFE_IDENTIFIER.pattern == r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$"
+    for char in "/ \t\n?#%&=\\":
+        assert not si._SAFE_IDENTIFIER.fullmatch(f"a{char}b"), f"{char!r} admitted"
+    assert not si._SAFE_IDENTIFIER.fullmatch("https://private.example/x")
+    assert not si._SAFE_IDENTIFIER.fullmatch("")  # must start with alphanumeric
+    assert not si._SAFE_IDENTIFIER.fullmatch("-leading-dash")
+    assert not si._SAFE_IDENTIFIER.fullmatch("a" * 256)  # 255-char ceiling
+    assert si._SAFE_IDENTIFIER.fullmatch("a" * 255)
+
+
+def test_receipt_signature_must_be_exactly_64_bytes():
+    """Ed25519 signatures are 64 bytes; a short one must not reach verify()."""
+
+    _request_value, response, _trust = _signed_response()
+    for size in (32, 63, 65, 128):
+        with pytest.raises(SignedInvocationError, match="64 bytes"):
+            replace(response.invocation_receipt, signature_b64=_b64url(b"\x01" * size))
+
+
+@pytest.mark.parametrize(
+    "field", ["run_id", "phase", "request_id"]
+)
+def test_verify_rejects_a_content_bearing_caller_identifier(field):
+    """verify()'s own `_safe_identifier` loop on caller-supplied arguments."""
+
+    request, response, trust = _signed_response()
+    verifier = InvokeReceiptVerifier((trust,))
+    kwargs = {
+        "run_id": request.run_id,
+        "phase": request.phase,
+        "request_id": request.request_id,
+        "input_text": request.input,
+        "operation_digest": request.operation_digest,
+        "quote_digest": request.quote_digest,
+        "resource_plan_digest": request.resource_plan_digest,
+    }
+    kwargs[field] = "https://private.example/leak"
+    with pytest.raises(SignedInvocationError, match="must be a safe identifier"):
+        verifier.verify(response.invocation_receipt, **kwargs)
+
+
+def test_phase_evidence_must_be_an_exact_json_object():
+    """`_require_exact_json_values` is removable wholesale without this."""
+
+    signer, trust = _authority()
+    request = _request()
+    for evidence in (
+        {"phase": "lora_submit", "nan": float("nan")},
+        {"phase": "lora_submit", "inf": float("inf")},
+        {"phase": "lora_submit", "nested": {"bad": float("-inf")}},
+        {"phase": "lora_submit", "list": [1, float("nan")]},
+    ):
+        with pytest.raises(SignedInvocationError):
+            phase_evidence_sha256(request.phase, evidence)
+    with pytest.raises(SignedInvocationError, match="string keys"):
+        phase_evidence_sha256(request.phase, {1: "non-string key"})
+    with pytest.raises(SignedInvocationError):
+        phase_evidence_sha256(request.phase, "not a mapping")
