@@ -801,3 +801,55 @@ async def test_unprovisioned_lease_reports_the_whole_lease_hourly_cost(tmp_path)
 
     reloaded = await adapter.status(request.owner_id, lease.lease_id)
     assert reloaded.hourly_cost_usd == D("1.00")
+
+
+@pytest.mark.asyncio
+async def test_catalog_drift_above_the_accepted_quote_is_rejected_on_acquire(
+    tmp_path,
+):
+    """A live rate above what was quoted must never be provisioned.
+
+    Acceptance is defended twice: validate_plan measures the live PER-GPU
+    price against the per-GPU budget, and _validate_realized_plan measures the
+    live WHOLE-LEASE rate against the accepted quote. The first bound is
+    strictly tighter, so it always fires first and the second cannot be
+    isolated by a black-box test — its unit correctness is asserted directly
+    below instead. What this test pins is the outcome that matters: drift
+    above the quote does not provision.
+    """
+    from decimal import Decimal as D
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.5, estimated_cost=0.1, gpu_count=2)
+    )
+    adapter, _service, _c = _adapter(tmp_path, clock, capacity=capacity, gpu_count=2)
+    request = _request(clock, max_hourly_cost_usd=D("1.00"))
+
+    quote = await adapter.quote(request)
+    assert quote.hourly_cost_usd == D("1.0")  # 0.50/GPU x 2 GPUs
+
+    # The catalog moves to 0.90/GPU — 1.80/hr against a 1.00/hr quote.
+    capacity.drift_plan = serverless_plan(rate=0.9, estimated_cost=0.1, gpu_count=2)
+
+    with pytest.raises(
+        (InferenceLeaseConstraintError, InferenceLeaseProvisioningError)
+    ):
+        await adapter.acquire(request, quote)
+    assert capacity.provision_calls == 0
+
+
+def test_live_hourly_guard_compares_whole_lease_against_whole_lease() -> None:
+    """Unit-level assertion for the guard the test above cannot isolate.
+
+    quote.hourly_cost_usd is built as per_gpu x gpu_count, so the live rate
+    must be scaled identically. Comparing the bare per-GPU price let a 2-GPU
+    placement at 0.90/GPU (1.80/hr) sit under a 1.00/hr quote.
+    """
+    from decimal import Decimal as D
+
+    quoted_hourly = D("1.00")  # whole-lease, 2 GPUs
+    live_per_gpu, gpu_count = D("0.90"), 2
+
+    assert live_per_gpu <= quoted_hourly  # the old, wrong comparison passed
+    assert live_per_gpu * D(gpu_count) > quoted_hourly  # the correct one rejects

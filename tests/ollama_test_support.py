@@ -134,6 +134,8 @@ class FakeOllamaProvider:
     def __init__(self, plan: OllamaPlacementPlan) -> None:
         self.selected_plan = plan
         self.provision_calls = 0
+        self.plan_calls = 0
+        self.drift_plan: OllamaPlacementPlan | None = None
         self.pull_calls = 0
         self.teardown_calls = 0
         self.teardown_failures = 0
@@ -150,6 +152,12 @@ class FakeOllamaProvider:
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         del request
+        self.plan_calls += 1
+        # The live catalog can move between quoting and acquiring. Returning
+        # the identical plan for both hides every acceptance guard that exists
+        # to catch that drift, so tests can supply a second plan.
+        if self.drift_plan is not None and self.plan_calls > 1:
+            return self.drift_plan
         return self.selected_plan
 
     async def provision(
