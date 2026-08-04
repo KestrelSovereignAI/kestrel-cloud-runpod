@@ -5,56 +5,34 @@ on these identities, phases and observation shapes WITHOUT importing the
 5,000-line live-test orchestrator. Nothing here executes a run, provisions a
 resource, or spends money: it is data shapes and their validation only.
 
-The orchestrator, CLI, workspace management, spend gate and benchmarks stay in
-``dogfood.py``, which imports these names rather than redefining them.
+The orchestrator, CLI, workspace management, spend gate and benchmarks are to
+stay in ``dogfood.py``, which will import these names rather than redefining
+them. That rebase has not landed yet: on the branch carrying ``dogfood.py``
+those definitions are still declared there, and the structural guard that they
+are re-exported rather than re-declared belongs with it.
+
+Imports here are deliberately minimal, and ``test_dogfood_contracts`` pins the
+module's own import graph: it must not acquire an edge to ``dogfood`` itself,
+to the Runpod control-plane transport (``.clients``), or to any provider
+lifecycle code.
+
+That is a guarantee about *this module*, not about the distribution. The
+package ``__init__`` is an eager aggregator, so ``import
+kestrel_cloud_runpod.dogfood_contracts`` still executes every sibling module;
+what the guard buys is that this file stays severable, so the contracts can be
+lifted into a lighter distribution without untangling a transport edge first.
 """
 
 from __future__ import annotations
 
-from __future__ import annotations
-import argparse
-import getpass
-import hashlib
-import hmac
-import importlib
-import importlib.util
-import json
-import os
 import re
-import secrets
-import socket
-import subprocess
-import sys
-import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import StrEnum
-from pathlib import Path
-from typing import Any, Protocol, cast
-import httpx
-from .clients import RunpodControlPlaneClient
-from .models import RunPodManagerError
-from .signed_invocations import (
-    AttestedInvokeRequest,
-    AttestedInvokeResponse,
-    InvokeReceiptSigner,
-    InvokeReceiptVerifier,
-    ReceiptTrust,
-    ServerInvokeReceipt,
-    SignedInvocationError,
-)
-from .signed_invocations import (
-    base64url_decode as _b64url_decode,
-)
-from .signed_invocations import (
-    base64url_encode as _b64url_encode,
-)
-from .signed_invocations import (
-    canonical_json as _canonical_json,
-)
+from typing import Any, cast
+
 from .signed_invocations import (
     canonical_sha256 as _digest,
 )
@@ -185,6 +163,12 @@ def _parse_time(value: object, name: str) -> datetime:
 
 
 def _safe_identifier(name: str, value: object) -> str:
+    # The `"://" in value` clause is currently unreachable: _SAFE_ID's character
+    # class omits "/", so no string can both fullmatch and contain "://". It is
+    # kept as a second line of defence should that class ever be widened, and
+    # to stay identical to the definition in dogfood.py. What actually enforces
+    # URL-freeness here is the character class, so that is what the tests pin -
+    # see test_safe_identifier_alphabet_is_what_excludes_urls.
     if not isinstance(value, str) or not _SAFE_ID.fullmatch(value) or "://" in value:
         raise DogfoodSafetyError(f"{name} must be a content-free safe identifier")
     return value

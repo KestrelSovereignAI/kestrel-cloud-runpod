@@ -2,6 +2,37 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.9.0] - 2026-08-04
+
+### Added
+
+- `kestrel_cloud_runpod.signed_invocations`: canonical Ed25519 receipts for
+  authenticated agent invocations — signer, verifier, receipt trust pinning and
+  the attested request/response pair. A serving boundary can import the signer
+  without importing any provider lifecycle code, and an external verifier can
+  pin the exact route, owner, companion, agent and public key that identify one
+  execution target.
+- `kestrel_cloud_runpod.dogfood_contracts`: the product-neutral typed contracts
+  (`DogfoodLane`, `DogfoodPhase`, `ResourceType`, `ResourceIdentity`,
+  `ExpectedResource`, `ResourcePlan`, `ProviderAttemptIdentity`, `SpendQuote`,
+  `PhaseObservation`) extracted from the live dogfood harness so production
+  consumers can depend on the shapes without the orchestrator. Nothing in this
+  module executes a run, provisions a resource, or spends money.
+- `cryptography` as an explicit runtime dependency. It is imported directly by
+  `signed_invocations`; it previously resolved only because `kestrel-sovereign`
+  happened to pull it in transitively.
+
+### Fixed
+
+- `serialization.load_der_{public,private}_key` raises
+  `cryptography.exceptions.UnsupportedAlgorithm`, which is **not** a
+  `ValueError`, for well-formed DER carrying an unrecognized algorithm OID.
+  Both key-loading sites caught only `ValueError`, so that input class escaped
+  `SignedInvocationError` — the module's entire error contract — and skipped
+  the `isinstance(..., Ed25519…)` check entirely. A consumer wrapping signer
+  construction in `except ValueError` died with an unhandled traceback instead
+  of its intended configuration error.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

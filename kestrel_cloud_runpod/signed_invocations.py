@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -295,7 +295,11 @@ class ReceiptTrust:
             raise SignedInvocationError("receipt trust public key digest differs")
         try:
             public_key = serialization.load_der_public_key(encoded)
-        except ValueError as exc:
+        except (UnsupportedAlgorithm, ValueError) as exc:
+            # UnsupportedAlgorithm is not a ValueError: well-formed DER whose
+            # algorithm OID is unrecognized raises it, so without this the
+            # isinstance check below never runs and the module's
+            # SignedInvocationError contract leaks a cryptography exception.
             raise SignedInvocationError(
                 "receipt trust public key is invalid DER"
             ) from exc
@@ -764,7 +768,11 @@ class InvokeReceiptSigner:
         )
         try:
             key = serialization.load_der_private_key(encoded, password=None)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, UnsupportedAlgorithm, ValueError) as exc:
+            # See the matching note in ReceiptTrust: UnsupportedAlgorithm sits
+            # outside the ValueError hierarchy, and app_lifecycle wraps signer
+            # construction in `except ValueError` because SignedInvocationError
+            # is this module's whole error contract.
             raise SignedInvocationError(
                 "invocation receipt signer private key is invalid DER"
             ) from exc

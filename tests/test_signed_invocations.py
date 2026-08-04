@@ -389,3 +389,238 @@ def test_response_rejects_unsigned_result_and_evidence_changes():
             completed_at=NOW + timedelta(seconds=2),
             issued_at=NOW + timedelta(seconds=1),
         )
+
+
+# ---------------------------------------------------------------------------
+# Key loading: the module's error contract is SignedInvocationError(ValueError)
+# ---------------------------------------------------------------------------
+
+
+def _mangled_oid(der: bytes) -> bytes:
+    """Rewrite the Ed25519 OID 1.3.101.112 to an unassigned 1.2.3.4.
+
+    The result is well-formed DER whose algorithm is unrecognized, which is the
+    one input class that raises `UnsupportedAlgorithm` rather than `ValueError`.
+    """
+
+    ed25519_oid = bytes.fromhex("06032b6570")
+    assert ed25519_oid in der
+    return der.replace(ed25519_oid, bytes.fromhex("06032a0304"))
+
+
+def test_signer_contains_an_unsupported_key_algorithm():
+    """`UnsupportedAlgorithm` is not a `ValueError`, so it escaped the contract.
+
+    `frinz/app_lifecycle.py` reads the signer key from the environment and
+    wraps construction in `except ValueError`, correct because
+    `SignedInvocationError` subclasses it. Without this containment, an
+    unassigned-OID blob in that env var kills startup with an unhandled
+    cryptography traceback instead of the intended configuration error.
+    """
+
+    private_key = Ed25519PrivateKey.generate()
+    der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    with pytest.raises(SignedInvocationError, match="invalid DER"):
+        InvokeReceiptSigner(
+            private_key_pkcs8_b64=_b64url(_mangled_oid(der)), key_id="frinz-test-key"
+        )
+
+
+def test_receipt_trust_contains_an_unsupported_key_algorithm():
+    private_key = Ed25519PrivateKey.generate()
+    der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    mangled = _mangled_oid(der)
+    with pytest.raises(SignedInvocationError, match="invalid DER"):
+        ReceiptTrust(
+            target="frinz_companion_kite",
+            route=ROUTE,
+            key_id="frinz-test-key",
+            public_key_spki_b64=_b64url(mangled),
+            public_key_sha256="sha256:" + hashlib.sha256(mangled).hexdigest(),
+            owner_binding_sha256="sha256:" + "1" * 64,
+            companion_id="00000000-0000-4000-8000-000000000001",
+            agent_id="kite",
+        )
+
+
+def test_receipt_trust_rejects_an_rsa_key():
+    """A supported-but-wrong algorithm takes the isinstance path, not the DER one."""
+
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    der = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    with pytest.raises(SignedInvocationError, match="must be Ed25519"):
+        ReceiptTrust(
+            target="frinz_companion_kite",
+            route=ROUTE,
+            key_id="frinz-test-key",
+            public_key_spki_b64=_b64url(der),
+            public_key_sha256="sha256:" + hashlib.sha256(der).hexdigest(),
+            owner_binding_sha256="sha256:" + "1" * 64,
+            companion_id="00000000-0000-4000-8000-000000000001",
+            agent_id="kite",
+        )
+
+
+def test_receipt_trust_rejects_a_public_key_digest_that_does_not_match_the_key():
+    """The digest is what a verifier pins; it must be bound to the actual key."""
+
+    other_der = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    der = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    with pytest.raises(SignedInvocationError, match="digest differs"):
+        ReceiptTrust(
+            target="frinz_companion_kite",
+            route=ROUTE,
+            key_id="frinz-test-key",
+            public_key_spki_b64=_b64url(der),
+            public_key_sha256="sha256:" + hashlib.sha256(other_der).hexdigest(),
+            owner_binding_sha256="sha256:" + "1" * 64,
+            companion_id="00000000-0000-4000-8000-000000000001",
+            agent_id="kite",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Route strictness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/api//kestrel/invoke",  # empty segment
+        "/api/../admin/invoke",  # parent traversal
+        "/api/./invoke",  # current-segment no-op
+        "/api/kestrel/..",  # trailing traversal
+        "/api/kestrel/.",  # trailing no-op
+        "api/kestrel/invoke",  # not absolute
+        "https://host/api/invoke",  # absolute URL
+        "/",  # no segment
+    ],
+)
+def test_receipt_trust_rejects_a_non_strict_route(route):
+    """A pinned route that normalizes differently is a pin on nothing.
+
+    Unlike the identifier alphabet, `_RELATIVE_ROUTE` does admit `/`, so these
+    clauses are reachable and each is load-bearing.
+    """
+
+    der = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    with pytest.raises(SignedInvocationError, match="strict relative HTTP route"):
+        ReceiptTrust(
+            target="frinz_companion_kite",
+            route=route,
+            key_id="frinz-test-key",
+            public_key_spki_b64=_b64url(der),
+            public_key_sha256="sha256:" + hashlib.sha256(der).hexdigest(),
+            owner_binding_sha256="sha256:" + "1" * 64,
+            companion_id="00000000-0000-4000-8000-000000000001",
+            agent_id="kite",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Trust-set resolution: exactly one target, or nothing
+# ---------------------------------------------------------------------------
+
+
+def _verify(verifier, receipt, request):
+    return verifier.verify(
+        receipt,
+        run_id=request.run_id,
+        phase=request.phase,
+        request_id=request.request_id,
+        input_text=request.input,
+        operation_digest=request.operation_digest,
+        quote_digest=request.quote_digest,
+        resource_plan_digest=request.resource_plan_digest,
+    )
+
+
+def test_verifier_refuses_a_receipt_matching_no_pinned_trust():
+    request, response, _trust = _signed_response()
+    _signer_b, trust_b = _authority()  # a different key entirely
+    verifier = InvokeReceiptVerifier((trust_b,))
+    with pytest.raises(SignedInvocationError, match="one pinned execution target"):
+        _verify(verifier, response.invocation_receipt, request)
+
+
+def test_verifier_refuses_a_receipt_matching_more_than_one_trust():
+    """Ambiguity must fail closed: two pinned targets means no inferred target."""
+
+    request, response, trust = _signed_response()
+    # Same key, route, companion, agent - only `target` differs, and `target`
+    # is what verify() returns rather than something it matches on.
+    twin = replace(trust, target="frinz_companion_kite_twin")
+    verifier = InvokeReceiptVerifier((trust, twin))
+    with pytest.raises(SignedInvocationError, match="one pinned execution target"):
+        _verify(verifier, response.invocation_receipt, request)
+
+
+def test_verifier_refuses_a_receipt_signed_by_another_pinned_key():
+    """Key A's receipt presented against a trust pinning key B.
+
+    The trust here is otherwise identical - same route, companion, agent and
+    key_id - so only the key material and its digest distinguish them.
+    """
+
+    request, response, trust = _signed_response()
+    other_public_der = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    impostor = replace(
+        trust,
+        public_key_spki_b64=_b64url(other_public_der),
+        public_key_sha256="sha256:" + hashlib.sha256(other_public_der).hexdigest(),
+    )
+    verifier = InvokeReceiptVerifier((impostor,))
+    with pytest.raises(SignedInvocationError, match="one pinned execution target"):
+        _verify(verifier, response.invocation_receipt, request)
+
+
+def test_verifier_rejects_duplicate_targets_and_an_empty_trust_set():
+    _request_value, _response, trust = _signed_response()
+    with pytest.raises(SignedInvocationError, match="trust set is invalid"):
+        InvokeReceiptVerifier(())
+    with pytest.raises(SignedInvocationError, match="targets must be unique"):
+        InvokeReceiptVerifier((trust, replace(trust, key_id="other-key-id")))
