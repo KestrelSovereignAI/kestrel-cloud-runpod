@@ -968,10 +968,14 @@ def test_verify_rejects_a_content_bearing_caller_identifier(field):
         verifier.verify(response.invocation_receipt, **kwargs)
 
 
-def test_phase_evidence_must_be_an_exact_json_object():
-    """`_require_exact_json_values` is removable wholesale without this."""
+def test_phase_evidence_rejects_non_finite_and_non_object_input():
+    """These are caught by canonical_json and the top-level Mapping/key check.
 
-    signer, trust = _authority()
+    Deliberately NOT claiming to pin `_require_exact_json_values`: every input
+    here is rejected by a different guard one line away, so this test stays
+    green with that one removed. The test below is the one that pins it.
+    """
+
     request = _request()
     for evidence in (
         {"phase": "lora_submit", "nan": float("nan")},
@@ -985,3 +989,89 @@ def test_phase_evidence_must_be_an_exact_json_object():
         phase_evidence_sha256(request.phase, {1: "non-string key"})
     with pytest.raises(SignedInvocationError):
         phase_evidence_sha256(request.phase, "not a mapping")
+
+
+@pytest.mark.parametrize(
+    ("lhs", "rhs"),
+    [
+        # json.dumps coerces non-string dict keys to strings, so two distinct
+        # evidence objects would produce ONE signed digest.
+        ({"m": {1: "x"}}, {"m": {"1": "x"}}),
+        ({"m": {True: "x"}}, {"m": {"true": "x"}}),
+        # ...and serializes tuples as arrays, collapsing another distinct pair.
+        ({"m": ("x",)}, {"m": ["x"]}),
+    ],
+)
+def test_phase_evidence_refuses_values_that_would_collide_after_serialization(lhs, rhs):
+    """This is what `_require_exact_json_values` alone prevents.
+
+    Its distinguishing behaviour is a DIGEST-IDENTITY property, not a
+    well-formedness one: without it both members of each pair serialize
+    identically and sign to the same digest. Two distinct evidence objects
+    collapsing onto one signed digest is precisely the "conflating distinct
+    identities" failure this module exists to prevent — and it is invisible to
+    any test that only feeds it malformed input.
+    """
+
+    # The LHS form is refused...
+    with pytest.raises(SignedInvocationError):
+        phase_evidence_sha256("lora_submit", {"phase": "lora_submit", **lhs})
+    # ...while its RHS twin, which is legitimate JSON, is accepted. Without the
+    # guard both would serialize identically and sign to the SAME digest, so
+    # refusing the LHS is the only thing keeping the two distinguishable.
+    assert phase_evidence_sha256(
+        "lora_submit", {"phase": "lora_submit", **rhs}
+    ).startswith("sha256:")
+
+
+def test_phase_evidence_admits_exact_json_values():
+    digest = phase_evidence_sha256(
+        "lora_submit",
+        {
+            "phase": "lora_submit",
+            "state_transitions": ["queued", "running"],
+            "timings_ms": {"total": 1},
+            "nullable": None,
+            "flag": True,
+            "count": 3,
+        },
+    )
+    assert digest.startswith("sha256:")
+
+
+def test_receipt_elapsed_ms_must_be_a_strict_integer():
+    """`_strict_int` and the elapsed_ms check shadow each other.
+
+    Dropping BOTH leaves `elapsed_ms=1.0` acceptable, which changes the
+    canonical bytes that get signed (`1.0` vs `1`), so the receipt a verifier
+    reconstructs no longer matches the one that was signed.
+    """
+
+    _request_value, response, _trust = _signed_response()
+    for bad in (1.0, True, "1", None):
+        with pytest.raises(SignedInvocationError):
+            replace(response.invocation_receipt, elapsed_ms=bad)
+    with pytest.raises(SignedInvocationError, match="elapsed time is invalid"):
+        replace(response.invocation_receipt, elapsed_ms=-1)
+
+
+def test_receipt_payload_rejects_a_non_integer_elapsed_ms():
+    """The `_strict_int` half of that pair, reached through from_payload."""
+
+    _request_value, response, _trust = _signed_response()
+    payload = response.invocation_receipt.to_payload()
+    payload["payload"]["elapsed_ms"] = 1.0
+    with pytest.raises(SignedInvocationError, match="must be an integer"):
+        ServerInvokeReceipt.from_payload(payload)
+
+
+def test_base64url_encode_requires_bytes():
+    for bad in ("a string", 7, None, ["list"], bytearray(b"x")):
+        with pytest.raises(SignedInvocationError, match="input must be bytes"):
+            base64url_encode(bad)
+    assert base64url_encode(b"") == ""
+
+
+def test_attested_request_requires_non_empty_input():
+    with pytest.raises(SignedInvocationError):
+        replace(_request(), input="")

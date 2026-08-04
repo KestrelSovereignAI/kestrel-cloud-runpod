@@ -122,6 +122,11 @@ def _canonical_json_object(value: object, name: str) -> dict[str, Any]:
         raise SignedInvocationError(f"{name} must be a JSON object with string keys")
     _require_exact_json_values(value, name)
     normalized = json.loads(canonical_json(value))
+    # Unreachable in the same structural sense as the `"="` and `"://"`
+    # clauses: `value` is a proven Mapping by this line, so its canonical JSON
+    # always round-trips to a dict. Kept as defence in depth, and narrated here
+    # so the next reader does not spend time looking for the input that hits
+    # it.
     if not isinstance(normalized, dict):
         raise SignedInvocationError(f"{name} must be a JSON object")
     return normalized

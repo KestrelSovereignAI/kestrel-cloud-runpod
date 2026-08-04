@@ -184,6 +184,21 @@ def _safe_identifier(name: str, value: object) -> str:
     return value
 
 
+def _is_sha256(value: object) -> bool:
+    """Whether `value` is a prefixed SHA-256 digest, for ANY input type.
+
+    `re.Pattern.fullmatch` raises TypeError on non-str input, so applying
+    `_SHA256.fullmatch` straight to a caller-supplied attribute let a bytes or
+    int digest escape `DogfoodSafetyError` — this module's whole contract — the
+    same way `UnsupportedAlgorithm` escaped `SignedInvocationError`. Passing
+    `hashlib.sha256(x).digest()` where `.hexdigest()` was meant is the ordinary
+    way to hit it. `signed_invocations._sha256` has always guarded this; these
+    are its twins.
+    """
+
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
 def _required_payload_string(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise DogfoodSafetyError(f"{name} must be a string")
@@ -352,6 +367,12 @@ class ResourcePlan:
             raise DogfoodSafetyError(
                 "resource plan initial resources must be a nonempty expected subset"
             )
+        # `initial_resources` was already detached; `expected_resources` was
+        # not, so appending to the caller's list after construction defeated
+        # the same-lane and uniqueness checks above AND changed `digest` -
+        # which `ProviderAttemptIdentity.plan_digest` pins against a billable
+        # attempt, so the recorded plan digest was not stable.
+        object.__setattr__(self, "expected_resources", tuple(self.expected_resources))
         object.__setattr__(self, "initial_resources", tuple(initial))
 
     def to_payload(self) -> dict[str, Any]:
@@ -448,9 +469,9 @@ class ProviderAttemptIdentity:
         if not isinstance(self.lane, DogfoodLane):
             raise DogfoodSafetyError("provider attempt lane is invalid")
         if (
-            not _SHA256.fullmatch(self.plan_digest)
-            or not _SHA256.fullmatch(self.quote_digest)
-            or not _SHA256.fullmatch(self.exclusive_window_sha256)
+            not _is_sha256(self.plan_digest)
+            or not _is_sha256(self.quote_digest)
+            or not _is_sha256(self.exclusive_window_sha256)
         ):
             raise DogfoodSafetyError("provider attempt quote or plan digest is invalid")
         if not isinstance(self.resource, ResourceIdentity):
@@ -565,7 +586,7 @@ class SpendQuote:
             "endpoint_plan_sha256",
         ):
             value = getattr(self, name)
-            if value is not None and not _SHA256.fullmatch(value):
+            if value is not None and not _is_sha256(value):
                 raise DogfoodSafetyError(f"spend quote {name} is invalid")
         if (
             not isinstance(self.observed_at, datetime)
@@ -651,7 +672,7 @@ class PhaseObservation:
                     f"timings_ms.{name} must be nonnegative milliseconds"
                 )
         for item in self.artifact_digests:
-            if not _SHA256.fullmatch(item):
+            if not _is_sha256(item):
                 raise DogfoodSafetyError("artifact digest must be sha256")
         for name in (
             "billing_receipt_digest",
@@ -664,7 +685,7 @@ class PhaseObservation:
             "recovered_resource_plan_digest",
         ):
             value = getattr(self, name)
-            if value is not None and not _SHA256.fullmatch(value):
+            if value is not None and not _is_sha256(value):
                 raise DogfoodSafetyError(f"{name} must be sha256")
         for name in ("estimated_cost_usd", "actual_cost_usd"):
             value = getattr(self, name)
@@ -703,6 +724,24 @@ class PhaseObservation:
             raise DogfoodSafetyError(
                 "phase observation contains duplicate provider attempts"
             )
+        # Detach from the caller's containers. This is frozen and its
+        # projection is signature-bound, so keeping the caller's live list or
+        # dict lets validated content change AFTER validation:
+        #
+        #   st = ["queued"]; obs = PhaseObservation(state_transitions=st, ...)
+        #   st.append("https://private.example/leak")
+        #   obs.binding_payload()["state_transitions"]  -> the URL is in it
+        #
+        # `_safe_identifier` passed over every element at construction, and
+        # `binding_payload()` is what Frinz feeds to `phase_evidence_sha256`
+        # for the server to sign. Same for a timing mutated to -1 after its
+        # bounds check. `AttestedInvokeResponse` already does this for
+        # `phase_evidence`; these are the sibling fields that did not.
+        object.__setattr__(self, "state_transitions", tuple(self.state_transitions))
+        object.__setattr__(self, "timings_ms", dict(self.timings_ms))
+        # `provider_attempts` needs no detaching: the isinstance check above
+        # already requires a tuple, and tuples cannot alias.
+        object.__setattr__(self, "artifact_digests", tuple(self.artifact_digests))
 
     def binding_payload(self) -> dict[str, Any]:
         """Canonical content-free projection bound by the server receipt."""

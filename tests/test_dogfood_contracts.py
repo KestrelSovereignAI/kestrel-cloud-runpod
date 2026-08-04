@@ -770,3 +770,165 @@ def test_to_evidence_rejects_a_non_datetime_observed_at():
     for bad in ("2026-08-03T12:00:00Z", None, 1754308800):
         with pytest.raises(dc.DogfoodSafetyError):
             _observation().to_evidence(run_id="run-0001", observed_at=bad)
+
+
+# --------------------------------------------------------------------------
+# Digest validation must not escape the module's error contract
+# --------------------------------------------------------------------------
+
+# `re.Pattern.fullmatch` raises TypeError on non-str input, so a bytes or int
+# digest used to escape DogfoodSafetyError entirely — the same escape class as
+# the UnsupportedAlgorithm leak. `hashlib.sha256(x).digest()` where
+# `.hexdigest()` was meant is the ordinary way to produce one, and these are
+# CONSTRUCTOR paths, so `_required_payload_string` never runs.
+NON_STRING_DIGESTS = [b"\x00" * 32, 7, None, ["sha256:" + "a" * 64], 3.14]
+
+
+@pytest.mark.parametrize("bad", NON_STRING_DIGESTS)
+@pytest.mark.parametrize(
+    "field", ["plan_digest", "quote_digest", "exclusive_window_sha256"]
+)
+def test_provider_attempt_contains_a_non_string_digest(field, bad):
+    with pytest.raises(dc.DogfoodSafetyError):
+        _attempt(**{field: bad})
+
+
+@pytest.mark.parametrize(
+    "bad", [v for v in NON_STRING_DIGESTS if v is not None]
+)
+@pytest.mark.parametrize(
+    "field", ["operation_digest", "provider_quote_sha256", "endpoint_plan_sha256"]
+)
+def test_spend_quote_contains_a_non_string_digest(field, bad):
+    """SpendQuote's optional-digest loop had no test at all.
+
+    `None` is excluded: these fields are Optional and default to None, so the
+    guard is `value is not None and not _is_sha256(value)`. Asserting None is
+    rejected would test the opposite of the contract.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError):
+        _quote(**{field: bad})
+
+
+@pytest.mark.parametrize(
+    "field", ["operation_digest", "provider_quote_sha256", "endpoint_plan_sha256"]
+)
+def test_spend_quote_optional_digests_admit_none_and_a_real_digest(field):
+    assert getattr(_quote(**{field: None}), field) is None
+    assert getattr(_quote(**{field: SHA}), field) == SHA
+
+
+@pytest.mark.parametrize("bad", NON_STRING_DIGESTS)
+def test_observation_artifact_digests_reject_a_non_string(bad):
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(artifact_digests=(bad,))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "billing_receipt_digest",
+        "trained_weight_digest",
+        "promoted_weight_digest",
+        "weight_digest_used",
+        "output_image_digest",
+        "uploaded_artifact_digest",
+        "recovered_artifact_digest",
+        "recovered_resource_plan_digest",
+    ],
+)
+def test_observation_optional_digest_fields_are_validated(field):
+    """All eight had no test: replacing the loop with `pass` stayed green."""
+
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(**{field: "a" * 64})  # missing the sha256: prefix
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(**{field: b"\x00" * 32})  # non-string: used to be TypeError
+    assert getattr(_observation(**{field: SHA}), field) == SHA
+
+
+def test_is_sha256_accepts_any_input_type_without_raising():
+    """The helper itself must never raise — it returns a bool for anything."""
+
+    for value in (b"bytes", 7, None, [], {}, object(), "sha256:" + "a" * 64):
+        assert isinstance(dc._is_sha256(value), bool)
+    assert dc._is_sha256("sha256:" + "a" * 64)
+    assert not dc._is_sha256("sha256:" + "A" * 64)  # uppercase hex rejected
+    assert not dc._is_sha256("a" * 64)
+
+
+# --------------------------------------------------------------------------
+# Frozen, digest-bearing fields must not alias the caller's containers
+# --------------------------------------------------------------------------
+
+
+def test_observation_detaches_state_transitions_from_the_caller():
+    """Validated content must not be mutable after validation.
+
+    `_safe_identifier` passes over every element at construction, then the
+    caller appends a URL to their own list and it appears in the projection
+    Frinz feeds to `phase_evidence_sha256` for the server to sign.
+    """
+
+    transitions = ["queued", "running"]
+    observation = _observation(state_transitions=transitions)
+    transitions.append("https://private.example/leak")
+    assert observation.binding_payload()["state_transitions"] == ["queued", "running"]
+
+
+def test_observation_detaches_timings_from_the_caller():
+    timings = {"total": 12}
+    observation = _observation(timings_ms=timings)
+    timings["total"] = -1  # would have been rejected at construction
+    assert observation.binding_payload()["timings_ms"] == {"total": 12}
+    assert observation.to_evidence(run_id="run-0001", observed_at=NOW)["timings_ms"] == {
+        "total": 12
+    }
+
+
+def test_observation_detaches_artifact_digests_from_the_caller():
+    """Passing a LIST is the case that aliases; a tuple cannot.
+
+    `artifact_digests` has no isinstance-tuple check, so a list is accepted and
+    was stored live. (`provider_attempts` does have one, so it needs no
+    detaching — that is why there is no sibling assertion here.)
+    """
+
+    digests = [SHA]
+    observation = _observation(artifact_digests=digests)
+    digests.append("not-a-digest")
+    assert observation.binding_payload()["artifact_digests"] == [SHA]
+    assert isinstance(observation.artifact_digests, tuple)
+
+
+def test_observation_requires_a_tuple_of_provider_attempts():
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(provider_attempts=[_attempt()])
+
+
+def test_resource_plan_digest_is_stable_after_construction():
+    """`plan.digest` is what `ProviderAttemptIdentity.plan_digest` pins.
+
+    Appending to the caller's list defeated both the same-lane and uniqueness
+    checks AND changed the digest recorded against a billable attempt.
+    """
+
+    resources = [_expected()]
+    plan = _plan(expected_resources=tuple(resources))
+    before = plan.digest
+    resources.append(
+        dc.ExpectedResource(
+            resource_type=dc.ResourceType.NETWORK_VOLUME,
+            resource_name="extra-volume",
+            lane=dc.DogfoodLane.OLLAMA,
+        )
+    )
+    assert plan.digest == before
+    assert [r["lane"] for r in plan.to_payload()["expected_resources"]] == ["lora"]
+
+
+def test_resource_plan_accepts_a_list_and_stores_a_tuple():
+    plan = _plan(expected_resources=[_expected()])
+    assert isinstance(plan.expected_resources, tuple)
+    assert isinstance(plan.initial_resources, tuple)

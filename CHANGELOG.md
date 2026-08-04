@@ -42,6 +42,17 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - `AttestedInvokeResponse.to_payload()` returned the live `phase_evidence`
   mapping on a frozen dataclass, so a caller could mutate signed evidence in
   place through the returned payload and break `verify_phase_evidence`.
+- Digest validation applied `_SHA256.fullmatch` directly to caller-supplied
+  attributes at four sites. `re.Pattern.fullmatch` raises `TypeError` on
+  non-`str` input, so a `bytes` digest — `hashlib.sha256(x).digest()` where
+  `.hexdigest()` was meant — escaped `DogfoodSafetyError` entirely. All four
+  now route through a guarded helper, matching `signed_invocations._sha256`.
+- `PhaseObservation` and `ResourcePlan` kept the caller's live containers after
+  validating them, on frozen dataclasses whose projections are
+  signature-bound. Appending to the caller's list after construction put
+  unvalidated content into `binding_payload()` — the projection Frinz feeds to
+  `phase_evidence_sha256` — and changed `ResourcePlan.digest`, which
+  `ProviderAttemptIdentity.plan_digest` pins against a billable attempt.
 
 ## [0.8.0] - 2026-08-03
 
