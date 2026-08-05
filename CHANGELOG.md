@@ -64,6 +64,14 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
   a generator of trusts was drained by the validity check, leaving a verifier
   that trusted nothing while blaming later receipts for the empty set.
+- `utf8_sha256` raised `UnicodeEncodeError` for a `str` holding a lone
+  surrogate. `isinstance(value, str)` does not imply UTF-8-encodable, and
+  `json.loads` produces such a string without complaint — a token-truncated
+  emoji cuts a surrogate pair and leaves one. `UnicodeEncodeError` is a
+  `ValueError` but not a `SignedInvocationError`, so it escaped the module's
+  contract on all three paths that digest text, including
+  `InvokeReceiptVerifier.verify(input_text=...)` — the verification path, not
+  merely key loading.
 - `ResourcePlan.phase` and `ProviderAttemptIdentity.phase` were checked for
   membership in the mutating-phase tuple but never for type. `DogfoodPhase` is
   a `StrEnum`, so a raw `"lora_submit"` satisfies the membership test, then

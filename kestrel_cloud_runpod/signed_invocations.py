@@ -64,7 +64,21 @@ def utf8_sha256(value: str) -> str:
 
     if not isinstance(value, str):
         raise SignedInvocationError("signed text must be a string")
-    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+    try:
+        encoded = value.encode()
+    except UnicodeEncodeError as exc:
+        # isinstance(str) does not imply UTF-8-encodable: a lone surrogate is
+        # a legal `str` and `json.loads` produces one without complaint. The
+        # ordinary source is a token-truncated emoji — cutting a surrogate
+        # pair leaves "\ud83d", which survives the wire and reaches here. This
+        # is on the VERIFICATION path (verify(input_text=...)), not just key
+        # loading, so without this a consumer wrapping verify() in
+        # `except SignedInvocationError` takes an unhandled traceback:
+        # UnicodeEncodeError is a ValueError but NOT a SignedInvocationError.
+        raise SignedInvocationError(
+            "signed text must be encodable UTF-8"
+        ) from exc
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def phase_evidence_sha256(phase: str, evidence_payload: Mapping[str, Any]) -> str:
@@ -118,6 +132,10 @@ def _required_payload_string(value: object, name: str) -> str:
 
 
 def _canonical_json_object(value: object, name: str) -> dict[str, Any]:
+    # Redundant rather than unreachable: `_require_exact_json_values` on the
+    # next line rejects the same inputs with the same message, and its callers
+    # already type-check. Kept as the cheap early exit; the tests pin the
+    # behaviour, not this line, so deleting it changes nothing observable.
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise SignedInvocationError(f"{name} must be a JSON object with string keys")
     _require_exact_json_values(value, name)
@@ -659,7 +677,10 @@ class AttestedInvokeResponse:
             raise SignedInvocationError("attested phase evidence must be an object")
         raw_response = value["response"]
         if not isinstance(raw_response, str):
-            raise SignedInvocationError("attested invoke response must be a string")
+            # Distinct wording from __post_init__'s identical check below: with
+            # the same message, neither guard could be pinned - a test matching
+            # it is satisfied by whichever fires. This one names the wire path.
+            raise SignedInvocationError("attested response payload must be a string")
         return cls(
             response=raw_response,
             model=_optional_payload_string(value["model"], "response.model"),

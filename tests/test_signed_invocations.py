@@ -1219,3 +1219,108 @@ def test_base64url_decode_rejects_a_length_that_cannot_be_padded():
 
     with pytest.raises(SignedInvocationError, match="not valid base64url"):
         base64url_decode("YWJjZ", "value")
+
+
+def test_utf8_sha256_rejects_a_lone_surrogate():
+    """isinstance(str) does not imply UTF-8-encodable.
+
+    A token-truncated emoji cuts a surrogate pair and leaves "\\ud83d", which
+    `json.loads` produces happily. `UnicodeEncodeError` is a ValueError but NOT
+    a SignedInvocationError, so it escaped the module's contract on the
+    verification path.
+    """
+
+    import json
+
+    body = json.loads('{"response": "partial emoji \\ud83d"}')["response"]
+    with pytest.raises(SignedInvocationError, match="encodable UTF-8"):
+        utf8_sha256(body)
+
+
+def test_a_lone_surrogate_is_contained_on_all_three_module_paths():
+    import json
+
+    body = json.loads('{"response": "partial emoji \\ud83d"}')["response"]
+    _request_value, response, trust = _signed_response()
+
+    # 1. constructing the response envelope (server side)
+    with pytest.raises(SignedInvocationError, match="encodable UTF-8"):
+        replace(response, response=body)
+    # 2. from_payload (consumer side)
+    payload = response.to_payload()
+    payload["response"] = body
+    with pytest.raises(SignedInvocationError, match="encodable UTF-8"):
+        AttestedInvokeResponse.from_payload(payload)
+    # 3. verify(input_text=...) — the one that matters most
+    verifier = InvokeReceiptVerifier((trust,))
+    with pytest.raises(SignedInvocationError, match="encodable UTF-8"):
+        verifier.verify(
+            response.invocation_receipt,
+            run_id=_request().run_id,
+            phase=_request().phase,
+            request_id=_request().request_id,
+            input_text=body,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("route"),
+        lambda p: p.update(unexpected=True),
+    ],
+)
+def test_receipt_trust_from_payload_rejects_a_bad_field_set(mutate):
+    """Without the field-set check this is a bare KeyError."""
+
+    _request_value, _response, trust = _signed_response()
+    payload = trust.to_payload() if hasattr(trust, "to_payload") else {
+        "target": trust.target, "route": trust.route, "key_id": trust.key_id,
+        "public_key_spki_b64": trust.public_key_spki_b64,
+        "public_key_sha256": trust.public_key_sha256,
+        "owner_binding_sha256": trust.owner_binding_sha256,
+        "companion_id": trust.companion_id, "agent_id": trust.agent_id,
+    }
+    mutate(payload)
+    with pytest.raises(SignedInvocationError, match="fields differ"):
+        ReceiptTrust.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [lambda p: p.pop("payload"), lambda p: p.update(unexpected=True)],
+)
+def test_server_receipt_from_payload_rejects_a_bad_envelope_field_set(mutate):
+    _request_value, response, _trust = _signed_response()
+    payload = response.invocation_receipt.to_payload()
+    mutate(payload)
+    with pytest.raises(SignedInvocationError, match="fields differ"):
+        ServerInvokeReceipt.from_payload(payload)
+
+
+@pytest.mark.parametrize("bad", ["not-a-mapping", 7, None, ["list"]])
+def test_response_from_payload_requires_mapping_phase_evidence(bad):
+    """Without this check, `dict(bad)` raises ValueError/TypeError."""
+
+    _request_value, response, _trust = _signed_response()
+    payload = response.to_payload()
+    payload["phase_evidence"] = bad
+    with pytest.raises(SignedInvocationError):
+        AttestedInvokeResponse.from_payload(payload)
+
+
+@pytest.mark.parametrize("bad", [7, None, b"bytes", ["list"]])
+def test_response_from_payload_requires_a_string_body(bad):
+    """The from_payload body check, distinct from __post_init__'s.
+
+    Both once raised the identical message, so a test matching it was
+    satisfied by whichever fired first and pinned neither.
+    """
+
+    _request_value, response, _trust = _signed_response()
+    payload = response.to_payload()
+    payload["response"] = bad
+    with pytest.raises(
+        SignedInvocationError, match="attested response payload must be a string"
+    ):
+        AttestedInvokeResponse.from_payload(payload)

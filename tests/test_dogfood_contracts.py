@@ -1155,6 +1155,10 @@ def test_expected_resource_from_payload_rejects_a_bad_envelope(mutate):
     [
         lambda p: p.pop("plan_id"),
         lambda p: p.update(unexpected=True),
+        # Matched by exact message below, because a bare `raises` is
+        # shadow-satisfied here: with the array check gone, "not-a-list" is
+        # iterated character-by-character and ExpectedResource.from_payload('n')
+        # raises "planned resource fields differ" from a different guard.
         lambda p: p.update(expected_resources="not-a-list"),
         lambda p: p.update(phase="lora_quote"),
     ],
@@ -1181,3 +1185,79 @@ def test_spend_quote_rejects_a_naive_or_non_datetime_timestamp(field):
     for bad in (datetime(2026, 8, 3, 12, 0), "2026-08-03T12:00:00Z", None):
         with pytest.raises(dc.DogfoodSafetyError):
             _quote(**{field: bad})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-a-list",                     # str: iterated char-by-char without the guard
+        tuple(),                          # tuple: the wire format says array
+        (r for r in []),                  # generator
+        {"resource_type": "pod"},         # mapping
+        7,
+        None,
+    ],
+)
+def test_resource_plan_from_payload_requires_an_actual_array(value):
+    """Pinned by EXACT message: the wire format says array, not any iterable.
+
+    A bare `raises` cannot pin this - every one of these values also trips a
+    downstream guard with a different message once the array check is gone.
+    """
+
+    payload = _plan().to_payload()
+    payload["expected_resources"] = value
+    with pytest.raises(dc.DogfoodSafetyError, match="must be an array"):
+        dc.ResourcePlan.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("resource_id"),
+        lambda p: p.update(unexpected=True),
+        lambda p: p.update(resource_type="not-a-type"),
+        lambda p: p.update(resource_id=7),
+    ],
+)
+def test_resource_identity_from_payload_rejects_a_bad_payload(mutate):
+    """`ResourceIdentity` is on FRINZ_SURFACE and had no rejection coverage.
+
+    It is reached from `ProviderAttemptIdentity.from_payload`, so without the
+    field-set check and the `except (TypeError, ValueError)` arm, a bad wire
+    row raises a bare KeyError or ValueError out of a module whose whole
+    advertised contract is DogfoodSafetyError.
+    """
+
+    payload = _identity().to_payload()
+    mutate(payload)
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc.ResourceIdentity.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("attempt_id"),
+        lambda p: p.update(unexpected=True),
+        lambda p: p.update(phase="not-a-phase"),
+        lambda p: p.update(lane="not-a-lane"),
+        lambda p: p.update(resource={"resource_type": "not-a-type",
+                                     "resource_id": "x", "resource_name": "y"}),
+        lambda p: p.update(started_at="not-a-timestamp"),
+    ],
+)
+def test_provider_attempt_from_payload_rejects_a_bad_payload(mutate):
+    payload = _attempt().to_payload()
+    mutate(payload)
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc.ProviderAttemptIdentity.from_payload(payload)
+
+
+def test_resource_plan_from_payload_rejects_an_unknown_phase():
+    """The `except (TypeError, ValueError)` arm — a bare ValueError without it."""
+
+    payload = _plan().to_payload()
+    payload["phase"] = "not-a-phase"
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc.ResourcePlan.from_payload(payload)
