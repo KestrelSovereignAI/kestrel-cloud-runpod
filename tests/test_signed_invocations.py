@@ -1154,3 +1154,68 @@ def test_sha256_helper_rejects_every_non_string(bad):
 
     with pytest.raises(SignedInvocationError, match="prefixed SHA-256 digest"):
         si._sha256("digest", bad)
+
+
+def test_verifier_materializes_its_trust_set_before_validating():
+    """A generator drained the guard and left the verifier trusting nothing.
+
+    `any(not isinstance(...))` consumed the input, `tuple(trusts)` then came
+    back empty, the "trust set is invalid" check passed over nothing, and the
+    uniqueness check passed vacuously. Construction succeeded with an empty
+    trust set, and every later verify() blamed the RECEIPT for a defect in the
+    trust set. Fails closed, but silently — the same validate-then-recopy
+    pattern fixed in PhaseObservation.
+    """
+
+    request, response, trust = _signed_response()
+    verifier = InvokeReceiptVerifier(t for t in [trust])
+    assert len(verifier._trusts) == 1
+    assert _verify(verifier, response.invocation_receipt, request) == trust.target
+
+
+@pytest.mark.parametrize("bad", [None, 7, object(), "not-a-trust"])
+def test_verifier_rejects_a_non_iterable_trust_set(bad):
+    with pytest.raises(SignedInvocationError, match="trust set is invalid"):
+        InvokeReceiptVerifier(bad)
+
+
+def test_verifier_rejects_an_empty_generator_trust_set():
+    with pytest.raises(SignedInvocationError, match="trust set is invalid"):
+        InvokeReceiptVerifier(t for t in [])
+
+
+def test_optional_sha256_admits_none_on_every_optional_receipt_digest():
+    """The `None` branch of `_optional_sha256` — the "optional" was unproven."""
+
+    signer, trust = _authority()
+    request = _request()
+    evidence = {"phase": request.phase, "state_transitions": ["queued"],
+                "timings_ms": {"total": 1}}
+    payload = _receipt_payload(request, trust, "r", evidence)
+    for field in ("operation_digest", "quote_digest", "resource_plan_digest"):
+        payload[field] = None
+    receipt = signer.sign(payload)
+    assert receipt.operation_digest is None
+    verifier = InvokeReceiptVerifier((trust,))
+    assert (
+        verifier.verify(
+            receipt,
+            run_id=request.run_id,
+            phase=request.phase,
+            request_id=request.request_id,
+            input_text=request.input,
+        )
+        == trust.target
+    )
+
+
+def test_base64url_decode_rejects_a_length_that_cannot_be_padded():
+    """`except (ValueError, TypeError)` at the decode is REACHABLE.
+
+    A length congruent to 1 mod 4 passes the character class, gets "===" 
+    appended, and raises binascii.Error. Unlike the `"="`/`"://"` clauses this
+    one is not defence in depth, and it was untested.
+    """
+
+    with pytest.raises(SignedInvocationError, match="not valid base64url"):
+        base64url_decode("YWJjZ", "value")

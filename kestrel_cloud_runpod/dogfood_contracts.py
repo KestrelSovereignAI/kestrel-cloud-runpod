@@ -26,7 +26,7 @@ lifted into a lighter distribution without untangling a transport edge first.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -199,6 +199,32 @@ def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
+def _materialized_sequence(value: object, name: str) -> tuple[Any, ...]:
+    """Copy a caller-supplied sequence exactly once, type-checking FIRST.
+
+    Ordering matters in both directions and this is the shape that satisfies
+    both. Validating and THEN copying re-iterates the input, so a one-shot
+    iterable validates on the first pass and is copied from an exhausted
+    iterator on the second - the field silently empties. Copying and THEN
+    validating fixes that but lets `tuple(None)` raise a bare TypeError,
+    escaping DogfoodSafetyError. So: type-check, copy, then validate content.
+
+    str/bytes are rejected rather than exploded into characters.
+    """
+
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Iterable):
+        raise DogfoodSafetyError(f"{name} must be a sequence")
+    return tuple(value)
+
+
+def _materialized_mapping(value: object, name: str) -> dict[str, Any]:
+    """Same contract as _materialized_sequence, for a mapping field."""
+
+    if not isinstance(value, Mapping):
+        raise DogfoodSafetyError(f"{name} must be a mapping")
+    return dict(value)
+
+
 def _required_payload_string(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise DogfoodSafetyError(f"{name} must be a string")
@@ -336,10 +362,16 @@ class ResourcePlan:
 
     def __post_init__(self) -> None:
         # Materialize before validating - see the note in PhaseObservation.
-        object.__setattr__(self, "expected_resources", tuple(self.expected_resources))
+        object.__setattr__(
+            self,
+            "expected_resources",
+            _materialized_sequence(self.expected_resources, "expected_resources"),
+        )
         if self.initial_resources is not None:
             object.__setattr__(
-                self, "initial_resources", tuple(self.initial_resources)
+                self,
+                "initial_resources",
+                _materialized_sequence(self.initial_resources, "initial_resources"),
             )
         _safe_identifier("resource plan run_id", self.run_id)
         # isinstance FIRST. DogfoodPhase is a StrEnum, so
@@ -680,9 +712,19 @@ class PhaseObservation:
         # emptiness guard below was bypassed because a generator is always
         # truthy. Detaching here also closes the aliasing case: the caller
         # cannot mutate a validated container afterwards.
-        object.__setattr__(self, "state_transitions", tuple(self.state_transitions))
-        object.__setattr__(self, "timings_ms", dict(self.timings_ms))
-        object.__setattr__(self, "artifact_digests", tuple(self.artifact_digests))
+        object.__setattr__(
+            self,
+            "state_transitions",
+            _materialized_sequence(self.state_transitions, "state_transitions"),
+        )
+        object.__setattr__(
+            self, "timings_ms", _materialized_mapping(self.timings_ms, "timings_ms")
+        )
+        object.__setattr__(
+            self,
+            "artifact_digests",
+            _materialized_sequence(self.artifact_digests, "artifact_digests"),
+        )
         if not isinstance(self.phase, DogfoodPhase):
             raise DogfoodSafetyError("phase observation has an invalid phase")
         if not self.state_transitions:
@@ -691,10 +733,9 @@ class PhaseObservation:
             )
         for item in self.state_transitions:
             _safe_identifier("state transition", item)
-        if (
-            not isinstance(self.timings_ms, Mapping)
-            or set(self.timings_ms) - _OPERATIONAL_TIMING_FIELDS
-        ):
+        # The Mapping type check lives in `_materialized_mapping` above; by
+        # here `timings_ms` is a dict, so testing it again would pin nothing.
+        if set(self.timings_ms) - _OPERATIONAL_TIMING_FIELDS:
             raise DogfoodSafetyError("phase observation has unknown timing fields")
         for name, value in self.timings_ms.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:

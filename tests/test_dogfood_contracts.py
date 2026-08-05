@@ -1029,3 +1029,155 @@ def test_resource_plan_accepts_a_generator_of_expected_resources():
     plan = _plan(expected_resources=(r for r in [_expected()]))
     assert len(plan.expected_resources) == 1
     assert plan.digest.startswith("sha256:")
+
+
+# --------------------------------------------------------------------------
+# Materialization must not let a bad type escape the contract
+#
+# Round 5 fixed one-shot iterables by copying BEFORE validating. That broke
+# the other direction: `tuple(None)` / `dict(None)` raise bare TypeError, and
+# DogfoodError subclasses RuntimeError, so a caller's `except DogfoodError`
+# never sees them. The order that satisfies both is type-check, copy, validate.
+# --------------------------------------------------------------------------
+
+NON_SEQUENCES = [None, 12, 3.5, object(), True]
+NON_MAPPINGS = [None, 12, "total=12", {"total"}, ["total", 12], object()]
+
+
+@pytest.mark.parametrize("bad", NON_SEQUENCES)
+def test_observation_rejects_a_non_sequence_state_transitions(bad):
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a sequence"):
+        _observation(state_transitions=bad)
+
+
+@pytest.mark.parametrize("bad", NON_SEQUENCES)
+def test_observation_rejects_a_non_sequence_artifact_digests(bad):
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a sequence"):
+        _observation(artifact_digests=bad)
+
+
+@pytest.mark.parametrize("bad", NON_MAPPINGS)
+def test_observation_rejects_a_non_mapping_timings(bad):
+    """`None` is the ordinary shape of an absent field from a deserialized row.
+
+    A list of pairs is also refused rather than coerced: the declared type is
+    `Mapping[str, int]`, and silently accepting `[("total", 12)]` would put a
+    shape the annotation excludes into the signature-bound projection.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a mapping"):
+        _observation(timings_ms=bad)
+
+
+@pytest.mark.parametrize("bad", NON_SEQUENCES)
+def test_resource_plan_rejects_a_non_sequence_expected_resources(bad):
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a sequence"):
+        _plan(expected_resources=bad)
+
+
+@pytest.mark.parametrize("bad", [v for v in NON_SEQUENCES if v is not None])
+def test_resource_plan_rejects_a_non_sequence_initial_resources(bad):
+    """`None` is excluded: it is the documented default, meaning "same as
+    expected_resources". Asserting it is rejected would test the opposite of
+    the contract - the same mistake made once already on SpendQuote's optional
+    digest fields."""
+
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a sequence"):
+        _plan(initial_resources=bad)
+
+
+def test_resource_plan_initial_resources_defaults_to_expected():
+    plan = _plan(initial_resources=None)
+    assert plan.initial_resources == plan.expected_resources
+
+
+@pytest.mark.parametrize("field", ["state_transitions", "artifact_digests"])
+def test_observation_refuses_a_bare_string_sequence(field):
+    """A str is Iterable; exploding it into characters would be silent damage."""
+
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a sequence"):
+        _observation(**{field: "queued"})
+
+
+def test_expected_resource_rejects_an_untyped_resource_type():
+    """The one isinstance guard in either module that survived its own removal.
+
+    Without it `ExpectedResource(resource_type="pod", ...)` constructs, and the
+    failure surfaces later at `to_payload()` -> `self.resource_type.value` ->
+    AttributeError, reached through `ResourcePlan.digest` — the signed path.
+    """
+
+    with pytest.raises(dc.DogfoodSafetyError, match="must be a ResourceType"):
+        dc.ExpectedResource(
+            resource_type="pod", resource_name="kite-pod", lane=dc.DogfoodLane.LORA
+        )
+
+
+# --------------------------------------------------------------------------
+# from_payload round trips — on FRINZ_SURFACE, previously untested
+# --------------------------------------------------------------------------
+
+
+def test_expected_resource_round_trips_through_its_payload():
+    resource = _expected()
+    assert dc.ExpectedResource.from_payload(resource.to_payload()) == resource
+    assert resource.to_payload() == {
+        "resource_type": "pod",
+        "resource_name": "kite-pod",
+        "lane": "lora",
+    }
+
+
+def test_resource_plan_round_trips_through_its_payload():
+    plan = _plan()
+    assert dc.ResourcePlan.from_payload(plan.to_payload()) == plan
+    assert dc.ResourcePlan.from_payload(plan.to_payload()).digest == plan.digest
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("lane"),
+        lambda p: p.update(unexpected=True),
+        lambda p: p.update(resource_type="not-a-type"),
+        lambda p: p.update(lane="not-a-lane"),
+    ],
+)
+def test_expected_resource_from_payload_rejects_a_bad_envelope(mutate):
+    payload = _expected().to_payload()
+    mutate(payload)
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc.ExpectedResource.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("plan_id"),
+        lambda p: p.update(unexpected=True),
+        lambda p: p.update(expected_resources="not-a-list"),
+        lambda p: p.update(phase="lora_quote"),
+    ],
+)
+def test_resource_plan_from_payload_rejects_a_bad_envelope(mutate):
+    payload = _plan().to_payload()
+    mutate(payload)
+    with pytest.raises(dc.DogfoodSafetyError):
+        dc.ResourcePlan.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "field", ["provider_ack_interruption_count", "recovery_count",
+              "publication_count", "promotion_count", "product_consent_count"]
+)
+@pytest.mark.parametrize("bad", [-1, True, 1.0, "1", None])
+def test_observation_integer_counters_are_validated(field, bad):
+    with pytest.raises(dc.DogfoodSafetyError):
+        _observation(**{field: bad})
+
+
+@pytest.mark.parametrize("field", ["observed_at", "expires_at"])
+def test_spend_quote_rejects_a_naive_or_non_datetime_timestamp(field):
+    for bad in (datetime(2026, 8, 3, 12, 0), "2026-08-03T12:00:00Z", None):
+        with pytest.raises(dc.DogfoodSafetyError):
+            _quote(**{field: bad})

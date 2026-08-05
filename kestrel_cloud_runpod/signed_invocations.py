@@ -12,7 +12,7 @@ import base64
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -692,9 +692,20 @@ class InvokeReceiptVerifier:
     """Verify a receipt and infer its target only from pinned signed identity."""
 
     def __init__(self, trusts: Sequence[ReceiptTrust]) -> None:
-        if not trusts or any(not isinstance(item, ReceiptTrust) for item in trusts):
+        # Materialize BEFORE validating, and validate the COPY. Validating the
+        # argument and then re-iterating it drains a one-shot input: passing a
+        # generator made `any(...)` consume it, `tuple(trusts)` come back
+        # empty, and the "trust set is invalid" guard pass over nothing. The
+        # verifier then trusted nothing at all, and every later verify() blamed
+        # the receipt ("does not identify one pinned execution target") for a
+        # defect in the trust set. It fails closed, but silently.
+        if isinstance(trusts, (str, bytes)) or not isinstance(trusts, Iterable):
             raise SignedInvocationError("receipt verifier trust set is invalid")
         self._trusts = tuple(trusts)
+        if not self._trusts or any(
+            not isinstance(item, ReceiptTrust) for item in self._trusts
+        ):
+            raise SignedInvocationError("receipt verifier trust set is invalid")
         targets = [item.target for item in self._trusts]
         if len(targets) != len(set(targets)):
             raise SignedInvocationError("receipt verifier targets must be unique")

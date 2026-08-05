@@ -53,12 +53,17 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   unvalidated content into `binding_payload()` — the projection Frinz feeds to
   `phase_evidence_sha256` — and changed `ResourcePlan.digest`, which
   `ProviderAttemptIdentity.plan_digest` pins against a billable attempt. Both
-  now materialize their sequence fields BEFORE validating rather than after,
-  which additionally fixes a one-shot iterable silently emptying itself: a
-  generator passed as `state_transitions` validated on the first pass and was
-  copied from an exhausted iterator on the second, so the signed projection
-  carried `[]` while the emptiness guard was bypassed (a generator is always
-  truthy).
+  now type-check, then materialize, then validate content. That ordering is
+  what both failure directions require: validating and copying afterwards
+  re-iterates the input, so a one-shot iterable (`(t.name for t in log)`)
+  validated on the first pass and was copied from an exhausted iterator on the
+  second — the field silently emptied into the signed projection while the
+  emptiness guard was bypassed, a generator being always truthy — whereas
+  copying first would let `tuple(None)`/`dict(None)` raise a bare `TypeError`,
+  which escapes `DogfoodError` entirely since it derives from `RuntimeError`.
+  `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
+  a generator of trusts was drained by the validity check, leaving a verifier
+  that trusted nothing while blaming later receipts for the empty set.
 - `ResourcePlan.phase` and `ProviderAttemptIdentity.phase` were checked for
   membership in the mutating-phase tuple but never for type. `DogfoodPhase` is
   a `StrEnum`, so a raw `"lora_submit"` satisfies the membership test, then
