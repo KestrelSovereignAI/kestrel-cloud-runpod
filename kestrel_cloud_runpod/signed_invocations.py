@@ -206,7 +206,18 @@ def _iso(value: datetime) -> str:
         or value.utcoffset() is None
     ):
         raise SignedInvocationError("signed timestamps must be timezone-aware")
-    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        # An aware datetime is not necessarily REPRESENTABLE after the offset
+        # shift: near datetime.min/max, astimezone raises OverflowError, which
+        # is an ArithmeticError - neither SignedInvocationError nor even
+        # ValueError, so it bypasses both this module's contract and the
+        # `except ValueError` wrappers consumers use. Same class as the
+        # UnsupportedAlgorithm and UnicodeEncodeError leaks.
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError) as exc:
+        raise SignedInvocationError(
+            "signed timestamp is out of representable range"
+        ) from exc
 
 
 def _parse_time(value: object, name: str) -> datetime:
@@ -218,7 +229,14 @@ def _parse_time(value: object, name: str) -> datetime:
         raise SignedInvocationError(f"{name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise SignedInvocationError(f"{name} must include a timezone")
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, OSError) as exc:
+        # "0001-01-01T00:00:00+00:01" is a one-minute offset, not an exotic
+        # input, and it arrives from untrusted wire data.
+        raise SignedInvocationError(
+            f"{name} is out of representable range"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,6 +817,12 @@ class InvokeReceiptVerifier:
     def verify_phase_evidence(
         receipt: ServerInvokeReceipt, evidence_payload: Mapping[str, Any]
     ) -> None:
+        # `verify()` has this guard; this staticmethod did not, and being a
+        # staticmethod it is the natural call site for a consumer holding a row
+        # it deserialized itself - so a plain dict gave AttributeError instead
+        # of SignedInvocationError, on the verification path.
+        if not isinstance(receipt, ServerInvokeReceipt):
+            raise SignedInvocationError("invocation receipt is not typed")
         if receipt.evidence_digest != phase_evidence_sha256(
             receipt.phase, evidence_payload
         ):
@@ -845,9 +869,17 @@ class InvokeReceiptSigner:
         self.public_key_sha256 = "sha256:" + hashlib.sha256(public_der).hexdigest()
 
     def sign(self, payload: Mapping[str, Any]) -> ServerInvokeReceipt:
+        # The signing boundary of the whole module took `dict(payload)`
+        # unguarded: `sign(None)` gave TypeError and `sign("string")` gave
+        # ValueError, neither a SignedInvocationError.
+        # `AttestedInvokeResponse.from_payload` already has exactly this guard.
+        # A Mapping is required rather than any dict()-able input, because a
+        # list of pairs would take a path the annotation excludes.
+        if not isinstance(payload, Mapping):
+            raise SignedInvocationError("invocation receipt payload must be a mapping")
         unsigned_envelope = {
             "contract": INVOCATION_RECEIPT_CONTRACT,
-            "payload": dict(payload),
+            "payload": dict(payload),  # guarded above
             "signature": {
                 "algorithm": INVOCATION_RECEIPT_SIGNATURE_ALGORITHM,
                 "key_id": self.key_id,

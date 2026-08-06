@@ -157,7 +157,15 @@ def _iso(value: datetime) -> str:
         or value.utcoffset() is None
     ):
         raise DogfoodSafetyError("dogfood timestamps must be timezone-aware")
-    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        # See the note in signed_invocations._iso: aware does not imply
+        # representable, and OverflowError is an ArithmeticError that escapes
+        # DogfoodError entirely.
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError) as exc:
+        raise DogfoodSafetyError(
+            "dogfood timestamp is out of representable range"
+        ) from exc
 
 
 def _parse_time(value: object, name: str) -> datetime:
@@ -169,7 +177,12 @@ def _parse_time(value: object, name: str) -> datetime:
         raise DogfoodSafetyError(f"{name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise DogfoodSafetyError(f"{name} must include a timezone")
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, OSError) as exc:
+        raise DogfoodSafetyError(
+            f"{name} is out of representable range"
+        ) from exc
 
 
 def _safe_identifier(name: str, value: object) -> str:
@@ -534,6 +547,12 @@ class ProviderAttemptIdentity:
             or self.started_at > self.completed_at
         ):
             raise DogfoodSafetyError("provider attempt interval is invalid")
+        # Serializability is part of the contract, not a to_payload() concern:
+        # without this an extreme timestamp constructed successfully and raised
+        # OverflowError later from PhaseObservation.binding_payload() - the
+        # projection Frinz feeds to phase_evidence_sha256.
+        _iso(self.started_at)
+        _iso(self.completed_at)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -645,14 +664,23 @@ class SpendQuote:
             or self.expires_at.utcoffset() is None
         ):
             raise DogfoodSafetyError("spend quote timestamps must be aware")
-        if (
-            not self.observed_at
-            < self.expires_at
-            <= self.observed_at + timedelta(minutes=5)
-        ):
+        try:
+            # `observed_at + timedelta(minutes=5)` overflows near datetime.max,
+            # raising OverflowError out of a money-invariant validator.
+            latest = self.observed_at + timedelta(minutes=5)
+        except (OverflowError, OSError) as exc:
+            raise DogfoodSafetyError(
+                "spend quote observed_at is out of representable range"
+            ) from exc
+        if not self.observed_at < self.expires_at <= latest:
             raise DogfoodSafetyError(
                 "spend quote may remain valid for at most five minutes"
             )
+        # Prove both timestamps are serializable NOW rather than at to_payload
+        # time: `digest` is bound into attempts, so a deferred failure would
+        # surface on the signature-bound path.
+        _iso(self.observed_at)
+        _iso(self.expires_at)
 
     @property
     def digest(self) -> str:

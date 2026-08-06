@@ -64,6 +64,23 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
   a generator of trusts was drained by the validity check, leaving a verifier
   that trusted nothing while blaming later receipts for the empty set.
+- `astimezone(UTC)` raised `OverflowError` near `datetime.min`/`datetime.max`.
+  An aware datetime is not necessarily representable after the offset shift,
+  and `OverflowError` is an `ArithmeticError` — neither module's error type nor
+  even a `ValueError`, so it bypassed both contracts and the `except ValueError`
+  wrappers consumers use. Reached from untrusted wire data by an ordinary
+  one-minute offset (`"0001-01-01T00:00:00+00:01"`) through every `from_payload`
+  carrying a timestamp, through the signing boundary, and — because
+  `ProviderAttemptIdentity` validated awareness but never serialized — deferred
+  onto `PhaseObservation.binding_payload()`, the projection Frinz signs.
+  `SpendQuote`'s five-minute window had the same problem in its own arithmetic.
+- `InvokeReceiptVerifier.verify_phase_evidence` had no typedness guard, unlike
+  its sibling `verify`. Being a staticmethod it is the natural call site for a
+  consumer holding a row it deserialized itself, so a plain dict raised
+  `AttributeError` on the verification path.
+- `InvokeReceiptSigner.sign` did not validate its payload argument at the
+  signing boundary: `sign(None)` raised `TypeError` and `sign("string")` raised
+  `ValueError` out of `dict(payload)`.
 - `utf8_sha256` raised `UnicodeEncodeError` for a `str` holding a lone
   surrogate. `isinstance(value, str)` does not imply UTF-8-encodable, and
   `json.loads` produces such a string without complaint — a token-truncated
