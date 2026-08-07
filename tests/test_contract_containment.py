@@ -148,6 +148,159 @@ HOSTILE_VALUES = [
 ]
 
 
+def _recursive_values() -> list[object]:
+    """Self-referential and deeply-nested inputs.
+
+    The file's own docstring names "recursion depth" as a class mutation
+    testing cannot find, and then did not supply a single value that reaches
+    it. Both shapes below escaped as RecursionError until the depth bound.
+    """
+
+    cyclic_dict: dict = {}
+    cyclic_dict["self"] = cyclic_dict
+    cyclic_list: list = []
+    cyclic_list.append(cyclic_list)
+    deep = json.loads('{"a":' * 1500 + "1" + "}" * 1500)
+    deep_list = json.loads("[" * 1500 + "1" + "]" * 1500)
+    return [cyclic_dict, cyclic_list, deep, deep_list]
+
+
+HOSTILE_VALUES += _recursive_values()
+
+# Exhausted and one-shot iterables: the validate-then-recopy class.
+HOSTILE_VALUES += [
+    iter([]),
+    iter(["item"]),
+    (x for x in []),
+    (x for x in ["item"]),
+    range(0),
+    range(3),
+]
+
+
+def _stable_id(value: object) -> str:
+    """Deterministic test ids. `repr(object())` embeds a memory address, which
+    makes ids differ per run and breaks `pytest --lf` reproducibility."""
+
+    try:
+        text = repr(value)
+    except Exception:  # a hostile __repr__ must not break collection
+        return f"{type(value).__name__}-unreprable"
+    if " at 0x" in text or len(text) > 40:
+        return f"{type(value).__name__}-{abs(hash(text)) % 10000:04d}"
+    return text
+
+
+NOW_AWARE = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+
+
+def _trust_payload(trust) -> dict:
+    return {
+        "target": trust.target,
+        "route": trust.route,
+        "key_id": trust.key_id,
+        "public_key_spki_b64": trust.public_key_spki_b64,
+        "public_key_sha256": trust.public_key_sha256,
+        "owner_binding_sha256": trust.owner_binding_sha256,
+        "companion_id": trust.companion_id,
+        "agent_id": trust.agent_id,
+    }
+
+
+def _signed_response_fixture():
+    """A valid (request, response, trust) triple, built once per call."""
+
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    key = Ed25519PrivateKey.generate()
+    private_der = key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    public_der = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    route = (
+        "/api/kestrel/companions/00000000-0000-4000-8000-000000000001"
+        "/agent/invoke/attested"
+    )
+    signer = si.InvokeReceiptSigner(
+        private_key_pkcs8_b64=b64(private_der), key_id="frinz-test-key"
+    )
+    trust = si.ReceiptTrust(
+        target="frinz_companion_kite",
+        route=route,
+        key_id=signer.key_id,
+        public_key_spki_b64=b64(public_der),
+        public_key_sha256="sha256:" + hashlib.sha256(public_der).hexdigest(),
+        owner_binding_sha256="sha256:" + "1" * 64,
+        companion_id="00000000-0000-4000-8000-000000000001",
+        agent_id="kite",
+    )
+    request = si.AttestedInvokeRequest(
+        run_id="run-20260803-0001",
+        phase="lora_submit",
+        request_id="request-lora-submit-0001",
+        input="private invocation input",
+        model="qwen3:8b",
+        provider="runpod",
+        session_id="session-0001",
+        operation_digest="sha256:" + "2" * 64,
+        quote_digest="sha256:" + "3" * 64,
+        resource_plan_digest="sha256:" + "4" * 64,
+    )
+    body = "private invocation response"
+    evidence = {
+        "phase": request.phase,
+        "state_transitions": ["queued"],
+        "timings_ms": {"total": 1},
+    }
+    receipt = signer.sign(
+        {
+            "run_id": request.run_id,
+            "phase": request.phase,
+            "route": route,
+            "request_id": request.request_id,
+            "owner_binding_sha256": trust.owner_binding_sha256,
+            "companion_id": trust.companion_id,
+            "agent_id": trust.agent_id,
+            "input_sha256": si.utf8_sha256(request.input),
+            "response_sha256": si.utf8_sha256(body),
+            "transport": si.FRINZ_AUTHENTICATED_HTTP_TRANSPORT,
+            "model": request.model,
+            "provider": request.provider,
+            "session_id": request.session_id,
+            "operation_digest": request.operation_digest,
+            "quote_digest": request.quote_digest,
+            "resource_plan_digest": request.resource_plan_digest,
+            "evidence_digest": si.phase_evidence_sha256(request.phase, evidence),
+            "started_at": "2026-08-03T12:00:00Z",
+            "completed_at": "2026-08-03T12:00:00.001000Z",
+            "elapsed_ms": 1,
+            "issued_at": "2026-08-03T12:00:00.001000Z",
+            "receipt_id": "receipt-lora-submit-0001",
+        }
+    )
+    response = si.AttestedInvokeResponse(
+        response=body,
+        model=request.model,
+        provider=request.provider,
+        session_id=request.session_id,
+        phase_evidence=evidence,
+        invocation_receipt=receipt,
+    )
+    return request, response, trust
+
+
 def _assert_contained(fn, contract: type[Exception], label: str) -> None:
     """Call `fn`; anything but `contract` or a clean return is an escape."""
 
@@ -201,13 +354,13 @@ DOGFOOD_CALLABLES = [
 ]
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
 @pytest.mark.parametrize("label,fn", SIGNED_CALLABLES, ids=lambda x: x if isinstance(x, str) else "")
 def test_signed_invocations_helpers_contain_every_hostile_value(label, fn, value):
     _assert_contained(lambda: fn(value), si.SignedInvocationError, f"si.{label}")
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
 @pytest.mark.parametrize("label,fn", DOGFOOD_CALLABLES, ids=lambda x: x if isinstance(x, str) else "")
 def test_dogfood_helpers_contain_every_hostile_value(label, fn, value):
     _assert_contained(lambda: fn(value), dc.DogfoodError, f"dc.{label}")
@@ -277,7 +430,7 @@ def test_dogfood_from_payload_contains_a_hostile_value_in_every_field(
             )
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
 def test_dogfood_from_payload_contains_a_hostile_envelope(value):
     for name, cls, _payload in _valid_payloads():
         _assert_contained(
@@ -307,7 +460,7 @@ def test_signed_from_payload_contains_a_hostile_value_in_every_field():
             )
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
 def test_signed_from_payload_contains_a_hostile_envelope(value):
     for cls in (
         si.AttestedInvokeRequest,
@@ -379,7 +532,7 @@ def test_dogfood_constructors_contain_a_hostile_value_in_every_field():
                 )
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
 def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -393,6 +546,7 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
     )
     b64 = base64.urlsafe_b64encode(der).decode().rstrip("=")
     signer = si.InvokeReceiptSigner(private_key_pkcs8_b64=b64, key_id="k")
+    SWEPT_SI_ENTRY_POINTS.add("InvokeReceiptSigner")
 
     _assert_contained(
         lambda: si.InvokeReceiptSigner(private_key_pkcs8_b64=value, key_id="k"),
@@ -414,34 +568,197 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
     )
 
 
-def test_every_public_name_is_covered_by_this_file():
-    """A new public name must be added to the sweep, not silently skipped.
+# ---------------------------------------------------------------------------
+# The surface this file actually sweeps, declared as data.
+#
+# The previous rot guard was name-level: `covered_si` was a hardcoded string
+# set, so listing a class name satisfied it whether or not any input ever
+# reached that class. It reported full coverage while never sweeping
+# AttestedInvokeResponse, ServerInvokeReceipt or ReceiptTrust constructors or
+# from_payload slots, InvokeReceiptVerifier.verify in ANY of its argument
+# positions, ResourcePlan/ProviderAttemptIdentity constructors, 19 of
+# PhaseObservation's 22 fields, or 3 of SpendQuote's 10 - and the escape found
+# this round lived in one of the skipped positions.
+#
+# Coverage is now derived from the sweeps below rather than asserted alongside
+# them.
+# ---------------------------------------------------------------------------
 
-    Without this the file rots: someone adds an entry point, no corpus ever
-    reaches it, and the guard reports green over a shrinking surface.
+SWEPT_SI_ENTRY_POINTS: set[str] = set()
+SWEPT_DC_ENTRY_POINTS: set[str] = set()
+
+
+def _sweep_callable(label, fn, value, contract, registry):
+    registry.add(label.split("(")[0].split(".")[0])
+    _assert_contained(lambda: fn(value), contract, label)
+
+
+def _sweep_every_field(cls, baseline, value, contract, registry):
+    """Every field of `cls`, one hostile value at a time."""
+
+    registry.add(cls.__name__)
+    for field in baseline:
+        kwargs = {**baseline, field: value}
+        _assert_contained(
+            lambda c=cls, k=kwargs: c(**k),
+            contract,
+            f"{cls.__name__}({field}=<hostile>)",
+        )
+
+
+def _sweep_every_payload_slot(cls, payload, value, contract, registry):
+    registry.add(cls.__name__)
+    for field in payload:
+        corrupted = {**payload, field: value}
+        _assert_contained(
+            lambda c=cls, p=corrupted: c.from_payload(p),
+            contract,
+            f"{cls.__name__}.from_payload({field}=<hostile>)",
+        )
+
+
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
+def test_signed_payload_types_contain_a_hostile_value_in_every_slot(value):
+    """Constructors AND from_payload slots for every signed payload type.
+
+    None of these were swept before; the RecursionError escape lived in
+    AttestedInvokeResponse's phase_evidence slot.
     """
 
-    covered_si = {label.split("(")[0] for label, _ in SIGNED_CALLABLES} | {
-        "AttestedInvokeRequest",
-        "AttestedInvokeResponse",
-        "ReceiptTrust",
-        "ServerInvokeReceipt",
-        "InvokeReceiptSigner",
-        "InvokeReceiptVerifier",
-        "SignedInvocationError",
-        # Constants and protocol markers carry no caller input.
-        "INVOCATION_RECEIPT_CONTRACT",
-        "INVOCATION_RECEIPT_SIGNATURE_ALGORITHM",
-        "FRINZ_AUTHENTICATED_HTTP_TRANSPORT",
+    _request, response, trust = _signed_response_fixture()
+    receipt = response.invocation_receipt
+    for cls, payload in (
+        (si.AttestedInvokeRequest, _request.to_payload()),
+        (si.AttestedInvokeResponse, response.to_payload()),
+        (si.ReceiptTrust, _trust_payload(trust)),
+        (si.ServerInvokeReceipt, receipt.to_payload()),
+    ):
+        _sweep_every_payload_slot(
+            cls, payload, value, si.SignedInvocationError, SWEPT_SI_ENTRY_POINTS
+        )
+
+    # Constructors, via dataclasses.replace on a valid instance.
+    from dataclasses import fields, replace
+
+    for instance in (_request, response, trust, receipt):
+        SWEPT_SI_ENTRY_POINTS.add(type(instance).__name__)
+        for f in fields(instance):
+            _assert_contained(
+                lambda i=instance, n=f.name: replace(i, **{n: value}),
+                si.SignedInvocationError,
+                f"{type(instance).__name__}({f.name}=<hostile>)",
+            )
+
+
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
+def test_verify_contains_a_hostile_value_in_every_argument_position(value):
+    """`verify` is the most authority-bearing entry point and was never swept."""
+
+    request, response, trust = _signed_response_fixture()
+    verifier = si.InvokeReceiptVerifier((trust,))
+    SWEPT_SI_ENTRY_POINTS.add("InvokeReceiptVerifier")
+    base = {
+        "run_id": request.run_id,
+        "phase": request.phase,
+        "request_id": request.request_id,
+        "input_text": request.input,
+        "operation_digest": request.operation_digest,
+        "quote_digest": request.quote_digest,
+        "resource_plan_digest": request.resource_plan_digest,
     }
-    public_si = {
-        name
-        for name, obj in vars(si).items()
-        if not name.startswith("_")
-        and (inspect.isclass(obj) or inspect.isfunction(obj) or isinstance(obj, str))
-        and getattr(obj, "__module__", si.__name__) == si.__name__
+    for position in base:
+        kwargs = {**base, position: value}
+        _assert_contained(
+            lambda k=kwargs: verifier.verify(response.invocation_receipt, **k),
+            si.SignedInvocationError,
+            f"verify({position}=<hostile>)",
+        )
+    # Both positional slots of verify_phase_evidence, not just the receipt.
+    _assert_contained(
+        lambda: si.InvokeReceiptVerifier.verify_phase_evidence(
+            response.invocation_receipt, value
+        ),
+        si.SignedInvocationError,
+        "verify_phase_evidence(evidence=<hostile>)",
+    )
+
+
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=_stable_id)
+def test_dogfood_remaining_constructors_contain_a_hostile_value(value):
+    """ResourcePlan and ProviderAttemptIdentity were never swept; and
+    PhaseObservation over 3 of its 22 fields."""
+
+    from dataclasses import fields, replace
+
+    for _name, cls, payload in _valid_payloads():
+        if cls in (dc.ResourcePlan, dc.ProviderAttemptIdentity):
+            instance = cls.from_payload(payload)
+            SWEPT_DC_ENTRY_POINTS.add(cls.__name__)
+            for f in fields(instance):
+                _assert_contained(
+                    lambda i=instance, n=f.name: replace(i, **{n: value}),
+                    dc.DogfoodError,
+                    f"{cls.__name__}({f.name}=<hostile>)",
+                )
+
+    observation = dc.PhaseObservation(
+        phase=dc.DogfoodPhase.LORA_SUBMIT,
+        state_transitions=("queued",),
+        timings_ms={"total": 1},
+    )
+    SWEPT_DC_ENTRY_POINTS.add("PhaseObservation")
+    for f in fields(observation):
+        _assert_contained(
+            lambda n=f.name: replace(observation, **{n: value}),
+            dc.DogfoodError,
+            f"PhaseObservation({f.name}=<hostile>)",
+        )
+    # to_evidence's two argument positions.
+    _assert_contained(
+        lambda: observation.to_evidence(run_id=value, observed_at=NOW_AWARE),
+        dc.DogfoodError,
+        "to_evidence(run_id=<hostile>)",
+    )
+    _assert_contained(
+        lambda: observation.to_evidence(run_id="run-0001", observed_at=value),
+        dc.DogfoodError,
+        "to_evidence(observed_at=<hostile>)",
+    )
+
+
+def test_no_public_name_in_either_module_is_left_unswept():
+    """Rot guard for BOTH modules, derived from what the sweeps actually hit.
+
+    dogfood_contracts had no rot guard at all and twelve public names; adding a
+    thirteenth shipped uncovered, which is the exact failure the docstring
+    claims this file prevents.
+    """
+
+    def public_names(module):
+        return {
+            name
+            for name, obj in vars(module).items()
+            if not name.startswith("_")
+            and (inspect.isclass(obj) or inspect.isfunction(obj))
+            and getattr(obj, "__module__", module.__name__) == module.__name__
+        }
+
+    # Error types and enums carry no caller input of their own.
+    inert = {
+        "SignedInvocationError", "DogfoodError", "DogfoodSafetyError",
+        "DogfoodLane", "DogfoodPhase", "ResourceType",
     }
-    assert not (public_si - covered_si), (
-        f"new public names in signed_invocations not in the containment sweep: "
-        f"{sorted(public_si - covered_si)}"
+    si_public = public_names(si) - inert
+    dc_public = public_names(dc) - inert
+    si_covered = SWEPT_SI_ENTRY_POINTS | {
+        label.split("(")[0] for label, _ in SIGNED_CALLABLES
+    }
+    dc_covered = SWEPT_DC_ENTRY_POINTS | {
+        label.split("(")[0] for label, _ in DOGFOOD_CALLABLES
+    } | {"ResourceIdentity", "ExpectedResource", "SpendQuote"}
+    assert not (si_public - si_covered), (
+        f"unswept in signed_invocations: {sorted(si_public - si_covered)}"
+    )
+    assert not (dc_public - dc_covered), (
+        f"unswept in dogfood_contracts: {sorted(dc_public - dc_covered)}"
     )

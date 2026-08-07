@@ -151,11 +151,14 @@ def _iso(value: datetime) -> str:
     # of a module whose advertised contract is DogfoodSafetyError. That is the
     # same escape class as the UnsupportedAlgorithm leak in signed_invocations.
     # This now matches si._iso exactly, modulo the exception type.
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+    # utcoffset() is called on a caller-supplied tzinfo, so a hostile one that
+    # returns a non-timedelta raises TypeError from inside the CHECK itself -
+    # outside any handler. Same "operation after the type check" class.
+    try:
+        aware = isinstance(value, datetime) and value.utcoffset() is not None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DogfoodSafetyError("dogfood timestamps must be timezone-aware") from exc
+    if not aware:
         raise DogfoodSafetyError("dogfood timestamps must be timezone-aware")
     try:
         # See the note in signed_invocations._iso: aware does not imply
@@ -244,7 +247,22 @@ def _required_payload_string(value: object, name: str) -> str:
     return value
 
 
-def _assert_content_free(value: object, *, path: str = "evidence") -> None:
+# Matches signed_invocations._MAX_JSON_DEPTH: deeper than any legitimate
+# evidence payload, well under the interpreter's recursion limit.
+_MAX_EVIDENCE_DEPTH = 64
+
+
+def _assert_content_free(
+    value: object, *, path: str = "evidence", depth: int = 0
+) -> None:
+    # Same unbounded-recursion shape as the signed_invocations twin. Reaching
+    # it today requires calling this helper directly, because `to_evidence`
+    # only ever hands it the bounded projection from `binding_payload()` - but
+    # it is a module-level helper, the bound costs nothing, and an unbounded
+    # recursion raises RecursionError, which is a RuntimeError and so escapes
+    # DogfoodError entirely. The bound doubles as cycle detection.
+    if depth > _MAX_EVIDENCE_DEPTH:
+        raise DogfoodSafetyError(f"{path} nests deeper than {_MAX_EVIDENCE_DEPTH}")
     if isinstance(value, Mapping):
         for raw_key, item in value.items():
             if not isinstance(raw_key, str):
@@ -257,11 +275,11 @@ def _assert_content_free(value: object, *, path: str = "evidence") -> None:
                 raise DogfoodSafetyError(
                     f"{path}.{raw_key} is not content-free evidence"
                 )
-            _assert_content_free(item, path=f"{path}.{raw_key}")
+            _assert_content_free(item, path=f"{path}.{raw_key}", depth=depth + 1)
         return
     if isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
-            _assert_content_free(item, path=f"{path}[{index}]")
+            _assert_content_free(item, path=f"{path}[{index}]", depth=depth + 1)
         return
     if isinstance(value, str) and _SENSITIVE_VALUE.search(value):
         raise DogfoodSafetyError(f"{path} contains a URL or credential-like value")

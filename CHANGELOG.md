@@ -64,6 +64,16 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
   a generator of trusts was drained by the validity check, leaving a verifier
   that trusted nothing while blaming later receipts for the empty set.
+- `_require_exact_json_values` recursed one Python frame per nesting level with
+  no depth bound and no cycle detection, so attacker-controlled `phase_evidence`
+  nested ~1000 deep — or any cyclic mapping — raised `RecursionError` on the
+  verification path. That is a `RuntimeError`: neither the module's error type
+  nor a `ValueError`, so a consumer wrapping the boundary returned 500 rather
+  than 4xx. `canonical_json` alone already contained both shapes, because
+  `json.dumps` is C-implemented and turns a cycle into `ValueError`, so running
+  this pure-Python pre-pass first *removed* containment rather than adding it.
+  Both it and its `dogfood_contracts` twin are now depth-bounded, which doubles
+  as cycle detection.
 - `astimezone(UTC)` raised `OverflowError` near `datetime.min`/`datetime.max`.
   An aware datetime is not necessarily representable after the offset shift,
   and `OverflowError` is an `ArithmeticError` — neither module's error type nor

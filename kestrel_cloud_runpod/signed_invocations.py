@@ -150,13 +150,31 @@ def _canonical_json_object(value: object, name: str) -> dict[str, Any]:
     return normalized
 
 
-def _require_exact_json_values(value: object, name: str) -> None:
+# Deeper than any legitimate evidence payload, and far below the interpreter's
+# default recursion limit so this bound is hit first and deterministically
+# rather than depending on the caller's remaining stack.
+_MAX_JSON_DEPTH = 64
+
+
+def _require_exact_json_values(value: object, name: str, depth: int = 0) -> None:
+    # This pre-pass is pure Python and recurses one frame per nesting level.
+    # `canonical_json` alone already contained both hostile shapes — json.dumps
+    # is C-implemented, so it tolerates depths far past sys.getrecursionlimit()
+    # and turns a cycle into ValueError("Circular reference detected") — which
+    # means running this pass FIRST removed containment rather than adding it.
+    # Attacker-controlled `phase_evidence` nested ~1000 deep, or any cyclic
+    # mapping, raised RecursionError: a RuntimeError, so neither
+    # SignedInvocationError nor even ValueError, escaping the contract on the
+    # verification path (a 500, not a 4xx). The depth bound restores it and
+    # doubles as cycle detection, since a cycle exceeds any finite depth.
+    if depth > _MAX_JSON_DEPTH:
+        raise SignedInvocationError(f"{name} nests deeper than {_MAX_JSON_DEPTH}")
     if value is None or isinstance(value, (str, int, float, bool)):
         canonical_json(value)
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
-            _require_exact_json_values(item, f"{name}[{index}]")
+            _require_exact_json_values(item, f"{name}[{index}]", depth + 1)
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
@@ -164,7 +182,7 @@ def _require_exact_json_values(value: object, name: str) -> None:
                 raise SignedInvocationError(
                     f"{name} must be a JSON object with string keys"
                 )
-            _require_exact_json_values(item, f"{name}.{key}")
+            _require_exact_json_values(item, f"{name}.{key}", depth + 1)
         return
     raise SignedInvocationError(f"{name} contains a non-JSON value")
 
@@ -200,11 +218,14 @@ def _relative_route(name: str, value: object) -> str:
 
 
 def _iso(value: datetime) -> str:
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+    # utcoffset() is called on a caller-supplied tzinfo, so a hostile one that
+    # returns a non-timedelta raises TypeError from inside the CHECK itself -
+    # outside any handler. Same "operation after the type check" class.
+    try:
+        aware = isinstance(value, datetime) and value.utcoffset() is not None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SignedInvocationError("signed timestamps must be timezone-aware") from exc
+    if not aware:
         raise SignedInvocationError("signed timestamps must be timezone-aware")
     try:
         # An aware datetime is not necessarily REPRESENTABLE after the offset
