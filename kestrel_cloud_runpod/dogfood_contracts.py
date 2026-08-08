@@ -25,6 +25,7 @@ lifted into a lighter distribution without untangling a transport edge first.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -144,6 +145,46 @@ _RESOURCE_MUTATING_PHASES = (
 )
 
 
+def _contract_boundary(func):
+    """Convert ANY escaping exception into this module's error type.
+
+    THE TERMINATING DECISION, after eleven review rounds spent enumerating
+    hostile value classes one at a time.
+
+    The escape class is not "hostile datetimes" or "hostile mappings" — it is
+    "caller code runs inside a guard". A validator calls `utcoffset()`,
+    `__iter__`, `__eq__`, `__hash__` or `__str__`, and any of those may execute
+    arbitrary user code that raises arbitrary exceptions. For any FINITE set of
+    value classes in a test corpus there is another dunder that escapes, so
+    corpus enumeration provably cannot terminate: rounds 7-11 each closed the
+    instances found and each shipped a new instance.
+
+    This wrapper makes the contract structural instead. Every public entry
+    point is guaranteed to raise only DogfoodSafetyError, whatever a caller's objects do
+    inside it. The specific validators are kept — they produce the precise
+    diagnostics — and the hostile corpus is kept as a regression test for the
+    instances already found. Neither is load-bearing for the contract any more.
+
+    BaseException is deliberately not caught, so KeyboardInterrupt and
+    SystemExit still propagate.
+    """
+
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except DogfoodSafetyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - this IS the contract
+            raise DogfoodSafetyError(
+                f"{func.__qualname__} failed its contract: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    return guarded
+
+
+@_contract_boundary
 def _require_aware(value: object) -> datetime:
     """The single place either module decides a datetime is usable.
 
@@ -168,12 +209,11 @@ def _require_aware(value: object) -> datetime:
         # the previous version of this fix, and a tzinfo raising RuntimeError
         # walked straight through it. This is a trust boundary, not a
         # type check.
-        if isinstance(exc, DogfoodSafetyError):
-            raise
         raise DogfoodSafetyError("dogfood timestamps must be timezone-aware") from exc
     return value
 
 
+@_contract_boundary
 def _iso(value: datetime) -> str:
     # The isinstance check matters as much as the tz one: `observed_at` reaches
     # here straight from `to_evidence`'s caller, so a deserialized ISO *string*
@@ -193,6 +233,7 @@ def _iso(value: datetime) -> str:
         ) from exc
 
 
+@_contract_boundary
 def _parse_time(value: object, name: str) -> datetime:
     if not isinstance(value, str):
         raise DogfoodSafetyError(f"{name} must be an ISO-8601 timestamp")
@@ -212,6 +253,7 @@ def _parse_time(value: object, name: str) -> datetime:
         ) from exc
 
 
+@_contract_boundary
 def _safe_identifier(name: str, value: object) -> str:
     # The `"://" in value` clause is currently unreachable: _SAFE_ID's character
     # class omits "/", so no string can both fullmatch and contain "://". It is
@@ -239,6 +281,7 @@ def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
+@_contract_boundary
 def _materialized_sequence(value: object, name: str) -> tuple[Any, ...]:
     """Copy a caller-supplied sequence exactly once, type-checking FIRST.
 
@@ -257,6 +300,7 @@ def _materialized_sequence(value: object, name: str) -> tuple[Any, ...]:
     return tuple(value)
 
 
+@_contract_boundary
 def _materialized_mapping(value: object, name: str) -> dict[str, Any]:
     """Same contract as _materialized_sequence, for a mapping field."""
 
@@ -265,6 +309,7 @@ def _materialized_mapping(value: object, name: str) -> dict[str, Any]:
     return dict(value)
 
 
+@_contract_boundary
 def _required_payload_string(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise DogfoodSafetyError(f"{name} must be a string")
@@ -276,6 +321,7 @@ def _required_payload_string(value: object, name: str) -> str:
 _MAX_EVIDENCE_DEPTH = 64
 
 
+@_contract_boundary
 def _assert_content_free(
     value: object, *, path: str = "evidence", depth: int = 0
 ) -> None:
@@ -317,6 +363,7 @@ class ResourceIdentity:
     resource_id: str
     resource_name: str
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         if not isinstance(self.resource_type, ResourceType):
             raise DogfoodSafetyError("resource_type must be a ResourceType")
@@ -324,6 +371,7 @@ class ResourceIdentity:
         _safe_identifier("resource_name", self.resource_name)
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ResourceIdentity:
         if not isinstance(value, Mapping) or set(value) != {
             "resource_type",
@@ -349,6 +397,7 @@ class ResourceIdentity:
             ),
         )
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, str]:
         return {
             "resource_type": self.resource_type.value,
@@ -363,6 +412,7 @@ class ExpectedResource:
     resource_name: str
     lane: DogfoodLane
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         if not isinstance(self.resource_type, ResourceType):
             raise DogfoodSafetyError("expected resource_type must be a ResourceType")
@@ -370,6 +420,7 @@ class ExpectedResource:
             raise DogfoodSafetyError("expected resource lane must be a DogfoodLane")
         _safe_identifier("expected resource_name", self.resource_name)
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, str]:
         return {
             "resource_type": self.resource_type.value,
@@ -378,6 +429,7 @@ class ExpectedResource:
         }
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ExpectedResource:
         if not isinstance(value, Mapping) or set(value) != {
             "resource_type",
@@ -415,6 +467,7 @@ class ResourcePlan:
     expected_resources: tuple[ExpectedResource, ...]
     initial_resources: tuple[ExpectedResource, ...] | None = None
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         # Materialize before validating - see the note in PhaseObservation.
         object.__setattr__(
@@ -475,6 +528,7 @@ class ResourcePlan:
         # attempt, so the recorded plan digest was not stable.
         object.__setattr__(self, "initial_resources", tuple(initial))
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -492,10 +546,12 @@ class ResourcePlan:
         }
 
     @property
+    @_contract_boundary
     def digest(self) -> str:
         return _digest(self.to_payload())
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ResourcePlan:
         if not isinstance(value, Mapping) or set(value) != {
             "run_id",
@@ -558,6 +614,7 @@ class ProviderAttemptIdentity:
     started_at: datetime
     completed_at: datetime
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         _safe_identifier("provider attempt run_id", self.run_id)
         _safe_identifier("provider attempt attempt_id", self.attempt_id)
@@ -592,6 +649,7 @@ class ProviderAttemptIdentity:
         _iso(self.started_at)
         _iso(self.completed_at)
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -608,6 +666,7 @@ class ProviderAttemptIdentity:
         }
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ProviderAttemptIdentity:
         if not isinstance(value, Mapping) or set(value) != {
             "run_id",
@@ -674,6 +733,7 @@ class SpendQuote:
     provider_quote_sha256: str | None = None
     endpoint_plan_sha256: str | None = None
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         _safe_identifier("run_id", self.run_id)
         _safe_identifier("quote_id", self.quote_id)
@@ -717,9 +777,11 @@ class SpendQuote:
         _iso(self.expires_at)
 
     @property
+    @_contract_boundary
     def digest(self) -> str:
         return _digest(self.to_payload())
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, str | None]:
         return {
             "run_id": self.run_id,
@@ -762,6 +824,7 @@ class PhaseObservation:
     promotion_count: int = 0
     provider_attempts: tuple[ProviderAttemptIdentity, ...] = ()
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         # Materialize BEFORE validating, not after. Validating first and
         # copying afterwards means the content that gets copied is not the
@@ -861,6 +924,7 @@ class PhaseObservation:
         # already requires a tuple, and tuples cannot alias. The other three
         # were materialized at the TOP of this method, before validation.
 
+    @_contract_boundary
     def binding_payload(self) -> dict[str, Any]:
         """Canonical content-free projection bound by the server receipt."""
 
@@ -895,6 +959,7 @@ class PhaseObservation:
             "provider_attempts": [item.to_payload() for item in self.provider_attempts],
         }
 
+    @_contract_boundary
     def to_evidence(self, *, run_id: str, observed_at: datetime) -> dict[str, Any]:
         # ``run_id`` is caller-supplied and was the one run_id in either module
         # that reached a persisted record without passing through

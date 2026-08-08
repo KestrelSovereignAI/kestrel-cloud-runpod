@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import functools
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
@@ -38,6 +39,46 @@ class SignedInvocationError(ValueError):
     """A signed invocation object failed its exact contract."""
 
 
+def _contract_boundary(func):
+    """Convert ANY escaping exception into this module's error type.
+
+    THE TERMINATING DECISION, after eleven review rounds spent enumerating
+    hostile value classes one at a time.
+
+    The escape class is not "hostile datetimes" or "hostile mappings" — it is
+    "caller code runs inside a guard". A validator calls `utcoffset()`,
+    `__iter__`, `__eq__`, `__hash__` or `__str__`, and any of those may execute
+    arbitrary user code that raises arbitrary exceptions. For any FINITE set of
+    value classes in a test corpus there is another dunder that escapes, so
+    corpus enumeration provably cannot terminate: rounds 7-11 each closed the
+    instances found and each shipped a new instance.
+
+    This wrapper makes the contract structural instead. Every public entry
+    point is guaranteed to raise only SignedInvocationError, whatever a caller's objects do
+    inside it. The specific validators are kept — they produce the precise
+    diagnostics — and the hostile corpus is kept as a regression test for the
+    instances already found. Neither is load-bearing for the contract any more.
+
+    BaseException is deliberately not caught, so KeyboardInterrupt and
+    SystemExit still propagate.
+    """
+
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except SignedInvocationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - this IS the contract
+            raise SignedInvocationError(
+                f"{func.__qualname__} failed its contract: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    return guarded
+
+
+@_contract_boundary
 def canonical_json(value: object) -> str:
     """Serialize one JSON value into the only signed representation."""
 
@@ -60,12 +101,14 @@ def canonical_json(value: object) -> str:
         raise SignedInvocationError("signed value is not canonical JSON") from exc
 
 
+@_contract_boundary
 def canonical_sha256(value: object) -> str:
     """Return the prefixed digest of a canonical JSON value."""
 
     return "sha256:" + hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
+@_contract_boundary
 def utf8_sha256(value: str) -> str:
     """Return the prefixed digest of exact UTF-8 text."""
 
@@ -88,6 +131,7 @@ def utf8_sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+@_contract_boundary
 def phase_evidence_sha256(phase: str, evidence_payload: Mapping[str, Any]) -> str:
     """Digest exact phase evidence after proving its phase discriminator."""
 
@@ -100,12 +144,14 @@ def phase_evidence_sha256(phase: str, evidence_payload: Mapping[str, Any]) -> st
     return canonical_sha256(normalized)
 
 
+@_contract_boundary
 def base64url_encode(value: bytes) -> str:
     if not isinstance(value, bytes):
         raise SignedInvocationError("base64url input must be bytes")
     return base64.urlsafe_b64encode(value).decode().rstrip("=")
 
 
+@_contract_boundary
 def base64url_decode(value: str, name: str = "signed value") -> bytes:
     # The `"=" in value` clause is unreachable for the same reason as the
     # `"://"` clause in dogfood_contracts._safe_identifier: the preceding
@@ -126,18 +172,21 @@ def base64url_decode(value: str, name: str = "signed value") -> bytes:
         raise SignedInvocationError(f"{name} is not valid base64url") from exc
 
 
+@_contract_boundary
 def _safe_identifier(name: str, value: object) -> str:
     if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
         raise SignedInvocationError(f"{name} must be a safe identifier")
     return value
 
 
+@_contract_boundary
 def _required_payload_string(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise SignedInvocationError(f"{name} must be a string")
     return value
 
 
+@_contract_boundary
 def _canonical_json_object(value: object, name: str) -> dict[str, Any]:
     # Redundant rather than unreachable: `_require_exact_json_values` on the
     # next line rejects the same inputs with the same message, and its callers
@@ -163,6 +212,7 @@ def _canonical_json_object(value: object, name: str) -> dict[str, Any]:
 _MAX_JSON_DEPTH = 64
 
 
+@_contract_boundary
 def _require_exact_json_values(value: object, name: str, depth: int = 0) -> None:
     # This pre-pass is pure Python and recurses one frame per nesting level,
     # exhausting the stack far earlier than json.dumps does. `canonical_json`
@@ -197,24 +247,28 @@ def _require_exact_json_values(value: object, name: str, depth: int = 0) -> None
     raise SignedInvocationError(f"{name} contains a non-JSON value")
 
 
+@_contract_boundary
 def _sha256(name: str, value: object) -> str:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise SignedInvocationError(f"{name} must be a prefixed SHA-256 digest")
     return value
 
 
+@_contract_boundary
 def _optional_sha256(name: str, value: object) -> str | None:
     if value is None:
         return None
     return _sha256(name, value)
 
 
+@_contract_boundary
 def _optional_identifier(name: str, value: object) -> str | None:
     if value is None:
         return None
     return _safe_identifier(name, value)
 
 
+@_contract_boundary
 def _relative_route(name: str, value: object) -> str:
     if (
         not isinstance(value, str)
@@ -227,6 +281,7 @@ def _relative_route(name: str, value: object) -> str:
     return value
 
 
+@_contract_boundary
 def _require_aware(value: object) -> datetime:
     """The single place either module decides a datetime is usable.
 
@@ -251,12 +306,11 @@ def _require_aware(value: object) -> datetime:
         # the previous version of this fix, and a tzinfo raising RuntimeError
         # walked straight through it. This is a trust boundary, not a
         # type check.
-        if isinstance(exc, SignedInvocationError):
-            raise
         raise SignedInvocationError("signed timestamps must be timezone-aware") from exc
     return value
 
 
+@_contract_boundary
 def _iso(value: datetime) -> str:
     _require_aware(value)
     try:
@@ -273,6 +327,7 @@ def _iso(value: datetime) -> str:
         ) from exc
 
 
+@_contract_boundary
 def _parse_time(value: object, name: str) -> datetime:
     if not isinstance(value, str):
         raise SignedInvocationError(f"{name} must be an ISO-8601 timestamp")
@@ -309,6 +364,7 @@ class AttestedInvokeRequest:
     quote_digest: str | None = None
     resource_plan_digest: str | None = None
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         for name in ("run_id", "phase", "request_id"):
             _safe_identifier(f"attested invoke {name}", getattr(self, name))
@@ -319,6 +375,7 @@ class AttestedInvokeRequest:
         for name in ("operation_digest", "quote_digest", "resource_plan_digest"):
             _optional_sha256(f"attested invoke {name}", getattr(self, name))
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, str | None]:
         return {
             "run_id": self.run_id,
@@ -334,6 +391,7 @@ class AttestedInvokeRequest:
         }
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> AttestedInvokeRequest:
         fields = {
             "run_id",
@@ -386,6 +444,7 @@ class ReceiptTrust:
     companion_id: str
     agent_id: str
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         _safe_identifier("receipt trust target", self.target)
         _relative_route("receipt trust route", self.route)
@@ -411,6 +470,7 @@ class ReceiptTrust:
             raise SignedInvocationError("receipt trust key must be Ed25519")
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ReceiptTrust:
         expected = {
             "target",
@@ -431,6 +491,7 @@ class ReceiptTrust:
             }
         )
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, str]:
         return {
             "target": self.target,
@@ -476,6 +537,7 @@ class ServerInvokeReceipt:
     contract: str = INVOCATION_RECEIPT_CONTRACT
     signature_algorithm: str = INVOCATION_RECEIPT_SIGNATURE_ALGORITHM
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         if self.contract != INVOCATION_RECEIPT_CONTRACT:
             raise SignedInvocationError("invocation receipt contract differs")
@@ -534,6 +596,7 @@ class ServerInvokeReceipt:
                 "invocation receipt signature must contain 64 bytes"
             )
 
+    @_contract_boundary
     def signed_payload(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -560,6 +623,7 @@ class ServerInvokeReceipt:
             "receipt_id": self.receipt_id,
         }
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, Any]:
         return {
             "contract": self.contract,
@@ -573,6 +637,7 @@ class ServerInvokeReceipt:
         }
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> ServerInvokeReceipt:
         if not isinstance(value, Mapping) or set(value) != {
             "contract",
@@ -689,6 +754,7 @@ class AttestedInvokeResponse:
     phase_evidence: Mapping[str, Any]
     invocation_receipt: ServerInvokeReceipt
 
+    @_contract_boundary
     def __post_init__(self) -> None:
         if not isinstance(self.response, str):
             raise SignedInvocationError("attested invoke response must be a string")
@@ -717,6 +783,7 @@ class AttestedInvokeResponse:
             )
         object.__setattr__(self, "phase_evidence", normalized_evidence)
 
+    @_contract_boundary
     def to_payload(self) -> dict[str, Any]:
         return {
             "response": self.response,
@@ -734,6 +801,7 @@ class AttestedInvokeResponse:
         }
 
     @classmethod
+    @_contract_boundary
     def from_payload(cls, value: object) -> AttestedInvokeResponse:
         fields = {
             "response",
@@ -768,6 +836,7 @@ class AttestedInvokeResponse:
         )
 
 
+@_contract_boundary
 def _optional_payload_string(value: object, name: str) -> str | None:
     if value is None:
         return None
@@ -776,6 +845,7 @@ def _optional_payload_string(value: object, name: str) -> str | None:
     return value
 
 
+@_contract_boundary
 def _strict_int(value: object, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise SignedInvocationError(f"{name} must be an integer")
@@ -785,6 +855,7 @@ def _strict_int(value: object, name: str) -> int:
 class InvokeReceiptVerifier:
     """Verify a receipt and infer its target only from pinned signed identity."""
 
+    @_contract_boundary
     def __init__(self, trusts: Sequence[ReceiptTrust]) -> None:
         # Materialize BEFORE validating, and validate the COPY. Validating the
         # argument and then re-iterating it drains a one-shot input: passing a
@@ -804,6 +875,7 @@ class InvokeReceiptVerifier:
         if len(targets) != len(set(targets)):
             raise SignedInvocationError("receipt verifier targets must be unique")
 
+    @_contract_boundary
     def verify(
         self,
         receipt: ServerInvokeReceipt,
@@ -869,6 +941,7 @@ class InvokeReceiptVerifier:
         return trust.target
 
     @staticmethod
+    @_contract_boundary
     def verify_phase_evidence(
         receipt: ServerInvokeReceipt, evidence_payload: Mapping[str, Any]
     ) -> None:
@@ -891,6 +964,7 @@ class InvokeReceiptSigner:
 
     __slots__ = ("_key", "key_id", "public_key_sha256")
 
+    @_contract_boundary
     def __init__(self, *, private_key_pkcs8_b64: str, key_id: str) -> None:
         self.key_id = _safe_identifier("invocation receipt signer key_id", key_id)
         encoded = base64url_decode(
@@ -923,6 +997,7 @@ class InvokeReceiptSigner:
         )
         self.public_key_sha256 = "sha256:" + hashlib.sha256(public_der).hexdigest()
 
+    @_contract_boundary
     def sign(self, payload: Mapping[str, Any]) -> ServerInvokeReceipt:
         # The signing boundary of the whole module took `dict(payload)`
         # unguarded: `sign(None)` gave TypeError and `sign("string")` gave

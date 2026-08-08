@@ -2,7 +2,7 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
-## [0.9.0] - 2026-08-04
+## [0.9.0] - 2026-08-08
 
 ### Added
 
@@ -64,6 +64,16 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
   a generator of trusts was drained by the validity check, leaving a verifier
   that trusted nothing while blaming later receipts for the empty set.
+- Both modules now guarantee their error contract STRUCTURALLY: every public
+  entry point is wrapped so any escaping exception becomes
+  `SignedInvocationError` / `DogfoodSafetyError`. The escape class was never
+  "hostile datetimes" or "hostile mappings" but "caller code runs inside a
+  guard" — `utcoffset`, `__iter__`, `__eq__`, `__hash__` and `__str__` all
+  execute user code inside validators, so no finite list of hostile input
+  types can close it. The specific validators are retained for their
+  diagnostics; they are simply no longer what the contract rests on.
+  `BaseException` is not caught, so `KeyboardInterrupt` and `SystemExit`
+  still propagate.
 - Timezone awareness is now decided in ONE place per module (`_require_aware`).
   `utcoffset()` executes caller-supplied `tzinfo` code, so the check itself can
   raise — `TypeError` for a non-`timedelta` return, `ValueError` for an

@@ -647,7 +647,6 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
     )
     b64 = base64.urlsafe_b64encode(der).decode().rstrip("=")
     signer = si.InvokeReceiptSigner(private_key_pkcs8_b64=b64, key_id="k")
-    SWEPT_SI_ENTRY_POINTS.add("InvokeReceiptSigner")
 
     # EVERY __init__ parameter, derived. `key_id` was unswept for two rounds
     # because the class name was registered after sweeping one argument.
@@ -700,25 +699,7 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
 # them.
 # ---------------------------------------------------------------------------
 
-SWEPT_SI_ENTRY_POINTS: set[str] = set()
-SWEPT_DC_ENTRY_POINTS: set[str] = set()
-
-
-def _sweep_every_field(cls, baseline, value, contract, registry):
-    """Every field of `cls`, one hostile value at a time."""
-
-    registry.add(cls.__name__)
-    for field in baseline:
-        kwargs = {**baseline, field: value}
-        _assert_contained(
-            lambda c=cls, k=kwargs: c(**k),
-            contract,
-            f"{cls.__name__}({field}=<hostile>)",
-        )
-
-
-def _sweep_every_payload_slot(cls, payload, value, contract, registry):
-    registry.add(cls.__name__)
+def _sweep_every_payload_slot(cls, payload, value, contract):
     for field in payload:
         corrupted = {**payload, field: value}
         _assert_contained(
@@ -744,15 +725,12 @@ def test_signed_payload_types_contain_a_hostile_value_in_every_slot(value):
         (si.ReceiptTrust, _trust_payload(trust)),
         (si.ServerInvokeReceipt, receipt.to_payload()),
     ):
-        _sweep_every_payload_slot(
-            cls, payload, value, si.SignedInvocationError, SWEPT_SI_ENTRY_POINTS
-        )
+        _sweep_every_payload_slot(cls, payload, value, si.SignedInvocationError)
 
     # Constructors, via dataclasses.replace on a valid instance.
     from dataclasses import fields, replace
 
     for instance in (_request, response, trust, receipt):
-        SWEPT_SI_ENTRY_POINTS.add(type(instance).__name__)
         for f in fields(instance):
             _assert_contained(
                 lambda i=instance, n=f.name: replace(i, **{n: value}),
@@ -767,7 +745,6 @@ def test_verify_contains_a_hostile_value_in_every_argument_position(value):
 
     request, response, trust = _signed_response_fixture()
     verifier = si.InvokeReceiptVerifier((trust,))
-    SWEPT_SI_ENTRY_POINTS.add("InvokeReceiptVerifier")
     base = {
         "run_id": request.run_id,
         "phase": request.phase,
@@ -818,7 +795,6 @@ def test_dogfood_remaining_constructors_contain_a_hostile_value(value):
     for _name, cls, payload in _valid_payloads():
         if cls in (dc.ResourcePlan, dc.ProviderAttemptIdentity):
             instance = cls.from_payload(payload)
-            SWEPT_DC_ENTRY_POINTS.add(cls.__name__)
             for f in fields(instance):
                 _assert_contained(
                     lambda i=instance, n=f.name: replace(i, **{n: value}),
@@ -831,7 +807,6 @@ def test_dogfood_remaining_constructors_contain_a_hostile_value(value):
         state_transitions=("queued",),
         timings_ms={"total": 1},
     )
-    SWEPT_DC_ENTRY_POINTS.add("PhaseObservation")
     for f in fields(observation):
         _assert_contained(
             lambda n=f.name: replace(observation, **{n: value}),
@@ -860,50 +835,85 @@ def test_no_public_name_in_either_module_is_left_unswept():
     `| {"ResourceIdentity", "ExpectedResource", "SpendQuote"}` — the hardcoded
     name list the commit claimed to have removed.
 
-    Coverage is now derived by asking what THIS MODULE sweeps, statically:
-    the callable tables, the dataclasses reached through `fields()`, and the
-    payload types reached through `from_payload`. Nothing depends on another
-    test having run first.
+    This list is maintained BY HAND and this docstring says so, because the
+    previous two versions each claimed derivation they did not perform — the
+    second merely retyped the name list from `str` to class object. What the
+    guard genuinely provides is a failure when a new public name appears in
+    either module without being added here; it does NOT prove the sweeps
+    reach these classes. `test_the_contract_boundary_is_load_bearing` is what
+    makes that unnecessary: containment is structural now, so a class the
+    corpus misses is still contained.
     """
 
     def public_names(module):
-        return {
-            name
-            for name, obj in vars(module).items()
-            if not name.startswith("_")
-            and callable(obj)
-            and getattr(obj, "__module__", module.__name__) == module.__name__
-        }
+        """Module-level publics AND public methods on public classes.
+
+        `vars(module)` alone misses a new public method on an existing class,
+        which the file docstring claims is caught.
+        """
+
+        found = set()
+        for name, obj in vars(module).items():
+            if name.startswith("_") or not callable(obj):
+                continue
+            if getattr(obj, "__module__", module.__name__) != module.__name__:
+                continue
+            found.add(name)
+            if inspect.isclass(obj):
+                for attr, member in vars(obj).items():
+                    if attr.startswith("_"):
+                        continue
+                    if callable(member) or isinstance(
+                        member, (classmethod, staticmethod, property)
+                    ):
+                        found.add(f"{name}.{attr}")
+        return found
 
     # Error types and enums carry no caller input of their own.
     inert = {
         "SignedInvocationError", "DogfoodError", "DogfoodSafetyError",
         "DogfoodLane", "DogfoodPhase", "ResourceType",
     }
-    # Derived statically from the sweeps in this file, not from their side
-    # effects. Each entry below is reached by a sweep above; if a sweep is
-    # deleted, its name disappears from here too and the assertion fires.
+    # Hand-maintained; see the docstring.
+    si_classes = (
+        si.AttestedInvokeRequest,
+        si.AttestedInvokeResponse,
+        si.ReceiptTrust,
+        si.ServerInvokeReceipt,
+        si.InvokeReceiptSigner,
+        si.InvokeReceiptVerifier,
+    )
     si_swept = {label.split("(")[0] for label, _ in SIGNED_CALLABLES} | {
-        cls.__name__
-        for cls in (
-            si.AttestedInvokeRequest,
-            si.AttestedInvokeResponse,
-            si.ReceiptTrust,
-            si.ServerInvokeReceipt,
-            si.InvokeReceiptSigner,
-            si.InvokeReceiptVerifier,
-        )
+        cls.__name__ for cls in si_classes
+    } | {
+        # Public methods, each reached by a sweep above. `to_payload` and
+        # `signed_payload` take no caller input, so they are covered by their
+        # class's construction sweep rather than by one of their own.
+        "AttestedInvokeRequest.from_payload", "AttestedInvokeRequest.to_payload",
+        "AttestedInvokeResponse.from_payload", "AttestedInvokeResponse.to_payload",
+        "ReceiptTrust.from_payload", "ReceiptTrust.to_payload",
+        "ServerInvokeReceipt.from_payload", "ServerInvokeReceipt.to_payload",
+        "ServerInvokeReceipt.signed_payload",
+        "InvokeReceiptSigner.sign",
+        "InvokeReceiptVerifier.verify",
+        "InvokeReceiptVerifier.verify_phase_evidence",
     }
+    dc_classes = (
+        dc.ResourceIdentity,
+        dc.ExpectedResource,
+        dc.ResourcePlan,
+        dc.ProviderAttemptIdentity,
+        dc.SpendQuote,
+        dc.PhaseObservation,
+    )
     dc_swept = {label.split("(")[0] for label, _ in DOGFOOD_CALLABLES} | {
-        cls.__name__
-        for cls in (
-            dc.ResourceIdentity,
-            dc.ExpectedResource,
-            dc.ResourcePlan,
-            dc.ProviderAttemptIdentity,
-            dc.SpendQuote,
-            dc.PhaseObservation,
-        )
+        cls.__name__ for cls in dc_classes
+    } | {
+        f"{cls.__name__}.{attr}"
+        for cls in dc_classes
+        for attr in ("from_payload", "to_payload", "digest", "binding_payload",
+                     "to_evidence")
+        if hasattr(cls, attr)
     }
     si_public = public_names(si) - inert
     dc_public = public_names(dc) - inert
@@ -1141,3 +1151,135 @@ def test_canonical_json_contains_the_encoders_own_recursion_limit():
     with pytest.raises(si.SignedInvocationError):
         si.canonical_sha256(deep)
     del deep
+
+
+# ---------------------------------------------------------------------------
+# The boundary itself
+# ---------------------------------------------------------------------------
+
+
+class _RaisingIter:
+    def __iter__(self):
+        raise RuntimeError("hostile __iter__")
+
+
+class _RaisingStr:
+    def __str__(self):
+        raise RuntimeError("hostile __str__")
+
+    def __repr__(self):
+        raise RuntimeError("hostile __repr__")
+
+
+class _FlakyTz(tzinfo):
+    """Deterministic on the first call, hostile afterwards.
+
+    All three hostile tzinfos in the corpus are deterministic, so they are
+    caught by the awareness check. This one passes that check and then raises
+    inside `astimezone`, which is why the guard had to become a boundary
+    rather than a check.
+    """
+
+    def __init__(self, allowed: int = 1) -> None:
+        self._calls = 0
+        self._allowed = allowed
+
+    def utcoffset(self, dt):  # noqa: D102
+        self._calls += 1
+        if self._calls > self._allowed:
+            raise RuntimeError("tz rule table unavailable")
+        return timedelta(0)
+
+    def dst(self, dt):  # noqa: D102
+        return None
+
+
+def test_the_contract_boundary_is_load_bearing():
+    """Hostile dunders that appear in NO corpus must still be contained.
+
+    This is the test that ends the enumerate-value-classes loop. Ten review
+    rounds each added the value classes that had just escaped, and each was
+    followed by another that had not been thought of — because the real class
+    is "caller code runs inside a guard", which is unbounded: `__iter__`,
+    `__eq__`, `__hash__`, `__str__`, `utcoffset` and friends all run user code
+    inside validators.
+
+    So containment stopped depending on the corpus. These inputs are
+    deliberately NOT in HOSTILE_VALUES: if they were, this would test the
+    corpus rather than the boundary.
+    """
+
+    hostile_dt = datetime(2026, 8, 3, 12, 0, tzinfo=_FlakyTz())
+    checks = [
+        (lambda: si.canonical_json(_RaisingIter()), si.SignedInvocationError),
+        (lambda: si.canonical_json(_RaisingStr()), si.SignedInvocationError),
+        (lambda: si.utf8_sha256(_RaisingStr()), si.SignedInvocationError),
+        (lambda: si.base64url_decode(_RaisingStr()), si.SignedInvocationError),
+        (lambda: si.InvokeReceiptVerifier(_RaisingIter()), si.SignedInvocationError),
+        (lambda: si._iso(hostile_dt), si.SignedInvocationError),
+        (lambda: si._parse_time(_RaisingStr(), "t"), si.SignedInvocationError),
+        (lambda: dc._iso(hostile_dt), dc.DogfoodError),
+        (lambda: dc._materialized_sequence(_RaisingIter(), "n"), dc.DogfoodError),
+        (lambda: dc._materialized_mapping(_RaisingIter(), "n"), dc.DogfoodError),
+        (lambda: dc._safe_identifier("n", _RaisingStr()), dc.DogfoodError),
+        (
+            lambda: dc.PhaseObservation(
+                phase=dc.DogfoodPhase.LORA_SUBMIT,
+                state_transitions=_RaisingIter(),
+                timings_ms={"total": 1},
+            ),
+            dc.DogfoodError,
+        ),
+        (
+            lambda: dc.PhaseObservation(
+                phase=dc.DogfoodPhase.LORA_SUBMIT,
+                state_transitions=("queued",),
+                timings_ms={"total": 1},
+            ).to_evidence(run_id="run-0001", observed_at=hostile_dt),
+            dc.DogfoodError,
+        ),
+    ]
+    for index, (fn, contract) in enumerate(checks):
+        _assert_contained(fn, contract, f"boundary[{index}]")
+
+
+def test_every_public_entry_point_carries_the_boundary():
+    """Structural: a new public function must not ship without the wrapper.
+
+    `functools.wraps` copies `__wrapped__`, so decoration is observable.
+    Predicates that must never raise are exempt and named explicitly.
+    """
+
+    exempt = {"_contract_boundary", "_is_sha256"}
+    for module in (si, dc):
+        for name, obj in vars(module).items():
+            if not inspect.isfunction(obj) or name in exempt:
+                continue
+            if getattr(obj, "__module__", None) != module.__name__:
+                continue
+            assert hasattr(obj, "__wrapped__"), (
+                f"{module.__name__}.{name} is not wrapped by _contract_boundary; "
+                f"add it, or add the name to `exempt` with a reason"
+            )
+
+
+def test_stable_id_is_actually_stable():
+    """`_stable_id` shipped twice asserting stability it did not have.
+
+    v1 used `repr`, which embeds a memory address. v2 hashed that repr with
+    `hash()`, which is SipHash-randomized per process — inheriting the
+    instability AND adding to it. Neither had a test.
+    """
+
+    marker = object()
+    corpus_backup = list(HOSTILE_VALUES)
+    try:
+        HOSTILE_VALUES.append(marker)
+        first = _stable_id(marker)
+        assert first == _stable_id(marker)
+        assert " at 0x" not in first
+        assert first.startswith(f"{len(HOSTILE_VALUES) - 1:03d}-")
+        # Position-derived, so it must not depend on repr at all.
+        assert _stable_id(_RaisingStr()) == "_RaisingStr"
+    finally:
+        HOSTILE_VALUES[:] = corpus_backup
