@@ -144,6 +144,36 @@ _RESOURCE_MUTATING_PHASES = (
 )
 
 
+def _require_aware(value: object) -> datetime:
+    """The single place either module decides a datetime is usable.
+
+    `utcoffset()` executes caller-supplied `tzinfo` code, so the CHECK itself
+    can raise: a tzinfo returning a non-timedelta gives TypeError, one
+    returning an out-of-range offset gives ValueError. Both escape the module
+    contract, and DogfoodSafetyError derives from
+    RuntimeError.
+
+    This existed inline at six sites; the round that first fixed it patched
+    two and left four live. One helper, one handler, so there is no next four.
+    """
+
+    try:
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise DogfoodSafetyError("dogfood timestamps must be timezone-aware")
+    except Exception as exc:  # noqa: BLE001 - utcoffset() is arbitrary caller code
+        # Deliberately open. `utcoffset()` executes a caller-supplied tzinfo's
+        # own implementation, so the set of exceptions it can raise is not
+        # ours to enumerate: TypeError and ValueError are the documented ones,
+        # but a tzinfo may raise anything at all. An enumerated tuple here was
+        # the previous version of this fix, and a tzinfo raising RuntimeError
+        # walked straight through it. This is a trust boundary, not a
+        # type check.
+        if isinstance(exc, DogfoodSafetyError):
+            raise
+        raise DogfoodSafetyError("dogfood timestamps must be timezone-aware") from exc
+    return value
+
+
 def _iso(value: datetime) -> str:
     # The isinstance check matters as much as the tz one: `observed_at` reaches
     # here straight from `to_evidence`'s caller, so a deserialized ISO *string*
@@ -151,15 +181,7 @@ def _iso(value: datetime) -> str:
     # of a module whose advertised contract is DogfoodSafetyError. That is the
     # same escape class as the UnsupportedAlgorithm leak in signed_invocations.
     # This now matches si._iso exactly, modulo the exception type.
-    # utcoffset() is called on a caller-supplied tzinfo, so a hostile one that
-    # returns a non-timedelta raises TypeError from inside the CHECK itself -
-    # outside any handler. Same "operation after the type check" class.
-    try:
-        aware = isinstance(value, datetime) and value.utcoffset() is not None
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise DogfoodSafetyError("dogfood timestamps must be timezone-aware") from exc
-    if not aware:
-        raise DogfoodSafetyError("dogfood timestamps must be timezone-aware")
+    _require_aware(value)
     try:
         # See the note in signed_invocations._iso: aware does not imply
         # representable, and OverflowError is an ArithmeticError that escapes
@@ -178,8 +200,10 @@ def _parse_time(value: object, name: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise DogfoodSafetyError(f"{name} must be an ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise DogfoodSafetyError(f"{name} must include a timezone")
+    try:
+        _require_aware(parsed)
+    except DogfoodSafetyError as exc:
+        raise DogfoodSafetyError(f"{name} must include a timezone") from exc
     try:
         return parsed.astimezone(UTC)
     except (OverflowError, OSError) as exc:
@@ -555,15 +579,11 @@ class ProviderAttemptIdentity:
             raise DogfoodSafetyError("provider attempt quote or plan digest is invalid")
         if not isinstance(self.resource, ResourceIdentity):
             raise DogfoodSafetyError("provider attempt resource identity is invalid")
-        if (
-            not isinstance(self.started_at, datetime)
-            or not isinstance(self.completed_at, datetime)
-            or self.started_at.tzinfo is None
-            or self.started_at.utcoffset() is None
-            or self.completed_at.tzinfo is None
-            or self.completed_at.utcoffset() is None
-            or self.started_at > self.completed_at
-        ):
+        # Awareness through the one helper, so a hostile tzinfo cannot raise
+        # from inside the check. The comparison is safe only afterwards.
+        _require_aware(self.started_at)
+        _require_aware(self.completed_at)
+        if self.started_at > self.completed_at:
             raise DogfoodSafetyError("provider attempt interval is invalid")
         # Serializability is part of the contract, not a to_payload() concern:
         # without this an extreme timestamp constructed successfully and raised
@@ -673,15 +693,11 @@ class SpendQuote:
             value = getattr(self, name)
             if value is not None and not _is_sha256(value):
                 raise DogfoodSafetyError(f"spend quote {name} is invalid")
-        if (
-            not isinstance(self.observed_at, datetime)
-            or not isinstance(self.expires_at, datetime)
-            or self.observed_at.tzinfo is None
-            or self.observed_at.utcoffset() is None
-            or self.expires_at.tzinfo is None
-            or self.expires_at.utcoffset() is None
-        ):
-            raise DogfoodSafetyError("spend quote timestamps must be aware")
+        try:
+            _require_aware(self.observed_at)
+            _require_aware(self.expires_at)
+        except DogfoodSafetyError as exc:
+            raise DogfoodSafetyError("spend quote timestamps must be aware") from exc
         try:
             # `observed_at + timedelta(minutes=5)` overflows near datetime.max,
             # raising OverflowError out of a money-invariant validator.

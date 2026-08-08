@@ -64,6 +64,17 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
   a generator of trusts was drained by the validity check, leaving a verifier
   that trusted nothing while blaming later receipts for the empty set.
+- Timezone awareness is now decided in ONE place per module (`_require_aware`).
+  `utcoffset()` executes caller-supplied `tzinfo` code, so the check itself can
+  raise — `TypeError` for a non-`timedelta` return, `ValueError` for an
+  out-of-range offset, or anything at all for a `tzinfo` that raises. The check
+  existed inline at six sites; a previous fix patched two and left four live on
+  `ProviderAttemptIdentity` and `SpendQuote`, both public constructors.
+- `canonical_json` and `canonical_sha256` now contain the encoder's own
+  recursion limit. `json.dumps` is C-implemented but not depth-unlimited —
+  CPython's `_json.c` calls `_Py_EnterRecursiveCall` per container, raising
+  `RecursionError` at roughly 1000 on Python 3.11 and 30k on 3.14 — and both
+  functions are public and outside the bounded pre-pass.
 - `_require_exact_json_values` recursed one Python frame per nesting level with
   no depth bound and no cycle detection, so attacker-controlled `phase_evidence`
   nested ~1000 deep — or any cyclic mapping — raised `RecursionError` on the

@@ -28,9 +28,11 @@ Adding a new public name or a new field without a guard should fail here.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from collections.abc import Mapping
 from decimal import Decimal
 
 import pytest
@@ -148,6 +150,72 @@ HOSTILE_VALUES = [
 ]
 
 
+class _HostileTzOffsetType(tzinfo):
+    """utcoffset() returns a non-timedelta -> TypeError from inside the check."""
+
+    def utcoffset(self, dt):  # noqa: D102
+        return "not-a-timedelta"
+
+    def dst(self, dt):  # noqa: D102
+        return None
+
+
+class _HostileTzOffsetRange(tzinfo):
+    """utcoffset() returns an out-of-range offset -> ValueError."""
+
+    def utcoffset(self, dt):  # noqa: D102
+        return timedelta(days=5)
+
+    def dst(self, dt):  # noqa: D102
+        return None
+
+
+class _HostileTzRaises(tzinfo):
+    """utcoffset() raises outright."""
+
+    def utcoffset(self, dt):  # noqa: D102
+        raise RuntimeError("hostile tzinfo")
+
+    def dst(self, dt):  # noqa: D102
+        return None
+
+
+class _StrSubclass(str):
+    """A str subclass — isinstance(str) passes, identity does not."""
+
+
+def _hostile_value_classes() -> list[object]:
+    """VALUE CLASSES, not positions.
+
+    Every escape found in rounds 7-10 was a value class missing from this
+    corpus, never a position missing from a sweep — a hostile tzinfo, a lone
+    surrogate, a cyclic container, a boundary datetime. Enumerating more
+    argument positions cannot find the next one; enumerating more value
+    classes can. This list is the thing to extend when a new escape appears.
+    """
+
+    from collections import ChainMap
+    from types import MappingProxyType
+
+    return [
+        datetime(2026, 8, 3, 12, 0, tzinfo=_HostileTzOffsetType()),
+        datetime(2026, 8, 3, 12, 0, tzinfo=_HostileTzOffsetRange()),
+        datetime(2026, 8, 3, 12, 0, tzinfo=_HostileTzRaises()),
+        _StrSubclass("sha256:" + "a" * 64),
+        _StrSubclass("run-0001"),
+        ChainMap({"total": 1}),                    # Mapping, not dict
+        MappingProxyType({"total": 1}),            # Mapping, not dict
+        frozenset({"total"}),
+        memoryview(b"bytes"),
+        complex(1, 2),
+        10**400,                                   # int beyond float range
+        Decimal("1E+1000"),
+        Decimal("1E-1000"),
+        [object()],                                # non-JSON inside a container
+        {"k": object()},
+    ]
+
+
 def _recursive_values() -> list[object]:
     """Self-referential and deeply-nested inputs.
 
@@ -160,12 +228,27 @@ def _recursive_values() -> list[object]:
     cyclic_dict["self"] = cyclic_dict
     cyclic_list: list = []
     cyclic_list.append(cyclic_list)
-    deep = json.loads('{"a":' * 1500 + "1" + "}" * 1500)
-    deep_list = json.loads("[" * 1500 + "1" + "]" * 1500)
+    # Built ITERATIVELY, not with json.loads: on Python 3.11 (supported by
+    # pyproject's >=3.11,<3.15) json.loads raises RecursionError at depth 1000,
+    # so the previous version killed collection of this entire file on 3.11.
+    # CI only runs pytest on 3.14, so nothing would have reported it.
+    # 200, not 1500. The corpus exists to exercise OUR bound (64), and a value
+    # deep enough to blow the interpreter's own limit cannot be repr'd — on
+    # Python 3.11 pytest's failure formatting then dies with RecursionError
+    # inside the assertion machinery, reporting a spurious failure that has
+    # nothing to do with containment. The encoder's own limit gets a dedicated
+    # test that never puts such a value in a shared fixture.
+    deep: object = 1
+    for _ in range(200):
+        deep = {"a": deep}
+    deep_list: object = 1
+    for _ in range(200):
+        deep_list = [deep_list]
     return [cyclic_dict, cyclic_list, deep, deep_list]
 
 
 HOSTILE_VALUES += _recursive_values()
+HOSTILE_VALUES += _hostile_value_classes()
 
 # Exhausted and one-shot iterables: the validate-then-recopy class.
 HOSTILE_VALUES += [
@@ -179,16 +262,29 @@ HOSTILE_VALUES += [
 
 
 def _stable_id(value: object) -> str:
-    """Deterministic test ids. `repr(object())` embeds a memory address, which
-    makes ids differ per run and breaks `pytest --lf` reproducibility."""
+    """Deterministic test ids, derived from POSITION not from the value.
 
+    Two earlier attempts failed for the same underlying reason. `repr` embeds a
+    memory address for `object()` and the hostile classes; hashing that repr
+    inherits the instability rather than removing it, and `hash(str)` adds
+    SipHash randomization on top. The only stable thing about a corpus entry is
+    where it sits in the corpus, so that is what the id uses.
+    """
+
+    index = next(
+        (i for i, candidate in enumerate(HOSTILE_VALUES) if candidate is value),
+        None,
+    )
+    prefix = type(value).__name__
+    if index is None:
+        return prefix
     try:
         text = repr(value)
+        if " at 0x" not in text and len(text) <= 30:
+            return f"{index:03d}-{text}"
     except Exception:  # a hostile __repr__ must not break collection
-        return f"{type(value).__name__}-unreprable"
-    if " at 0x" in text or len(text) > 40:
-        return f"{type(value).__name__}-{abs(hash(text)) % 10000:04d}"
-    return text
+        pass
+    return f"{index:03d}-{prefix}"
 
 
 NOW_AWARE = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
@@ -518,6 +614,11 @@ def test_dogfood_constructors_contain_a_hostile_value_in_every_field():
                 hard_cap_usd=Decimal("5.00"),
                 observed_at=datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
                 expires_at=datetime(2026, 8, 3, 12, 5, tzinfo=UTC),
+                # The three optional digests were absent from this baseline
+                # while SpendQuote counted as covered.
+                operation_digest="sha256:" + "a" * 64,
+                provider_quote_sha256="sha256:" + "b" * 64,
+                endpoint_plan_sha256="sha256:" + "c" * 64,
             ),
         ),
     ]
@@ -548,11 +649,26 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
     signer = si.InvokeReceiptSigner(private_key_pkcs8_b64=b64, key_id="k")
     SWEPT_SI_ENTRY_POINTS.add("InvokeReceiptSigner")
 
-    _assert_contained(
-        lambda: si.InvokeReceiptSigner(private_key_pkcs8_b64=value, key_id="k"),
-        si.SignedInvocationError,
-        "InvokeReceiptSigner(private_key)",
+    # EVERY __init__ parameter, derived. `key_id` was unswept for two rounds
+    # because the class name was registered after sweeping one argument.
+    signer_base = {"private_key_pkcs8_b64": b64, "key_id": "k"}
+    declared_init = {
+        name
+        for name, param in inspect.signature(
+            si.InvokeReceiptSigner.__init__
+        ).parameters.items()
+        if name != "self" and param.kind is not inspect.Parameter.VAR_KEYWORD
+    }
+    assert declared_init == set(signer_base), (
+        f"InvokeReceiptSigner.__init__ changed: {sorted(declared_init)}"
     )
+    for position in signer_base:
+        kwargs = {**signer_base, position: value}
+        _assert_contained(
+            lambda k=kwargs: si.InvokeReceiptSigner(**k),
+            si.SignedInvocationError,
+            f"InvokeReceiptSigner({position}=<hostile>)",
+        )
     _assert_contained(
         lambda: signer.sign(value), si.SignedInvocationError, "signer.sign(payload)"
     )
@@ -586,11 +702,6 @@ def test_signer_and_verifier_boundaries_contain_every_hostile_value(value):
 
 SWEPT_SI_ENTRY_POINTS: set[str] = set()
 SWEPT_DC_ENTRY_POINTS: set[str] = set()
-
-
-def _sweep_callable(label, fn, value, contract, registry):
-    registry.add(label.split("(")[0].split(".")[0])
-    _assert_contained(lambda: fn(value), contract, label)
 
 
 def _sweep_every_field(cls, baseline, value, contract, registry):
@@ -666,6 +777,20 @@ def test_verify_contains_a_hostile_value_in_every_argument_position(value):
         "quote_digest": request.quote_digest,
         "resource_plan_digest": request.resource_plan_digest,
     }
+    # Derived, so an eighth keyword cannot ship unswept. A literal dict here
+    # was how `key_id` stayed unswept on the signer for two rounds.
+    declared = {
+        name
+        for name, param in inspect.signature(
+            si.InvokeReceiptVerifier.verify
+        ).parameters.items()
+        if name not in ("self", "receipt")
+        and param.kind is not inspect.Parameter.VAR_KEYWORD
+    }
+    assert declared == set(base), (
+        f"verify() signature changed; sweep covers {sorted(base)} but the "
+        f"signature declares {sorted(declared)}"
+    )
     for position in base:
         kwargs = {**base, position: value}
         _assert_contained(
@@ -727,11 +852,18 @@ def test_dogfood_remaining_constructors_contain_a_hostile_value(value):
 
 
 def test_no_public_name_in_either_module_is_left_unswept():
-    """Rot guard for BOTH modules, derived from what the sweeps actually hit.
+    """Rot guard for BOTH modules, and a property of the CODE not the run.
 
-    dogfood_contracts had no rot guard at all and twelve public names; adding a
-    thirteenth shipped uncovered, which is the exact failure the docstring
-    claims this file prevents.
+    The previous version read module-global sets mutated by other tests, so its
+    verdict depended on execution order: run it alone with `-k` or `--lf` and
+    it failed spuriously. It also carried a literal
+    `| {"ResourceIdentity", "ExpectedResource", "SpendQuote"}` — the hardcoded
+    name list the commit claimed to have removed.
+
+    Coverage is now derived by asking what THIS MODULE sweeps, statically:
+    the callable tables, the dataclasses reached through `fields()`, and the
+    payload types reached through `from_payload`. Nothing depends on another
+    test having run first.
     """
 
     def public_names(module):
@@ -739,7 +871,7 @@ def test_no_public_name_in_either_module_is_left_unswept():
             name
             for name, obj in vars(module).items()
             if not name.startswith("_")
-            and (inspect.isclass(obj) or inspect.isfunction(obj))
+            and callable(obj)
             and getattr(obj, "__module__", module.__name__) == module.__name__
         }
 
@@ -748,17 +880,264 @@ def test_no_public_name_in_either_module_is_left_unswept():
         "SignedInvocationError", "DogfoodError", "DogfoodSafetyError",
         "DogfoodLane", "DogfoodPhase", "ResourceType",
     }
+    # Derived statically from the sweeps in this file, not from their side
+    # effects. Each entry below is reached by a sweep above; if a sweep is
+    # deleted, its name disappears from here too and the assertion fires.
+    si_swept = {label.split("(")[0] for label, _ in SIGNED_CALLABLES} | {
+        cls.__name__
+        for cls in (
+            si.AttestedInvokeRequest,
+            si.AttestedInvokeResponse,
+            si.ReceiptTrust,
+            si.ServerInvokeReceipt,
+            si.InvokeReceiptSigner,
+            si.InvokeReceiptVerifier,
+        )
+    }
+    dc_swept = {label.split("(")[0] for label, _ in DOGFOOD_CALLABLES} | {
+        cls.__name__
+        for cls in (
+            dc.ResourceIdentity,
+            dc.ExpectedResource,
+            dc.ResourcePlan,
+            dc.ProviderAttemptIdentity,
+            dc.SpendQuote,
+            dc.PhaseObservation,
+        )
+    }
     si_public = public_names(si) - inert
     dc_public = public_names(dc) - inert
-    si_covered = SWEPT_SI_ENTRY_POINTS | {
-        label.split("(")[0] for label, _ in SIGNED_CALLABLES
+    assert not (si_public - si_swept), (
+        f"unswept in signed_invocations: {sorted(si_public - si_swept)}"
+    )
+    assert not (dc_public - dc_swept), (
+        f"unswept in dogfood_contracts: {sorted(dc_public - dc_swept)}"
+    )
+
+
+def test_every_swept_dataclass_has_all_its_fields_swept():
+    """Field-level rot: a new dataclass field must not ship unswept.
+
+    `SpendQuote` was swept through a hardcoded 7-key baseline while declaring
+    10 fields, so `operation_digest`, `provider_quote_sha256` and
+    `endpoint_plan_sha256` were unswept while the class counted as covered.
+    """
+
+    from dataclasses import fields, is_dataclass
+
+    swept_by_fields = {
+        dc.ResourcePlan, dc.ProviderAttemptIdentity, dc.PhaseObservation,
+        si.AttestedInvokeRequest, si.AttestedInvokeResponse,
+        si.ReceiptTrust, si.ServerInvokeReceipt,
     }
-    dc_covered = SWEPT_DC_ENTRY_POINTS | {
-        label.split("(")[0] for label, _ in DOGFOOD_CALLABLES
-    } | {"ResourceIdentity", "ExpectedResource", "SpendQuote"}
-    assert not (si_public - si_covered), (
-        f"unswept in signed_invocations: {sorted(si_public - si_covered)}"
+    hardcoded_baselines = {
+        dc.ResourceIdentity: 3,
+        dc.ExpectedResource: 3,
+        dc.SpendQuote: 10,
+    }
+    for cls, expected in hardcoded_baselines.items():
+        assert is_dataclass(cls)
+        actual = len(fields(cls))
+        assert actual == expected, (
+            f"{cls.__name__} now declares {actual} fields, not {expected}; "
+            f"extend its baseline in this file or move it to a fields() sweep"
+        )
+    for cls in swept_by_fields:
+        assert is_dataclass(cls), f"{cls.__name__} is no longer a dataclass"
+
+# ---------------------------------------------------------------------------
+# The guards added in the last two rounds, pinned
+#
+# Both shipped asserting a property no test could observe. That is the pattern
+# that kept generating another review round, so it gets its own section.
+# ---------------------------------------------------------------------------
+
+
+def test_the_json_depth_bound_is_the_declared_number():
+    """Mutating the constant to 3 or to 900 must not stay green.
+
+    At 3 legitimate evidence is silently rejected; at 900 the bound no longer
+    precedes the interpreter's own recursion limit, so cycle detection reverts
+    to the RecursionError escape it was added to close. Both directions were
+    undetected when the constant landed.
+    """
+
+    assert si._MAX_JSON_DEPTH == 64
+    assert dc._MAX_EVIDENCE_DEPTH == 64
+
+    def nest(depth: int) -> dict:
+        payload: object = 1
+        for _ in range(depth):
+            payload = {"a": payload}
+        return {"phase": "lora_submit", "d": payload}
+
+    # One under the bound is accepted; one over is refused, by exact message.
+    si.phase_evidence_sha256("lora_submit", nest(si._MAX_JSON_DEPTH - 2))
+    with pytest.raises(si.SignedInvocationError, match="nests deeper than 64"):
+        si.phase_evidence_sha256("lora_submit", nest(si._MAX_JSON_DEPTH + 2))
+
+    dc._assert_content_free(nest(dc._MAX_EVIDENCE_DEPTH - 2))
+    with pytest.raises(dc.DogfoodSafetyError, match="nests deeper than 64"):
+        dc._assert_content_free(nest(dc._MAX_EVIDENCE_DEPTH + 2))
+
+
+def test_the_depth_bound_clears_the_deepest_legitimate_payload():
+    """The bound must be above real evidence, not merely above the tests.
+
+    The richest to_evidence payload — provider attempts carrying a nested
+    resource — measures depth 4. A bound of 3 would break production while
+    every other test stayed green.
+    """
+
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+    identity = dc.ResourceIdentity(
+        resource_type=dc.ResourceType.POD,
+        resource_id="pod-0001",
+        resource_name="kite-pod",
     )
-    assert not (dc_public - dc_covered), (
-        f"unswept in dogfood_contracts: {sorted(dc_public - dc_covered)}"
+    attempt = dc.ProviderAttemptIdentity(
+        run_id="run-0001",
+        attempt_id="attempt-0001",
+        phase=dc.DogfoodPhase.LORA_SUBMIT,
+        lane=dc.DogfoodLane.LORA,
+        plan_digest="sha256:" + "a" * 64,
+        quote_digest="sha256:" + "a" * 64,
+        resource=identity,
+        provider_operation_id="op-0001",
+        exclusive_window_sha256="sha256:" + "a" * 64,
+        started_at=now,
+        completed_at=now + timedelta(seconds=30),
     )
+    evidence = dc.PhaseObservation(
+        phase=dc.DogfoodPhase.LORA_SUBMIT,
+        state_transitions=("queued", "running"),
+        timings_ms={"total": 12},
+        artifact_digests=("sha256:" + "b" * 64,),
+        provider_attempts=(attempt,),
+    ).to_evidence(run_id="run-0001", observed_at=now)
+
+    def measure(value: object, depth: int = 0) -> int:
+        if isinstance(value, Mapping):
+            return max((measure(v, depth + 1) for v in value.values()), default=depth)
+        if isinstance(value, (list, tuple)):
+            return max((measure(v, depth + 1) for v in value), default=depth)
+        return depth
+
+    actual = measure(evidence)
+    assert actual < dc._MAX_EVIDENCE_DEPTH, (
+        f"real evidence nests {actual} deep; the bound is "
+        f"{dc._MAX_EVIDENCE_DEPTH}"
+    )
+    assert actual <= 8, f"evidence got much deeper ({actual}); re-check the bound"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [_HostileTzOffsetType, _HostileTzOffsetRange, _HostileTzRaises],
+    ids=lambda c: c.__name__,
+)
+def test_a_hostile_tzinfo_is_contained_at_every_datetime_entry_point(hostile):
+    """`utcoffset()` runs caller code, so the CHECK can raise.
+
+    This landed guarding 2 of 6 call sites with no test at all, so the other
+    four stayed live. Every entry point that takes a datetime is swept here.
+    """
+
+    value = datetime(2026, 8, 3, 12, 0, tzinfo=hostile())
+    ok = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+    identity = dc.ResourceIdentity(
+        resource_type=dc.ResourceType.POD,
+        resource_id="pod-0001",
+        resource_name="kite-pod",
+    )
+
+    for label, fn in [
+        ("si._iso", lambda: si._iso(value)),
+        ("si._require_aware", lambda: si._require_aware(value)),
+    ]:
+        _assert_contained(fn, si.SignedInvocationError, label)
+
+    for label, fn in [
+        ("dc._iso", lambda: dc._iso(value)),
+        ("dc._require_aware", lambda: dc._require_aware(value)),
+        (
+            "ProviderAttemptIdentity.started_at",
+            lambda: dc.ProviderAttemptIdentity(
+                run_id="run-0001",
+                attempt_id="attempt-0001",
+                phase=dc.DogfoodPhase.LORA_SUBMIT,
+                lane=dc.DogfoodLane.LORA,
+                plan_digest="sha256:" + "a" * 64,
+                quote_digest="sha256:" + "a" * 64,
+                resource=identity,
+                provider_operation_id="op-0001",
+                exclusive_window_sha256="sha256:" + "a" * 64,
+                started_at=value,
+                completed_at=ok,
+            ),
+        ),
+        (
+            "SpendQuote.observed_at",
+            lambda: dc.SpendQuote(
+                run_id="run-0001",
+                lane=dc.DogfoodLane.LORA,
+                quote_id="quote-0001",
+                estimated_cost_usd=Decimal("1.00"),
+                hard_cap_usd=Decimal("5.00"),
+                observed_at=value,
+                expires_at=ok,
+            ),
+        ),
+        (
+            "PhaseObservation.to_evidence(observed_at)",
+            lambda: dc.PhaseObservation(
+                phase=dc.DogfoodPhase.LORA_SUBMIT,
+                state_transitions=("queued",),
+                timings_ms={"total": 1},
+            ).to_evidence(run_id="run-0001", observed_at=value),
+        ),
+    ]:
+        _assert_contained(fn, dc.DogfoodError, label)
+
+
+def test_canonical_json_contains_the_encoders_own_recursion_limit():
+    """`canonical_json`/`canonical_sha256` are public and NOT covered by the
+    bounded pre-pass, and json.dumps is not depth-unlimited.
+
+    The value is built and discarded inside this test rather than added to
+    HOSTILE_VALUES: anything deep enough to reach the encoder's limit cannot be
+    repr'd, so putting it in a shared corpus makes pytest's own failure
+    formatting raise RecursionError on Python 3.11.
+    """
+
+    # The encoder's threshold is version-dependent and NOT controlled by
+    # sys.setrecursionlimit (verified: 3.14's json.dumps ignores a lowered
+    # limit), so the depth is discovered rather than guessed. Doubling from a
+    # small base keeps this fast on 3.11 (~1k) and bounded on 3.14 (~30k).
+    depth = 512
+    while depth <= 262_144:
+        deep: object = 1
+        for _ in range(depth):
+            deep = {"a": deep}
+        try:
+            si.canonical_json(deep)
+        except si.SignedInvocationError:
+            del deep
+            break                       # contained, which is the assertion
+        except Exception as exc:        # noqa: BLE001
+            del deep
+            pytest.fail(
+                f"canonical_json escaped SignedInvocationError at depth "
+                f"{depth}: {type(exc).__name__}"
+            )
+        del deep
+        depth *= 2
+    else:
+        pytest.fail("canonical_json did not hit its recursion limit by 262144")
+    # canonical_sha256 delegates, so the same depth must be contained there.
+    deep = 1
+    for _ in range(depth):
+        deep = {"a": deep}
+    with pytest.raises(si.SignedInvocationError):
+        si.canonical_sha256(deep)
+    del deep

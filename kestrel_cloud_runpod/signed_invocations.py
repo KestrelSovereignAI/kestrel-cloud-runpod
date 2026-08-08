@@ -49,6 +49,13 @@ def canonical_json(value: object) -> str:
             ensure_ascii=True,
             allow_nan=False,
         )
+    except RecursionError as exc:
+        # json.dumps is C-implemented but NOT depth-unlimited: CPython's
+        # _json.c calls _Py_EnterRecursiveCall per container, so it raises
+        # RecursionError at ~1000 on 3.11 and ~30k on 3.14. RecursionError is
+        # a RuntimeError, so without this it escapes the contract from two
+        # public entry points the bounded pre-pass does not cover.
+        raise SignedInvocationError("signed value nests too deeply") from exc
     except (TypeError, ValueError) as exc:
         raise SignedInvocationError("signed value is not canonical JSON") from exc
 
@@ -157,11 +164,14 @@ _MAX_JSON_DEPTH = 64
 
 
 def _require_exact_json_values(value: object, name: str, depth: int = 0) -> None:
-    # This pre-pass is pure Python and recurses one frame per nesting level.
-    # `canonical_json` alone already contained both hostile shapes — json.dumps
-    # is C-implemented, so it tolerates depths far past sys.getrecursionlimit()
-    # and turns a cycle into ValueError("Circular reference detected") — which
-    # means running this pass FIRST removed containment rather than adding it.
+    # This pre-pass is pure Python and recurses one frame per nesting level,
+    # exhausting the stack far earlier than json.dumps does. `canonical_json`
+    # already turned a CYCLE into ValueError("Circular reference detected"), so
+    # running this pass first removed that containment; on depth it merely
+    # lowered the threshold. (An earlier version of this comment claimed
+    # json.dumps was depth-unlimited. It is not - _json.c calls
+    # _Py_EnterRecursiveCall per container, raising RecursionError at ~1000 on
+    # 3.11 and ~30k on 3.14 - so canonical_json now converts that itself.)
     # Attacker-controlled `phase_evidence` nested ~1000 deep, or any cyclic
     # mapping, raised RecursionError: a RuntimeError, so neither
     # SignedInvocationError nor even ValueError, escaping the contract on the
@@ -217,16 +227,38 @@ def _relative_route(name: str, value: object) -> str:
     return value
 
 
-def _iso(value: datetime) -> str:
-    # utcoffset() is called on a caller-supplied tzinfo, so a hostile one that
-    # returns a non-timedelta raises TypeError from inside the CHECK itself -
-    # outside any handler. Same "operation after the type check" class.
+def _require_aware(value: object) -> datetime:
+    """The single place either module decides a datetime is usable.
+
+    `utcoffset()` executes caller-supplied `tzinfo` code, so the CHECK itself
+    can raise: a tzinfo returning a non-timedelta gives TypeError, one
+    returning an out-of-range offset gives ValueError. Both escape the module
+    contract, and SignedInvocationError derives from
+    ValueError.
+
+    This existed inline at six sites; the round that first fixed it patched
+    two and left four live. One helper, one handler, so there is no next four.
+    """
+
     try:
-        aware = isinstance(value, datetime) and value.utcoffset() is not None
-    except (TypeError, ValueError, OverflowError) as exc:
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise SignedInvocationError("signed timestamps must be timezone-aware")
+    except Exception as exc:  # noqa: BLE001 - utcoffset() is arbitrary caller code
+        # Deliberately open. `utcoffset()` executes a caller-supplied tzinfo's
+        # own implementation, so the set of exceptions it can raise is not
+        # ours to enumerate: TypeError and ValueError are the documented ones,
+        # but a tzinfo may raise anything at all. An enumerated tuple here was
+        # the previous version of this fix, and a tzinfo raising RuntimeError
+        # walked straight through it. This is a trust boundary, not a
+        # type check.
+        if isinstance(exc, SignedInvocationError):
+            raise
         raise SignedInvocationError("signed timestamps must be timezone-aware") from exc
-    if not aware:
-        raise SignedInvocationError("signed timestamps must be timezone-aware")
+    return value
+
+
+def _iso(value: datetime) -> str:
+    _require_aware(value)
     try:
         # An aware datetime is not necessarily REPRESENTABLE after the offset
         # shift: near datetime.min/max, astimezone raises OverflowError, which
@@ -248,8 +280,10 @@ def _parse_time(value: object, name: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise SignedInvocationError(f"{name} must be an ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise SignedInvocationError(f"{name} must include a timezone")
+    try:
+        _require_aware(parsed)
+    except SignedInvocationError as exc:
+        raise SignedInvocationError(f"{name} must include a timezone") from exc
     try:
         return parsed.astimezone(UTC)
     except (OverflowError, OSError) as exc:
