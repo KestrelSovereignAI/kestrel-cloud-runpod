@@ -2,6 +2,131 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.9.0] - 2026-08-08
+
+### Added
+
+- `kestrel_cloud_runpod.signed_invocations`: canonical Ed25519 receipts for
+  authenticated agent invocations — signer, verifier, receipt trust pinning and
+  the attested request/response pair. A serving boundary can import the signer
+  without importing any provider lifecycle code, and an external verifier can
+  pin the exact route, owner, companion, agent and public key that identify one
+  execution target.
+- `kestrel_cloud_runpod.dogfood_contracts`: the product-neutral typed contracts
+  (`DogfoodLane`, `DogfoodPhase`, `ResourceType`, `ResourceIdentity`,
+  `ExpectedResource`, `ResourcePlan`, `ProviderAttemptIdentity`, `SpendQuote`,
+  `PhaseObservation`) extracted from the live dogfood harness so production
+  consumers can depend on the shapes without the orchestrator. Nothing in this
+  module executes a run, provisions a resource, or spends money.
+- `cryptography` as an explicit runtime dependency. It is imported directly by
+  `signed_invocations`; it previously resolved only because `kestrel-sovereign`
+  happened to pull it in transitively.
+
+### Fixed
+
+- `serialization.load_der_{public,private}_key` raises
+  `cryptography.exceptions.UnsupportedAlgorithm`, which is **not** a
+  `ValueError`, for well-formed DER carrying an unrecognized algorithm OID.
+  Both key-loading sites caught only `ValueError`, so that input class escaped
+  `SignedInvocationError` — the module's entire error contract — and skipped
+  the `isinstance(..., Ed25519…)` check entirely. A consumer wrapping signer
+  construction in `except ValueError` died with an unhandled traceback instead
+  of its intended configuration error.
+- `PhaseObservation.to_evidence` now validates both of its caller-supplied
+  arguments. `run_id` reached the persisted evidence record without passing
+  through `_safe_identifier` — the only run_id in either module that did not —
+  and `observed_at` raised `AttributeError` rather than `DogfoodSafetyError`
+  when handed a deserialized ISO string, because `dogfood_contracts._iso`
+  lacked the `isinstance` check its `signed_invocations` twin has. Both are
+  the same escape class as the `UnsupportedAlgorithm` leak above.
+- `AttestedInvokeResponse.to_payload()` returned the live `phase_evidence`
+  mapping on a frozen dataclass, so a caller could mutate signed evidence in
+  place through the returned payload and break `verify_phase_evidence`.
+- Digest validation applied `_SHA256.fullmatch` directly to caller-supplied
+  attributes at four sites. `re.Pattern.fullmatch` raises `TypeError` on
+  non-`str` input, so a `bytes` digest — `hashlib.sha256(x).digest()` where
+  `.hexdigest()` was meant — escaped `DogfoodSafetyError` entirely. All four
+  now route through a guarded helper, matching `signed_invocations._sha256`.
+- `PhaseObservation` and `ResourcePlan` kept the caller's live containers after
+  validating them, on frozen dataclasses whose projections are
+  signature-bound. Appending to the caller's list after construction put
+  unvalidated content into `binding_payload()` — the projection Frinz feeds to
+  `phase_evidence_sha256` — and changed `ResourcePlan.digest`, which
+  `ProviderAttemptIdentity.plan_digest` pins against a billable attempt. Both
+  now type-check, then materialize, then validate content. That ordering is
+  what both failure directions require: validating and copying afterwards
+  re-iterates the input, so a one-shot iterable (`(t.name for t in log)`)
+  validated on the first pass and was copied from an exhausted iterator on the
+  second — the field silently emptied into the signed projection while the
+  emptiness guard was bypassed, a generator being always truthy — whereas
+  copying first would let `tuple(None)`/`dict(None)` raise a bare `TypeError`,
+  which escapes `DogfoodError` entirely since it derives from `RuntimeError`.
+  `InvokeReceiptVerifier.__init__` carried the same validate-then-recopy shape:
+  a generator of trusts was drained by the validity check, leaving a verifier
+  that trusted nothing while blaming later receipts for the empty set.
+- Both modules now guarantee their error contract STRUCTURALLY: every public
+  entry point is wrapped so any escaping exception becomes
+  `SignedInvocationError` / `DogfoodSafetyError`. The escape class was never
+  "hostile datetimes" or "hostile mappings" but "caller code runs inside a
+  guard" — `utcoffset`, `__iter__`, `__eq__`, `__hash__` and `__str__` all
+  execute user code inside validators, so no finite list of hostile input
+  types can close it. The specific validators are retained for their
+  diagnostics; they are simply no longer what the contract rests on.
+  `BaseException` is not caught, so `KeyboardInterrupt` and `SystemExit`
+  still propagate.
+- Timezone awareness is now decided in ONE place per module (`_require_aware`).
+  `utcoffset()` executes caller-supplied `tzinfo` code, so the check itself can
+  raise — `TypeError` for a non-`timedelta` return, `ValueError` for an
+  out-of-range offset, or anything at all for a `tzinfo` that raises. The check
+  existed inline at six sites; a previous fix patched two and left four live on
+  `ProviderAttemptIdentity` and `SpendQuote`, both public constructors.
+- `canonical_json` and `canonical_sha256` now contain the encoder's own
+  recursion limit. `json.dumps` is C-implemented but not depth-unlimited —
+  CPython's `_json.c` calls `_Py_EnterRecursiveCall` per container, raising
+  `RecursionError` at roughly 1000 on Python 3.11 and 30k on 3.14 — and both
+  functions are public and outside the bounded pre-pass.
+- `_require_exact_json_values` recursed one Python frame per nesting level with
+  no depth bound and no cycle detection, so attacker-controlled `phase_evidence`
+  nested ~1000 deep — or any cyclic mapping — raised `RecursionError` on the
+  verification path. That is a `RuntimeError`: neither the module's error type
+  nor a `ValueError`, so a consumer wrapping the boundary returned 500 rather
+  than 4xx. `canonical_json` alone already contained both shapes, because
+  `json.dumps` is C-implemented and turns a cycle into `ValueError`, so running
+  this pure-Python pre-pass first *removed* containment rather than adding it.
+  Both it and its `dogfood_contracts` twin are now depth-bounded, which doubles
+  as cycle detection.
+- `astimezone(UTC)` raised `OverflowError` near `datetime.min`/`datetime.max`.
+  An aware datetime is not necessarily representable after the offset shift,
+  and `OverflowError` is an `ArithmeticError` — neither module's error type nor
+  even a `ValueError`, so it bypassed both contracts and the `except ValueError`
+  wrappers consumers use. Reached from untrusted wire data by an ordinary
+  one-minute offset (`"0001-01-01T00:00:00+00:01"`) through every `from_payload`
+  carrying a timestamp, through the signing boundary, and — because
+  `ProviderAttemptIdentity` validated awareness but never serialized — deferred
+  onto `PhaseObservation.binding_payload()`, the projection Frinz signs.
+  `SpendQuote`'s five-minute window had the same problem in its own arithmetic.
+- `InvokeReceiptVerifier.verify_phase_evidence` had no typedness guard, unlike
+  its sibling `verify`. Being a staticmethod it is the natural call site for a
+  consumer holding a row it deserialized itself, so a plain dict raised
+  `AttributeError` on the verification path.
+- `InvokeReceiptSigner.sign` did not validate its payload argument at the
+  signing boundary: `sign(None)` raised `TypeError` and `sign("string")` raised
+  `ValueError` out of `dict(payload)`.
+- `utf8_sha256` raised `UnicodeEncodeError` for a `str` holding a lone
+  surrogate. `isinstance(value, str)` does not imply UTF-8-encodable, and
+  `json.loads` produces such a string without complaint — a token-truncated
+  emoji cuts a surrogate pair and leaves one. `UnicodeEncodeError` is a
+  `ValueError` but not a `SignedInvocationError`, so it escaped the module's
+  contract on all three paths that digest text, including
+  `InvokeReceiptVerifier.verify(input_text=...)` — the verification path, not
+  merely key loading.
+- `ResourcePlan.phase` and `ProviderAttemptIdentity.phase` were checked for
+  membership in the mutating-phase tuple but never for type. `DogfoodPhase` is
+  a `StrEnum`, so a raw `"lora_submit"` satisfies the membership test, then
+  reaches `.value` in `to_payload`/`digest` and raises `AttributeError` — the
+  same escape from `DogfoodSafetyError` as above, on the signature-bound path,
+  reachable by direct construction (the harness's own route).
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

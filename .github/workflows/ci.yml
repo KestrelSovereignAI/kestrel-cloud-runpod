@@ -112,6 +112,26 @@ jobs:
           from kestrel_sdk.llm import BackendType
           assert issubclass(RunPodFeature, Feature)
           import importlib.metadata as md
+          # Modules production Frinz imports at module scope. Importing
+          # RunPodFeature alone never reaches these, so an undeclared
+          # dependency of theirs would ship undetected.
+          import kestrel_cloud_runpod.signed_invocations as _si
+          import kestrel_cloud_runpod.dogfood_contracts as _dc
+          assert _dc.DogfoodPhase('lora_submit') is _dc.DogfoodPhase.LORA_SUBMIT
+          # cryptography must be OUR declared dependency, not one we inherit.
+          # signed_invocations imports it directly; today it resolves only
+          # because kestrel-sovereign happens to pull it in, and the SDK
+          # already proves that is revocable by putting it behind an extra.
+          # Requires-Dist mixes unconditional deps with extras-conditional
+          # ones ('pytest>=8.0.0; extra == \"test\"'). Demoting cryptography to
+          # an extra is the precise failure mode cited above, so drop every
+          # conditional entry before checking - otherwise the assertion would
+          # still pass on exactly the regression it guards against.
+          import re
+          reqs = md.requires('kestrel-cloud-runpod') or []
+          unconditional = [r for r in reqs if 'extra ==' not in r]
+          dep_names = {re.split(r'[<>=!~;\[ ]', r, maxsplit=1)[0].strip().lower().replace('_', '-') for r in unconditional}
+          assert 'cryptography' in dep_names, f'cryptography is imported but not an unconditional dependency: {reqs}'
           eps = md.entry_points(group='kestrel_sovereign.features')
           names = [e.name for e in eps]
           assert 'RunPodFeature' in names, f'Entry-point not registered: {names}'
@@ -126,18 +146,27 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: lint-and-imports
+    # pyproject declares >=3.11,<3.15, but this job ran 3.14 only. Behaviour
+    # that differs by interpreter therefore shipped unseen: json's recursion
+    # threshold is ~1000 on 3.11 and ~30k on 3.14, which made a deep-JSON
+    # fixture fail at IMPORT on 3.11 while every gate stayed green. The
+    # install-check matrix does cover 3.11, but only imports a module.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
       - name: Install + run pytest
         run: |
-          uv venv --python ${{ env.PYTHON_VERSION }} .venv
+          uv venv --python ${{ matrix.python-version }} .venv
           . .venv/bin/activate
           uv pip install -e '.[test]'
           uv run --no-sync pytest tests/ -v --tb=short -m "not cloud_resource"
-        timeout-minutes: 5
+        timeout-minutes: 8
