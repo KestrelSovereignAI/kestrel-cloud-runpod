@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 96 tracked files (70 `.py`, 8 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 101 tracked files (75 `.py`, 8 `.md`, 18 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -46,6 +46,8 @@ Repo entry points and standard project files.
   - `class RunpodTransport`; `class RunpodControlPlaneClient`; `class RunpodServerlessClient`
 - **kestrel_cloud_runpod/core.py** — RunPod Core Manager Operations.
   - `class RunPodManagerCore`
+- **kestrel_cloud_runpod/dogfood_contracts.py** — Product-neutral typed contracts shared with the live dogfood harness.
+  - `class DogfoodError`; `class DogfoodSafetyError`; `class ResourceType`; `class DogfoodLane`; `class DogfoodPhase`; `class ResourceIdentity`; `class ExpectedResource`; `class ResourcePlan`; `…`
 - **kestrel_cloud_runpod/feature.py** — —
   - `class RunPodFeature`
 - **kestrel_cloud_runpod/inference_provider.py** — SDK inference-lease adapter backed by durable Runpod Ollama capacity.
@@ -90,6 +92,8 @@ Repo entry points and standard project files.
   - `class ServerlessCapacityConstraints`; `class ServerlessEndpointSpec`; `class ServerlessEndpointProfile`; `class PlannedServerlessEndpoint`; `class ServerlessCapacityQuoteRequest`; `class PlannedServerlessCapacityQuoteRequest`; `class PlannedServerlessCapacityQuote`; `class ServerlessEndpointActivationReceipt`; `…`
 - **kestrel_cloud_runpod/serverless_capacity_provider.py** — Runpod REST v2 adapter for finite Serverless quotes and billing.
   - `class ServerlessEndpointActivationError`; `class ServerlessEndpointCleanupError`; `class RunpodServerlessCapacityProvider`
+- **kestrel_cloud_runpod/signed_invocations.py** — Canonical Ed25519 receipts for authenticated agent invocations.
+  - `class SignedInvocationError`; `def canonical_json(value)`; `def canonical_sha256(value)`; `def utf8_sha256(value)`; `def phase_evidence_sha256(phase, evidence_payload)`; `def base64url_encode(value)`; `def base64url_decode(value, name)`; `class AttestedInvokeRequest`; `…`
 - **kestrel_cloud_runpod/training.py** — RunPod LoRA Training Methods.
   - `class RunPodTrainingMixin`
 - **kestrel_cloud_runpod/training_contracts.py** — Compatibility names for the canonical Pod capacity contracts.
@@ -126,6 +130,10 @@ Repo entry points and standard project files.
   - `class MutableClock`; `def constraints(gpu_count)`; `def quote(clock, gpu_count)`; `def request(clock, gpu_count)`; `def profile()`; `class FakeCapabilityStore`; `class FakeCapacityProvider`; `class FakeWorkloadTransport`; `…`
 - **tests/serverless_capacity_test_support.py** — Shared fixtures for finite Serverless capacity tests.
   - `class MutableClock`; `def constraints()`; `def endpoint_spec()`; `def profile()`; `def planned_endpoint()`; `def request()`; `def planned_request()`; `def offer()`; `…`
+- **tests/test_contract_containment.py** — Every public entry point raises ONLY its module's declared error type.
+  - `def test_signed_invocations_helpers_contain_every_hostile_value(label, fn, value)`; `def test_dogfood_helpers_contain_every_hostile_value(label, fn, value)`; `def test_dogfood_from_payload_contains_a_hostile_value_in_every_field(name, cls, payload)`; `def test_dogfood_from_payload_contains_a_hostile_envelope(value)`; `def test_signed_from_payload_contains_a_hostile_value_in_every_field()`; `def test_signed_from_payload_contains_a_hostile_envelope(value)`; `def test_dogfood_constructors_contain_a_hostile_value_in_every_field()`; `def test_signer_and_verifier_boundaries_contain_every_hostile_value(value)`; `…`
+- **tests/test_dogfood_contracts.py** — Coverage for the product-neutral contracts extracted from ``dogfood.py``.
+  - `def test_frinz_facing_surface_is_present(name)`; `def test_module_does_not_import_the_harness_or_the_transport()`; `def test_the_import_guard_catches_every_spelling(source)`; `def test_every_phase_wire_value_is_pinned()`; `def test_every_lane_and_resource_type_wire_value_is_pinned()`; `def test_resource_mutating_phases_are_pinned()`; `def test_content_free_guard_rejects_private_material(payload)`; `def test_content_free_guard_admits_digests_and_timings(payload)`; `…`
 - **tests/test_inference_provider.py** — SDK provider boundary tests for durable private Runpod inference.
   - `def test_dedicated_entry_point_loads_sdk_provider_contract()`; `def test_capabilities_are_deterministic_and_policy_scoped(tmp_path)`; `async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path)`; `async def test_sdk_quote_and_acquire_expose_and_persist_all_in_cost_authority(tmp_path)`; `async def test_sdk_quote_enforces_all_in_ceiling_boundary(tmp_path, overhead, available)`; `async def test_sdk_acquire_revalidates_exact_non_compute_policy(tmp_path)`; `async def test_quote_expires_before_estimated_cold_start_window_closes(tmp_path)`; `async def test_catalog_refresh_cannot_consume_remaining_cold_start_window(tmp_path)`; `…`
 - **tests/test_ollama_contracts.py** — Cost selection and public-route contracts for Ollama leases.
@@ -178,6 +186,8 @@ Repo entry points and standard project files.
   - `def test_endpoint_spec_round_trip_is_canonical_and_digest_protected()`; `def test_endpoint_create_shape_is_pinned_to_api_served_openapi()`; `def test_public_package_exports_serverless_construction_dependencies()`; `def test_quote_round_trip_binds_normalized_parameters_and_exact_cost_math()`; `def test_ambiguous_window_and_receipt_round_trip_are_content_free()`; `def test_quote_rejects_unsafe_or_inconsistent_dimensions(changes, message)`; `def test_quote_deserialization_rejects_raw_or_content_bearing_fields()`; `def test_quote_serialization_is_content_free()`; `…`
 - **tests/test_serverless_capacity_provider.py** — REST v2 adapter tests for Serverless quote and billing reconciliation.
   - `async def test_planned_quote_is_get_only_and_has_no_fabricated_endpoint_id()`; `async def test_activation_creates_exact_zero_baseline_endpoint_and_readback()`; `async def test_activation_narrows_broad_plan_constraints_to_quoted_pool_and_region()`; `async def test_activation_rejects_quote_expiry_and_price_increase_before_create()`; `async def test_ambiguous_create_reconciles_exact_name_without_retry(match_count)`; `async def test_activation_never_adopts_a_preexisting_named_endpoint()`; `async def test_definite_create_failure_still_exposes_preplanned_cleanup_name()`; `async def test_activation_readback_mismatch_fails_with_cleanup_identity(readback)`; `…`
+- **tests/test_signed_invocations.py** — Production contract tests for server-issued invocation receipts.
+  - `def test_attested_request_is_exact_digest_bound_and_hides_input_from_repr()`; `def test_safe_identifiers_are_limited_to_255_characters()`; `def test_attested_request_rejects_every_wrong_string_field_type(field, wrong_value)`; `def test_canonical_digest_and_phase_evidence_reject_ambiguous_values()`; `def test_signed_response_round_trips_and_rejects_unknown_fields()`; `def test_receipt_trust_rejects_every_wrong_string_field_type(field, wrong_value)`; `def test_receipt_rejects_every_wrong_payload_string_field_type(field, wrong_value)`; `def test_receipt_rejects_every_wrong_envelope_string_field_type(section, field, wrong_value)`; `…`
 - **tests/test_training_contracts.py** — Public durable training ownership contracts.
   - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`; `def test_child_request_fingerprint_is_bound_to_its_cleanup_family()`; `def test_request_defaults_root_for_pre_family_callers()`
 - **tests/test_training_mixin.py** — Manager integration for durable training capacity and workload recovery.
