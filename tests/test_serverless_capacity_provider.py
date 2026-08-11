@@ -1731,12 +1731,27 @@ async def test_adoption_requires_the_name_to_identify_exactly_one_endpoint(
         planned_endpoint_resource(endpoint_id="endpoint-someone-else"),
         # Same identity, differing immutable config. These are the cases that
         # matter: the config comparison is the SOLE ownership proof, so testing
-        # only the id mismatch would leave it unexercised at this call site
-        # (the id check short-circuits before _validate_endpoint_config).
-        planned_endpoint_resource(workers={"min": 0, "max": 2, "idleTimeout": 10}),
-        planned_endpoint_resource(env={"SECRET": "not-allowed"}),
-        planned_endpoint_resource(registry="registry-other"),
-        planned_endpoint_resource(networkVolumes=["volume-not-allowed"]),
+        # only the id mismatch would leave it unexercised at this call site.
+        #
+        # Each MUST carry endpoint_id="endpoint-not-ours" to match the listed
+        # endpoint. _validate_planned_endpoint_binding checks identity before
+        # calling _validate_endpoint_config, so a mutation left on the fixture
+        # default id is rejected by the id check and never reaches the config
+        # comparison it exists to exercise — which is exactly what an earlier
+        # version of this test did while claiming the opposite.
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours",
+            workers={"min": 0, "max": 2, "idleTimeout": 10},
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", env={"SECRET": "not-allowed"}
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", registry="registry-other"
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", networkVolumes=["volume-not-allowed"]
+        ),
     ],
 )
 async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan(
