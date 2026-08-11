@@ -96,6 +96,9 @@ class _PlannedControl:
         }
         self.list_calls = 0
         self.get_calls: list[str] = []
+        # Readback transport failure. Without this the fake could only express
+        # "the endpoint is not ours", so the transport branch was untestable.
+        self.get_error: RunPodManagerError | None = None
 
     def list_gpus(self, **_: object):
         return tuple(self.offers)
@@ -114,6 +117,8 @@ class _PlannedControl:
 
     def get_endpoint(self, endpoint_id: str):
         self.get_calls.append(endpoint_id)
+        if self.get_error is not None:
+            raise self.get_error
         return self.readback
 
     def list_endpoint_workers(self, endpoint_id: str):
@@ -1614,3 +1619,320 @@ async def test_final_billing_uses_only_get_requests_and_never_serializes_job_out
     encoded = json.dumps(receipt.to_dict()).lower()
     assert "private-generated-content" not in encoded
     assert "image" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_adoption_recovers_the_endpoint_a_crashed_activation_left_behind() -> None:
+    """The hole activation cannot close: a crash between create and persist.
+
+    `activate_planned_endpoint` reconciles an ambiguous create inside the same
+    call. If the process dies after create_endpoint returns, the endpoint bills
+    with no receipt, and every later activation correctly refuses the taken
+    name — so it is never adopted and never deleted.
+    """
+
+    control = _PlannedControl()
+    orphan = planned_endpoint_resource(endpoint_id="endpoint-orphaned-by-crash")
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    # Adoption lists exactly once, unlike the ambiguous-create path which lists
+    # again after the failed create.
+    control.list_pages = [(orphan,)]
+    control.readback = orphan
+
+    receipt = await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert receipt.endpoint_id == "endpoint-orphaned-by-crash"
+    assert receipt.endpoint_name == accepted.endpoint_name
+    assert receipt.plan_id == accepted.plan_id
+    assert receipt.reconciled_after_ambiguous_create
+    # Adoption observes; it must never create or delete.
+    assert control.create_requests == []
+    assert control.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_ignores_quote_expiry_because_the_money_is_already_spent() -> (
+    None
+):
+    """Freshness governs whether we may START spending, never whether we may STOP.
+
+    The quote has certainly expired by the time a crash is recovered — a
+    60-second TTL cannot outlive an instance recycle and a sweep. Refusing here
+    would not save the money; it would guarantee the loss, because nothing else
+    can identify the endpoint afterwards.
+
+    Contrast `test_activation_rejects_quote_expiry_and_price_increase_before
+    _create`, which pins the opposite for activation. Both are correct.
+    """
+
+    clock = MutableClock()
+    control = _PlannedControl()
+    orphan = planned_endpoint_resource(endpoint_id="endpoint-expired-quote")
+    provider = RunpodServerlessCapacityProvider(control_client=control, clock=clock)
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    control.list_pages = [(orphan,)]
+    control.readback = orphan
+    clock.value = accepted.expires_at
+    # A price increase must not block adoption either: we are not buying.
+    control.offers[:] = [offer(secure_price_per_hr=99.0)]
+
+    receipt = await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert receipt.endpoint_id == "endpoint-expired-quote"
+    assert control.create_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("match_count", [0, 2])
+async def test_adoption_requires_the_name_to_identify_exactly_one_endpoint(
+    match_count: int,
+) -> None:
+    """Zero means nothing is spending. Two means the name stopped identifying.
+
+    Guessing which of two to adopt could hand a live endpoint to the wrong plan
+    and get it deleted, so both refuse — while still reporting what was seen.
+    """
+
+    control = _PlannedControl()
+    matches = tuple(
+        planned_endpoint_resource(endpoint_id=f"endpoint-dup-{index}")
+        for index in range(match_count)
+    )
+    control.list_pages = [matches]
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    with pytest.raises(ServerlessEndpointActivationError) as caught:
+        await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert caught.value.endpoint_name == accepted.endpoint_name
+    assert caught.value.observed_endpoint_ids == tuple(item.id for item in matches)
+    assert control.create_requests == []
+    assert control.delete_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "readback",
+    [
+        # A different identity under the same name.
+        planned_endpoint_resource(endpoint_id="endpoint-someone-else"),
+        # Same identity, differing immutable config. These are the cases that
+        # matter: the config comparison is the SOLE ownership proof, so testing
+        # only the id mismatch would leave it unexercised at this call site.
+        #
+        # Each MUST carry endpoint_id="endpoint-not-ours" to match the listed
+        # endpoint. _validate_planned_endpoint_binding checks identity before
+        # calling _validate_endpoint_config, so a mutation left on the fixture
+        # default id is rejected by the id check and never reaches the config
+        # comparison it exists to exercise — which is exactly what an earlier
+        # version of this test did while claiming the opposite.
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours",
+            workers={"min": 0, "max": 2, "idleTimeout": 10},
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", env={"SECRET": "not-allowed"}
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", registry="registry-other"
+        ),
+        planned_endpoint_resource(
+            endpoint_id="endpoint-not-ours", networkVolumes=["volume-not-allowed"]
+        ),
+    ],
+)
+async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan(
+    readback,
+) -> None:
+    """Identity, not a clock, is what makes adoption safe.
+
+    A same-named endpoint whose REST v2 readback does not match the accepted
+    plan belongs to someone else. Adopting it would attach another owner's
+    resource to this plan and later delete it.
+
+    Parametrized over config mutations as well as identity, mirroring
+    `test_activation_readback_mismatch_fails_with_cleanup_identity`.
+    """
+
+    control = _PlannedControl()
+    stranger = planned_endpoint_resource(endpoint_id="endpoint-not-ours")
+    control.list_pages = [(stranger,)]
+    control.readback = readback
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    with pytest.raises(ServerlessEndpointActivationError, match="does not bind"):
+        await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert control.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_readback_transport_failure_is_not_an_ownership_verdict() -> None:
+    """A 500 must not be reported as "this endpoint is not ours".
+
+    `RunPodAPIError` derives from `RunPodManagerError`, so catching the base
+    class around the readback would collapse three different states into one
+    verdict: a transient 5xx, a 401 after a key rotation, and a genuine config
+    mismatch. Only the last says anything about ownership.
+
+    That distinction is the whole point of this method. A caller told "not
+    ours" is entitled to stop trying — and stopping is what strands a billing
+    endpoint forever. Reporting a 500 that way would reopen the exact hole
+    adoption exists to close, through a transient failure instead of a crash.
+
+    So the transport error keeps its own type and propagates, and the caller
+    retries.
+    """
+
+    control = _PlannedControl()
+    orphan = planned_endpoint_resource(endpoint_id="endpoint-unreadable")
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    control.list_pages = [(orphan,)]
+    control.get_error = RunPodManagerError("upstream 500 after retries")
+
+    with pytest.raises(RunPodManagerError) as caught:
+        await provider.adopt_planned_endpoint(request_value, accepted)
+
+    # Specifically NOT the ownership verdict.
+    assert not isinstance(caught.value, ServerlessEndpointActivationError)
+    assert "does not bind" not in str(caught.value)
+    assert control.delete_calls == []
+    assert control.create_requests == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_and_activation_build_one_identical_receipt_shape() -> None:
+    """Both paths go through `_planned_activation_receipt`.
+
+    `provider_activation_id` is a digest over an identity dict that mirrors the
+    receipt field for field, and the receipt recomputes it on construction. Two
+    hand-built copies could drift; this pins that they are one construction
+    differing only in timestamps and the reconciliation flag.
+    """
+
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    activated = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+
+    control.list_pages = [(control.created,)]
+    adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert adopted.endpoint_id == activated.endpoint_id
+    assert adopted.endpoint_readback_sha256 == activated.endpoint_readback_sha256
+    assert adopted.plan_id == activated.plan_id
+    assert adopted.quote_sha256 == activated.quote_sha256
+    assert adopted.operation_digest == activated.operation_digest
+    # Differing only where they should.
+    assert activated.reconciled_after_ambiguous_create is False
+    assert adopted.reconciled_after_ambiguous_create is True
+    assert adopted.provider_activation_id != activated.provider_activation_id
+    # Both survive a round trip, i.e. both identity digests recompute.
+    assert ServerlessEndpointActivationReceipt.from_dict(adopted.to_dict()) == adopted
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_receipt_deletes_the_endpoint_it_adopted() -> None:
+    """The path adoption exists for: stop the spend.
+
+    This is the half that matters and the half that was untested. An earlier
+    version of this test asserted instead that an adopted receipt "can never
+    bill" — by setting the clock to expiry itself and then observing that
+    `authorize_planned_submission` rejects an expired quote. That asserts on
+    the harness's own setup and on a pre-existing property of `assert_fresh`,
+    not on anything `adopt_planned_endpoint` does.
+
+    It was also wrong as a claim. Adoption imposes NO freshness constraint, so
+    adopting on a still-fresh quote yields a receipt that settles exactly like
+    an activation receipt. Settlement being unavailable in a real recovery is
+    an operational consequence of the quote having expired, not a guarantee
+    this method makes. See the docstring, which now says only that.
+    """
+
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    control.list_pages = [(control.created,)]
+    adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+    assert control.delete_calls == []
+
+    control.list_pages = [()]
+    cleanup = await provider.cleanup_planned_endpoint(
+        request_value,
+        accepted,
+        adopted,
+    )
+
+    assert control.delete_calls == [adopted.endpoint_id]
+    assert cleanup.endpoint_id == adopted.endpoint_id
+    assert cleanup.provider_activation_id == adopted.provider_activation_id
+    assert ServerlessEndpointCleanupReceipt.from_dict(cleanup.to_dict()) == cleanup
+
+
+@pytest.mark.asyncio
+async def test_adoption_imposes_no_freshness_constraint_in_either_direction() -> None:
+    """Adoption works on an expired quote AND on a fresh one.
+
+    The expired case is the recovery scenario. The fresh case is included
+    because it is reachable — nothing gates adoption on expiry — and pinning it
+    stops the docstring drifting back to claiming a settlement guarantee that
+    only holds when the quote happens to have expired.
+    """
+
+    for advance_to_expiry in (False, True):
+        clock = MutableClock()
+        control = _PlannedControl()
+        provider = RunpodServerlessCapacityProvider(
+            control_client=control, clock=clock
+        )
+        request_value = planned_request()
+        accepted = await provider.quote_planned_endpoint(request_value)
+
+        control.list_pages = [(control.created,)]
+        if advance_to_expiry:
+            clock.value = accepted.expires_at
+
+        adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+
+        assert adopted.endpoint_id == control.created.id
+        assert adopted.reconciled_after_ambiguous_create
+        assert control.create_requests == []
+        assert control.delete_calls == []

@@ -2,6 +2,67 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.0] - 2026-08-11
+
+### Added
+
+- `RunpodServerlessCapacityProvider.adopt_planned_endpoint(request, quote)`:
+  recover the activation receipt for an endpoint a CRASHED activation already
+  created.
+
+  `activate_planned_endpoint` already reconciles an ambiguous create, but only
+  inside the same call. If the process dies between `create_endpoint` returning
+  and the caller persisting the receipt — an instance recycle, an OOM, a deploy
+  — the endpoint exists and bills while no receipt does. Every later activation
+  then finds the planned name taken and raises, correctly and permanently, so
+  the endpoint is never adopted and never deleted. It just bills, with nothing
+  left pointing at it.
+
+  Deliberately a separate method rather than a relaxation of activation.
+  Activation must keep refusing a pre-existing name — adopting during a
+  purchase would treat an unauthorized endpoint as bought — and that refusal
+  stays pinned by `test_activation_never_adopts_a_preexisting_named_endpoint`.
+
+  Adoption does NOT check quote freshness, which is the point rather than an
+  oversight. The quote has certainly expired: a 60-second TTL cannot outlive a
+  crash and a recovery sweep. Refusing on an expired quote does not save the
+  money, it guarantees the loss, because nothing else can identify the endpoint
+  afterwards. Freshness governs whether we may START spending, never whether we
+  may STOP. Safety comes from identity instead, which is strictly stronger than
+  a clock: exactly one endpoint may carry the plan-scoped name, and its REST v2
+  readback must match this plan's immutable configuration — the endpoint spec
+  plus the `gpu_pool` and `data_center_id` the quote fixes — through the same
+  `_validate_planned_endpoint_binding` activation uses. Anything failing either
+  check is somebody else's and is left alone.
+
+  A readback that fails to TRANSPORT is not an ownership verdict. `RunPodAPIError`
+  derives from `RunPodManagerError`, so catching the base class around the read
+  would report a 5xx or a rotated key as "not ours" — and a caller told that is
+  entitled to stop trying, which is what strands a billing endpoint. Transport
+  errors keep their own type and propagate for retry; only a successful read
+  whose config does not match the plan produces the ownership verdict.
+
+  The receipt's three instants are all this process's adoption time. The
+  endpoint's own `createdAt` IS available (the vendored v2 schema makes it a
+  required date-time on the Endpoint resource) and is deliberately unused:
+  `create_started_at` means "when this process began the create call", Runpod's
+  `createdAt` answers a different question, and mixing a provider clock into
+  fields otherwise sourced from `self._clock` would break the receipt's
+  `create_started_at <= activated_at <= readback_at` invariant under skew.
+  Carrying the provider instant properly needs its own field and a
+  contract-version bump rather than being smuggled into one that means
+  something else.
+
+  The call mutates nothing — it lists, reads back, and returns a receipt
+  carrying `reconciled_after_ambiguous_create=True`, which can be fed to
+  `cleanup_planned_endpoint` to delete the endpoint. Adoption imposes no
+  freshness constraint, so a receipt adopted while the quote is still fresh
+  settles like any activation receipt; in a real recovery the quote has expired
+  and `authorize_planned_submission` refuses it. That is a consequence of the
+  timing, not a guarantee this method makes.
+
+  Consumers on `>=0.9.0,<0.10` must widen their cap to reach this.
+
 ## [0.9.0] - 2026-08-08
 
 ### Added

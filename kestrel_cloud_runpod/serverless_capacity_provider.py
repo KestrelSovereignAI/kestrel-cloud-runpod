@@ -261,6 +261,191 @@ class RunpodServerlessCapacityProvider:
                 observed_endpoint_ids=(created.id,),
             ) from exc
         readback_at = self._now()
+        return self._planned_activation_receipt(
+            quote,
+            endpoint_id=endpoint.id,
+            readback_digest=readback_digest,
+            create_started_at=create_started_at,
+            activated_at=activated_at,
+            readback_at=readback_at,
+            reconciled_after_ambiguous_create=ambiguous,
+        )
+
+    async def adopt_planned_endpoint(
+        self,
+        request: PlannedServerlessCapacityQuoteRequest,
+        quote: PlannedServerlessCapacityQuote,
+    ) -> ServerlessEndpointActivationReceipt:
+        """Recover the receipt for an endpoint a CRASHED activation already created.
+
+        ``activate_planned_endpoint`` reconciles an ambiguous create inside the
+        same call, but only inside it. If the process dies between
+        ``create_endpoint`` returning and the caller persisting the receipt —
+        an instance recycle, an OOM, a deploy — the endpoint exists and is
+        billing while no receipt does. Every later activation attempt then
+        finds the name already taken and raises, correctly and permanently, so
+        the endpoint is never adopted and never deleted. It simply bills.
+
+        This is the operation that closes that hole, and it is deliberately a
+        SEPARATE method rather than a relaxation of activation:
+
+        * ``activate_planned_endpoint`` must keep refusing a pre-existing name.
+          Adopting during a purchase would let an endpoint nobody authorized be
+          silently treated as bought, and that refusal is a pinned invariant
+          (``test_activation_never_adopts_a_preexisting_named_endpoint``).
+        * Adoption is not a purchase. The money is already being spent. The
+          only question is whether we can still name the thing spending it.
+
+        ADOPTION DOES NOT CHECK QUOTE FRESHNESS, and that is the point rather
+        than an oversight. The quote has certainly expired — a 60-second TTL
+        cannot outlive a crash and a recovery sweep. Refusing to adopt on an
+        expired quote does not save the money; it guarantees the money is lost,
+        because nothing else can identify the endpoint afterwards. Freshness
+        governs whether we may START spending, never whether we may STOP.
+
+        Safety comes from identity instead, and it is strictly stronger than a
+        clock:
+
+        * exactly one endpoint may carry the planned name (which is plan-scoped,
+          so a collision is not an ordinary event);
+        * its REST v2 readback must match this plan's immutable configuration
+          via ``_validate_planned_endpoint_binding`` — the same check
+          activation itself performs. Precisely: the endpoint spec, plus the
+          ``gpu_pool`` and ``data_center_id`` the quote fixes. Two quotes with
+          identical placement for the same plan are therefore indistinguishable
+          to it, which is harmless — they describe the same endpoint — but it
+          is a config match, not proof of which quote created the endpoint.
+
+        An endpoint that fails either check is somebody else's and is left
+        alone. Nothing here mutates the control plane: it lists, reads back,
+        and returns a receipt.
+
+        The returned receipt carries ``reconciled_after_ambiguous_create=True``
+        and describes the same real endpoint the crashed attempt created, so it
+        can be fed to ``cleanup_planned_endpoint`` — which performs no freshness
+        check — to delete it. That is the path this method exists for.
+
+        On settlement, stated precisely because it is easy to overclaim: this
+        method imposes NO freshness constraint, so a receipt adopted while the
+        quote is still fresh settles exactly like an activation receipt. In a
+        real recovery the quote has expired, and ``authorize_planned_submission``
+        calls ``quote.assert_fresh``, so settlement is unavailable there. That
+        is an operational consequence of the timing, NOT a guarantee this method
+        makes. If a non-settleable adoption is ever wanted, it needs its own
+        receipt marker and a contract-version bump rather than being inferred
+        from a clock.
+        """
+
+        _validate_planned_request_binding(request, quote)
+
+        existing = await asyncio.to_thread(self.control_client.list_endpoints)
+        named = tuple(item for item in existing if item.name == quote.endpoint_name)
+        if len(named) != 1:
+            # Zero: nothing to adopt here and now. Usually that means the
+            # create never landed, but ``list_endpoints`` is a single
+            # unpaginated GET with no read-your-writes guarantee, so it can
+            # also mean "not visible yet" — which is why this refuses rather
+            # than concluding no endpoint exists, and why a caller should keep
+            # sweeping instead of closing the ledger row on one empty result.
+            # More than one: the name no longer identifies a single resource,
+            # and guessing which to adopt could delete a live endpoint.
+            # Both are reported with the observed identities so an operator can
+            # act on facts rather than on this refusal.
+            raise ServerlessEndpointActivationError(
+                "Planned Serverless endpoint name does not identify exactly one "
+                "endpoint to adopt",
+                endpoint_name=quote.endpoint_name,
+                observed_endpoint_ids=tuple(item.id for item in named),
+            )
+
+        observed = named[0]
+
+        # The readback call is deliberately NOT inside the validation try below.
+        # ``RunPodAPIError`` derives from ``RunPodManagerError``, so catching the
+        # base class here would report a 500, a 401 after a key rotation, or a
+        # read timeout as "this endpoint is not ours" — an ownership verdict a
+        # caller is entitled to act on by giving up. That would reopen exactly
+        # the hole this method closes, through a transient failure instead of a
+        # crash. A transport error means UNKNOWN, so it propagates with its own
+        # type and the caller retries.
+        endpoint = await asyncio.to_thread(
+            self.control_client.get_endpoint, observed.id
+        )
+
+        try:
+            readback_digest = _validate_planned_endpoint_binding(
+                endpoint,
+                request.endpoint,
+                expected_endpoint_id=observed.id,
+                gpu_pool=quote.gpu_pool,
+                data_center_id=quote.data_center_id,
+            )
+        except RunPodManagerError as exc:
+            # Only a validation failure reaches here, and only that justifies
+            # the ownership verdict: we read the endpoint successfully and its
+            # immutable config does not match the accepted plan.
+            raise ServerlessEndpointActivationError(
+                "Pre-existing Serverless endpoint does not bind to the accepted "
+                "plan and was not adopted",
+                endpoint_name=quote.endpoint_name,
+                observed_endpoint_ids=(observed.id,),
+            ) from exc
+
+        # Stamped AFTER the successful readback, as activation stamps its own
+        # readback_at. Taking it before the call would make the same receipt
+        # field mean "just before the read" here and "just after" there.
+        adopted_at = self._now()
+        return self._planned_activation_receipt(
+            quote,
+            endpoint_id=endpoint.id,
+            readback_digest=readback_digest,
+            # All three instants are this process's adoption time, on
+            # ``self._clock``.
+            #
+            # The endpoint's own creation time IS available — the vendored
+            # Runpod v2 schema makes ``createdAt`` a required date-time on the
+            # Endpoint resource, so it is in ``endpoint.raw`` — and it is not
+            # used here on purpose, so nobody has to rediscover why.
+            #
+            # ``create_started_at`` means "when THIS process began the create
+            # call". For an adoption there was no create call in this process,
+            # and Runpod's ``createdAt`` answers a different question: when the
+            # provider created it. Mixing a provider clock into fields the rest
+            # of this receipt sources from ``self._clock`` would make them
+            # incomparable, and the receipt enforces
+            # ``create_started_at <= activated_at <= readback_at``
+            # (serverless_capacity_contracts.py) — an ordering that only holds
+            # if one clock produced all three. Provider skew would turn a valid
+            # adoption into a ValueError.
+            #
+            # Carrying the provider instant properly needs its own receipt
+            # field and a contract-version bump; it is not smuggled into a
+            # field that means something else.
+            create_started_at=adopted_at,
+            activated_at=adopted_at,
+            readback_at=adopted_at,
+            reconciled_after_ambiguous_create=True,
+        )
+
+    def _planned_activation_receipt(
+        self,
+        quote: PlannedServerlessCapacityQuote,
+        *,
+        endpoint_id: str,
+        readback_digest: str,
+        create_started_at: datetime,
+        activated_at: datetime,
+        readback_at: datetime,
+        reconciled_after_ambiguous_create: bool,
+    ) -> ServerlessEndpointActivationReceipt:
+        """Build one activation receipt and its self-describing identity digest.
+
+        Shared by activation and adoption. The identity dict and the receipt
+        must stay in step — ``provider_activation_id`` is a digest OVER that
+        dict and the receipt recomputes it on construction — so they are built
+        in one place rather than in two that can drift.
+        """
+
         activation_identity = {
             "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
             "provider_quote_id": quote.provider_quote_id,
@@ -268,14 +453,14 @@ class RunpodServerlessCapacityProvider:
             "plan_id": quote.plan_id,
             "plan_sha256": quote.plan_sha256,
             "endpoint_name": quote.endpoint_name,
-            "endpoint_id": endpoint.id,
+            "endpoint_id": endpoint_id,
             "endpoint_spec_sha256": quote.endpoint_spec_sha256,
             "operation_digest": quote.operation_digest,
             "endpoint_readback_sha256": readback_digest,
             "create_started_at": iso_datetime(create_started_at),
             "activated_at": iso_datetime(activated_at),
             "readback_at": iso_datetime(readback_at),
-            "reconciled_after_ambiguous_create": ambiguous,
+            "reconciled_after_ambiguous_create": reconciled_after_ambiguous_create,
         }
         return ServerlessEndpointActivationReceipt(
             schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
@@ -288,14 +473,14 @@ class RunpodServerlessCapacityProvider:
             plan_id=quote.plan_id,
             plan_sha256=quote.plan_sha256,
             endpoint_name=quote.endpoint_name,
-            endpoint_id=endpoint.id,
+            endpoint_id=endpoint_id,
             endpoint_spec_sha256=quote.endpoint_spec_sha256,
             operation_digest=quote.operation_digest,
             endpoint_readback_sha256=readback_digest,
             create_started_at=create_started_at,
             activated_at=activated_at,
             readback_at=readback_at,
-            reconciled_after_ambiguous_create=ambiguous,
+            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
         )
 
     async def authorize_planned_submission(
