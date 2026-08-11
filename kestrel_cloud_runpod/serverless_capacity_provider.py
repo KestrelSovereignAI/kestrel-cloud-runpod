@@ -322,16 +322,18 @@ class RunpodServerlessCapacityProvider:
 
         The returned receipt carries ``reconciled_after_ambiguous_create=True``
         and describes the same real endpoint the crashed attempt created, so it
-        can be fed to ``cleanup_planned_endpoint``, which performs no freshness
-        check.
+        can be fed to ``cleanup_planned_endpoint`` — which performs no freshness
+        check — to delete it. That is the path this method exists for.
 
-        IT CANNOT BE SETTLED. ``authorize_planned_submission`` calls
-        ``quote.assert_fresh``, and an adopted receipt necessarily carries an
-        expired quote, so no billing receipt can be derived from one. Re-quoting
-        does not help either: ``validate_quote`` then rejects the mismatched
-        ``provider_quote_id``/``quote_sha256``. Adoption exists to STOP the
-        spend, not to make it chargeable — recovering the ability to bill for a
-        crashed activation would need its own contract change.
+        On settlement, stated precisely because it is easy to overclaim: this
+        method imposes NO freshness constraint, so a receipt adopted while the
+        quote is still fresh settles exactly like an activation receipt. In a
+        real recovery the quote has expired, and ``authorize_planned_submission``
+        calls ``quote.assert_fresh``, so settlement is unavailable there. That
+        is an operational consequence of the timing, NOT a guarantee this method
+        makes. If a non-settleable adoption is ever wanted, it needs its own
+        receipt marker and a contract-version bump rather than being inferred
+        from a clock.
         """
 
         _validate_planned_request_binding(request, quote)

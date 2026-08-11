@@ -1865,49 +1865,74 @@ async def test_adoption_and_activation_build_one_identical_receipt_shape() -> No
 
 
 @pytest.mark.asyncio
-async def test_an_adopted_receipt_can_delete_but_can_never_bill() -> None:
-    """Adoption stops spend; it must not become a way to charge for it.
+async def test_an_adopted_receipt_deletes_the_endpoint_it_adopted() -> None:
+    """The path adoption exists for: stop the spend.
 
-    An adopted receipt necessarily carries an expired quote — that is the
-    premise of the whole method. `authorize_planned_submission` calls
-    `quote.assert_fresh`, so no billing receipt can be derived from one, and
-    re-quoting does not help because `validate_quote` then rejects the
-    mismatched provider_quote_id.
+    This is the half that matters and the half that was untested. An earlier
+    version of this test asserted instead that an adopted receipt "can never
+    bill" — by setting the clock to expiry itself and then observing that
+    `authorize_planned_submission` rejects an expired quote. That asserts on
+    the harness's own setup and on a pre-existing property of `assert_fresh`,
+    not on anything `adopt_planned_endpoint` does.
 
-    Pinned as a test rather than left as a docstring claim: the previous two
-    review rounds both blocked on prose that asserted more than the code did.
+    It was also wrong as a claim. Adoption imposes NO freshness constraint, so
+    adopting on a still-fresh quote yields a receipt that settles exactly like
+    an activation receipt. Settlement being unavailable in a real recovery is
+    an operational consequence of the quote having expired, not a guarantee
+    this method makes. See the docstring, which now says only that.
     """
 
-    clock = MutableClock()
     control = _PlannedControl()
-    provider = RunpodServerlessCapacityProvider(control_client=control, clock=clock)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
     request_value = planned_request()
     accepted = await provider.quote_planned_endpoint(request_value)
 
     control.list_pages = [(control.created,)]
-    clock.value = accepted.expires_at
     adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+    assert control.delete_calls == []
 
-    # The billing door is shut on the quote the adopted receipt must carry.
-    with pytest.raises(RunPodManagerError, match="expired"):
-        await provider.authorize_planned_submission(
-            request_value,
-            accepted,
-            adopted,
-            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
-            exclusive_window_sha256="a" * 64,
+    control.list_pages = [()]
+    cleanup = await provider.cleanup_planned_endpoint(
+        request_value,
+        accepted,
+        adopted,
+    )
+
+    assert control.delete_calls == [adopted.endpoint_id]
+    assert cleanup.endpoint_id == adopted.endpoint_id
+    assert cleanup.provider_activation_id == adopted.provider_activation_id
+    assert ServerlessEndpointCleanupReceipt.from_dict(cleanup.to_dict()) == cleanup
+
+
+@pytest.mark.asyncio
+async def test_adoption_imposes_no_freshness_constraint_in_either_direction() -> None:
+    """Adoption works on an expired quote AND on a fresh one.
+
+    The expired case is the recovery scenario. The fresh case is included
+    because it is reachable — nothing gates adoption on expiry — and pinning it
+    stops the docstring drifting back to claiming a settlement guarantee that
+    only holds when the quote happens to have expired.
+    """
+
+    for advance_to_expiry in (False, True):
+        clock = MutableClock()
+        control = _PlannedControl()
+        provider = RunpodServerlessCapacityProvider(
+            control_client=control, clock=clock
         )
+        request_value = planned_request()
+        accepted = await provider.quote_planned_endpoint(request_value)
 
-    # And a freshly re-observed quote is rejected as a different quote, so the
-    # expiry cannot be sidestepped by re-quoting.
-    #
-    # The clock is advanced, not rewound. A quote is a pure function of its
-    # inputs including the observation instant, so re-quoting at the ORIGINAL
-    # instant reproduces a byte-identical quote that `validate_quote` would
-    # accept — a scenario reachable only in a test that can move time
-    # backwards. Real re-quoting always happens later.
-    clock.value = accepted.expires_at + timedelta(seconds=1)
-    requoted = await provider.quote_planned_endpoint(request_value)
-    assert requoted.quote_sha256 != adopted.quote_sha256
-    with pytest.raises(RunPodManagerError):
-        adopted.validate_quote(requoted)
+        control.list_pages = [(control.created,)]
+        if advance_to_expiry:
+            clock.value = accepted.expires_at
+
+        adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+
+        assert adopted.endpoint_id == control.created.id
+        assert adopted.reconciled_after_ambiguous_create
+        assert control.create_requests == []
+        assert control.delete_calls == []

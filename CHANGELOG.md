@@ -55,10 +55,11 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
   The call mutates nothing — it lists, reads back, and returns a receipt
   carrying `reconciled_after_ambiguous_create=True`, which can be fed to
-  `cleanup_planned_endpoint` to delete the endpoint. It CANNOT be settled:
-  `authorize_planned_submission` calls `quote.assert_fresh` and an adopted
-  receipt necessarily carries an expired quote, so no billing receipt derives
-  from one. Adoption stops the spend; it does not make it chargeable.
+  `cleanup_planned_endpoint` to delete the endpoint. Adoption imposes no
+  freshness constraint, so a receipt adopted while the quote is still fresh
+  settles like any activation receipt; in a real recovery the quote has expired
+  and `authorize_planned_submission` refuses it. That is a consequence of the
+  timing, not a guarantee this method makes.
 
   Consumers on `>=0.9.0,<0.10` must widen their cap to reach this.
 
