@@ -308,9 +308,13 @@ class RunpodServerlessCapacityProvider:
 
         * exactly one endpoint may carry the planned name (which is plan-scoped,
           so a collision is not an ordinary event);
-        * its REST v2 readback must bind to this exact request and quote via
-          ``_validate_planned_endpoint_binding`` — the same immutable-config
-          digest activation itself validates.
+        * its REST v2 readback must match this plan's immutable configuration
+          via ``_validate_planned_endpoint_binding`` — the same check
+          activation itself performs. Precisely: the endpoint spec, plus the
+          ``gpu_pool`` and ``data_center_id`` the quote fixes. Two quotes with
+          identical placement for the same plan are therefore indistinguishable
+          to it, which is harmless — they describe the same endpoint — but it
+          is a config match, not proof of which quote created the endpoint.
 
         An endpoint that fails either check is somebody else's and is left
         alone. Nothing here mutates the control plane: it lists, reads back,
@@ -339,7 +343,6 @@ class RunpodServerlessCapacityProvider:
             )
 
         observed = named[0]
-        adopted_at = self._now()
 
         # The readback call is deliberately NOT inside the validation try below.
         # ``RunPodAPIError`` derives from ``RunPodManagerError``, so catching the
@@ -372,6 +375,10 @@ class RunpodServerlessCapacityProvider:
                 observed_endpoint_ids=(observed.id,),
             ) from exc
 
+        # Stamped AFTER the successful readback, as activation stamps its own
+        # readback_at. Taking it before the call would make the same receipt
+        # field mean "just before the read" here and "just after" there.
+        adopted_at = self._now()
         return self._planned_activation_receipt(
             quote,
             endpoint_id=endpoint.id,

@@ -1724,19 +1724,38 @@ async def test_adoption_requires_the_name_to_identify_exactly_one_endpoint(
 
 
 @pytest.mark.asyncio
-async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan() -> None:
+@pytest.mark.parametrize(
+    "readback",
+    [
+        # A different identity under the same name.
+        planned_endpoint_resource(endpoint_id="endpoint-someone-else"),
+        # Same identity, differing immutable config. These are the cases that
+        # matter: the config comparison is the SOLE ownership proof, so testing
+        # only the id mismatch would leave it unexercised at this call site
+        # (the id check short-circuits before _validate_endpoint_config).
+        planned_endpoint_resource(workers={"min": 0, "max": 2, "idleTimeout": 10}),
+        planned_endpoint_resource(env={"SECRET": "not-allowed"}),
+        planned_endpoint_resource(registry="registry-other"),
+        planned_endpoint_resource(networkVolumes=["volume-not-allowed"]),
+    ],
+)
+async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan(
+    readback,
+) -> None:
     """Identity, not a clock, is what makes adoption safe.
 
     A same-named endpoint whose REST v2 readback does not match the accepted
     plan belongs to someone else. Adopting it would attach another owner's
     resource to this plan and later delete it.
+
+    Parametrized over config mutations as well as identity, mirroring
+    `test_activation_readback_mismatch_fails_with_cleanup_identity`.
     """
 
     control = _PlannedControl()
     stranger = planned_endpoint_resource(endpoint_id="endpoint-not-ours")
     control.list_pages = [(stranger,)]
-    # Readback returns a different identity than the one listed.
-    control.readback = planned_endpoint_resource(endpoint_id="endpoint-someone-else")
+    control.readback = readback
     provider = RunpodServerlessCapacityProvider(
         control_client=control,
         clock=MutableClock(),

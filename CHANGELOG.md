@@ -30,7 +30,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   afterwards. Freshness governs whether we may START spending, never whether we
   may STOP. Safety comes from identity instead, which is strictly stronger than
   a clock: exactly one endpoint may carry the plan-scoped name, and its REST v2
-  readback must bind to this exact request and quote through the same
+  readback must match this plan's immutable configuration — the endpoint spec
+  plus the `gpu_pool` and `data_center_id` the quote fixes — through the same
   `_validate_planned_endpoint_binding` activation uses. Anything failing either
   check is somebody else's and is left alone.
 
