@@ -1847,3 +1847,52 @@ async def test_adoption_and_activation_build_one_identical_receipt_shape() -> No
     assert adopted.provider_activation_id != activated.provider_activation_id
     # Both survive a round trip, i.e. both identity digests recompute.
     assert ServerlessEndpointActivationReceipt.from_dict(adopted.to_dict()) == adopted
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_receipt_can_delete_but_can_never_bill() -> None:
+    """Adoption stops spend; it must not become a way to charge for it.
+
+    An adopted receipt necessarily carries an expired quote — that is the
+    premise of the whole method. `authorize_planned_submission` calls
+    `quote.assert_fresh`, so no billing receipt can be derived from one, and
+    re-quoting does not help because `validate_quote` then rejects the
+    mismatched provider_quote_id.
+
+    Pinned as a test rather than left as a docstring claim: the previous two
+    review rounds both blocked on prose that asserted more than the code did.
+    """
+
+    clock = MutableClock()
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(control_client=control, clock=clock)
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    control.list_pages = [(control.created,)]
+    clock.value = accepted.expires_at
+    adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+
+    # The billing door is shut on the quote the adopted receipt must carry.
+    with pytest.raises(RunPodManagerError, match="expired"):
+        await provider.authorize_planned_submission(
+            request_value,
+            accepted,
+            adopted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+            exclusive_window_sha256="a" * 64,
+        )
+
+    # And a freshly re-observed quote is rejected as a different quote, so the
+    # expiry cannot be sidestepped by re-quoting.
+    #
+    # The clock is advanced, not rewound. A quote is a pure function of its
+    # inputs including the observation instant, so re-quoting at the ORIGINAL
+    # instant reproduces a byte-identical quote that `validate_quote` would
+    # accept — a scenario reachable only in a test that can move time
+    # backwards. Real re-quoting always happens later.
+    clock.value = accepted.expires_at + timedelta(seconds=1)
+    requoted = await provider.quote_planned_endpoint(request_value)
+    assert requoted.quote_sha256 != adopted.quote_sha256
+    with pytest.raises(RunPodManagerError):
+        adopted.validate_quote(requoted)

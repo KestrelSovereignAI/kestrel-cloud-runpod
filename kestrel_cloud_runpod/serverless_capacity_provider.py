@@ -320,9 +320,18 @@ class RunpodServerlessCapacityProvider:
         alone. Nothing here mutates the control plane: it lists, reads back,
         and returns a receipt.
 
-        The returned receipt carries ``reconciled_after_ambiguous_create=True``.
-        It describes the same real endpoint the crashed attempt created, so a
-        caller can settle or delete it through the ordinary paths.
+        The returned receipt carries ``reconciled_after_ambiguous_create=True``
+        and describes the same real endpoint the crashed attempt created, so it
+        can be fed to ``cleanup_planned_endpoint``, which performs no freshness
+        check.
+
+        IT CANNOT BE SETTLED. ``authorize_planned_submission`` calls
+        ``quote.assert_fresh``, and an adopted receipt necessarily carries an
+        expired quote, so no billing receipt can be derived from one. Re-quoting
+        does not help either: ``validate_quote`` then rejects the mismatched
+        ``provider_quote_id``/``quote_sha256``. Adoption exists to STOP the
+        spend, not to make it chargeable — recovering the ability to bill for a
+        crashed activation would need its own contract change.
         """
 
         _validate_planned_request_binding(request, quote)
@@ -330,11 +339,16 @@ class RunpodServerlessCapacityProvider:
         existing = await asyncio.to_thread(self.control_client.list_endpoints)
         named = tuple(item for item in existing if item.name == quote.endpoint_name)
         if len(named) != 1:
-            # Zero: nothing to adopt — the create never landed, so there is no
-            # spend to stop. More than one: the name no longer identifies a
-            # single resource, and guessing which to adopt could delete a live
-            # endpoint. Both are reported with the observed identities so an
-            # operator can act on facts rather than on this refusal.
+            # Zero: nothing to adopt here and now. Usually that means the
+            # create never landed, but ``list_endpoints`` is a single
+            # unpaginated GET with no read-your-writes guarantee, so it can
+            # also mean "not visible yet" — which is why this refuses rather
+            # than concluding no endpoint exists, and why a caller should keep
+            # sweeping instead of closing the ledger row on one empty result.
+            # More than one: the name no longer identifies a single resource,
+            # and guessing which to adopt could delete a live endpoint.
+            # Both are reported with the observed identities so an operator can
+            # act on facts rather than on this refusal.
             raise ServerlessEndpointActivationError(
                 "Planned Serverless endpoint name does not identify exactly one "
                 "endpoint to adopt",
