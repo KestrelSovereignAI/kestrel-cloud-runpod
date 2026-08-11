@@ -2,6 +2,44 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.0] - 2026-08-11
+
+### Added
+
+- `RunpodServerlessCapacityProvider.adopt_planned_endpoint(request, quote)`:
+  recover the activation receipt for an endpoint a CRASHED activation already
+  created.
+
+  `activate_planned_endpoint` already reconciles an ambiguous create, but only
+  inside the same call. If the process dies between `create_endpoint` returning
+  and the caller persisting the receipt — an instance recycle, an OOM, a deploy
+  — the endpoint exists and bills while no receipt does. Every later activation
+  then finds the planned name taken and raises, correctly and permanently, so
+  the endpoint is never adopted and never deleted. It just bills, with nothing
+  left pointing at it.
+
+  Deliberately a separate method rather than a relaxation of activation.
+  Activation must keep refusing a pre-existing name — adopting during a
+  purchase would treat an unauthorized endpoint as bought — and that refusal
+  stays pinned by `test_activation_never_adopts_a_preexisting_named_endpoint`.
+
+  Adoption does NOT check quote freshness, which is the point rather than an
+  oversight. The quote has certainly expired: a 60-second TTL cannot outlive a
+  crash and a recovery sweep. Refusing on an expired quote does not save the
+  money, it guarantees the loss, because nothing else can identify the endpoint
+  afterwards. Freshness governs whether we may START spending, never whether we
+  may STOP. Safety comes from identity instead, which is strictly stronger than
+  a clock: exactly one endpoint may carry the plan-scoped name, and its REST v2
+  readback must bind to this exact request and quote through the same
+  `_validate_planned_endpoint_binding` activation uses. Anything failing either
+  check is somebody else's and is left alone.
+
+  The call mutates nothing — it lists, reads back, and returns a receipt
+  carrying `reconciled_after_ambiguous_create=True`, so a caller can settle or
+  delete the endpoint through the ordinary paths.
+
+  Consumers on `>=0.9.0,<0.10` must widen their cap to reach this.
+
 ## [0.9.0] - 2026-08-08
 
 ### Added

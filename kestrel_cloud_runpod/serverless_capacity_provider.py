@@ -298,6 +298,135 @@ class RunpodServerlessCapacityProvider:
             reconciled_after_ambiguous_create=ambiguous,
         )
 
+    async def adopt_planned_endpoint(
+        self,
+        request: PlannedServerlessCapacityQuoteRequest,
+        quote: PlannedServerlessCapacityQuote,
+    ) -> ServerlessEndpointActivationReceipt:
+        """Recover the receipt for an endpoint a CRASHED activation already created.
+
+        ``activate_planned_endpoint`` reconciles an ambiguous create inside the
+        same call, but only inside it. If the process dies between
+        ``create_endpoint`` returning and the caller persisting the receipt —
+        an instance recycle, an OOM, a deploy — the endpoint exists and is
+        billing while no receipt does. Every later activation attempt then
+        finds the name already taken and raises, correctly and permanently, so
+        the endpoint is never adopted and never deleted. It simply bills.
+
+        This is the operation that closes that hole, and it is deliberately a
+        SEPARATE method rather than a relaxation of activation:
+
+        * ``activate_planned_endpoint`` must keep refusing a pre-existing name.
+          Adopting during a purchase would let an endpoint nobody authorized be
+          silently treated as bought, and that refusal is a pinned invariant
+          (``test_activation_never_adopts_a_preexisting_named_endpoint``).
+        * Adoption is not a purchase. The money is already being spent. The
+          only question is whether we can still name the thing spending it.
+
+        ADOPTION DOES NOT CHECK QUOTE FRESHNESS, and that is the point rather
+        than an oversight. The quote has certainly expired — a 60-second TTL
+        cannot outlive a crash and a recovery sweep. Refusing to adopt on an
+        expired quote does not save the money; it guarantees the money is lost,
+        because nothing else can identify the endpoint afterwards. Freshness
+        governs whether we may START spending, never whether we may STOP.
+
+        Safety comes from identity instead, and it is strictly stronger than a
+        clock:
+
+        * exactly one endpoint may carry the planned name (which is plan-scoped,
+          so a collision is not an ordinary event);
+        * its REST v2 readback must bind to this exact request and quote via
+          ``_validate_planned_endpoint_binding`` — the same immutable-config
+          digest activation itself validates.
+
+        An endpoint that fails either check is somebody else's and is left
+        alone. Nothing here mutates the control plane: it lists, reads back,
+        and returns a receipt.
+
+        The returned receipt carries ``reconciled_after_ambiguous_create=True``.
+        It describes the same real endpoint the crashed attempt created, so a
+        caller can settle or delete it through the ordinary paths.
+        """
+
+        _validate_planned_request_binding(request, quote)
+
+        existing = await asyncio.to_thread(self.control_client.list_endpoints)
+        named = tuple(item for item in existing if item.name == quote.endpoint_name)
+        if len(named) != 1:
+            # Zero: nothing to adopt — the create never landed, so there is no
+            # spend to stop. More than one: the name no longer identifies a
+            # single resource, and guessing which to adopt could delete a live
+            # endpoint. Both are reported with the observed identities so an
+            # operator can act on facts rather than on this refusal.
+            raise ServerlessEndpointActivationError(
+                "Planned Serverless endpoint name does not identify exactly one "
+                "endpoint to adopt",
+                endpoint_name=quote.endpoint_name,
+                observed_endpoint_ids=tuple(item.id for item in named),
+            )
+
+        observed = named[0]
+        adopted_at = self._now()
+        try:
+            endpoint = await asyncio.to_thread(
+                self.control_client.get_endpoint, observed.id
+            )
+            readback_digest = _validate_planned_endpoint_binding(
+                endpoint,
+                request.endpoint,
+                expected_endpoint_id=observed.id,
+                gpu_pool=quote.gpu_pool,
+                data_center_id=quote.data_center_id,
+            )
+        except RunPodManagerError as exc:
+            raise ServerlessEndpointActivationError(
+                "Pre-existing Serverless endpoint does not bind to the accepted "
+                "plan and was not adopted",
+                endpoint_name=quote.endpoint_name,
+                observed_endpoint_ids=(observed.id,),
+            ) from exc
+
+        activation_identity = {
+            "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            "provider_quote_id": quote.provider_quote_id,
+            "quote_sha256": quote.quote_sha256,
+            "plan_id": quote.plan_id,
+            "plan_sha256": quote.plan_sha256,
+            "endpoint_name": quote.endpoint_name,
+            "endpoint_id": endpoint.id,
+            "endpoint_spec_sha256": quote.endpoint_spec_sha256,
+            "operation_digest": quote.operation_digest,
+            "endpoint_readback_sha256": readback_digest,
+            # The crashed attempt's create/activate instants are unknowable from
+            # here, so the adoption instant stands for all three rather than a
+            # fabricated earlier time. The receipt says when we learned of the
+            # endpoint, which is the only thing this process actually observed.
+            "create_started_at": iso_datetime(adopted_at),
+            "activated_at": iso_datetime(adopted_at),
+            "readback_at": iso_datetime(adopted_at),
+            "reconciled_after_ambiguous_create": True,
+        }
+        return ServerlessEndpointActivationReceipt(
+            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
+            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            provider_activation_id=(
+                "runpod-serverless-activation:" + json_sha256(activation_identity)
+            ),
+            provider_quote_id=quote.provider_quote_id,
+            quote_sha256=quote.quote_sha256,
+            plan_id=quote.plan_id,
+            plan_sha256=quote.plan_sha256,
+            endpoint_name=quote.endpoint_name,
+            endpoint_id=endpoint.id,
+            endpoint_spec_sha256=quote.endpoint_spec_sha256,
+            operation_digest=quote.operation_digest,
+            endpoint_readback_sha256=readback_digest,
+            create_started_at=adopted_at,
+            activated_at=adopted_at,
+            readback_at=adopted_at,
+            reconciled_after_ambiguous_create=True,
+        )
+
     async def authorize_planned_submission(
         self,
         request: PlannedServerlessCapacityQuoteRequest,
