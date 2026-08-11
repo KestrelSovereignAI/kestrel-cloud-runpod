@@ -96,6 +96,9 @@ class _PlannedControl:
         }
         self.list_calls = 0
         self.get_calls: list[str] = []
+        # Readback transport failure. Without this the fake could only express
+        # "the endpoint is not ours", so the transport branch was untestable.
+        self.get_error: RunPodManagerError | None = None
 
     def list_gpus(self, **_: object):
         return tuple(self.offers)
@@ -114,6 +117,8 @@ class _PlannedControl:
 
     def get_endpoint(self, endpoint_id: str):
         self.get_calls.append(endpoint_id)
+        if self.get_error is not None:
+            raise self.get_error
         return self.readback
 
     def list_endpoint_workers(self, endpoint_id: str):
@@ -1743,3 +1748,83 @@ async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan() -> 
         await provider.adopt_planned_endpoint(request_value, accepted)
 
     assert control.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_readback_transport_failure_is_not_an_ownership_verdict() -> None:
+    """A 500 must not be reported as "this endpoint is not ours".
+
+    `RunPodAPIError` derives from `RunPodManagerError`, so catching the base
+    class around the readback would collapse three different states into one
+    verdict: a transient 5xx, a 401 after a key rotation, and a genuine config
+    mismatch. Only the last says anything about ownership.
+
+    That distinction is the whole point of this method. A caller told "not
+    ours" is entitled to stop trying — and stopping is what strands a billing
+    endpoint forever. Reporting a 500 that way would reopen the exact hole
+    adoption exists to close, through a transient failure instead of a crash.
+
+    So the transport error keeps its own type and propagates, and the caller
+    retries.
+    """
+
+    control = _PlannedControl()
+    orphan = planned_endpoint_resource(endpoint_id="endpoint-unreadable")
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    control.list_pages = [(orphan,)]
+    control.get_error = RunPodManagerError("upstream 500 after retries")
+
+    with pytest.raises(RunPodManagerError) as caught:
+        await provider.adopt_planned_endpoint(request_value, accepted)
+
+    # Specifically NOT the ownership verdict.
+    assert not isinstance(caught.value, ServerlessEndpointActivationError)
+    assert "does not bind" not in str(caught.value)
+    assert control.delete_calls == []
+    assert control.create_requests == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_and_activation_build_one_identical_receipt_shape() -> None:
+    """Both paths go through `_planned_activation_receipt`.
+
+    `provider_activation_id` is a digest over an identity dict that mirrors the
+    receipt field for field, and the receipt recomputes it on construction. Two
+    hand-built copies could drift; this pins that they are one construction
+    differing only in timestamps and the reconciliation flag.
+    """
+
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+
+    activated = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+
+    control.list_pages = [(control.created,)]
+    adopted = await provider.adopt_planned_endpoint(request_value, accepted)
+
+    assert adopted.endpoint_id == activated.endpoint_id
+    assert adopted.endpoint_readback_sha256 == activated.endpoint_readback_sha256
+    assert adopted.plan_id == activated.plan_id
+    assert adopted.quote_sha256 == activated.quote_sha256
+    assert adopted.operation_digest == activated.operation_digest
+    # Differing only where they should.
+    assert activated.reconciled_after_ambiguous_create is False
+    assert adopted.reconciled_after_ambiguous_create is True
+    assert adopted.provider_activation_id != activated.provider_activation_id
+    # Both survive a round trip, i.e. both identity digests recompute.
+    assert ServerlessEndpointActivationReceipt.from_dict(adopted.to_dict()) == adopted

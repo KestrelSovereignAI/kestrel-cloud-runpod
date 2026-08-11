@@ -261,37 +261,10 @@ class RunpodServerlessCapacityProvider:
                 observed_endpoint_ids=(created.id,),
             ) from exc
         readback_at = self._now()
-        activation_identity = {
-            "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
-            "provider_quote_id": quote.provider_quote_id,
-            "quote_sha256": quote.quote_sha256,
-            "plan_id": quote.plan_id,
-            "plan_sha256": quote.plan_sha256,
-            "endpoint_name": quote.endpoint_name,
-            "endpoint_id": endpoint.id,
-            "endpoint_spec_sha256": quote.endpoint_spec_sha256,
-            "operation_digest": quote.operation_digest,
-            "endpoint_readback_sha256": readback_digest,
-            "create_started_at": iso_datetime(create_started_at),
-            "activated_at": iso_datetime(activated_at),
-            "readback_at": iso_datetime(readback_at),
-            "reconciled_after_ambiguous_create": ambiguous,
-        }
-        return ServerlessEndpointActivationReceipt(
-            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
-            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
-            provider_activation_id=(
-                "runpod-serverless-activation:" + json_sha256(activation_identity)
-            ),
-            provider_quote_id=quote.provider_quote_id,
-            quote_sha256=quote.quote_sha256,
-            plan_id=quote.plan_id,
-            plan_sha256=quote.plan_sha256,
-            endpoint_name=quote.endpoint_name,
+        return self._planned_activation_receipt(
+            quote,
             endpoint_id=endpoint.id,
-            endpoint_spec_sha256=quote.endpoint_spec_sha256,
-            operation_digest=quote.operation_digest,
-            endpoint_readback_sha256=readback_digest,
+            readback_digest=readback_digest,
             create_started_at=create_started_at,
             activated_at=activated_at,
             readback_at=readback_at,
@@ -367,10 +340,20 @@ class RunpodServerlessCapacityProvider:
 
         observed = named[0]
         adopted_at = self._now()
+
+        # The readback call is deliberately NOT inside the validation try below.
+        # ``RunPodAPIError`` derives from ``RunPodManagerError``, so catching the
+        # base class here would report a 500, a 401 after a key rotation, or a
+        # read timeout as "this endpoint is not ours" — an ownership verdict a
+        # caller is entitled to act on by giving up. That would reopen exactly
+        # the hole this method closes, through a transient failure instead of a
+        # crash. A transport error means UNKNOWN, so it propagates with its own
+        # type and the caller retries.
+        endpoint = await asyncio.to_thread(
+            self.control_client.get_endpoint, observed.id
+        )
+
         try:
-            endpoint = await asyncio.to_thread(
-                self.control_client.get_endpoint, observed.id
-            )
             readback_digest = _validate_planned_endpoint_binding(
                 endpoint,
                 request.endpoint,
@@ -379,12 +362,66 @@ class RunpodServerlessCapacityProvider:
                 data_center_id=quote.data_center_id,
             )
         except RunPodManagerError as exc:
+            # Only a validation failure reaches here, and only that justifies
+            # the ownership verdict: we read the endpoint successfully and its
+            # immutable config does not match the accepted plan.
             raise ServerlessEndpointActivationError(
                 "Pre-existing Serverless endpoint does not bind to the accepted "
                 "plan and was not adopted",
                 endpoint_name=quote.endpoint_name,
                 observed_endpoint_ids=(observed.id,),
             ) from exc
+
+        return self._planned_activation_receipt(
+            quote,
+            endpoint_id=endpoint.id,
+            readback_digest=readback_digest,
+            # All three instants are this process's adoption time, on
+            # ``self._clock``.
+            #
+            # The endpoint's own creation time IS available — the vendored
+            # Runpod v2 schema makes ``createdAt`` a required date-time on the
+            # Endpoint resource, so it is in ``endpoint.raw`` — and it is not
+            # used here on purpose, so nobody has to rediscover why.
+            #
+            # ``create_started_at`` means "when THIS process began the create
+            # call". For an adoption there was no create call in this process,
+            # and Runpod's ``createdAt`` answers a different question: when the
+            # provider created it. Mixing a provider clock into fields the rest
+            # of this receipt sources from ``self._clock`` would make them
+            # incomparable, and the receipt enforces
+            # ``create_started_at <= activated_at <= readback_at``
+            # (serverless_capacity_contracts.py) — an ordering that only holds
+            # if one clock produced all three. Provider skew would turn a valid
+            # adoption into a ValueError.
+            #
+            # Carrying the provider instant properly needs its own receipt
+            # field and a contract-version bump; it is not smuggled into a
+            # field that means something else.
+            create_started_at=adopted_at,
+            activated_at=adopted_at,
+            readback_at=adopted_at,
+            reconciled_after_ambiguous_create=True,
+        )
+
+    def _planned_activation_receipt(
+        self,
+        quote: PlannedServerlessCapacityQuote,
+        *,
+        endpoint_id: str,
+        readback_digest: str,
+        create_started_at: datetime,
+        activated_at: datetime,
+        readback_at: datetime,
+        reconciled_after_ambiguous_create: bool,
+    ) -> ServerlessEndpointActivationReceipt:
+        """Build one activation receipt and its self-describing identity digest.
+
+        Shared by activation and adoption. The identity dict and the receipt
+        must stay in step — ``provider_activation_id`` is a digest OVER that
+        dict and the receipt recomputes it on construction — so they are built
+        in one place rather than in two that can drift.
+        """
 
         activation_identity = {
             "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
@@ -393,18 +430,14 @@ class RunpodServerlessCapacityProvider:
             "plan_id": quote.plan_id,
             "plan_sha256": quote.plan_sha256,
             "endpoint_name": quote.endpoint_name,
-            "endpoint_id": endpoint.id,
+            "endpoint_id": endpoint_id,
             "endpoint_spec_sha256": quote.endpoint_spec_sha256,
             "operation_digest": quote.operation_digest,
             "endpoint_readback_sha256": readback_digest,
-            # The crashed attempt's create/activate instants are unknowable from
-            # here, so the adoption instant stands for all three rather than a
-            # fabricated earlier time. The receipt says when we learned of the
-            # endpoint, which is the only thing this process actually observed.
-            "create_started_at": iso_datetime(adopted_at),
-            "activated_at": iso_datetime(adopted_at),
-            "readback_at": iso_datetime(adopted_at),
-            "reconciled_after_ambiguous_create": True,
+            "create_started_at": iso_datetime(create_started_at),
+            "activated_at": iso_datetime(activated_at),
+            "readback_at": iso_datetime(readback_at),
+            "reconciled_after_ambiguous_create": reconciled_after_ambiguous_create,
         }
         return ServerlessEndpointActivationReceipt(
             schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
@@ -417,14 +450,14 @@ class RunpodServerlessCapacityProvider:
             plan_id=quote.plan_id,
             plan_sha256=quote.plan_sha256,
             endpoint_name=quote.endpoint_name,
-            endpoint_id=endpoint.id,
+            endpoint_id=endpoint_id,
             endpoint_spec_sha256=quote.endpoint_spec_sha256,
             operation_digest=quote.operation_digest,
             endpoint_readback_sha256=readback_digest,
-            create_started_at=adopted_at,
-            activated_at=adopted_at,
-            readback_at=adopted_at,
-            reconciled_after_ambiguous_create=True,
+            create_started_at=create_started_at,
+            activated_at=activated_at,
+            readback_at=readback_at,
+            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
         )
 
     async def authorize_planned_submission(

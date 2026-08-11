@@ -34,6 +34,24 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   `_validate_planned_endpoint_binding` activation uses. Anything failing either
   check is somebody else's and is left alone.
 
+  A readback that fails to TRANSPORT is not an ownership verdict. `RunPodAPIError`
+  derives from `RunPodManagerError`, so catching the base class around the read
+  would report a 5xx or a rotated key as "not ours" — and a caller told that is
+  entitled to stop trying, which is what strands a billing endpoint. Transport
+  errors keep their own type and propagate for retry; only a successful read
+  whose config does not match the plan produces the ownership verdict.
+
+  The receipt's three instants are all this process's adoption time. The
+  endpoint's own `createdAt` IS available (the vendored v2 schema makes it a
+  required date-time on the Endpoint resource) and is deliberately unused:
+  `create_started_at` means "when this process began the create call", Runpod's
+  `createdAt` answers a different question, and mixing a provider clock into
+  fields otherwise sourced from `self._clock` would break the receipt's
+  `create_started_at <= activated_at <= readback_at` invariant under skew.
+  Carrying the provider instant properly needs its own field and a
+  contract-version bump rather than being smuggled into one that means
+  something else.
+
   The call mutates nothing — it lists, reads back, and returns a receipt
   carrying `reconciled_after_ambiguous_create=True`, so a caller can settle or
   delete the endpoint through the ordinary paths.
