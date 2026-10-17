@@ -1,3 +1,3 @@
 module github.com/KestrelSovereignAI/kestrel-cloud-runpod/runtime/ollama-runtime
 
-go 1.26.5
+go 1.26.9

@@ -63,13 +63,15 @@ measures the `/ping` `204` to `200` cold-start interval.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.0`; it does not change the
+The runtime is independently versioned as `1.1.1`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds
-that exact source commit with Go `1.26.5` and explicit fixed module versions;
-the official binary currently contains fixed high-severity dependency findings
-and is overwritten in the final filesystem rather than waived.
+that exact source commit with Go `1.26.9` and explicit fixed module versions.
+The official binary is overwritten in the final filesystem, and both installed
+OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
+The build refuses toolchain auto-upgrades; the unchanged security gate must
+pass for the actual image, including its operating-system packages.
 
 ```bash
 docker buildx build --platform linux/amd64 \
