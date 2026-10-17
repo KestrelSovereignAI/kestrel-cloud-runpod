@@ -172,7 +172,7 @@ class DirectRunPodProvider(GPUProvider):
         return dict(pod.raw) if pod is not None else {"id": pod_id, "status": "EXITED"}
 
     def resume_pod(self, pod_id: str, gpu_count: int = 1) -> Dict[str, Any]:
-        """Start a stopped Pod; v2 chooses currently available compute."""
+        """Start the stopped Pod on its retained machine assignment."""
 
         if gpu_count != 1:
             logger.debug("Runpod v2 start action uses the Pod's configured GPU count")
