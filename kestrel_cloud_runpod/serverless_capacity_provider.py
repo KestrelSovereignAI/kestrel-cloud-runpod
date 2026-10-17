@@ -16,10 +16,13 @@ from .models import (
     BillingPage,
     ComputeProduct,
     EndpointResource,
+    EndpointResourceVersion,
     GPUOffer,
     RunPodAmbiguousResultError,
     RunPodManagerError,
     ServerlessJob,
+    normalize_cuda_floor,
+    validate_endpoint_mounts,
 )
 from .placement import select_gpu
 from .serverless_capacity_contracts import (
@@ -1212,6 +1215,11 @@ class RunpodServerlessCapacityProvider:
         )
 
     async def _observe_catalog(self, spec: ServerlessEndpointSpec) -> _CatalogSelection:
+        if spec.resource_schema_version is not EndpointResourceVersion.GA:
+            raise RunPodManagerError(
+                "Stored Serverless authority must upgrade before new quotes or spend; "
+                "legacy adoption and cleanup remain available"
+            )
         requirements = spec.constraints.placement_requirements()
         offers = await asyncio.to_thread(
             self.control_client.list_gpus,
@@ -1231,10 +1239,6 @@ class RunpodServerlessCapacityProvider:
         matching_pool = tuple(
             offer for offer in offers if offer.pool == placement.gpu_pool
         )
-        if len(matching_pool) != 1 or matching_pool[0].id != placement.gpu_id:
-            raise RunPodManagerError(
-                "Serverless endpoint pool does not identify one exact catalog GPU"
-            )
         data_center_id = _select_data_center(matching_pool[0], spec)
         catalog_observation_sha256 = _catalog_observation_sha256(
             matching_pool[0],
@@ -1585,6 +1589,25 @@ def _validate_endpoint_config(
         )
     if _integer(gpu.get("count"), "endpoint.gpu.count") != spec.constraints.gpu_count:
         raise RunPodManagerError("Serverless endpoint GPU count does not match profile")
+    ga_authority = spec.resource_schema_version is EndpointResourceVersion.GA
+    expected_floor = (
+        normalize_cuda_floor(spec.constraints.min_cuda_version)
+        if ga_authority
+        else None
+    )
+    if not {"minCudaVersion", "allowedCudaVersions"}.issubset(gpu):
+        raise RunPodManagerError("Serverless endpoint omitted its CUDA constraints")
+    if gpu.get("minCudaVersion") != expected_floor:
+        raise RunPodManagerError(
+            "Serverless endpoint CUDA floor does not match profile"
+        )
+    if _string_tuple(
+        gpu.get("allowedCudaVersions"), "endpoint.gpu.allowedCudaVersions"
+    ):
+        raise RunPodManagerError(
+            "Serverless endpoint has an unquoted CUDA version allowlist"
+        )
+    validate_endpoint_mounts(raw, spec.network_volume_ids)
     if (
         _integer(workers.get("min"), "endpoint.workers.min") != spec.workers_min
         or _integer(workers.get("max"), "endpoint.workers.max") != spec.workers_max
@@ -1639,7 +1662,15 @@ def _validate_endpoint_config(
         "name": endpoint.name,
         "image": spec.worker_reference,
         "type": "QUEUE",
-        "gpu": {"pools": [gpu_pool], "count": spec.constraints.gpu_count},
+        "gpu": {
+            "pools": [gpu_pool],
+            "count": spec.constraints.gpu_count,
+            **(
+                {"minCudaVersion": expected_floor, "allowedCudaVersions": []}
+                if ga_authority
+                else {}
+            ),
+        },
         "workers": {
             "min": spec.workers_min,
             "max": spec.workers_max,
@@ -1655,7 +1686,19 @@ def _validate_endpoint_config(
         "args": None,
         "registry": spec.registry_id,
         "dataCenterIds": [data_center_id],
-        "networkVolumes": [],
+        "networkVolumes": list(spec.network_volume_ids),
+        **(
+            {
+                "mounts": {
+                    "network": [
+                        {"volumeId": volume_id} for volume_id in spec.network_volume_ids
+                    ],
+                    "global": [],
+                }
+            }
+            if ga_authority
+            else {}
+        ),
         "timeout": spec.execution_timeout_ms,
         "flashboot": spec.flashboot.value,
     }

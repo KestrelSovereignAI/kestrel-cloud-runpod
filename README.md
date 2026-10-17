@@ -74,6 +74,23 @@ Both clients set an explicit application User-Agent. Base URLs are injectable fo
 
 Placement uses the product's catalog rate: `price.secure/community` for Pods and `price.serverless` for Serverless. A missing Serverless pool price is ineligible for a paid quote; a Pod rate never substitutes for it.
 
+Accepted CUDA floors are sent in resource create requests, not only used to
+filter catalog observations. Finite Serverless capacity readback verifies that
+floor before dispatch. Both finite capacity and private Ollama check all
+network/global mount fields before workload requests. Global mounts are unsupported
+by these workload profiles and fail clearly. Re-quote before creating new
+resources after upgrading; existing resource cleanup retains its exact IDs.
+
+Resource schema version 2 is written by new Serverless endpoint specs.
+Unversioned, historical specs are decoded as version 1 with their original
+digests, for adoption and cleanup only. Upgrade the external worker before
+enabling new API writers; cancel/re-quote pending historical operations
+instead of authorizing new work from a version 1 plan.
+
+The control-plane client's `max_inventory_pages` defaults to 1,000 pages.
+Exceeding that configurable bound fails the entire inventory, so a provider
+issuing endlessly unique cursors cannot hang reconciliation indefinitely.
+
 ### Direct client example
 
 ```python
@@ -192,12 +209,20 @@ changes.
 
 The GA catalog observed on 2026-10-17 maps PRO 6000 MIG 1g.24gb to
 `AMPERE_24` and 2g.48gb to `ADA_48_PRO`. Both pools also contain other GPU
-types; these IDs do not guarantee MIG or Blackwell placement. Finite
-Serverless quotes require an unambiguous GPU-to-pool mapping and reject
+types; these IDs do not guarantee MIG or Blackwell placement. All
+Serverless placement (including private Ollama) requires an unambiguous GPU-to-pool mapping and rejects
 shared pools before creation. Missing pool IDs are rejected too; Kestrel
 never guesses one from a marketing name or GPU ID. See
 [#21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21).
 A separately valid Pod offer may still be quoted explicitly as Pod capacity.
+
+Upgrade the controller before accepting new work. Historical Serverless
+authorities remain usable only for recovery, billing and cleanup, not new
+quotes or submissions. Drain and clean up those resources before replacing
+their authority; do not PATCH their CUDA or mounts in place. A reusable
+endpoint must already match the accepted CUDA and storage policy. If it does
+not, drain it and create a correctly constrained replacement instead of
+reusing an incompatible endpoint.
 
 The route endpoint and bearer are reconstructed from a fresh authenticated
 provider observation and live only in the SDK `InferenceRoute`. They are never

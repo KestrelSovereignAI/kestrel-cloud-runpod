@@ -79,7 +79,9 @@ def test_serverless_uses_pool_price_for_ranking_and_authorization():
     )
     offers = [
         replace(
-            _offer("cheap-pod"), secure_price_per_hr=0.1, serverless_price_per_hr=2.0
+            _offer("cheap-pod", pool="expensive-pool"),
+            secure_price_per_hr=0.1,
+            serverless_price_per_hr=2.0,
         ),
         replace(
             _offer("cheap-serverless"),
@@ -92,6 +94,45 @@ def test_serverless_uses_pool_price_for_ranking_and_authorization():
     assert decision.offered_cost_per_hr == 0.8
     with pytest.raises(RunPodManagerError, match="No live Runpod GPU offer"):
         select_gpu(offers[:1], requirements)
+
+
+@pytest.mark.parametrize("other_available", [Availability.HIGH, Availability.NONE])
+def test_serverless_rejects_shared_pool_before_filtering_policy(other_available):
+    offers = (
+        _offer("approved", pool="shared"),
+        _offer("unapproved", pool="shared", memory=16, availability=other_available),
+    )
+    with pytest.raises(RunPodManagerError, match="one exact catalog GPU"):
+        select_gpu(
+            iter(offers),
+            PlacementRequirements(
+                product=ComputeProduct.SERVERLESS,
+                min_vram_gb=24,
+                allowed_gpu_ids=("approved",),
+            ),
+        )
+
+
+def test_pod_can_select_an_exact_gpu_even_when_its_serverless_pool_is_shared():
+    decision = select_gpu(
+        [_offer("approved"), _offer("other")],
+        PlacementRequirements(
+            product=ComputeProduct.POD,
+            min_vram_gb=24,
+            allowed_gpu_ids=("approved",),
+        ),
+    )
+    assert decision.gpu_id == "approved"
+
+
+@pytest.mark.parametrize("product", [ComputeProduct.POD, ComputeProduct.SERVERLESS])
+def test_incompatible_gpu_is_not_misdiagnosed_as_a_shared_pool(product):
+    with pytest.raises(RunPodManagerError, match="No live Runpod GPU offer") as error:
+        select_gpu(
+            [_offer("too-small", memory=16)],
+            PlacementRequirements(product=product, min_vram_gb=24),
+        )
+    assert "one exact catalog GPU" not in str(error.value)
 
 
 def test_pod_uses_cloud_rate_even_when_serverless_rate_differs():

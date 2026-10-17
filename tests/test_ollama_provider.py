@@ -96,12 +96,16 @@ class _ControlClient:
                 "base": "https://endpoint.example",
                 "health": "https://endpoint.example/ping",
             },
-            raw={},
+            raw={"mounts": {"network": [], "global": []}},
         )
 
     def list_gpus(self, *, products, **kwargs):
-        del kwargs
-        return (_offer(products[0]),)
+        return (
+            replace(
+                _offer(products[0]),
+                availability_min_cuda_version=kwargs.get("min_cuda_version"),
+            ),
+        )
 
     def create_endpoint(self, request):
         self.endpoint_request = request
@@ -210,6 +214,23 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
             plan=plan,
             resource_name="unsafe-shared-cache",
         )
+
+
+@pytest.mark.asyncio
+async def test_private_ollama_rejects_shared_serverless_gpu_pool(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+    offer = _offer(ComputeProduct.SERVERLESS)
+    client.list_gpus = lambda **_: (offer, replace(offer, id="other-gpu"))
+    provider = _provider(client=client)
+    request = make_request(
+        MutableClock(), mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+
+    with pytest.raises(RunPodManagerError, match="one exact catalog GPU"):
+        await provider.plan(request)
+    assert client.endpoint_request is None
+    assert client.pod_request is None
 
 
 @pytest.mark.asyncio
@@ -336,6 +357,50 @@ async def test_serverless_provision_is_load_balanced_and_configuration_owned(
     )
     assert "leaked-secret" not in client.endpoint_request.env.values()
     assert client.endpoint_request.scaling["type"] == "REQUEST_COUNT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, OllamaLeaseMode.DEDICATED_POD]
+)
+async def test_ollama_creation_carries_the_accepted_cuda_floor(mode, monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+    provider = _provider(client=client)
+    value = make_request(MutableClock(), mode=mode, max_authorized_cost=5.0)
+    value = replace(
+        value, constraints=replace(value.constraints, min_cuda_version="12")
+    )
+    plan = await provider.plan(value)
+    await provider.provision(request=value, plan=plan, resource_name="test-cuda-floor")
+    created = client.endpoint_request or client.pod_request
+    assert created.to_payload()["gpu"]["minCudaVersion"] == "12.0"
+
+
+@pytest.mark.asyncio
+async def test_ollama_refuses_unaccepted_global_storage_before_workload_requests():
+    client = _ControlClient()
+    client.endpoint = replace(
+        client.endpoint,
+        raw={
+            "mounts": {"network": [], "global": [{"volumeId": "unquoted-volume"}]},
+        },
+    )
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200)
+
+    provider = _provider(client=client, transport=httpx.MockTransport(handler))
+    resource = ProvisionedOllamaResource(
+        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+        provider_resource_id="endpoint-1",
+        resource_name="resource",
+    )
+    with pytest.raises(RunPodManagerError, match="global mounts"):
+        await provider.observe(resource)
+    assert seen == []
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from .manager import RunPodManager
 from .models import (
     Availability,
     CloudType,
+    EndpointResourceVersion,
     FlashBoot,
     GPUProfile,
     PlacementRequirements,
@@ -173,6 +174,7 @@ __all__ = [
     "CatalogWorkerEvidence",
     "CloudType",
     "CreatedPodCapacity",
+    "EndpointResourceVersion",
     "FlashBoot",
     "GPUProfile",
     "OllamaLease",

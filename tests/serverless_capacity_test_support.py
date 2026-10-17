@@ -11,6 +11,7 @@ from kestrel_cloud_runpod.models import (
     EndpointResource,
     FlashBoot,
     GPUOffer,
+    normalize_cuda_floor,
 )
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     SERVERLESS_CAPACITY_CONTRACT_VERSION,
@@ -181,7 +182,14 @@ def endpoint(
                 "run": f"https://api.runpod.ai/v2/{selected.endpoint_id}/run"
             },
             "image": selected.worker_reference,
-            "gpu": {"pools": [pool], "count": selected.constraints.gpu_count},
+            "gpu": {
+                "pools": [pool],
+                "count": selected.constraints.gpu_count,
+                "minCudaVersion": normalize_cuda_floor(
+                    selected.constraints.min_cuda_version
+                ),
+                "allowedCudaVersions": [],
+            },
             "workers": {
                 "min": selected.workers_min,
                 "max": selected.workers_max,
@@ -193,6 +201,12 @@ def endpoint(
             },
             "dataCenterIds": [data_center],
             "networkVolumes": list(selected.network_volume_ids),
+            "mounts": {
+                "network": [
+                    {"volumeId": volume_id} for volume_id in selected.network_volume_ids
+                ],
+                "global": [],
+            },
             "timeout": selected.execution_timeout_ms,
             "flashboot": selected.flashboot.value,
             "disk": selected.disk_gb,
@@ -221,6 +235,8 @@ def planned_endpoint_resource(
         "gpu": {
             "pools": [spec.constraints.allowed_gpu_pools[0]],
             "count": spec.constraints.gpu_count,
+            "minCudaVersion": normalize_cuda_floor(spec.constraints.min_cuda_version),
+            "allowedCudaVersions": [],
         },
         "workers": {
             "min": spec.workers_min,
@@ -232,7 +248,13 @@ def planned_endpoint_resource(
             "queueDelay": float(spec.scaling_value),
         },
         "dataCenterIds": [spec.constraints.allowed_data_center_ids[0]],
-        "networkVolumes": [],
+        "networkVolumes": list(spec.network_volume_ids),
+        "mounts": {
+            "network": [
+                {"volumeId": volume_id} for volume_id in spec.network_volume_ids
+            ],
+            "global": [],
+        },
         "timeout": spec.execution_timeout_ms,
         "flashboot": spec.flashboot.value,
         "disk": spec.disk_gb,

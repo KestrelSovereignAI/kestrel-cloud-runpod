@@ -19,6 +19,45 @@ class RunPodManagerError(Exception):
     """Base exception for Runpod manager and provider failures."""
 
 
+def normalize_cuda_floor(value: Optional[str]) -> Optional[str]:
+    """Represent a configured CUDA floor in the API's major.minor format."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        raise ValueError("min_cuda_version must be a CUDA major or major.minor")
+    major, _, minor = value.partition(".")
+    return f"{int(major)}.{int(minor or '0')}"
+
+
+def validate_endpoint_mounts(
+    raw: Mapping[str, Any], expected_network_volume_ids: Sequence[str]
+) -> None:
+    """Verify all endpoint storage kinds against the accepted storage policy."""
+
+    mounts = _mapping(raw, "mounts", "Endpoint")
+    if set(mounts) != {"network", "global"}:
+        raise RunPodManagerError("Endpoint mounts contain missing or unsupported kinds")
+    network, global_mounts = mounts["network"], mounts["global"]
+    if not isinstance(network, list) or not isinstance(global_mounts, list):
+        raise RunPodManagerError(
+            "Endpoint mounts must contain network and global lists"
+        )
+    if global_mounts:
+        raise RunPodManagerError(
+            "Endpoint global mounts are outside the accepted policy"
+        )
+    network_ids = []
+    for mount in network:
+        if not isinstance(mount, Mapping) or set(mount) != {"volumeId"}:
+            raise RunPodManagerError("Endpoint network mount has an invalid shape")
+        network_ids.append(_string(mount, "volumeId", "Endpoint network mount"))
+    if tuple(network_ids) != tuple(expected_network_volume_ids):
+        raise RunPodManagerError(
+            "Endpoint network mounts do not match the accepted policy"
+        )
+
+
 @dataclass(frozen=True)
 class RateLimit:
     """Rate-limit information returned by either Runpod v2 service."""
@@ -94,6 +133,13 @@ class VolumeType(str, Enum):
     HIGH_PERFORMANCE = "HIGH_PERFORMANCE"
 
 
+class EndpointResourceVersion(Enum):
+    """Version the saved create/readback authority independently of the API URL."""
+
+    LEGACY = 1
+    GA = 2
+
+
 @dataclass(frozen=True)
 class PlacementRequirements:
     """Stable workload constraints used to select a live catalog offer."""
@@ -117,10 +163,7 @@ class PlacementRequirements:
             raise ValueError("gpu_count must be at least 1")
         if self.max_cost_per_hr is not None and self.max_cost_per_hr <= 0:
             raise ValueError("max_cost_per_hr must be positive")
-        if self.min_cuda_version is not None and not re.fullmatch(
-            r"\d+(?:\.\d+)?", self.min_cuda_version
-        ):
-            raise ValueError("min_cuda_version must be a CUDA major or major.minor")
+        normalize_cuda_floor(self.min_cuda_version)
 
 
 @dataclass(frozen=True)
@@ -245,12 +288,14 @@ class PodCreateRequest:
     data_center_ids: tuple[str, ...] = ()
     mounts: Optional[Mapping[str, Any]] = None
     global_networking: bool = False
+    min_cuda_version: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.name or not self.image or not self.gpu_id:
             raise ValueError("Pod name, image, and gpu_id are required")
         if self.gpu_count < 1 or self.disk_gb < 1:
             raise ValueError("Pod gpu_count and disk_gb must be positive")
+        normalize_cuda_floor(self.min_cuda_version)
 
     def to_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -271,6 +316,10 @@ class PodCreateRequest:
             payload["dataCenterIds"] = list(self.data_center_ids)
         if self.mounts is not None:
             payload["mounts"] = dict(self.mounts)
+        if self.min_cuda_version is not None:
+            payload["gpu"]["minCudaVersion"] = normalize_cuda_floor(
+                self.min_cuda_version
+            )
         return payload
 
 
@@ -296,6 +345,8 @@ class EndpointCreateRequest:
     network_volume_ids: tuple[str, ...] = ()
     execution_timeout_ms: int = 300_000
     flashboot: FlashBoot = FlashBoot.FLASHBOOT
+    min_cuda_version: Optional[str] = None
+    resource_schema_version: EndpointResourceVersion = EndpointResourceVersion.GA
 
     def __post_init__(self) -> None:
         if not self.name or not self.image or not self.gpu_pools:
@@ -325,6 +376,9 @@ class EndpointCreateRequest:
             raise ValueError("Endpoint GPU and worker counts are invalid")
         if not isinstance(self.flashboot, FlashBoot):
             raise ValueError("flashboot must be a FlashBoot enum value")
+        normalize_cuda_floor(self.min_cuda_version)
+        if not isinstance(self.resource_schema_version, EndpointResourceVersion):
+            raise ValueError("Endpoint resource_schema_version is invalid")
 
     def to_payload(self) -> Dict[str, Any]:
         workers: Dict[str, int] = {"min": self.workers_min, "max": self.workers_max}
@@ -349,6 +403,20 @@ class EndpointCreateRequest:
             payload["args"] = self.args
         if self.registry_id is not None:
             payload["registry"] = self.registry_id
+        if self.resource_schema_version is EndpointResourceVersion.GA:
+            payload["mounts"] = {
+                "network": [
+                    {"volumeId": volume_id} for volume_id in self.network_volume_ids
+                ],
+                "global": [],
+            }
+        if (
+            self.resource_schema_version is EndpointResourceVersion.GA
+            and self.min_cuda_version is not None
+        ):
+            payload["gpu"]["minCudaVersion"] = normalize_cuda_floor(
+                self.min_cuda_version
+            )
         return payload
 
 

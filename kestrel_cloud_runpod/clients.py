@@ -22,6 +22,7 @@ from .models import (
     ComputeProduct,
     EndpointCreateRequest,
     EndpointResource,
+    EndpointResourceVersion,
     EndpointUpdateRequest,
     GPUOffer,
     NetworkVolume,
@@ -329,10 +330,14 @@ class RunpodControlPlaneClient:
         connect_timeout: float = 5.0,
         read_timeout: float = 30.0,
         max_safe_retries: int = 2,
+        max_inventory_pages: int = 1000,
         user_agent: str = DEFAULT_USER_AGENT,
         sleep: Callable[[float], None] = time.sleep,
         http_transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
+        if type(max_inventory_pages) is not int or max_inventory_pages < 1:
+            raise ValueError("max_inventory_pages must be a positive integer")
+        self.max_inventory_pages = max_inventory_pages
         self.transport = RunpodTransport(
             api_key=api_key,
             base_url=base_url,
@@ -469,6 +474,10 @@ class RunpodControlPlaneClient:
         )
 
     def create_endpoint(self, request: EndpointCreateRequest) -> EndpointResource:
+        if request.resource_schema_version is not EndpointResourceVersion.GA:
+            raise RunPodManagerError(
+                "Legacy endpoint authority must upgrade before new spend"
+            )
         payload = _required_payload(
             self.transport.request_json(
                 "POST",
@@ -500,10 +509,16 @@ class RunpodControlPlaneClient:
         query = dict(params or {})
         seen_cursors: set[str] = set()
         seen_ids: set[str] = set()
+        pages = 0
         while True:
+            if pages >= self.max_inventory_pages:
+                raise RunPodManagerError(
+                    "Runpod inventory exceeded max_inventory_pages; completeness is unknown"
+                )
             payload = _required_payload(
                 self.transport.request_json("GET", path, params=query)
             )
+            pages += 1
             items = _list_envelope(payload, key)
             pagination = payload.get("pagination")
             if not isinstance(pagination, Mapping):

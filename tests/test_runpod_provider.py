@@ -131,6 +131,7 @@ def test_direct_provider_selects_from_live_catalog_and_records_placement():
     )
 
     assert client.catalog_kwargs["min_cuda_version"] == "12.8"
+    assert client.create_request.to_payload()["gpu"]["minCudaVersion"] == "12.8"
     assert client.create_request.gpu_id == "live-gpu-id"
     assert client.create_request.env == {"MODEL": "flux", "JOB_KIND": "selfie"}
     assert result["_kestrel_placement"].offered_cost_per_hr == 0.69
