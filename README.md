@@ -75,8 +75,9 @@ Both clients set an explicit application User-Agent. Base URLs are injectable fo
 Placement uses the product's catalog rate: `price.secure/community` for Pods and `price.serverless` for Serverless. A missing Serverless pool price is ineligible for a paid quote; a Pod rate never substitutes for it.
 
 Accepted CUDA floors are sent in resource create requests, not only used to
-filter catalog observations. Serverless readback verifies that floor and all
-network/global mount fields before dispatch. Global mounts are unsupported
+filter catalog observations. Finite Serverless capacity readback verifies that
+floor before dispatch. Both finite capacity and private Ollama check all
+network/global mount fields before workload requests. Global mounts are unsupported
 by these workload profiles and fail clearly. Re-quote before creating new
 resources after upgrading; existing resource cleanup retains its exact IDs.
 

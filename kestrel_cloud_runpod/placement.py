@@ -34,20 +34,18 @@ def select_gpu(
 
     catalog = tuple(offers)
     pool_members = Counter(offer.pool for offer in catalog if offer.pool)
-    compatible = [
-        offer
-        for offer in catalog
-        if _is_compatible(offer, requirements)
-        and (
-            requirements.product is not ComputeProduct.SERVERLESS
-            or pool_members[offer.pool] == 1
-        )
-    ]
+    compatible = [offer for offer in catalog if _is_compatible(offer, requirements)]
+    if compatible and requirements.product is ComputeProduct.SERVERLESS:
+        exact = [offer for offer in compatible if pool_members[offer.pool] == 1]
+        if not exact:
+            raise RunPodManagerError(
+                "Compatible Runpod Serverless pools do not identify one exact catalog GPU"
+            )
+        compatible = exact
     if not compatible:
         raise RunPodManagerError(
             "No live Runpod GPU offer satisfies the workload's VRAM, CUDA, "
-            "availability, cloud, data-center, pool, and cost constraints; "
-            "Serverless pools must identify one exact catalog GPU"
+            "availability, cloud, data-center, pool, and cost constraints"
         )
     compatible.sort(
         key=lambda offer: (

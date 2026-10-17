@@ -119,7 +119,7 @@ The beta catalog observed on 2026-08-02 returned `pool=null` for both PRO
 6000 MIG Serverless products. On 2026-10-17, the GA catalog instead returned
 `AMPERE_24` (1g.24gb) and `ADA_48_PRO` (2g.48gb), but each pool includes other
 GPU types. A canonical pool is now available, not an exact MIG placement
-guarantee. Finite Serverless quotes reject ambiguous pools before creation;
+guarantee. All Serverless placement, including private Ollama, rejects ambiguous pools before creation;
 they cannot promise an exact GPU/rate/benchmark identity from one member of
 a shared pool. Missing IDs also fail clearly and are never derived from a
 SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)

@@ -145,6 +145,17 @@ def test_removing_a_ga_version_marker_cannot_downgrade_its_saved_authority():
         ServerlessEndpointSpec.from_dict(ga)
 
 
+def test_adding_ga_marker_cannot_upgrade_historical_spend_authority():
+    historical = json.loads(
+        (
+            Path(__file__).parent / "fixtures/serverless-0.10.1-authority.json"
+        ).read_text()
+    )["endpoint"]["spec"]
+    historical["resource_schema_version"] = EndpointResourceVersion.GA.value
+    with pytest.raises(RunPodManagerError, match="digest mismatches"):
+        ServerlessEndpointSpec.from_dict(historical)
+
+
 @pytest.mark.parametrize(
     "mounts",
     [

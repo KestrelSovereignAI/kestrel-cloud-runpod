@@ -125,6 +125,16 @@ def test_pod_can_select_an_exact_gpu_even_when_its_serverless_pool_is_shared():
     assert decision.gpu_id == "approved"
 
 
+@pytest.mark.parametrize("product", [ComputeProduct.POD, ComputeProduct.SERVERLESS])
+def test_incompatible_gpu_is_not_misdiagnosed_as_a_shared_pool(product):
+    with pytest.raises(RunPodManagerError, match="No live Runpod GPU offer") as error:
+        select_gpu(
+            [_offer("too-small", memory=16)],
+            PlacementRequirements(product=product, min_vram_gb=24),
+        )
+    assert "one exact catalog GPU" not in str(error.value)
+
+
 def test_pod_uses_cloud_rate_even_when_serverless_rate_differs():
     offer = replace(_offer("pod"), serverless_price_per_hr=8.0)
     decision = select_gpu(
