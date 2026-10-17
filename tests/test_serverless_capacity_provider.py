@@ -138,6 +138,32 @@ async def test_pre_upgrade_plan_cannot_authorize_new_spend():
     assert control.create_requests == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover_first", [False, True])
+async def test_legacy_activation_cannot_authorize_a_new_job_submission(recover_first):
+    value, accepted, activation, raw = _legacy_authority()
+    control = _PlannedControl()
+    control.readback = planned_endpoint_resource(**raw)
+    control.list_pages = [(control.readback,)]
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control, clock=MutableClock()
+    )
+    if recover_first:
+        activation = await provider.adopt_planned_endpoint(value, accepted)
+    observed_reads = list(control.get_calls)
+    with pytest.raises(RunPodManagerError, match="upgrade"):
+        await provider.authorize_planned_submission(
+            value,
+            accepted,
+            activation,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+            exclusive_window_sha256="8" * 64,
+        )
+    assert control.get_calls == observed_reads
+    assert control.create_requests == []
+    assert control.delete_calls == []
+
+
 class _PlannedControl:
     def __init__(self) -> None:
         self.offers = [offer()]
