@@ -2,6 +2,19 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.3] - 2026-10-17
+
+### Fixed
+
+- Resolve the default Pod cloud once: `RUNPOD_CLOUD_TYPE`, then
+  `manager.cloud_type`, then SECURE. Profiles without an explicit cloud now
+  honor the same default as the direct provider. Invalid values fail before
+  provider initialization.
+- Expose `require_uniform_profile_cloud()` so single-cloud pricing consumers
+  can bind quotes to actual configured profiles and reject mixed or mismatched
+  cloud policies. Explicit profile overrides and historical cleanup remain
+  independent of the current default.
+
 ## [0.10.2] - 2026-10-17
 
 ### Fixed

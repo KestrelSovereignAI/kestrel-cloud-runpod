@@ -21,6 +21,7 @@ the public SDK lease contract and never imports this package.
 | Variable | Description |
 |----------|-------------|
 | `RUNPOD_API_KEY` | RunPod API key (required) |
+| `RUNPOD_CLOUD_TYPE` | Default Pod cloud: SECURE or COMMUNITY; overrides `manager.cloud_type` |
 | `RUNPOD_SERVERLESS_API_KEY` | Restricted Serverless invocation key for Ollama endpoint probes and model pulls |
 | `RUNPOD_OLLAMA_BEARER_TOKEN` | Workload-scoped token enforced by the reviewed Ollama Pod image |
 | `RUNPOD_CONTROL_PLANE_BASE_URL` | Optional dev override; must end in `/v2` |
@@ -40,6 +41,21 @@ Runtime settings and profiles live in the standalone
 is the canonical shape. `RunPodManager(config=...)` may receive that same
 mapping explicitly. This package does not read a `[runpod]` section from
 `kestrel.toml`.
+
+Pod cloud configuration is resolved once when constructing the manager:
+`RUNPOD_CLOUD_TYPE` overrides `manager.cloud_type`, which defaults to SECURE.
+An explicit `profiles.<name>.cloud` overrides that default for that profile;
+Pod metadata can explicitly override the selected profile cloud. Catalog
+selection and create requests use the same selected cloud. Invalid or empty
+cloud settings fail rather than falling back. Configuration accepts case and
+surrounding whitespace; persisted resource authority remains strictly decoded.
+
+Applications quoting a single Pod cloud must call
+`manager.require_uniform_profile_cloud()` and inject the returned `CloudType`
+into pricing. Pass `expected=...` to reject a disagreement with an independently
+configured pricing cloud. Mixed profile clouds are supported by the manager,
+but cannot be represented by a single-cloud price quote. Historical resource
+cleanup uses the saved resource identity, not the current default cloud.
 
 ## What's provided
 

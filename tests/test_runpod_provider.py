@@ -1,11 +1,15 @@
 """Compatibility-provider migration tests for the v2 client boundary."""
 
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
+from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.manager import RunPodManager
 from kestrel_cloud_runpod.models import (
     Availability,
@@ -136,6 +140,132 @@ def test_direct_provider_selects_from_live_catalog_and_records_placement():
     assert client.create_request.env == {"MODEL": "flux", "JOB_KIND": "selfie"}
     assert result["_kestrel_placement"].offered_cost_per_hr == 0.69
     assert result["gpu"]["id"] == "live-gpu-id"
+
+
+@pytest.mark.parametrize(
+    ("environment_cloud", "manager_cloud", "profile_cloud", "metadata_cloud", "expected"),
+    [
+        (None, None, None, None, CloudType.SECURE),
+        (None, " community ", None, None, CloudType.COMMUNITY),
+        (" community ", "SECURE", None, None, CloudType.COMMUNITY),
+        ("SECURE", "COMMUNITY", None, None, CloudType.SECURE),
+        ("COMMUNITY", "SECURE", " secure ", None, CloudType.SECURE),
+        ("SECURE", "SECURE", None, CloudType.COMMUNITY, CloudType.COMMUNITY),
+    ],
+)
+def test_cloud_policy_reaches_catalog_and_actual_create_payload(
+    monkeypatch, environment_cloud, manager_cloud, profile_cloud, metadata_cloud, expected
+):
+    """Exercise the real typed client's HTTP serialization without network access."""
+
+    monkeypatch.delenv("RUNPOD_CLOUD_TYPE", raising=False)
+    monkeypatch.setenv("RUNPOD_API_KEY", "unit-test-only")
+    if environment_cloud is not None:
+        monkeypatch.setenv("RUNPOD_CLOUD_TYPE", environment_cloud)
+    config = deepcopy(MINIMAL_RUNPOD_CONFIG)
+    config["manager"] = {} if manager_cloud is None else {"cloud_type": manager_cloud}
+    if profile_cloud is not None:
+        config["profiles"]["llm"]["cloud"] = profile_cloud
+    seen = []
+
+    def handle(request):
+        seen.append(request)
+        if request.method == "GET":
+            assert request.url.path == "/v2/catalog/gpus"
+            assert request.url.params["cloud"] == expected.value
+            return httpx.Response(200, json={"gpus": [{
+                "id": "live-gpu-id", "name": "Live GPU", "pool": "ADA_24",
+                "manufacturer": "NVIDIA", "memory": 24,
+                "secure": True, "community": True,
+                "price": {"secure": 0.69, "community": 0.40},
+                "maxCount": {"secure": 1, "community": 1},
+                "availability": "HIGH",
+            }]})
+        assert request.method == "POST"
+        assert request.url.path == "/v2/pods"
+        payload = json.loads(request.content)
+        assert payload["cloud"] == expected.value
+        return httpx.Response(201, json={
+            "id": "pod-test", "name": payload["name"], "status": "PROVISIONING",
+            "gpu": {"id": "live-gpu-id", "count": 1},
+            "cost": 0.69 if expected is CloudType.SECURE else 0.40,
+        })
+
+    client = RunpodControlPlaneClient(
+        api_key="unit-test-only", http_transport=httpx.MockTransport(handle)
+    )
+    with patch("kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client):
+        manager = RunPodManager(config=config)
+    metadata = {} if metadata_cloud is None else {"cloud_type": metadata_cloud}
+    result = manager.provider.start_pod(manager.profiles["llm"], metadata)
+    assert result["_kestrel_placement"].cloud is expected
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize(
+    ("source", "invalid"),
+    [(source, invalid) for source in ("manager", "profile")
+     for invalid in (None, "", "   ", "cheap", True, 1)]
+    + [("environment", invalid) for invalid in ("", "   ", "cheap")],
+)
+def test_invalid_cloud_configuration_fails_before_provider(monkeypatch, invalid, source):
+    monkeypatch.delenv("RUNPOD_CLOUD_TYPE", raising=False)
+    config = deepcopy(MINIMAL_RUNPOD_CONFIG)
+    if source == "environment":
+        monkeypatch.setenv("RUNPOD_CLOUD_TYPE", invalid)
+    elif source == "manager":
+        config["manager"]["cloud_type"] = invalid
+    else:
+        config["profiles"]["llm"]["cloud"] = invalid
+    with patch.object(RunPodManager, "_build_provider") as build_provider:
+        with pytest.raises(RunPodManagerError, match="SECURE or COMMUNITY"):
+            RunPodManager(config=config)
+        build_provider.assert_not_called()
+
+
+def test_uniform_cloud_binds_actual_profiles_not_mutable_environment(monkeypatch):
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "COMMUNITY")
+    with patch.object(RunPodManager, "_build_provider"):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "SECURE")
+    assert manager.require_uniform_profile_cloud() is CloudType.COMMUNITY
+    assert manager.require_uniform_profile_cloud(CloudType.COMMUNITY) is CloudType.COMMUNITY
+    with pytest.raises(RunPodManagerError, match="does not match"):
+        manager.require_uniform_profile_cloud(CloudType.SECURE)
+    assert manager.default_cloud_type is CloudType.COMMUNITY
+
+
+def test_single_cloud_pricing_rejects_mixed_explicit_profiles(monkeypatch):
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "COMMUNITY")
+    config = deepcopy(MINIMAL_RUNPOD_CONFIG)
+    config["profiles"]["image"] = {**config["profiles"]["llm"], "cloud": "SECURE"}
+    with patch.object(RunPodManager, "_build_provider"):
+        manager = RunPodManager(config=config)
+    with pytest.raises(RunPodManagerError, match="all GPU profiles"):
+        manager.require_uniform_profile_cloud()
+
+
+@pytest.mark.parametrize("invalid", [None, True, "", "invalid"])
+def test_invalid_metadata_cloud_never_reads_catalog_or_creates(invalid):
+    client = _FakeControlClient()
+    provider = DirectRunPodProvider(api_key="", client=client)
+    with pytest.raises(RunPodManagerError, match="SECURE or COMMUNITY"):
+        provider.start_pod(_profile(), {"cloud_type": invalid})
+    assert client.catalog_kwargs is None
+    assert client.create_request is None
+
+
+def test_changed_default_cannot_redirect_saved_resource_cleanup(monkeypatch):
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "COMMUNITY")
+    monkeypatch.setenv("RUNPOD_API_KEY", "unit-test-only")
+    client = _FakeControlClient()
+    with patch("kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    assert manager.provider.cloud is CloudType.COMMUNITY
+    manager.provider.terminate_pod("old-secure-pod")
+    assert client.actions == [("old-secure-pod", "terminate")]
+    assert client.catalog_kwargs is None
+    assert client.create_request is None
 
 
 def test_direct_provider_fails_before_catalog_when_required_env_is_unset(

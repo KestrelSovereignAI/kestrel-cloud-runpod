@@ -105,6 +105,19 @@ class CloudType(str, Enum):
     SECURE = "SECURE"
     COMMUNITY = "COMMUNITY"
 
+    @classmethod
+    def from_config(cls, value: "str | CloudType") -> "CloudType":
+        """Normalize operator configuration, not persisted resource authority."""
+
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("Cloud type must be SECURE or COMMUNITY")
+        try:
+            return cls(value.strip().upper())
+        except ValueError as exc:
+            raise ValueError("Cloud type must be SECURE or COMMUNITY") from exc
+
 
 class ComputeProduct(str, Enum):
     POD = "POD"

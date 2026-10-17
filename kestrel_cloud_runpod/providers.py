@@ -72,7 +72,7 @@ class DirectRunPodProvider(GPUProvider):
     def __init__(
         self,
         api_key: str,
-        cloud_type: str = "SECURE",
+        cloud_type: str | CloudType = CloudType.SECURE,
         *,
         client: Optional[RunpodControlPlaneClient] = None,
         control_plane_base_url: Optional[str] = None,
@@ -81,7 +81,7 @@ class DirectRunPodProvider(GPUProvider):
         if not api_key and client is None:
             raise RunPodManagerError("RUNPOD_API_KEY is required for direct mode")
         try:
-            self.cloud = CloudType(cloud_type.upper())
+            self.cloud = CloudType.from_config(cloud_type)
         except ValueError as exc:
             raise RunPodManagerError(
                 "RUNPOD_CLOUD_TYPE must be SECURE or COMMUNITY"
@@ -99,9 +99,9 @@ class DirectRunPodProvider(GPUProvider):
         pod_env = _resolve_env_vars(
             {**profile.env, **metadata.get("env_overrides", {})}
         )
-        cloud_value = metadata.get("cloud_type", profile.cloud.value)
+        cloud_value = metadata.get("cloud_type", profile.cloud)
         try:
-            cloud = CloudType(str(cloud_value).upper())
+            cloud = CloudType.from_config(cloud_value)
         except ValueError as exc:
             raise RunPodManagerError(
                 "Pod cloud_type must be SECURE or COMMUNITY"
