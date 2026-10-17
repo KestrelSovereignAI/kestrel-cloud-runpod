@@ -1,5 +1,6 @@
 """Live-catalog placement policy tests."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -35,6 +36,7 @@ def _offer(
         secure=True,
         community=False,
         secure_price_per_hr=price,
+        serverless_price_per_hr=price,
         community_price_per_hr=0.0,
         secure_max_count=max_count,
         community_max_count=0,
@@ -67,6 +69,62 @@ def test_placement_prefers_availability_then_live_price_and_records_snapshot():
     assert decision.offered_cost_per_hr == 0.7
     assert decision.catalog_observed_at == observed
     assert decision.requirements.benchmark_id == "catalog-selfie"
+
+
+def test_serverless_uses_pool_price_for_ranking_and_authorization():
+    requirements = PlacementRequirements(
+        product=ComputeProduct.SERVERLESS,
+        min_vram_gb=24,
+        max_cost_per_hr=1.0,
+    )
+    offers = [
+        replace(
+            _offer("cheap-pod"), secure_price_per_hr=0.1, serverless_price_per_hr=2.0
+        ),
+        replace(
+            _offer("cheap-serverless"),
+            secure_price_per_hr=5.0,
+            serverless_price_per_hr=0.8,
+        ),
+    ]
+    decision = select_gpu(offers, requirements)
+    assert decision.gpu_id == "cheap-serverless"
+    assert decision.offered_cost_per_hr == 0.8
+    with pytest.raises(RunPodManagerError, match="No live Runpod GPU offer"):
+        select_gpu(offers[:1], requirements)
+
+
+def test_pod_uses_cloud_rate_even_when_serverless_rate_differs():
+    offer = replace(_offer("pod"), serverless_price_per_hr=8.0)
+    decision = select_gpu(
+        [offer],
+        PlacementRequirements(
+            product=ComputeProduct.POD,
+            min_vram_gb=24,
+            max_cost_per_hr=1.0,
+        ),
+    )
+    assert decision.offered_cost_per_hr == 0.69
+
+
+def test_legacy_price_for_defaults_to_pods_and_missing_serverless_rate_is_explicit():
+    offer = replace(_offer("pod-only"), serverless_price_per_hr=None)
+    assert offer.price_for(CloudType.SECURE) == 0.69
+    with pytest.raises(RunPodManagerError, match="no Serverless pool price"):
+        offer.price_for(CloudType.SECURE, ComputeProduct.SERVERLESS)
+
+
+@pytest.mark.parametrize("pool_price", [None, float("nan"), float("inf"), -1.0])
+def test_serverless_rejects_missing_or_unsafe_pool_rate(pool_price):
+    offer = replace(_offer("pod-price-only"), serverless_price_per_hr=pool_price)
+    with pytest.raises(RunPodManagerError, match="No live Runpod GPU offer"):
+        select_gpu(
+            [offer],
+            PlacementRequirements(
+                product=ComputeProduct.SERVERLESS,
+                min_vram_gb=24,
+            ),
+        )
 
 
 def test_serverless_mig_uses_product_availability_not_pod_max_count():

@@ -60,7 +60,7 @@ def _gpu_payload(**changes: object) -> dict[str, object]:
         "memory": 24,
         "secure": True,
         "community": False,
-        "price": {"secure": 0.69, "community": 0.0},
+        "price": {"secure": 0.19, "community": 0.0, "serverless": 0.69},
         "maxCount": {"secure": 0, "community": 0},
         "availability": "HIGH",
         "dataCenters": [{"id": "US-TX-3", "availability": "HIGH"}],
@@ -260,7 +260,7 @@ async def test_activation_rejects_quote_expiry_and_price_increase_before_create(
     request_value = planned_request()
     accepted = await provider.quote_planned_endpoint(request_value)
 
-    control.offers[:] = [offer(secure_price_per_hr=0.70)]
+    control.offers[:] = [offer(serverless_price_per_hr=0.70)]
     with pytest.raises(RunPodManagerError, match="rate increased"):
         await provider.activate_planned_endpoint(
             request_value,
@@ -746,7 +746,7 @@ async def test_quote_rejects_shared_pool_and_unsafe_catalog_numbers() -> None:
         await provider.quote(request())
 
     provider.control_client.list_gpus = lambda **_: (
-        offer(secure_price_per_hr=float("nan")),
+        offer(serverless_price_per_hr=float("nan")),
     )
     with pytest.raises(RunPodManagerError, match="unsafe GPU rate"):
         await provider.quote(request())
@@ -779,7 +779,7 @@ async def test_submission_validation_rejects_rate_pool_workload_and_expiry_drift
     assert current is accepted
     assert current.hourly_worker_rate_usd == accepted.hourly_worker_rate_usd
 
-    offers[:] = [offer(secure_price_per_hr=0.68)]
+    offers[:] = [offer(serverless_price_per_hr=0.68)]
     assert (
         await provider.validate_quote_for_submission(
             original_request,
@@ -789,7 +789,7 @@ async def test_submission_validation_rejects_rate_pool_workload_and_expiry_drift
         is accepted
     )
 
-    offers[:] = [offer(secure_price_per_hr=0.70)]
+    offers[:] = [offer(serverless_price_per_hr=0.70)]
     with pytest.raises(RunPodManagerError, match="rate increased"):
         await provider.validate_quote_for_submission(
             original_request,
@@ -1622,7 +1622,9 @@ async def test_final_billing_uses_only_get_requests_and_never_serializes_job_out
 
 
 @pytest.mark.asyncio
-async def test_adoption_recovers_the_endpoint_a_crashed_activation_left_behind() -> None:
+async def test_adoption_recovers_the_endpoint_a_crashed_activation_left_behind() -> (
+    None
+):
     """The hole activation cannot close: a crash between create and persist.
 
     `activate_planned_endpoint` reconciles an ambiguous create inside the same
@@ -1682,7 +1684,7 @@ async def test_adoption_ignores_quote_expiry_because_the_money_is_already_spent(
     control.readback = orphan
     clock.value = accepted.expires_at
     # A price increase must not block adoption either: we are not buying.
-    control.offers[:] = [offer(secure_price_per_hr=99.0)]
+    control.offers[:] = [offer(serverless_price_per_hr=99.0)]
 
     receipt = await provider.adopt_planned_endpoint(request_value, accepted)
 
@@ -1785,7 +1787,9 @@ async def test_adoption_refuses_an_endpoint_that_does_not_bind_to_the_plan(
 
 
 @pytest.mark.asyncio
-async def test_adoption_readback_transport_failure_is_not_an_ownership_verdict() -> None:
+async def test_adoption_readback_transport_failure_is_not_an_ownership_verdict() -> (
+    None
+):
     """A 500 must not be reported as "this endpoint is not ours".
 
     `RunPodAPIError` derives from `RunPodManagerError`, so catching the base
@@ -1920,9 +1924,7 @@ async def test_adoption_imposes_no_freshness_constraint_in_either_direction() ->
     for advance_to_expiry in (False, True):
         clock = MutableClock()
         control = _PlannedControl()
-        provider = RunpodServerlessCapacityProvider(
-            control_client=control, clock=clock
-        )
+        provider = RunpodServerlessCapacityProvider(control_client=control, clock=clock)
         request_value = planned_request()
         accepted = await provider.quote_planned_endpoint(request_value)
 

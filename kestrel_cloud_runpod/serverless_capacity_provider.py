@@ -342,8 +342,8 @@ class RunpodServerlessCapacityProvider:
         named = tuple(item for item in existing if item.name == quote.endpoint_name)
         if len(named) != 1:
             # Zero: nothing to adopt here and now. Usually that means the
-            # create never landed, but ``list_endpoints`` is a single
-            # unpaginated GET with no read-your-writes guarantee, so it can
+            # create never landed, but even a complete paginated inventory
+            # has no read-your-writes guarantee, so it can
             # also mean "not visible yet" — which is why this refuses rather
             # than concluding no endpoint exists, and why a caller should keep
             # sweeping instead of closing the ledger row on one empty result.
@@ -1435,6 +1435,8 @@ def _quote_amounts(
 def _validate_catalog_numbers(offers: Sequence[GPUOffer]) -> None:
     for offer in offers:
         rates = (offer.secure_price_per_hr, offer.community_price_per_hr)
+        if offer.serverless_price_per_hr is not None:
+            rates += (offer.serverless_price_per_hr,)
         if any(not math.isfinite(rate) or rate < 0 for rate in rates):
             raise RunPodManagerError("Serverless catalog contained an unsafe GPU rate")
         if (
@@ -1490,7 +1492,13 @@ def _catalog_observation_sha256(
             "cloud": spec.constraints.cloud.value,
             "gpu_count": spec.constraints.gpu_count,
             "hourly_worker_rate_usd": decimal_text(
-                Decimal(str(offer.price_for(spec.constraints.cloud)))
+                Decimal(
+                    str(
+                        offer.price_for(
+                            spec.constraints.cloud, ComputeProduct.SERVERLESS
+                        )
+                    )
+                )
             ),
             "availability": offer.availability.value if offer.availability else None,
             "data_center_id": data_center_id,

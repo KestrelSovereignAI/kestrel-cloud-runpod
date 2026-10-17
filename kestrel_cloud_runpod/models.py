@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-CONTROL_PLANE_BASE_URL = "https://v2-rest.runpod.io/v2"
+CONTROL_PLANE_BASE_URL = "https://api.runpod.io/v2"
 SERVERLESS_DATA_PLANE_BASE_URL = "https://api.runpod.ai/v2"
 _URL_RE = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
 _SECRET_RE = re.compile(
@@ -141,6 +141,7 @@ class GPUOffer:
     availability: Optional[Availability] = None
     data_centers: tuple[Mapping[str, Any], ...] = ()
     availability_min_cuda_version: Optional[str] = None
+    serverless_price_per_hr: Optional[float] = None
 
     @classmethod
     def from_dict(
@@ -163,6 +164,11 @@ class GPUOffer:
                 community=_boolean(value, "community", "GPU offer"),
                 secure_price_per_hr=_number(price, "secure", "GPU offer.price"),
                 community_price_per_hr=_number(price, "community", "GPU offer.price"),
+                serverless_price_per_hr=(
+                    _number(price, "serverless", "GPU offer.price")
+                    if "serverless" in price
+                    else None
+                ),
                 secure_max_count=_integer(max_count, "secure", "GPU offer.maxCount"),
                 community_max_count=_integer(
                     max_count, "community", "GPU offer.maxCount"
@@ -181,7 +187,14 @@ class GPUOffer:
                 f"Invalid GPU offer availability: {availability}"
             ) from exc
 
-    def price_for(self, cloud: CloudType) -> float:
+    def price_for(
+        self, cloud: CloudType, product: ComputeProduct = ComputeProduct.POD
+    ) -> float:
+        """Return the per-GPU product rate; omitted product retains Pod API compatibility."""
+        if product is ComputeProduct.SERVERLESS:
+            if self.serverless_price_per_hr is None:
+                raise RunPodManagerError("GPU offer has no Serverless pool price")
+            return self.serverless_price_per_hr
         return (
             self.secure_price_per_hr
             if cloud is CloudType.SECURE

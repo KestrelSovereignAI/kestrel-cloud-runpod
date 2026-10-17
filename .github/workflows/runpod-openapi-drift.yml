@@ -15,5 +15,5 @@ jobs:
           python-version: "3.14"
       - name: Install schema parser
         run: python -m pip install 'PyYAML>=6.0.2,<7'
-      - name: Compare pin with live beta contract
+      - name: Compare pin with live v2 contract
         run: python scripts/check_runpod_openapi.py --check-pin --check-live

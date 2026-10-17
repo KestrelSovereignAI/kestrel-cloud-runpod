@@ -1,4 +1,4 @@
-"""Opt-in, read-only authenticated smoke checks for the beta v2 API."""
+"""Opt-in, read-only authenticated smoke checks for the v2 API."""
 
 import os
 

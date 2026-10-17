@@ -1,5 +1,5 @@
 {
-  "source": "https://v2-rest.runpod.io/v2/openapi.yaml",
-  "retrieved_at": "2026-08-01",
-  "sha256": "bae03c59c177ac3fba3a356f4ceec106d45c5d82e4ffc3acbfc50b492087c9dc"
+  "source": "https://api.runpod.io/v2/openapi.yaml",
+  "retrieved_at": "2026-10-17",
+  "sha256": "202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415"
 }

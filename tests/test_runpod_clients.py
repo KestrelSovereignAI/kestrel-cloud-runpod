@@ -24,6 +24,16 @@ from kestrel_cloud_runpod.models import (
 )
 
 
+def _page(key, items, next_cursor=None):
+    return {
+        key: items,
+        "pagination": {
+            "nextCursor": next_cursor,
+            "hasNextPage": next_cursor is not None,
+        },
+    }
+
+
 def _gpu(**overrides):
     value = {
         "id": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -33,7 +43,7 @@ def _gpu(**overrides):
         "memory": 48,
         "secure": True,
         "community": False,
-        "price": {"secure": 1.75, "community": 0.0},
+        "price": {"secure": 1.75, "community": 0.0, "serverless": 2.50},
         "maxCount": {"secure": 2, "community": 0},
         "availability": "HIGH",
         "dataCenters": [{"id": "US-TX-3", "name": "Texas", "availability": "HIGH"}],
@@ -98,6 +108,8 @@ def test_control_client_auth_user_agent_catalog_query_and_timeouts():
     )
 
     assert offers[0].pool == "BLACKWELL_48"
+    assert offers[0].serverless_price_per_hr == 2.50
+    assert seen[0].url.host == "api.runpod.io"
     assert offers[0].availability_min_cuda_version == "12.8"
     request = seen[0]
     assert request.headers["Authorization"] == "Bearer secret"
@@ -114,12 +126,126 @@ def test_control_client_auth_user_agent_catalog_query_and_timeouts():
     assert client.transport._client.timeout.read == 17.0
 
 
+@pytest.mark.parametrize(
+    "method,key,path,factory",
+    [
+        ("list_pods", "pods", "/v2/pods", _pod),
+        ("list_endpoints", "endpoints", "/v2/serverless", _endpoint),
+        (
+            "list_network_volumes",
+            "networkVolumes",
+            "/v2/network-volumes",
+            _network_volume,
+        ),
+    ],
+)
+def test_inventory_walks_all_pages_including_an_empty_intermediate_page(
+    method, key, path, factory
+):
+    seen = []
+    cursors = ("opaque+/cursor?one", "second-cursor", None)
+    pages = [
+        _page(key, [factory(id="first")], cursors[0]),
+        _page(key, [], cursors[1]),
+        _page(key, [factory(id="last")]),
+    ]
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=pages.pop(0))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret", http_transport=httpx.MockTransport(handler)
+    )
+    resources = getattr(client, method)()
+    assert [resource.id for resource in resources] == ["first", "last"]
+    assert [request.url.params.get("cursor") for request in seen] == [
+        None,
+        cursors[0],
+        cursors[1],
+    ]
+    assert all(request.url.host == "api.runpod.io" for request in seen)
+    assert all(request.url.path == path for request in seen)
+    if method == "list_pods":
+        assert all(
+            request.url.params["includeClusterPods"] == "true" for request in seen
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        {},
+        {"hasNextPage": "false", "nextCursor": None},
+        {"hasNextPage": 0, "nextCursor": None},
+        {"hasNextPage": False},
+        {"hasNextPage": True, "nextCursor": None},
+        {"hasNextPage": True, "nextCursor": ""},
+        {"hasNextPage": True, "nextCursor": 123},
+        {"hasNextPage": False, "nextCursor": "unexpected"},
+    ],
+)
+def test_inventory_rejects_missing_or_ambiguous_pagination(metadata):
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"pods": [], "pagination": metadata}
+            )
+        ),
+    )
+    with pytest.raises(RunPodManagerError, match="pagination"):
+        client.list_pods()
+
+
+def test_inventory_rejects_cursor_cycles_instead_of_hanging():
+    cursors = iter(("first", "second", "first"))
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=_page("pods", [], next(cursors)))
+        ),
+    )
+    with pytest.raises(RunPodManagerError, match="repeated.*cursor"):
+        client.list_pods()
+
+
+def test_inventory_rejects_duplicate_resources_across_pages():
+    pages = iter((_page("pods", [_pod()], "next"), _page("pods", [_pod()])))
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=next(pages))
+        ),
+    )
+    with pytest.raises(RunPodManagerError, match="Duplicate.*identity"):
+        client.list_pods()
+
+
+def test_inventory_does_not_return_partial_success_after_a_later_page_fails():
+    responses = iter(
+        (
+            httpx.Response(200, json=_page("pods", [_pod()], "next")),
+            httpx.Response(503, json={"title": "Unavailable", "detail": "retry later"}),
+        )
+    )
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=0,
+        http_transport=httpx.MockTransport(lambda request: next(responses)),
+    )
+    with pytest.raises(RunPodAPIError) as raised:
+        client.list_pods()
+    assert raised.value.status_code == 503
+
+
 def test_default_user_agent_is_explicit_and_non_generic():
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json={"pods": []})
+        return httpx.Response(200, json=_page("pods", []))
 
     client = RunpodControlPlaneClient(
         api_key="secret", http_transport=httpx.MockTransport(handler)
@@ -206,7 +332,7 @@ def test_safe_get_retries_using_retry_after_and_records_rate_limit():
         return httpx.Response(
             200,
             headers={"RateLimit": "limit=10, remaining=9, reset=60"},
-            json={"pods": []},
+            json=_page("pods", []),
         )
 
     client = RunpodControlPlaneClient(
@@ -233,7 +359,7 @@ def test_safe_get_uses_rate_limit_reset_when_retry_after_is_absent():
                 headers={"RateLimit": "limit=10, remaining=0, reset=3.5"},
                 json={"title": "Rate limited", "status": 429, "detail": "wait"},
             )
-        return httpx.Response(200, json={"pods": []})
+        return httpx.Response(200, json=_page("pods", []))
 
     client = RunpodControlPlaneClient(
         api_key="secret",
@@ -347,7 +473,7 @@ def test_pod_lifecycle_request_shapes():
             ),
         ),
         httpx.Response(200, json=_pod(status="RUNNING")),
-        httpx.Response(200, json={"pods": [_pod()]}),
+        httpx.Response(200, json=_page("pods", [_pod()])),
         httpx.Response(200, json=_pod(status="EXITED")),
         httpx.Response(204),
     ]
@@ -403,7 +529,7 @@ def test_network_volume_inventory_is_typed_and_read_only():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json={"networkVolumes": [_network_volume()]})
+        return httpx.Response(200, json=_page("networkVolumes", [_network_volume()]))
 
     client = RunpodControlPlaneClient(
         api_key="secret", http_transport=httpx.MockTransport(handler)
@@ -433,7 +559,7 @@ def test_network_volume_inventory_rejects_invalid_provider_shapes(volume):
     client = RunpodControlPlaneClient(
         api_key="secret",
         http_transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, json={"networkVolumes": [volume]})
+            lambda request: httpx.Response(200, json=_page("networkVolumes", [volume]))
         ),
     )
 
@@ -446,7 +572,7 @@ def test_endpoint_worker_and_billing_request_shapes():
     responses = [
         httpx.Response(201, json=_endpoint()),
         httpx.Response(200, json=_endpoint()),
-        httpx.Response(200, json={"endpoints": [_endpoint()]}),
+        httpx.Response(200, json=_page("endpoints", [_endpoint()])),
         httpx.Response(200, json=_endpoint(name="updated")),
         httpx.Response(200, json={"workers": [], "summary": {"total": 0}}),
         httpx.Response(200, json={"records": [], "metadata": {"recordCount": 0}}),

@@ -7,7 +7,7 @@ max_ttl_seconds = 3600
 poll_interval_seconds = 10
 readiness_timeout_seconds = 600
 cloud_type = "SECURE"
-# control_plane_base_url = "https://v2-rest.runpod.io/v2" # Override only for beta/dev smoke tests.
+# control_plane_base_url = "https://api.runpod.io/v2" # Override only for dev smoke tests.
 # user_agent = "your-app/runpod-integration"               # Must be a non-empty application UA.
 
 [training_pods]

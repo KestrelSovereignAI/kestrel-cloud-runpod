@@ -10,7 +10,7 @@
 
 Kestrel's Runpod integration predates Runpod Serverless. It creates and manages Pods through legacy module-level Python SDK and GraphQL behavior, keeps only one active session in process memory, and relies on a TTL that is not an external billing-safety mechanism. GPU identifiers, prices, availability, and startup estimates are also embedded in local profiles.
 
-That design was reasonable when inexpensive GPU capacity was scarce and model downloads made every replacement Pod expensive. Persistent disks and stopped Pods reduced repeat downloads, but tied the workload to a host or data-center capacity pool. Current Runpod provides a beta v2 REST control plane, queue and load-balancing Serverless endpoints, a live compute catalog, model caching, and billing records. These capabilities change the correct boundary: Kestrel should dispatch work to reusable execution services and manage durable leases, not recreate the old Pod lifecycle around a newer SDK.
+That design was reasonable when inexpensive GPU capacity was scarce and model downloads made every replacement Pod expensive. Persistent disks and stopped Pods reduced repeat downloads, but tied the workload to a host or data-center capacity pool. Runpod provides a v2 REST control plane, queue and load-balancing Serverless endpoints, a live compute catalog, model caching, and billing records. These capabilities change the correct boundary: Kestrel should dispatch work to reusable execution services and manage durable leases, not recreate the old Pod lifecycle around a newer SDK.
 
 This record defines one vendor boundary for three workload families:
 
@@ -20,16 +20,23 @@ This record defines one vendor boundary for three workload families:
 
 ## Decision
 
-`kestrel-cloud-runpod` will own a typed, v2-only Runpod integration. Runpod's v1 REST control plane remains supported and generally available during the beta migration, but new Kestrel production code will not call `rest.runpod.io/v1`. It also will not call the legacy GraphQL infrastructure API or private helpers from the Runpod Python CLI. There is no automatic v1 or GraphQL fallback. Choosing the beta v2 API for new work accepts additional contract-churn risk in exchange for building on Runpod's stated forward platform; the OpenAPI pin, drift gate, and injectable base URL below contain that risk without silently reverting to an older surface.
+`kestrel-cloud-runpod` owns the typed, v2-only Runpod integration. As of the
+2026-10-17 review, REST v2 is generally available; REST v1 retires on
+2026-11-15 and GraphQL retires in January 2027. Production code uses neither
+legacy surface nor private helpers from the Runpod Python CLI. The OpenAPI
+pin, drift gate, and injectable base URL make contract changes explicit.
 
 Runpod exposes two separate v2 services, and the distinction is part of the contract:
 
 | Service | Canonical base URL | Responsibility |
 | --- | --- | --- |
-| Control plane | `https://v2-rest.runpod.io/v2` | GPU/CPU/data-center catalog, Pods, Serverless endpoint definitions and workers, volumes, registries, and billing |
+| Control plane | `https://api.runpod.io/v2` | GPU/CPU/data-center catalog, Pods, Serverless endpoint definitions and workers, volumes, registries, and billing |
 | Serverless data plane | `https://api.runpod.ai/v2` | Queue job `/run`, `/status`, `/cancel`, `/retry`, and `/health` operations; endpoint-specific load-balanced traffic |
 
-The production control-plane base comes from Runpod's [official MCP/reference client's v2 configuration](https://github.com/runpod/runpod-mcp/blob/main/docs/configuration.md). The current [v2 OpenAPI document](https://v2-rest.runpod.io/v2/openapi.yaml) has a different `servers` value, so clients must not derive the production host from that field while v2 is beta. Both base URLs are declared once, are injectable for tests, and remain explicitly pinned to v2.
+The control-plane base matches Runpod's [migration guide](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
+and [API-served OpenAPI document](https://api.runpod.io/v2/openapi.yaml).
+This supersedes the original August beta-host discrepancy. Both base URLs
+are declared once, are injectable for tests, and remain explicitly pinned to v2.
 
 The Python `runpod` package may still be used inside a worker container for `runpod.serverless.start`. It will not be used as the infrastructure control-plane client.
 
@@ -83,16 +90,16 @@ Create requests are not automatically retried after an ambiguous timeout or conn
 
 ### OpenAPI pin and drift detection
 
-The beta API contract will be treated as an external dependency with an explicit upgrade process:
+The API contract is an external dependency with an explicit upgrade process:
 
-1. Vendor the reviewed [v2 OpenAPI YAML](https://v2-rest.runpod.io/v2/openapi.yaml) with its source URL, retrieval date, and SHA-256 checksum.
+1. Vendor the reviewed [v2 OpenAPI YAML](https://api.runpod.io/v2/openapi.yaml) with its source URL, retrieval date, and SHA-256 checksum.
 2. Generate or validate typed request/response models deterministically from that pinned document.
 3. Commit generated artifacts only when they are required at runtime; otherwise make CI prove regeneration produces no diff.
 4. Add contract tests for every operation the package uses, including list envelopes, nullable fields, action schemas, and RFC 9457 errors.
 5. Add a scheduled/manual drift check that fetches the live schema, reports the semantic diff, and opens or fails with an actionable update requirement. It must not silently overwrite the pin.
 6. Keep authenticated smoke tests opt-in and read-only by default. Mutating smoke tests require an explicit disposable-resource fixture and guaranteed teardown.
 
-An additive upstream field does not require an emergency release. A removed/renamed field, enum narrowing, required-field change, path change, or security change blocks a client upgrade until reviewed. The OpenAPI document is authoritative for shapes, but not for choosing the production base URL while the documented beta discrepancy remains.
+An additive upstream field does not require an emergency release. A removed/renamed field, enum narrowing, required-field change, path change, or security change blocks a client upgrade until reviewed. The API-served OpenAPI document is authoritative for wire shapes.
 
 ## Catalog, placement, pricing, and billing
 
@@ -108,14 +115,16 @@ The client queries `/catalog/gpus` with the availability expansion and product c
 
 Marketing SKU names are useful benchmark labels, not durable API identifiers. The initial benchmark matrix includes PRO 6000 MIG 1g.24gb, PRO 6000 MIG 2g.48gb, RTX PRO 4500, and RTX PRO 4000 Blackwell, but production configuration will use identifiers/pools returned by v2 and validated by the pinned schema.
 
-As of 2026-08-02, the live beta catalog returns `availability=HIGH` but
-`pool=null` for both PRO 6000 MIG Serverless products. The current v2
-`CreateEndpointRequest` requires at least one catalog-provided pool ID, so this
-is availability evidence but not actionable placement authority. The selector
-fails clearly before any create call and does not derive or hardcode a pool
-from the SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)
-tracks the vendor-contract gap; a Serverless benchmark remains blocked until
-the catalog supplies a canonical pool or the endpoint-create schema changes.
+The beta catalog observed on 2026-08-02 returned `pool=null` for both PRO
+6000 MIG Serverless products. On 2026-10-17, the GA catalog instead returned
+`AMPERE_24` (1g.24gb) and `ADA_48_PRO` (2g.48gb), but each pool includes other
+GPU types. A canonical pool is now available, not an exact MIG placement
+guarantee. Finite Serverless quotes reject ambiguous pools before creation;
+they cannot promise an exact GPU/rate/benchmark identity from one member of
+a shared pool. Missing IDs also fail clearly and are never derived from a
+SKU name. [Issue #21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21)
+tracks the remaining placement-contract gap. An explicitly quoted Pod or
+an unambiguous Serverless pool remains a separate product choice.
 
 Estimates use the live placement rate. Actual spend is reconciled from `/billing/serverless` or `/billing/pods` and attributed back to the catalog job or inference lease. A price change therefore affects a new placement decision without requiring a code release, while existing decisions remain auditable.
 
@@ -298,7 +307,7 @@ Queue-based Serverless remains valid for non-streaming batch inference but is no
 
 ## MCP boundary
 
-Runpod's [official MCP server](https://github.com/runpod/runpod-mcp) is a valuable operator tool and a reference client for the beta API. It is not a production dependency of the catalog dispatcher or inference-lease service.
+Runpod's [official MCP server](https://github.com/runpod/runpod-mcp) is a valuable operator tool and a reference client for the v2 API. It is not a production dependency of the catalog dispatcher or inference-lease service.
 
 The MCP server acts with the supplied API key's permissions. Product agents therefore do not receive unrestricted Runpod MCP/control-plane tools. They receive constrained provider-neutral operations such as acquire, status, and release for resources they own, with privacy, placement, deadline, and cost policies enforced before infrastructure changes. Operators may use MCP separately for inspection and emergency cleanup under appropriately scoped credentials.
 
@@ -384,7 +393,7 @@ The platform is not production-ready until all applicable gates pass:
 
 Positive consequences:
 
-- one Runpod implementation and one place to track the beta API;
+- one Runpod implementation and one place to track the Runpod API;
 - current availability and pricing replace stale configuration;
 - scale-to-zero catalog capacity without sacrificing the existing durable job contract;
 - private on-demand inference with enforceable ownership and teardown; and
@@ -392,7 +401,7 @@ Positive consequences:
 
 Costs and tradeoffs:
 
-- the beta control plane requires schema pinning, drift monitoring, and deliberate upgrades;
+- the external control plane requires schema pinning, drift monitoring, and deliberate upgrades;
 - CUDA portability is a real engine refactor, not a handler wrapper;
 - webhook reconciliation and durable leases add state-machine work;
 - load-balanced scale-to-zero Ollama can return temporary no-worker responses during initialization; and

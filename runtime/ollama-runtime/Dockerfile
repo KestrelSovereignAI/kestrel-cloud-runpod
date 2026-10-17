@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.18.0@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS proxy-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS proxy-builder
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.1.0
+ARG RUNTIME_VERSION=1.1.1
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -12,7 +12,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" go build \
     -ldflags="-s -w -buildid= -X main.runtimeVersion=${RUNTIME_VERSION} -X main.ollamaVersion=${OLLAMA_VERSION}" \
     -o /out/kestrel-ollama-runtime ./
 
-FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS ollama-builder
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS ollama-builder
+ENV GOTOOLCHAIN=local
 ARG OLLAMA_COMMIT=eec8e0b9458b8a01be0c216a9cc53eefde24ef50
 ADD --checksum=sha256:8c5030739b89aaa7eada7332c707cb3c6be27d9ec901b501a539fa57c576faae \
     https://github.com/ollama/ollama/archive/${OLLAMA_COMMIT}.tar.gz /tmp/ollama.tar.gz
@@ -25,17 +26,20 @@ WORKDIR /src/ollama
 # with fixed, explicit module versions and the patched Go toolchain.
 RUN go get \
       github.com/buger/jsonparser@v1.1.2 \
-      golang.org/x/crypto@v0.52.0 \
-      golang.org/x/image@v0.43.0 \
-      golang.org/x/net@v0.55.0 \
-      golang.org/x/text@v0.39.0 \
+      github.com/klauspost/compress@v1.20.2 \
+      golang.org/x/crypto@v0.57.0 \
+      golang.org/x/image@v0.45.0 \
+      golang.org/x/mod@v0.41.0 \
+      golang.org/x/net@v0.60.0 \
+      golang.org/x/text@v0.42.0 \
     && go mod download \
     && CGO_ENABLED=1 go build -buildvcs=false -trimpath -buildmode=pie \
       -ldflags="-s -w -buildid= -X=github.com/ollama/ollama/version.Version=0.32.5 -X=github.com/ollama/ollama/server.mode=release" \
-      -o /out/ollama .
+      -o /out/ollama . \
+    && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "github.com/klauspost/compress" {print $3}')" = v1.20.2
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.1.0
+ARG RUNTIME_VERSION=1.1.1
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \
@@ -45,7 +49,13 @@ LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       ai.kestrel.ollama.version="$OLLAMA_VERSION" \
       ai.kestrel.ollama.source.commit="eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
 
-RUN groupadd --gid 10001 kestrel-ollama \
+# The pinned upstream image contains OpenSSL from before CVE-2026-84782.
+# Upgrade both installed binary packages to the same fixed Ubuntu build.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --only-upgrade -y \
+      libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 kestrel-ollama \
     && useradd --uid 10001 --gid 10001 --home-dir /var/lib/kestrel-ollama --shell /usr/sbin/nologin kestrel-ollama \
     && mkdir -p /models /var/lib/kestrel-ollama \
     && chown -R 10001:10001 /models /var/lib/kestrel-ollama
