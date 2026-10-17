@@ -73,6 +73,26 @@ cleanup uses the saved resource identity, not the current default cloud.
 - Read-only `PodCapacityQuoteService` composition for ephemeral/scaled API
   processes that must never construct the writable SQLite lease authority
 
+Catalog hosts with revocable owner/generation admission should use
+`PodCapacityLeaseService.provision_catalog(request)` for the bounded provider
+create and durable locator transition, then `poll_catalog_readiness(...)` on
+their existing external worker loop. Each poll performs one readiness
+observation (it may terminate unusable/expired capacity), never sleeps, creates,
+or restarts a Pod. `acquire_catalog()` retains its wait-until-ready behavior for
+existing callers. Polling is not permission to submit: revalidate owner,
+generation and durable Stop immediately before workload submission, including
+recovery. An old resource may still be observed, terminated and settled after
+its authority to create or submit work is revoked.
+
+`await_owned_effect(effect)` retains an already-admitted mutation through
+repeated task cancellation. Persist intent before admission, include provider
+receipt or ambiguity persistence inside the effect, and hold the host's
+admission/Stop custody outside the await. Caller cancellation propagates after
+the entire effect finishes; a late effect error remains visible. This is not a
+retry or an authorization mechanism. Process crashes still require recovery
+from durable intent. Provider adapters use this same primitive to join blocking
+Pod and Serverless mutation threads before returning control.
+
 ## Architecture
 
 - [Runpod v2 execution platform](docs/architecture/RUNPOD_V2_EXECUTION_PLATFORM.md) — the accepted control-plane, Serverless, catalog inference, and private Ollama design.

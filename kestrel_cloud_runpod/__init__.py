@@ -34,6 +34,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
 from .clients import RunpodControlPlaneClient, RunpodServerlessClient
+from .effect_custody import await_owned_effect
 from .feature import RunPodFeature
 from .inference_provider import RunpodInferenceLeaseProvider
 from .manager import RunPodManager
@@ -158,6 +159,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
 __all__ = [
+    "await_owned_effect",
     "RUNPOD_V2_OPENAPI_SHA256",
     "RUNPOD_V2_OPENAPI_SOURCE_URL",
     "SERVERLESS_CAPACITY_CONTRACT_VERSION",

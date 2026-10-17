@@ -9,7 +9,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
+
+from .effect_custody import await_owned_effect
 
 from .models import (
     CloudType,
@@ -32,8 +34,6 @@ from .pod_capacity_contracts import (
     pod_cost_usd,
 )
 from .providers import DirectRunPodProvider
-
-_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -212,7 +212,9 @@ class RunpodPodCapacityProvider:
         )
 
     async def start(self, pod_id: str, *, gpu_count: int) -> None:
-        await _mutation_to_thread(self.provider.resume_pod, pod_id, gpu_count)
+        await await_owned_effect(
+            asyncio.to_thread(self.provider.resume_pod, pod_id, gpu_count)
+        )
 
     async def create(
         self,
@@ -252,8 +254,8 @@ class RunpodPodCapacityProvider:
         }
         if environment is not None:
             metadata["env_overrides"] = dict(environment)
-        result = await _mutation_to_thread(
-            self.provider.start_pod, effective_profile, metadata
+        result = await await_owned_effect(
+            asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
         )
         pod_id = result.get("id") or result.get("podId")
         if not isinstance(pod_id, str) or not pod_id:
@@ -335,7 +337,9 @@ class RunpodPodCapacityProvider:
         """Request idempotent stop and report whether v2 confirms non-billing state."""
 
         try:
-            result = await _mutation_to_thread(self.provider.stop_pod, pod_id)
+            result = await await_owned_effect(
+                asyncio.to_thread(self.provider.stop_pod, pod_id)
+            )
         except RunPodAPIError as exc:
             if exc.status_code == 404:
                 return True
@@ -362,7 +366,9 @@ class RunpodPodCapacityProvider:
         """Permanently terminate disposable capacity and confirm non-billing state."""
 
         try:
-            result = await _mutation_to_thread(self.provider.terminate_pod, pod_id)
+            result = await await_owned_effect(
+                asyncio.to_thread(self.provider.terminate_pod, pod_id)
+            )
         except RunPodAPIError as exc:
             if exc.status_code == 404:
                 return True
@@ -506,19 +512,6 @@ def _pod_base_url(
                 )
             return f"{protocol}://{ip}:{int(public)}"
     return None
-
-
-async def _mutation_to_thread(operation: Callable[..., _T], /, *args: Any) -> _T:
-    """Do not propagate cancellation until an in-flight v2 mutation resolves."""
-
-    task: asyncio.Task[_T] = asyncio.create_task(asyncio.to_thread(operation, *args))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Threads cannot be cancelled. Waiting here closes the race where a
-        # cleanup stop could run before a delayed create/start completed.
-        await task
-        raise
 
 
 PodCapacityObservation = TrainingPodObservation

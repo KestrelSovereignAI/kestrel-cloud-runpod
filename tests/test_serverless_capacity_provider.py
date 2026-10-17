@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -345,6 +347,44 @@ async def test_activation_creates_exact_zero_baseline_endpoint_and_readback() ->
     assert receipt.operation_digest == accepted.operation_digest
     assert not receipt.reconciled_after_ambiguous_create
     assert ServerlessEndpointActivationReceipt.from_dict(receipt.to_dict()) == receipt
+
+
+@pytest.mark.asyncio
+async def test_cancelled_activation_joins_create_before_named_recovery():
+    entered, finish = threading.Event(), threading.Event()
+
+    class BlockingControl(_PlannedControl):
+        def create_endpoint(self, request_value):
+            entered.set()
+            assert finish.wait(5), "test did not release endpoint mutation"
+            return super().create_endpoint(request_value)
+
+    control = BlockingControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control, clock=MutableClock()
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+    task = asyncio.create_task(
+        provider.activate_planned_endpoint(
+            value, accepted, accepted_cost_ceiling_usd=accepted.cost_ceiling_usd
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        for _ in range(4):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(control.create_requests) == 1
+    control.list_pages = [(control.created,)]
+    adopted = await provider.adopt_planned_endpoint(value, accepted)
+    assert adopted.endpoint_id == control.created.id
+    assert len(control.create_requests) == 1
 
 
 @pytest.mark.asyncio

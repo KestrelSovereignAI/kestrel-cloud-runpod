@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from .effect_custody import await_owned_effect
 from .models import GPUProfile, RunPodAmbiguousResultError, RunPodManagerError
 from .pod_capacity_contracts import (
     TRAINING_PROFILE_IDS,
@@ -154,7 +155,30 @@ class PodCapacityLeaseService:
     async def acquire_catalog(
         self, request: CatalogPodCapacityRequest
     ) -> TrainingPodLease:
-        """Acquire one isolated Pod for an opaque private catalog attempt."""
+        """Provision and wait for worker readiness (compatibility convenience).
+
+        Hosts with revocable admission should use ``provision_catalog`` followed
+        by bounded ``poll_catalog_readiness`` calls, then revalidate admission
+        and durable Stop immediately before workload submission.
+        """
+
+        return await self._acquire_catalog(request, wait_for_ready=True)
+
+    async def provision_catalog(
+        self, request: CatalogPodCapacityRequest
+    ) -> TrainingPodLease:
+        """Persist one Pod create and return without waiting for worker health.
+
+        Identical replay returns the existing STARTING/READY lease; it never
+        creates replacement capacity. The caller retains admission through the
+        mutation and receipt, but need not hold it throughout a cold start.
+        """
+
+        return await self._acquire_catalog(request, wait_for_ready=False)
+
+    async def _acquire_catalog(
+        self, request: CatalogPodCapacityRequest, *, wait_for_ready: bool
+    ) -> TrainingPodLease:
 
         self._require_workload_transport()
         existing = self.repository.get(request.capacity_id)
@@ -169,7 +193,12 @@ class PodCapacityLeaseService:
                     f"Pod capacity '{request.capacity_id}' already represents "
                     "a different request"
                 )
-            if existing.state is TrainingPodState.READY:
+            if existing.state is TrainingPodState.READY or (
+                not wait_for_ready
+                and existing.state is TrainingPodState.STARTING
+                and existing.provider_pod_id is not None
+                and not existing.creation_uncertain
+            ):
                 return self.heartbeat(existing.cleanup_token)
             raise TrainingPodConflictError(
                 f"Pod capacity '{request.capacity_id}' is already in state "
@@ -185,6 +214,12 @@ class PodCapacityLeaseService:
             request.attempt_id, request.bearer_expires_at
         )
         _validate_capability(request, capability)
+        if self._now() >= min(
+            request.quote.expires_at, request.readiness_deadline, request.hard_deadline
+        ):
+            raise RunPodManagerError(
+                "Catalog Pod authorization expired before creation"
+            )
         capacity_spec = PodCapacitySpec(
             request=request,
             capability_secret_id=capability.secret_id,
@@ -215,7 +250,9 @@ class PodCapacityLeaseService:
             "CATALOG_POD_BEARER_EXPIRES_AT": iso_datetime(capability.expires_at),
             "CONTAINER_DIGEST": request.image_reference.rsplit("@", 1)[1],
         }
-        return await self.acquire(internal, environment=environment)
+        return await self._acquire(
+            internal, environment=environment, wait_for_ready=wait_for_ready
+        )
 
     async def acquire(
         self,
@@ -225,6 +262,17 @@ class PodCapacityLeaseService:
     ) -> TrainingPodLease:
         """Acquire capacity, persisting authority before any provider mutation."""
 
+        return await self._acquire(
+            request, environment=environment, wait_for_ready=True
+        )
+
+    async def _acquire(
+        self,
+        request: TrainingPodRequest,
+        *,
+        environment: Mapping[str, str] | None,
+        wait_for_ready: bool,
+    ) -> TrainingPodLease:
         lease, inserted = self.repository.reserve(request)
         if not inserted:
             if lease.state is TrainingPodState.READY:
@@ -235,8 +283,12 @@ class PodCapacityLeaseService:
             )
         profile = self._profile(lease.profile_id)
         if request.source is TrainingPodSource.CREATED:
-            return await self._acquire_created(lease, profile, environment=environment)
-        return await self._acquire_existing(lease, profile)
+            lease = await self._acquire_created(lease, profile, environment=environment)
+        else:
+            lease = await self._acquire_existing(lease, profile)
+        if wait_for_ready:
+            return await self._wait_ready(lease, profile)
+        return lease
 
     async def _acquire_existing(
         self, lease: TrainingPodLease, profile: GPUProfile
@@ -309,7 +361,7 @@ class PodCapacityLeaseService:
             )
             raise self._lifecycle_error("Pod acquisition", released, billing_risk=False)
 
-        return await self._wait_ready(lease, profile)
+        return lease
 
     async def _acquire_created(
         self,
@@ -433,29 +485,67 @@ class PodCapacityLeaseService:
             lifecycle={"provider_create_accepted_at": accepted_at},
             realized_placement=created.realized_placement,
         )
-        return await self._wait_ready(lease, profile)
+        return lease
+
+    async def poll_catalog_readiness(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+    ) -> TrainingPodLease:
+        """Observe readiness once, without sleeping, creating, or starting a Pod.
+
+        Owner/workload identity is exact and a cancelled/releasing lease is never
+        promoted. Poll regularly while the admitted host owns this attempt;
+        missing/uncertain provider identity requires reconciliation, not replay.
+        This observation is not authorization to submit a workload.
+        """
+
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if lease.state is not TrainingPodState.STARTING:
+            return lease
+        if lease.provider_pod_id is None or lease.creation_uncertain:
+            raise TrainingPodConflictError(
+                "Catalog Pod readiness requires a reconciled provider identity"
+            )
+        lease = self.heartbeat(capacity_id)
+        return await self._observe_readiness(lease, self._profile(lease.profile_id))
 
     async def _wait_ready(
         self, lease: TrainingPodLease, profile: GPUProfile
     ) -> TrainingPodLease:
-        while self._now() < lease.readiness_deadline:
+        while True:
+            lease = await self._observe_readiness(lease, profile)
+            if lease.state is not TrainingPodState.STARTING:
+                return lease
             try:
-                observation = await self.provider.observe(
-                    self._pod_id(lease), profile=profile
-                )
+                await self._sleep(self.poll_interval_seconds)
             except asyncio.CancelledError:
                 await self._cleanup_cancelled_acquisition(
                     lease, "readiness cancellation"
                 )
                 raise
-            except RunPodManagerError as exc:
-                lease = self._record_retryable_failure(lease, exc)
-                return await self._raise_after_cleanup(
-                    lease, operation="readiness observation", cause=exc
-                )
+
+    async def _observe_readiness(
+        self, lease: TrainingPodLease, profile: GPUProfile
+    ) -> TrainingPodLease:
+        lease = self._required(lease.cleanup_token)
+        if lease.state not in {TrainingPodState.STARTING, TrainingPodState.READY}:
+            return lease
+        if lease.state is TrainingPodState.READY:
+            return lease
+        lease = await self._enforce_readiness_deadline(lease)
+        try:
+            observation = await self.provider.observe(
+                self._pod_id(lease), profile=profile
+            )
+            current = self._required(lease.cleanup_token)
+            if current.state is not TrainingPodState.STARTING:
+                return current
             observed_at = self._now()
             lease = self._transition_with_evidence(
-                self._required(lease.cleanup_token),
+                current,
                 changes={
                     "backend_base_url": observation.backend_base_url,
                     "last_heartbeat_at": observed_at,
@@ -466,7 +556,10 @@ class PodCapacityLeaseService:
                     if observation.is_running
                     else {}
                 ),
+                expected_states=frozenset({TrainingPodState.STARTING}),
             )
+            if lease.state is not TrainingPodState.STARTING:
+                return lease
             if observation.is_failed or observation.is_stopped:
                 cause = RunPodManagerError(
                     f"Training Pod entered unusable state {observation.status}"
@@ -474,40 +567,60 @@ class PodCapacityLeaseService:
                 return await self._raise_after_cleanup(
                     lease, operation="readiness", cause=cause
                 )
-            if observation.is_running and observation.backend_base_url:
-                if lease.is_catalog_attempt:
-                    try:
-                        await self._require_workload_transport().health(
-                            observation.backend_base_url
-                        )
-                    except CatalogPodTransportError as exc:
-                        lease = self._record_retryable_failure(lease, exc)
-                        try:
-                            await self._sleep(self.poll_interval_seconds)
-                        except asyncio.CancelledError:
-                            await self._cleanup_cancelled_acquisition(
-                                lease, "catalog health cancellation"
-                            )
-                            raise
-                        lease = self._required(lease.cleanup_token)
-                        continue
-                ready_at = self._now()
-                return self._transition_with_evidence(
-                    lease,
-                    changes={
-                        "state": TrainingPodState.READY,
-                        "last_heartbeat_at": ready_at,
-                    },
-                    lifecycle={"worker_ready_at": ready_at},
-                )
-            try:
-                await self._sleep(self.poll_interval_seconds)
-            except asyncio.CancelledError:
-                await self._cleanup_cancelled_acquisition(
-                    lease, "readiness cancellation"
-                )
-                raise
-            lease = self._required(lease.cleanup_token)
+            if not observation.is_running or not observation.backend_base_url:
+                return lease
+            if lease.is_catalog_attempt:
+                try:
+                    await self._require_workload_transport().health(
+                        observation.backend_base_url
+                    )
+                except CatalogPodTransportError as exc:
+                    current = self._required(lease.cleanup_token)
+                    if current.state is not TrainingPodState.STARTING:
+                        return current
+                    # An unready worker is not a failed cleanup. Keep STARTING
+                    # so a later bounded observation can become ready, without
+                    # reviving RECONCILE_REQUIRED/Stop states.
+                    return self._transition_with_evidence(
+                        current,
+                        changes={
+                            "last_provider_error": sanitize_training_error(exc),
+                            "last_heartbeat_at": self._now(),
+                        },
+                        expected_states=frozenset({TrainingPodState.STARTING}),
+                    )
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_acquisition(lease, "readiness cancellation")
+            raise
+        except TrainingPodLifecycleError:
+            raise
+        except RunPodManagerError as exc:
+            lease = self._record_retryable_failure(
+                self._required(lease.cleanup_token), exc
+            )
+            return await self._raise_after_cleanup(
+                lease, operation="readiness observation", cause=exc
+            )
+        current = self._required(lease.cleanup_token)
+        if current.state is not TrainingPodState.STARTING:
+            return current
+        current = await self._enforce_readiness_deadline(current)
+        ready_at = self._now()
+        return self._transition_with_evidence(
+            current,
+            changes={
+                "state": TrainingPodState.READY,
+                "last_heartbeat_at": ready_at,
+            },
+            lifecycle={"worker_ready_at": ready_at},
+            expected_states=frozenset({TrainingPodState.STARTING}),
+        )
+
+    async def _enforce_readiness_deadline(
+        self, lease: TrainingPodLease
+    ) -> TrainingPodLease:
+        if self._now() < min(lease.readiness_deadline, lease.hard_deadline):
+            return lease
         cause = RunPodManagerError(
             "Training Pod did not become route-ready before timeout"
         )
@@ -531,16 +644,9 @@ class PodCapacityLeaseService:
     async def _cleanup_cancelled_acquisition(
         self, lease: TrainingPodLease, operation: str
     ) -> None:
-        task = asyncio.create_task(
+        await await_owned_effect(
             self._release_one(lease.cleanup_token, reason=operation)
         )
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # A second cancellation must not detach the already-started cleanup task.
-            await task
-        except TrainingPodCleanupError:
-            raise
 
     def heartbeat(self, cleanup_token: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)
@@ -629,13 +735,13 @@ class PodCapacityLeaseService:
         lease = self._required(cleanup_token)
         if lease.is_terminal:
             return lease
-        return self.repository.compare_and_set(
-            lease,
-            changes={
-                "state": TrainingPodState.CANCEL_REQUESTED,
-                "last_heartbeat_at": self._now(),
-            },
-        )
+        changes: dict[str, Any] = {
+            "state": TrainingPodState.CANCEL_REQUESTED,
+            "last_heartbeat_at": self._now(),
+        }
+        if lease.is_catalog_attempt:
+            changes["workload_state"] = CatalogPodWorkloadState.CANCEL_REQUESTED
+        return self.repository.compare_and_set(lease, changes=changes)
 
     async def submit_catalog_workload(
         self,
@@ -647,13 +753,12 @@ class PodCapacityLeaseService:
     ) -> CatalogPodWorkloadObservation:
         """Submit one opaque request; identical replay is worker-idempotent."""
 
-        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
-            raise RunPodManagerError(
-                f"Pod capacity '{capacity_id}' is not ready for workload submission"
-            )
+        lease = self._submission_lease(capacity_id, owner_id, workload_id)
         spec = self._capacity_spec(lease)
         capability = await self._load_capability(spec)
+        # Capability I/O can yield while Stop persists its intent. Never submit
+        # using the state snapshot from before that await.
+        lease = self._submission_lease(capacity_id, owner_id, workload_id)
         observation = await self._require_workload_transport().submit(
             base_url=self._route(lease),
             attempt_id=spec.request.attempt_id,
@@ -1496,11 +1601,14 @@ class PodCapacityLeaseService:
         realized_placement: PodRealizedPlacement | None | object = _EVIDENCE_UNSET,
         worker: CatalogWorkerEvidence | object = _EVIDENCE_UNSET,
         billing: PodBillingReceipt | None | object = _EVIDENCE_UNSET,
+        expected_states: frozenset[TrainingPodState] | None = None,
     ) -> TrainingPodLease:
         """CAS state and first-observation evidence without stale overwrites."""
 
         current = lease
         while not current.is_terminal:
+            if expected_states is not None and current.state not in expected_states:
+                return current
             persisted = dict(changes)
             evidence = current.evidence
             if evidence is not None:
@@ -1635,8 +1743,29 @@ class PodCapacityLeaseService:
             }:
                 lifecycle["workload_terminal_at"] = observed_at
         return self._transition_with_evidence(
-            lease, changes=changes, lifecycle=lifecycle
+            lease,
+            changes=changes,
+            lifecycle=lifecycle,
+            expected_states=frozenset(
+                {
+                    TrainingPodState.READY,
+                    TrainingPodState.JOB_SUBMITTED,
+                    TrainingPodState.JOB_COMPLETED,
+                }
+            ),
         )
+
+    def _submission_lease(
+        self, capacity_id: str, owner_id: str, workload_id: str
+    ) -> TrainingPodLease:
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
+            raise RunPodManagerError(
+                f"Pod capacity '{capacity_id}' is not ready for workload submission"
+            )
+        if self._now() >= lease.hard_deadline:
+            raise RunPodManagerError("Catalog Pod submission hard deadline has expired")
+        return lease
 
     def _catalog_lease(
         self, capacity_id: str, owner_id: str, workload_id: str
