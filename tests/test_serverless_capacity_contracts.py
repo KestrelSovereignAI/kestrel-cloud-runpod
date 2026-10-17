@@ -62,9 +62,9 @@ def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
         .to_payload()
     )
 
-    assert RUNPOD_V2_OPENAPI_SOURCE_URL == "https://api.runpod.io/v2/openapi.json"
+    assert RUNPOD_V2_OPENAPI_SOURCE_URL == "https://api.runpod.io/v2/openapi.yaml"
     assert RUNPOD_V2_OPENAPI_SHA256 == (
-        "0bbdd828569233765e310e773e34586b33a6e38f55afde989ebd670152ed5c13"
+        "202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415"
     )
     assert payload["type"] == "QUEUE"
     assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}

@@ -24,9 +24,9 @@ from .models import (
 
 SERVERLESS_CAPACITY_SCHEMA_VERSION = 1
 SERVERLESS_CAPACITY_CONTRACT_VERSION = "serverless-capacity-v1"
-RUNPOD_V2_OPENAPI_SOURCE_URL = "https://api.runpod.io/v2/openapi.json"
+RUNPOD_V2_OPENAPI_SOURCE_URL = "https://api.runpod.io/v2/openapi.yaml"
 RUNPOD_V2_OPENAPI_SHA256 = (
-    "0bbdd828569233765e310e773e34586b33a6e38f55afde989ebd670152ed5c13"
+    "202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415"
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}")

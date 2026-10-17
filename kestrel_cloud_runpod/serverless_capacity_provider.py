@@ -342,8 +342,8 @@ class RunpodServerlessCapacityProvider:
         named = tuple(item for item in existing if item.name == quote.endpoint_name)
         if len(named) != 1:
             # Zero: nothing to adopt here and now. Usually that means the
-            # create never landed, but ``list_endpoints`` is a single
-            # unpaginated GET with no read-your-writes guarantee, so it can
+            # create never landed, but even a complete paginated inventory
+            # has no read-your-writes guarantee, so it can
             # also mean "not visible yet" — which is why this refuses rather
             # than concluding no endpoint exists, and why a caller should keep
             # sweeping instead of closing the ledger row on one empty result.

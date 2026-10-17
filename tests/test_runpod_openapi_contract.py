@@ -10,6 +10,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from kestrel_cloud_runpod import RUNPOD_V2_OPENAPI_SHA256, RUNPOD_V2_OPENAPI_SOURCE_URL
 from kestrel_cloud_runpod.models import (
     CONTROL_PLANE_BASE_URL,
     EndpointCreateRequest,
@@ -51,6 +52,8 @@ def _schema():
 
 def test_pin_checksum_and_validator_script():
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    assert RUNPOD_V2_OPENAPI_SOURCE_URL == lock["source"]
+    assert RUNPOD_V2_OPENAPI_SHA256 == lock["sha256"]
     digest = hashlib.sha256(SCHEMA_PATH.read_bytes()).hexdigest()
     assert digest == lock["sha256"]
     result = subprocess.run(

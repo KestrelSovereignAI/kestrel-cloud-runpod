@@ -8,8 +8,8 @@ served by the Runpod v2 API itself:
 - Observed: 2026-10-17
 
 That schema requires `type: QUEUE`, puts `idleTimeout` under `workers`, and
-uses `scaling: {type: QUEUE_DELAY, queueDelay: ...}`. The checked-in schema in
-`runpod/docs` main was stale at the observation time (SHA-256
+uses `scaling: {type: QUEUE_DELAY, queueDelay: ...}`. In August 2026, the
+checked-in schema in `runpod/docs` main was stale (SHA-256
 `64635d12b9e03d2ad7136e0375baaed7d2a8ac1b13ef4698e652f94e6e5db1f2`):
 it described `QUEUE_BASED` and the older `scaling.value/idleTimeout` layout.
 

@@ -190,6 +190,7 @@ class GPUOffer:
     def price_for(
         self, cloud: CloudType, product: ComputeProduct = ComputeProduct.POD
     ) -> float:
+        """Return the per-GPU product rate; omitted product retains Pod API compatibility."""
         if product is ComputeProduct.SERVERLESS:
             if self.serverless_price_per_hr is None:
                 raise RunPodManagerError("GPU offer has no Serverless pool price")

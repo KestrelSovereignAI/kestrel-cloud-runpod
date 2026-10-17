@@ -107,6 +107,13 @@ def test_pod_uses_cloud_rate_even_when_serverless_rate_differs():
     assert decision.offered_cost_per_hr == 0.69
 
 
+def test_legacy_price_for_defaults_to_pods_and_missing_serverless_rate_is_explicit():
+    offer = replace(_offer("pod-only"), serverless_price_per_hr=None)
+    assert offer.price_for(CloudType.SECURE) == 0.69
+    with pytest.raises(RunPodManagerError, match="no Serverless pool price"):
+        offer.price_for(CloudType.SECURE, ComputeProduct.SERVERLESS)
+
+
 @pytest.mark.parametrize("pool_price", [None, float("nan"), float("inf"), -1.0])
 def test_serverless_rejects_missing_or_unsafe_pool_rate(pool_price):
     offer = replace(_offer("pod-price-only"), serverless_price_per_hr=pool_price)

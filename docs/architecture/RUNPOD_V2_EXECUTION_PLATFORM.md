@@ -10,7 +10,7 @@
 
 Kestrel's Runpod integration predates Runpod Serverless. It creates and manages Pods through legacy module-level Python SDK and GraphQL behavior, keeps only one active session in process memory, and relies on a TTL that is not an external billing-safety mechanism. GPU identifiers, prices, availability, and startup estimates are also embedded in local profiles.
 
-That design was reasonable when inexpensive GPU capacity was scarce and model downloads made every replacement Pod expensive. Persistent disks and stopped Pods reduced repeat downloads, but tied the workload to a host or data-center capacity pool. Current Runpod provides a beta v2 REST control plane, queue and load-balancing Serverless endpoints, a live compute catalog, model caching, and billing records. These capabilities change the correct boundary: Kestrel should dispatch work to reusable execution services and manage durable leases, not recreate the old Pod lifecycle around a newer SDK.
+That design was reasonable when inexpensive GPU capacity was scarce and model downloads made every replacement Pod expensive. Persistent disks and stopped Pods reduced repeat downloads, but tied the workload to a host or data-center capacity pool. Runpod provides a v2 REST control plane, queue and load-balancing Serverless endpoints, a live compute catalog, model caching, and billing records. These capabilities change the correct boundary: Kestrel should dispatch work to reusable execution services and manage durable leases, not recreate the old Pod lifecycle around a newer SDK.
 
 This record defines one vendor boundary for three workload families:
 
@@ -305,7 +305,7 @@ Queue-based Serverless remains valid for non-streaming batch inference but is no
 
 ## MCP boundary
 
-Runpod's [official MCP server](https://github.com/runpod/runpod-mcp) is a valuable operator tool and a reference client for the beta API. It is not a production dependency of the catalog dispatcher or inference-lease service.
+Runpod's [official MCP server](https://github.com/runpod/runpod-mcp) is a valuable operator tool and a reference client for the v2 API. It is not a production dependency of the catalog dispatcher or inference-lease service.
 
 The MCP server acts with the supplied API key's permissions. Product agents therefore do not receive unrestricted Runpod MCP/control-plane tools. They receive constrained provider-neutral operations such as acquire, status, and release for resources they own, with privacy, placement, deadline, and cost policies enforced before infrastructure changes. Operators may use MCP separately for inspection and emergency cleanup under appropriately scoped credentials.
 
@@ -391,7 +391,7 @@ The platform is not production-ready until all applicable gates pass:
 
 Positive consequences:
 
-- one Runpod implementation and one place to track the beta API;
+- one Runpod implementation and one place to track the Runpod API;
 - current availability and pricing replace stale configuration;
 - scale-to-zero catalog capacity without sacrificing the existing durable job contract;
 - private on-demand inference with enforceable ownership and teardown; and
@@ -399,7 +399,7 @@ Positive consequences:
 
 Costs and tradeoffs:
 
-- the beta control plane requires schema pinning, drift monitoring, and deliberate upgrades;
+- the external control plane requires schema pinning, drift monitoring, and deliberate upgrades;
 - CUDA portability is a real engine refactor, not a handler wrapper;
 - webhook reconciliation and durable leases add state-machine work;
 - load-balanced scale-to-zero Ollama can return temporary no-worker responses during initialization; and
