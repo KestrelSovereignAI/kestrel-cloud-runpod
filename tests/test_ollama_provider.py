@@ -217,6 +217,23 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
 
 
 @pytest.mark.asyncio
+async def test_private_ollama_rejects_shared_serverless_gpu_pool(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+    offer = _offer(ComputeProduct.SERVERLESS)
+    client.list_gpus = lambda **_: (offer, replace(offer, id="other-gpu"))
+    provider = _provider(client=client)
+    request = make_request(
+        MutableClock(), mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+
+    with pytest.raises(RunPodManagerError, match="one exact catalog GPU"):
+        await provider.plan(request)
+    assert client.endpoint_request is None
+    assert client.pod_request is None
+
+
+@pytest.mark.asyncio
 async def test_plan_uses_product_specific_live_catalog_prices(monkeypatch):
     monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
     client = _ControlClient()

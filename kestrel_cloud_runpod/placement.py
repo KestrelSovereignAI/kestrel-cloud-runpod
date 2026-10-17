@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -31,11 +32,22 @@ def select_gpu(
 ) -> PlacementDecision:
     """Choose the highest-availability, lowest-cost compatible catalog offer."""
 
-    compatible = [offer for offer in offers if _is_compatible(offer, requirements)]
+    catalog = tuple(offers)
+    pool_members = Counter(offer.pool for offer in catalog if offer.pool)
+    compatible = [
+        offer
+        for offer in catalog
+        if _is_compatible(offer, requirements)
+        and (
+            requirements.product is not ComputeProduct.SERVERLESS
+            or pool_members[offer.pool] == 1
+        )
+    ]
     if not compatible:
         raise RunPodManagerError(
             "No live Runpod GPU offer satisfies the workload's VRAM, CUDA, "
-            "availability, cloud, data-center, pool, and cost constraints"
+            "availability, cloud, data-center, pool, and cost constraints; "
+            "Serverless pools must identify one exact catalog GPU"
         )
     compatible.sort(
         key=lambda offer: (

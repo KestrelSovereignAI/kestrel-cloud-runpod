@@ -1239,10 +1239,6 @@ class RunpodServerlessCapacityProvider:
         matching_pool = tuple(
             offer for offer in offers if offer.pool == placement.gpu_pool
         )
-        if len(matching_pool) != 1 or matching_pool[0].id != placement.gpu_id:
-            raise RunPodManagerError(
-                "Serverless endpoint pool does not identify one exact catalog GPU"
-            )
         data_center_id = _select_data_center(matching_pool[0], spec)
         catalog_observation_sha256 = _catalog_observation_sha256(
             matching_pool[0],

@@ -24,7 +24,7 @@ def normalize_cuda_floor(value: Optional[str]) -> Optional[str]:
 
     if value is None:
         return None
-    if not isinstance(value, str) or not re.fullmatch(r"\d+(?:\.\d+)?", value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
         raise ValueError("min_cuda_version must be a CUDA major or major.minor")
     major, _, minor = value.partition(".")
     return f"{int(major)}.{int(minor or '0')}"

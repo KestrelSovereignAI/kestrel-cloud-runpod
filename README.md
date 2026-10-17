@@ -208,12 +208,20 @@ changes.
 
 The GA catalog observed on 2026-10-17 maps PRO 6000 MIG 1g.24gb to
 `AMPERE_24` and 2g.48gb to `ADA_48_PRO`. Both pools also contain other GPU
-types; these IDs do not guarantee MIG or Blackwell placement. Finite
-Serverless quotes require an unambiguous GPU-to-pool mapping and reject
+types; these IDs do not guarantee MIG or Blackwell placement. All
+Serverless placement (including private Ollama) requires an unambiguous GPU-to-pool mapping and rejects
 shared pools before creation. Missing pool IDs are rejected too; Kestrel
 never guesses one from a marketing name or GPU ID. See
 [#21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21).
 A separately valid Pod offer may still be quoted explicitly as Pod capacity.
+
+Upgrade the controller before accepting new work. Historical Serverless
+authorities remain usable only for recovery, billing and cleanup, not new
+quotes or submissions. Drain and clean up those resources before replacing
+their authority; do not PATCH their CUDA or mounts in place. A reusable
+endpoint must already match the accepted CUDA and storage policy. If it does
+not, drain it and create a correctly constrained replacement instead of
+reusing an incompatible endpoint.
 
 The route endpoint and bearer are reconstructed from a fresh authenticated
 provider observation and live only in the SDK `InferenceRoute`. They are never

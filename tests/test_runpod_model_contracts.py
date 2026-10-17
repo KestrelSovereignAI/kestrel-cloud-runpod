@@ -5,7 +5,19 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_cloud_runpod.core import RunPodManagerCore
-from kestrel_cloud_runpod.models import RunPodManagerError
+from kestrel_cloud_runpod.models import RunPodManagerError, normalize_cuda_floor
+
+
+@pytest.mark.parametrize("floor", ["１２.８", "١٢", "12.８"])
+def test_cuda_floor_requires_ascii_wire_numbers(floor):
+    with pytest.raises(ValueError, match="CUDA major"):
+        normalize_cuda_floor(floor)
+
+
+def test_resource_authority_version_is_exported_with_public_contracts():
+    from kestrel_cloud_runpod import EndpointResourceVersion
+
+    assert EndpointResourceVersion.GA.value == 2
 
 
 class _ResumeHarness:

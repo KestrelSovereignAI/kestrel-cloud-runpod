@@ -6,6 +6,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Apply the exact-GPU Serverless pool restriction to private Ollama as well
+  as finite jobs. Shared pools cannot satisfy a specific GPU authorization,
+  even when their other members are unavailable or filtered by policy.
 - Send accepted CUDA minimums in Pod and Serverless create requests,
   normalizing major-only floors to the required major.minor wire format.
 - Validate Serverless CUDA and storage readback against the accepted policy.
