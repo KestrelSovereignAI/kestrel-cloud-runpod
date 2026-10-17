@@ -17,9 +17,11 @@ from .models import (
     CloudType,
     ComputeProduct,
     EndpointCreateRequest,
+    EndpointResourceVersion,
     FlashBoot,
     PlacementRequirements,
     RunPodManagerError,
+    normalize_cuda_floor,
 )
 
 SERVERLESS_CAPACITY_SCHEMA_VERSION = 1
@@ -63,10 +65,7 @@ class ServerlessCapacityConstraints:
             raise TypeError(
                 "Serverless capacity minimum_availability must be an Availability"
             )
-        if self.min_cuda_version is not None and not re.fullmatch(
-            r"\d+(?:\.\d+)?", self.min_cuda_version
-        ):
-            raise ValueError("Serverless capacity CUDA version is invalid")
+        normalize_cuda_floor(self.min_cuda_version)
         _identifiers(
             self.allowed_gpu_pools,
             "allowed_gpu_pools",
@@ -170,8 +169,11 @@ class ServerlessEndpointSpec:
     disk_gb: int
     registry_id: str | None = None
     network_volume_ids: tuple[str, ...] = ()
+    resource_schema_version: EndpointResourceVersion = EndpointResourceVersion.GA
 
     def __post_init__(self) -> None:
+        if not isinstance(self.resource_schema_version, EndpointResourceVersion):
+            raise ValueError("Endpoint resource_schema_version is invalid")
         if not _IMMUTABLE_REFERENCE_RE.fullmatch(self.worker_reference):
             raise ValueError(
                 "Serverless worker reference must be pinned by a SHA-256 digest"
@@ -224,6 +226,11 @@ class ServerlessEndpointSpec:
         return json_sha256(
             {
                 "worker_reference": self.worker_reference,
+                **(
+                    {"resource_schema_version": self.resource_schema_version.value}
+                    if self.resource_schema_version is EndpointResourceVersion.GA
+                    else {}
+                ),
                 "constraints": self.constraints.fingerprint_dict(),
                 "workers": {"min": self.workers_min, "max": self.workers_max},
                 "idle_tail_seconds": self.idle_tail_seconds,
@@ -257,6 +264,7 @@ class ServerlessEndpointSpec:
             )
         return EndpointCreateRequest(
             name=endpoint_name,
+            resource_schema_version=self.resource_schema_version,
             image=self.worker_reference,
             gpu_pools=(gpu_pool,),
             endpoint_type="QUEUE",
@@ -265,6 +273,7 @@ class ServerlessEndpointSpec:
                 "queueDelay": float(self.scaling_value),
             },
             gpu_count=self.constraints.gpu_count,
+            min_cuda_version=self.constraints.min_cuda_version,
             workers_min=self.workers_min,
             workers_max=self.workers_max,
             idle_timeout_seconds=self.idle_tail_seconds,
@@ -299,6 +308,11 @@ class ServerlessEndpointSpec:
     def to_dict(self) -> dict[str, Any]:
         return {
             "worker_reference": self.worker_reference,
+            **(
+                {"resource_schema_version": self.resource_schema_version.value}
+                if self.resource_schema_version is EndpointResourceVersion.GA
+                else {}
+            ),
             "constraints": self.constraints.fingerprint_dict(),
             "workers_min": self.workers_min,
             "workers_max": self.workers_max,
@@ -315,7 +329,25 @@ class ServerlessEndpointSpec:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ServerlessEndpointSpec:
-        _exact_keys(value, _ENDPOINT_SPEC_FIELDS, "Serverless endpoint spec")
+        if "resource_schema_version" in value:
+            _exact_keys(
+                value,
+                _ENDPOINT_SPEC_FIELDS | {"resource_schema_version"},
+                "Serverless endpoint spec",
+            )
+            if (
+                _required_int(value, "resource_schema_version")
+                != EndpointResourceVersion.GA.value
+            ):
+                raise RunPodManagerError(
+                    "Unsupported Serverless resource schema version"
+                )
+            version = EndpointResourceVersion.GA
+        else:
+            # The published v1 shape omitted this field and must retain its
+            # exact digests for recovery and cleanup, never for new spend.
+            _exact_keys(value, _ENDPOINT_SPEC_FIELDS, "Serverless endpoint spec")
+            version = EndpointResourceVersion.LEGACY
         raw_constraints = value.get("constraints")
         if not isinstance(raw_constraints, Mapping):
             raise RunPodManagerError("Stored Serverless constraints are invalid")
@@ -328,6 +360,7 @@ class ServerlessEndpointSpec:
         if registry is not None and not isinstance(registry, str):
             raise RunPodManagerError("Stored Serverless registry ID is invalid")
         parsed = cls(
+            resource_schema_version=version,
             worker_reference=_required_string(value, "worker_reference"),
             constraints=ServerlessCapacityConstraints.from_dict(raw_constraints),
             workers_min=_required_int(value, "workers_min"),
@@ -705,10 +738,7 @@ class PlannedServerlessCapacityQuote:
             )
         _positive_int(self.gpu_count, "gpu_count")
         _positive_int(self.vram_gb, "vram_gb")
-        if self.min_cuda_version is not None and not re.fullmatch(
-            r"\d+(?:\.\d+)?", self.min_cuda_version
-        ):
-            raise ValueError("Planned Serverless quote CUDA version is invalid")
+        normalize_cuda_floor(self.min_cuda_version)
         for name, value in (
             ("hourly_worker_rate_usd", self.hourly_worker_rate_usd),
             ("estimated_worker_cost_usd", self.estimated_worker_cost_usd),
@@ -1442,10 +1472,7 @@ class ServerlessCapacityQuote:
             )
         _positive_int(self.gpu_count, "gpu_count")
         _positive_int(self.vram_gb, "vram_gb")
-        if self.min_cuda_version is not None and not re.fullmatch(
-            r"\d+(?:\.\d+)?", self.min_cuda_version
-        ):
-            raise ValueError("Serverless capacity quote CUDA version is invalid")
+        normalize_cuda_floor(self.min_cuda_version)
         for name, value in (
             ("hourly_worker_rate_usd", self.hourly_worker_rate_usd),
             ("estimated_worker_cost_usd", self.estimated_worker_cost_usd),

@@ -22,6 +22,7 @@ from .models import (
     PodCreateRequest,
     RunPodAPIError,
     RunPodManagerError,
+    validate_endpoint_mounts,
 )
 from .ollama_contracts import (
     OllamaLeaseMode,
@@ -276,6 +277,7 @@ class RunpodOllamaCapacityProvider:
                         "requestCount": self.deployment.serverless_request_count,
                     },
                     gpu_count=plan.placement.gpu_count,
+                    min_cuda_version=request.constraints.min_cuda_version,
                     workers_min=0,
                     workers_max=self.deployment.serverless_workers_max,
                     idle_timeout_seconds=request.idle_timeout_seconds,
@@ -336,6 +338,7 @@ class RunpodOllamaCapacityProvider:
                 registry_id=profile.registry_id,
                 data_center_ids=request.constraints.allowed_data_center_ids,
                 mounts=mounts,
+                min_cuda_version=request.constraints.min_cuda_version,
             ),
         )
         return ProvisionedOllamaResource(
@@ -371,6 +374,12 @@ class RunpodOllamaCapacityProvider:
         if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
             endpoint = await asyncio.to_thread(
                 self.client.get_endpoint, resource.provider_resource_id
+            )
+            validate_endpoint_mounts(
+                endpoint.raw,
+                (self.deployment.profile.network_volume_id,)
+                if self.deployment.profile.network_volume_id
+                else (),
             )
             base_url = endpoint.request_urls.get("base")
             health_url = endpoint.request_urls.get("health")

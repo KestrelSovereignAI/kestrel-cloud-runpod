@@ -137,6 +137,7 @@ def test_typed_create_and_update_payloads_validate_against_pin():
             name="kestrel-pod",
             image="registry.example/kestrel:sha",
             gpu_id="NVIDIA RTX PRO 4000 Blackwell",
+            min_cuda_version="12",
             env={"MODEL": "flux"},
         ).to_payload(),
     )
@@ -146,6 +147,7 @@ def test_typed_create_and_update_payloads_validate_against_pin():
             name="kestrel-catalog",
             image="registry.example/catalog:sha",
             gpu_pools=("BLACKWELL_24",),
+            min_cuda_version="12.8",
             endpoint_type="QUEUE",
             scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
             flashboot=FlashBoot.FLASHBOOT,

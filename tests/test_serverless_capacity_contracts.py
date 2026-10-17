@@ -69,7 +69,12 @@ def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
     assert payload["type"] == "QUEUE"
     assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}
     assert payload["scaling"] == {"type": "QUEUE_DELAY", "queueDelay": 4.0}
-    assert payload["gpu"] == {"pools": ["BLACKWELL_24"], "count": 1}
+    assert payload["gpu"] == {
+        "pools": ["BLACKWELL_24"],
+        "count": 1,
+        "minCudaVersion": "12.8",
+    }
+    assert payload["mounts"] == {"network": [], "global": []}
     assert payload["dataCenterIds"] == ["US-TX-3"]
     assert payload["networkVolumes"] == []
     assert payload["env"] == {}

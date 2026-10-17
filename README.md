@@ -74,6 +74,22 @@ Both clients set an explicit application User-Agent. Base URLs are injectable fo
 
 Placement uses the product's catalog rate: `price.secure/community` for Pods and `price.serverless` for Serverless. A missing Serverless pool price is ineligible for a paid quote; a Pod rate never substitutes for it.
 
+Accepted CUDA floors are sent in resource create requests, not only used to
+filter catalog observations. Serverless readback verifies that floor and all
+network/global mount fields before dispatch. Global mounts are unsupported
+by these workload profiles and fail clearly. Re-quote before creating new
+resources after upgrading; existing resource cleanup retains its exact IDs.
+
+Resource schema version 2 is written by new Serverless endpoint specs.
+Unversioned, historical specs are decoded as version 1 with their original
+digests, for adoption and cleanup only. Upgrade the external worker before
+enabling new API writers; cancel/re-quote pending historical operations
+instead of authorizing new work from a version 1 plan.
+
+The control-plane client's `max_inventory_pages` defaults to 1,000 pages.
+Exceeding that configurable bound fails the entire inventory, so a provider
+issuing endlessly unique cursors cannot hang reconciliation indefinitely.
+
 ### Direct client example
 
 ```python

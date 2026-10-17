@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -39,6 +40,7 @@ from kestrel_cloud_runpod.models import (
 )
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     PlannedServerlessCapacityQuote,
+    PlannedServerlessEndpoint,
     ServerlessActivatedSubmission,
     ServerlessBillingAttempt,
     ServerlessEndpointActivationReceipt,
@@ -71,6 +73,69 @@ def _gpu_payload(**changes: object) -> dict[str, object]:
 
 def _endpoint_payload() -> dict[str, object]:
     return dict(endpoint().raw)
+
+
+def _legacy_authority():
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures/serverless-0.10.1-authority.json"
+        ).read_text()
+    )
+    value = replace(
+        planned_request(),
+        endpoint=PlannedServerlessEndpoint.from_dict(fixture["endpoint"]),
+    )
+    accepted = PlannedServerlessCapacityQuote.from_dict(fixture["quote"])
+    activation = ServerlessEndpointActivationReceipt.from_dict(fixture["activation"])
+    raw = fixture["readback"]
+    # The GA API reports the previously implicit, unset values on an old endpoint.
+    raw["gpu"].update({"minCudaVersion": None, "allowedCudaVersions": []})
+    raw["mounts"] = {"network": [], "global": []}
+    return value, accepted, activation, raw
+
+
+@pytest.mark.asyncio
+async def test_pre_upgrade_authority_still_cleans_up_its_exact_created_endpoint():
+    value, accepted, activation, raw = _legacy_authority()
+    control = _PlannedControl()
+    control.readback = planned_endpoint_resource(**raw)
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control, clock=MutableClock()
+    )
+    receipt = await provider.cleanup_planned_endpoint(value, accepted, activation)
+    assert receipt.endpoint_id == activation.endpoint_id
+    assert control.delete_calls == [activation.endpoint_id]
+
+
+@pytest.mark.asyncio
+async def test_pre_upgrade_crashed_activation_can_still_be_adopted_for_cleanup():
+    value, accepted, activation, raw = _legacy_authority()
+    control = _PlannedControl()
+    control.readback = planned_endpoint_resource(**raw)
+    control.list_pages = [(control.readback,)]
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control, clock=MutableClock()
+    )
+    adopted = await provider.adopt_planned_endpoint(value, accepted)
+    assert adopted.endpoint_id == activation.endpoint_id
+    assert adopted.endpoint_readback_sha256 == activation.endpoint_readback_sha256
+    assert control.create_requests == []
+
+
+@pytest.mark.asyncio
+async def test_pre_upgrade_plan_cannot_authorize_new_spend():
+    value, accepted, _, _ = _legacy_authority()
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control, clock=MutableClock()
+    )
+    with pytest.raises(RunPodManagerError, match="upgrade"):
+        await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+    assert control.create_requests == []
 
 
 class _PlannedControl:
@@ -129,6 +194,52 @@ class _PlannedControl:
         self.delete_calls.append(endpoint_id)
         if self.delete_error is not None:
             raise self.delete_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mounts": {"network": [], "global": [{"volumeId": "unquoted-global"}]}},
+        {"mounts": {"network": [{"volumeId": "unquoted-network"}], "global": []}},
+        {"mounts": None},
+        {
+            "gpu": {
+                "pools": ["BLACKWELL_24"],
+                "count": 1,
+                "allowedCudaVersions": [],
+                "minCudaVersion": None,
+            }
+        },
+        {
+            "gpu": {
+                "pools": ["BLACKWELL_24"],
+                "count": 1,
+                "allowedCudaVersions": ["12.8"],
+                "minCudaVersion": "12.8",
+            }
+        },
+    ],
+)
+async def test_created_endpoint_with_unaccepted_cuda_or_storage_keeps_cleanup_identity(
+    changes,
+):
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+    control.readback = planned_endpoint_resource(**changes)
+    with pytest.raises(ServerlessEndpointActivationError) as raised:
+        await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+    assert raised.value.observed_endpoint_ids == (control.created.id,)
+    assert len(control.create_requests) == 1
 
 
 def _ambiguous_create_error() -> RunPodAmbiguousResultError:
@@ -193,7 +304,11 @@ async def test_activation_creates_exact_zero_baseline_endpoint_and_readback() ->
     payload = control.create_requests[0].to_payload()
     assert payload["name"] == accepted.endpoint_name
     assert payload["type"] == "QUEUE"
-    assert payload["gpu"] == {"pools": [accepted.gpu_pool], "count": 1}
+    assert payload["gpu"] == {
+        "pools": [accepted.gpu_pool],
+        "count": 1,
+        "minCudaVersion": "12.8",
+    }
     assert payload["dataCenterIds"] == [accepted.data_center_id]
     assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}
     assert payload["networkVolumes"] == []

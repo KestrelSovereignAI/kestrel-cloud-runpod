@@ -211,6 +211,29 @@ def test_inventory_rejects_cursor_cycles_instead_of_hanging():
         client.list_pods()
 
 
+def test_inventory_bounds_a_provider_that_keeps_issuing_unique_cursors():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=_page("pods", [], f"cursor-{len(seen)}"))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_inventory_pages=2,
+        http_transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(RunPodManagerError, match="completeness is unknown"):
+        client.list_pods()
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "2"])
+def test_inventory_page_bound_is_strictly_positive_and_integral(limit):
+    with pytest.raises(ValueError, match="max_inventory_pages"):
+        RunpodControlPlaneClient(api_key="secret", max_inventory_pages=limit)
+
+
 def test_inventory_rejects_duplicate_resources_across_pages():
     pages = iter((_page("pods", [_pod()], "next"), _page("pods", [_pod()])))
     client = RunpodControlPlaneClient(

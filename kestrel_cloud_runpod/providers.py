@@ -157,6 +157,7 @@ class DirectRunPodProvider(GPUProvider):
                 registry_id=profile.registry_id,
                 data_center_ids=profile.allowed_data_center_ids,
                 mounts=mounts,
+                min_cuda_version=requirements.min_cuda_version,
             )
         )
         result = dict(pod.raw)

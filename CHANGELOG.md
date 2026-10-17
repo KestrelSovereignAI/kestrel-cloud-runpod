@@ -2,6 +2,22 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.2] - 2026-10-17
+
+### Fixed
+
+- Send accepted CUDA minimums in Pod and Serverless create requests,
+  normalizing major-only floors to the required major.minor wire format.
+- Validate Serverless CUDA and storage readback against the accepted policy.
+  Unsupported global mounts and extra network volumes fail before dispatch.
+- Check private Ollama endpoint storage before sending workload requests.
+  These guards preserve exact created-resource IDs for durable cleanup.
+- Version persisted Serverless resource authority explicitly. Historical
+  specs keep their exact digests for adoption and cleanup; new quotes and
+  creates require the GA version and cannot reuse historical spend authority.
+- Bound inventory walks with configurable `max_inventory_pages`; exceeding
+  the bound never produces partial cleanup evidence.
+
 ## [0.10.1] - 2026-10-17
 
 ### Fixed
