@@ -43,6 +43,17 @@ class RunPodManagerCore:
     ):
         self.config = config or load_config("runpod_config.toml")
         self.manager_config = self.config.get("manager", {})
+        try:
+            self.default_cloud_type = CloudType.from_config(
+                os.environ.get(
+                    "RUNPOD_CLOUD_TYPE",
+                    self.manager_config.get("cloud_type", "SECURE"),
+                )
+            )
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "RUNPOD_CLOUD_TYPE or manager.cloud_type must be SECURE or COMMUNITY"
+            ) from exc
         self.mode = (
             mode
             or os.getenv("RUNPOD_MODE")
@@ -135,13 +146,8 @@ class RunPodManagerCore:
                     min_cuda_version=data.get("min_cuda_version"),
                     max_cost_per_hr=data.get("max_cost_per_hr"),
                     gpu_count=int(data.get("gpu_count", 1)),
-                    cloud=CloudType(
-                        str(
-                            data.get(
-                                "cloud",
-                                self.manager_config.get("cloud_type", "SECURE"),
-                            )
-                        ).upper()
+                    cloud=CloudType.from_config(
+                        data.get("cloud", self.default_cloud_type)
                     ),
                     allowed_gpu_ids=tuple(data.get("allowed_gpu_ids", ())),
                     allowed_data_center_ids=tuple(
@@ -169,6 +175,28 @@ class RunPodManagerCore:
                 raise RunPodManagerError(f"Invalid profile '{key}': {exc}") from exc
         return profiles
 
+    def require_uniform_profile_cloud(
+        self, expected: Optional[CloudType] = None
+    ) -> CloudType:
+        """Bind single-cloud pricing to the actual configured Pod profiles.
+
+        Explicit per-profile clouds remain supported. Consumers that quote a
+        single cloud must reject a mixed profile set rather than price one
+        cloud and provision another. This does not reinterpret saved sessions.
+        """
+
+        clouds = {profile.cloud for profile in self.profiles.values()}
+        if len(clouds) != 1:
+            raise RunPodManagerError(
+                "Single-cloud pricing requires all GPU profiles to use the same cloud"
+            )
+        cloud = next(iter(clouds))
+        if expected is not None and cloud != CloudType.from_config(expected):
+            raise RunPodManagerError(
+                "Configured GPU profile cloud does not match the pricing cloud"
+            )
+        return cloud
+
     @staticmethod
     def _expand_single_env_var(value: Optional[str]) -> Optional[str]:
         """Expand ${VAR} syntax in a single string value."""
@@ -192,9 +220,6 @@ class RunPodManagerCore:
             )
             return ManagedRunPodProvider(api_base=api_base, api_key=api_key)
         api_key = os.getenv("RUNPOD_API_KEY")
-        cloud_type = os.getenv(
-            "RUNPOD_CLOUD_TYPE", self.manager_config.get("cloud_type", "SECURE")
-        )
         control_plane_base_url = os.getenv(
             "RUNPOD_CONTROL_PLANE_BASE_URL"
         ) or self.manager_config.get("control_plane_base_url")
@@ -203,7 +228,7 @@ class RunPodManagerCore:
         )
         return DirectRunPodProvider(
             api_key=api_key,
-            cloud_type=cloud_type,
+            cloud_type=self.default_cloud_type,
             control_plane_base_url=control_plane_base_url,
             user_agent=user_agent,
         )
