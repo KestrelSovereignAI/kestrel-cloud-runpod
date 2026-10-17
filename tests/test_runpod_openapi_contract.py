@@ -1,4 +1,4 @@
-"""Parity tests between Kestrel's typed calls and the pinned beta schema."""
+"""Parity tests between Kestrel's typed calls and the pinned v2 schema."""
 
 from __future__ import annotations
 
@@ -71,6 +71,18 @@ def test_all_consumed_control_plane_operations_match_pin():
 
 def test_consumed_request_and_response_shapes_match_pin():
     schemas = _schema()["components"]["schemas"]
+
+    def required(name):
+        def collect(schema):
+            result = set(schema.get("required", ()))
+            if "$ref" in schema:
+                result |= collect(schemas[schema["$ref"].rsplit("/", 1)[1]])
+            for part in schema.get("allOf", ()):
+                result |= collect(part)
+            return result
+
+        return collect(schemas[name])
+
     assert set(schemas["GpuType"]["required"]) >= {
         "id",
         "pool",
@@ -79,9 +91,11 @@ def test_consumed_request_and_response_shapes_match_pin():
         "maxCount",
     }
     assert schemas["ListGpuTypesResponse"]["required"] == ["gpus"]
-    assert schemas["ListPodsResponse"]["required"] == ["pods"]
-    assert schemas["ListEndpointsResponse"]["required"] == ["endpoints"]
-    assert schemas["ListNetworkVolumesResponse"]["required"] == ["networkVolumes"]
+    assert required("ListPodsResponse") == {"pods", "pagination"}
+    assert required("ListEndpointsResponse") == {"endpoints", "pagination"}
+    assert required("ListNetworkVolumesResponse") == {"networkVolumes", "pagination"}
+    assert required("Pagination") == {"nextCursor", "hasNextPage"}
+    assert "serverless" in schemas["GpuType"]["properties"]["price"]["properties"]
     assert set(schemas["NetworkVolume"]["required"]) == {
         "id",
         "name",
@@ -144,10 +158,10 @@ def test_typed_create_and_update_payloads_validate_against_pin():
     )
 
 
-def test_runtime_base_url_is_explicit_despite_beta_schema_server_discrepancy():
+def test_runtime_base_url_matches_the_ga_schema_server():
     document = _schema()
     assert document["servers"][0]["url"] == "https://api.runpod.io"
-    assert CONTROL_PLANE_BASE_URL == "https://v2-rest.runpod.io/v2"
+    assert CONTROL_PLANE_BASE_URL == document["servers"][0]["url"] + "/v2"
 
 
 def test_semantic_diff_reports_breaking_and_additive_changes():

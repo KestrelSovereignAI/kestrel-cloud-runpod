@@ -23,7 +23,7 @@ the public SDK lease contract and never imports this package.
 | `RUNPOD_API_KEY` | RunPod API key (required) |
 | `RUNPOD_SERVERLESS_API_KEY` | Restricted Serverless invocation key for Ollama endpoint probes and model pulls |
 | `RUNPOD_OLLAMA_BEARER_TOKEN` | Workload-scoped token enforced by the reviewed Ollama Pod image |
-| `RUNPOD_CONTROL_PLANE_BASE_URL` | Optional beta/dev override; must end in `/v2` |
+| `RUNPOD_CONTROL_PLANE_BASE_URL` | Optional dev override; must end in `/v2` |
 | `RUNPOD_USER_AGENT` | Optional non-empty application User-Agent override |
 | `RUNPOD_OLLAMA_IMAGE` | Immutable `ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime@sha256:...` reference |
 | `RUNPOD_OLLAMA_ALLOWED_MODELS` | Comma-separated operator allowlist of `name:tag@sha256:<digest>` model pins |
@@ -67,10 +67,12 @@ Runpod has two distinct v2 services:
 
 | Service | Default base | Authentication | Use |
 | --- | --- | --- | --- |
-| Control plane | `https://v2-rest.runpod.io/v2` | Bearer API key | Catalog, Pods, endpoint definitions, workers/logs, billing |
+| Control plane | `https://api.runpod.io/v2` | Bearer API key | Catalog, Pods, endpoint definitions, workers/logs, billing |
 | Serverless data plane | `https://api.runpod.ai/v2` | Bearer API key | Queue job run, status, cancel, retry, and health |
 
-Both clients set an explicit application User-Agent because the beta control plane rejects generic/default clients at its edge. Base URLs are injectable for testing but must end in `/v2`; there is no v1 or GraphQL production fallback.
+Both clients set an explicit application User-Agent. Base URLs are injectable for testing but must end in `/v2`; there is no v1 or GraphQL production fallback. Pod, endpoint, and network-volume inventories follow every cursor page and reject incomplete or cyclic pagination. Pod inventory includes cluster members so cleanup checks cannot mistake an incomplete inventory for an empty account.
+
+Placement uses the product's catalog rate: `price.secure/community` for Pods and `price.serverless` for Serverless. A missing Serverless pool price is ineligible for a paid quote; a Pod rate never substitutes for it.
 
 ### Direct client example
 
@@ -354,7 +356,7 @@ At Pod creation time, the direct provider queries v2 with product-specific avail
 
 The old private CLI SSH helper is also gone. `RunPodManager.get_logs()` uses the v2 SSE Pod log endpoint. Arbitrary commands must be exposed as scoped workload HTTP operations.
 
-### OpenAPI beta pin
+### OpenAPI pin
 
 The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its checksum in `vendor/runpod-v2-openapi.lock.json`. Unit/contract CI validates the operations and shapes Kestrel consumes. A weekly/manual workflow compares the live schema and reports semantic drift without overwriting the pin.
 

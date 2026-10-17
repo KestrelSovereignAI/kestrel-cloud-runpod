@@ -2,6 +2,18 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.1] - 2026-10-17
+
+### Fixed
+
+- Use the generally available `https://api.runpod.io/v2` control plane and
+  refresh the reviewed OpenAPI snapshot from that API.
+- Follow cursor pagination for Pod, endpoint, and network-volume inventories,
+  including cluster Pods. Missing, inconsistent, repeated cursors or duplicate
+  resource identities fail clearly instead of returning partial cleanup evidence.
+- Quote and revalidate Serverless using `price.serverless`, independently of
+  Pod cloud rates. Missing pool rates cannot authorize paid placement.
+
 ## [0.10.0] - 2026-08-11
 
 ### Added

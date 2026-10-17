@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .models import (
     Availability,
@@ -39,7 +40,7 @@ def select_gpu(
     compatible.sort(
         key=lambda offer: (
             -_AVAILABILITY_RANK.get(offer.availability or Availability.NONE, 0),
-            offer.price_for(requirements.cloud),
+            offer.price_for(requirements.cloud, requirements.product),
             offer.memory_gb,
             offer.id,
         )
@@ -52,9 +53,11 @@ def select_gpu(
         memory_gb=selected.memory_gb,
         cloud=requirements.cloud,
         gpu_count=requirements.gpu_count,
-        offered_cost_per_hr=selected.price_for(requirements.cloud),
+        offered_cost_per_hr=selected.price_for(
+            requirements.cloud, requirements.product
+        ),
         availability=selected.availability,
-        catalog_observed_at=observed_at or datetime.now(timezone.utc),
+        catalog_observed_at=observed_at or datetime.now(UTC),
         requirements=requirements,
     )
 
@@ -80,7 +83,9 @@ def _is_compatible(offer: GPUOffer, requirements: PlacementRequirements) -> bool
         and offer.max_count_for(requirements.cloud) < requirements.gpu_count
     ):
         return False
-    if requirements.product is ComputeProduct.SERVERLESS and not offer.pool:
+    if requirements.product is ComputeProduct.SERVERLESS and (
+        not offer.pool or offer.serverless_price_per_hr is None
+    ):
         return False
     if requirements.allowed_gpu_ids and offer.id not in requirements.allowed_gpu_ids:
         return False
@@ -89,7 +94,9 @@ def _is_compatible(offer: GPUOffer, requirements: PlacementRequirements) -> bool
         and offer.pool not in requirements.allowed_gpu_pools
     ):
         return False
-    price = offer.price_for(requirements.cloud)
+    price = offer.price_for(requirements.cloud, requirements.product)
+    if not math.isfinite(price) or price < 0:
+        return False
     if (
         requirements.max_cost_per_hr is not None
         and price > requirements.max_cost_per_hr

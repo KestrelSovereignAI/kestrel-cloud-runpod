@@ -20,16 +20,23 @@ This record defines one vendor boundary for three workload families:
 
 ## Decision
 
-`kestrel-cloud-runpod` will own a typed, v2-only Runpod integration. Runpod's v1 REST control plane remains supported and generally available during the beta migration, but new Kestrel production code will not call `rest.runpod.io/v1`. It also will not call the legacy GraphQL infrastructure API or private helpers from the Runpod Python CLI. There is no automatic v1 or GraphQL fallback. Choosing the beta v2 API for new work accepts additional contract-churn risk in exchange for building on Runpod's stated forward platform; the OpenAPI pin, drift gate, and injectable base URL below contain that risk without silently reverting to an older surface.
+`kestrel-cloud-runpod` owns the typed, v2-only Runpod integration. As of the
+2026-10-17 review, REST v2 is generally available; REST v1 retires on
+2026-11-15 and GraphQL retires in January 2027. Production code uses neither
+legacy surface nor private helpers from the Runpod Python CLI. The OpenAPI
+pin, drift gate, and injectable base URL make contract changes explicit.
 
 Runpod exposes two separate v2 services, and the distinction is part of the contract:
 
 | Service | Canonical base URL | Responsibility |
 | --- | --- | --- |
-| Control plane | `https://v2-rest.runpod.io/v2` | GPU/CPU/data-center catalog, Pods, Serverless endpoint definitions and workers, volumes, registries, and billing |
+| Control plane | `https://api.runpod.io/v2` | GPU/CPU/data-center catalog, Pods, Serverless endpoint definitions and workers, volumes, registries, and billing |
 | Serverless data plane | `https://api.runpod.ai/v2` | Queue job `/run`, `/status`, `/cancel`, `/retry`, and `/health` operations; endpoint-specific load-balanced traffic |
 
-The production control-plane base comes from Runpod's [official MCP/reference client's v2 configuration](https://github.com/runpod/runpod-mcp/blob/main/docs/configuration.md). The current [v2 OpenAPI document](https://v2-rest.runpod.io/v2/openapi.yaml) has a different `servers` value, so clients must not derive the production host from that field while v2 is beta. Both base URLs are declared once, are injectable for tests, and remain explicitly pinned to v2.
+The control-plane base matches Runpod's [migration guide](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
+and [API-served OpenAPI document](https://api.runpod.io/v2/openapi.yaml).
+This supersedes the original August beta-host discrepancy. Both base URLs
+are declared once, are injectable for tests, and remain explicitly pinned to v2.
 
 The Python `runpod` package may still be used inside a worker container for `runpod.serverless.start`. It will not be used as the infrastructure control-plane client.
 
@@ -83,16 +90,16 @@ Create requests are not automatically retried after an ambiguous timeout or conn
 
 ### OpenAPI pin and drift detection
 
-The beta API contract will be treated as an external dependency with an explicit upgrade process:
+The API contract is an external dependency with an explicit upgrade process:
 
-1. Vendor the reviewed [v2 OpenAPI YAML](https://v2-rest.runpod.io/v2/openapi.yaml) with its source URL, retrieval date, and SHA-256 checksum.
+1. Vendor the reviewed [v2 OpenAPI YAML](https://api.runpod.io/v2/openapi.yaml) with its source URL, retrieval date, and SHA-256 checksum.
 2. Generate or validate typed request/response models deterministically from that pinned document.
 3. Commit generated artifacts only when they are required at runtime; otherwise make CI prove regeneration produces no diff.
 4. Add contract tests for every operation the package uses, including list envelopes, nullable fields, action schemas, and RFC 9457 errors.
 5. Add a scheduled/manual drift check that fetches the live schema, reports the semantic diff, and opens or fails with an actionable update requirement. It must not silently overwrite the pin.
 6. Keep authenticated smoke tests opt-in and read-only by default. Mutating smoke tests require an explicit disposable-resource fixture and guaranteed teardown.
 
-An additive upstream field does not require an emergency release. A removed/renamed field, enum narrowing, required-field change, path change, or security change blocks a client upgrade until reviewed. The OpenAPI document is authoritative for shapes, but not for choosing the production base URL while the documented beta discrepancy remains.
+An additive upstream field does not require an emergency release. A removed/renamed field, enum narrowing, required-field change, path change, or security change blocks a client upgrade until reviewed. The API-served OpenAPI document is authoritative for wire shapes.
 
 ## Catalog, placement, pricing, and billing
 

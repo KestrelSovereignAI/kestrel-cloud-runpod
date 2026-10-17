@@ -319,7 +319,7 @@ class RunpodTransport:
 
 
 class RunpodControlPlaneClient:
-    """Typed client for ``https://v2-rest.runpod.io/v2`` resources."""
+    """Typed client for ``https://api.runpod.io/v2`` resources."""
 
     def __init__(
         self,
@@ -412,20 +412,19 @@ class RunpodControlPlaneClient:
         return PodResource.from_dict(payload)
 
     def list_pods(self) -> tuple[PodResource, ...]:
-        payload = _required_payload(self.transport.request_json("GET", "/pods"))
         return tuple(
-            PodResource.from_dict(item) for item in _list_envelope(payload, "pods")
+            PodResource.from_dict(item)
+            for item in self._list_resources(
+                "/pods", "pods", params={"includeClusterPods": True}
+            )
         )
 
     def list_network_volumes(self) -> tuple[NetworkVolume, ...]:
         """List account volumes for read-only cleanup and cost verification."""
 
-        payload = _required_payload(
-            self.transport.request_json("GET", "/network-volumes")
-        )
         return tuple(
             NetworkVolume.from_dict(item)
-            for item in _list_envelope(payload, "networkVolumes")
+            for item in self._list_resources("/network-volumes", "networkVolumes")
         )
 
     def pod_action(self, pod_id: str, action: str) -> Optional[PodResource]:
@@ -488,11 +487,52 @@ class RunpodControlPlaneClient:
         return EndpointResource.from_dict(payload)
 
     def list_endpoints(self) -> tuple[EndpointResource, ...]:
-        payload = _required_payload(self.transport.request_json("GET", "/serverless"))
         return tuple(
             EndpointResource.from_dict(item)
-            for item in _list_envelope(payload, "endpoints")
+            for item in self._list_resources("/serverless", "endpoints")
         )
+
+    def _list_resources(
+        self, path: str, key: str, *, params: Optional[Mapping[str, Any]] = None
+    ) -> Iterator[Mapping[str, Any]]:
+        """Walk the complete inventory; incomplete pages cannot prove cleanup."""
+
+        query = dict(params or {})
+        seen_cursors: set[str] = set()
+        seen_ids: set[str] = set()
+        while True:
+            payload = _required_payload(
+                self.transport.request_json("GET", path, params=query)
+            )
+            items = _list_envelope(payload, key)
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, Mapping):
+                raise RunPodManagerError("Invalid v2 pagination metadata")
+            has_next = pagination.get("hasNextPage")
+            if type(has_next) is not bool or "nextCursor" not in pagination:
+                raise RunPodManagerError("Invalid v2 pagination metadata")
+            cursor = pagination["nextCursor"]
+            if has_next:
+                if (
+                    not isinstance(cursor, str)
+                    or not cursor.strip()
+                    or cursor in seen_cursors
+                ):
+                    raise RunPodManagerError("Invalid or repeated v2 pagination cursor")
+                seen_cursors.add(cursor)
+            elif cursor is not None:
+                raise RunPodManagerError("Invalid final v2 pagination cursor")
+            for item in items:
+                resource_id = item.get("id")
+                if not isinstance(resource_id, str) or not resource_id:
+                    raise RunPodManagerError("Invalid v2 inventory resource identity")
+                if resource_id in seen_ids:
+                    raise RunPodManagerError("Duplicate v2 inventory resource identity")
+                seen_ids.add(resource_id)
+                yield item
+            if not has_next:
+                return
+            query["cursor"] = cursor
 
     def update_endpoint(
         self, endpoint_id: str, changes: EndpointUpdateRequest
