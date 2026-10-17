@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .clients import RunpodControlPlaneClient, RunpodServerlessClient
+from .effect_custody import await_owned_effect
 from .models import (
     Availability,
     BillingPage,
@@ -216,8 +217,8 @@ class RunpodServerlessCapacityProvider:
         create_started_at = self._now()
         ambiguous = False
         try:
-            created = await asyncio.to_thread(
-                self.control_client.create_endpoint, create_request
+            created = await await_owned_effect(
+                asyncio.to_thread(self.control_client.create_endpoint, create_request)
             )
         except RunPodAmbiguousResultError as exc:
             ambiguous = True
@@ -630,8 +631,10 @@ class RunpodServerlessCapacityProvider:
         delete_started_at = self._now()
         reconciled = False
         try:
-            await asyncio.to_thread(
-                self.control_client.delete_endpoint, activation.endpoint_id
+            await await_owned_effect(
+                asyncio.to_thread(
+                    self.control_client.delete_endpoint, activation.endpoint_id
+                )
             )
         except RunPodAmbiguousResultError:
             reconciled = True

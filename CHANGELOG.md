@@ -2,6 +2,28 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.10.4] - 2026-10-17
+
+### Added
+
+- Separate catalog Pod provisioning from one-shot readiness polling, using the
+  existing durable lifecycle. Hosts can release generation admission during a
+  cold start and revalidate it before workload submission. Existing acquisition
+  callers retain the wait-until-ready API.
+- Export `await_owned_effect` so admitted mutation and durable receipt tails
+  remain joined through repeated cancellation, including blocking provider
+  threads. Late effect failures remain visible; no automatic retry is added.
+
+### Fixed
+
+- Clean up acquisition cancelled during worker health, not only observation or
+  sleep. Readiness CAS retries cannot overwrite durable Stop, and cold-worker
+  health failures remain STARTING rather than implying cleanup failure.
+- Recheck creation authorization after capability I/O and submission state
+  after capability loading. Readiness cannot promote an attempt after its
+  deadline. Serverless create/delete and Pod mutation threads finish before
+  cancellation releases their caller's custody.
+
 ## [0.10.3] - 2026-10-17
 
 ### Fixed

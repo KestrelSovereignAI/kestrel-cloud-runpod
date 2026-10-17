@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -32,6 +33,237 @@ from kestrel_cloud_runpod.pod_capacity_provider import (
     PodCapacityCreatedMismatchError,
 )
 from kestrel_cloud_runpod.pod_transport import CatalogPodTransportError
+
+
+@pytest.mark.asyncio
+async def test_provision_and_poll_share_lifecycle_without_waiting_or_recreating(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    provider.status_value = "PROVISIONING"
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    scope = dict(
+        capacity_id=value.capacity_id,
+        owner_id=value.owner_id,
+        workload_id=value.workload_id,
+    )
+    lease = await runtime.provision_catalog(value)
+    assert lease.state is PodCapacityState.STARTING
+    assert lease.provider_pod_id == "pod-catalog-1"
+    assert lease.evidence.lifecycle.provider_create_accepted_at == clock()
+    assert not transport.health_calls
+    assert (await runtime.provision_catalog(value)).capacity_id == lease.capacity_id
+    assert (
+        await runtime.poll_catalog_readiness(**scope)
+    ).state is PodCapacityState.STARTING
+    provider.status_value = "RUNNING"
+    ready = await runtime.poll_catalog_readiness(**scope)
+    assert ready.state is PodCapacityState.READY
+    assert ready.evidence.lifecycle.worker_ready_at == clock()
+    assert len(provider.create_calls) == 1
+    assert transport.health_calls == [provider.route]
+
+
+@pytest.mark.asyncio
+async def test_readiness_poll_validates_scope_and_never_revives_stop(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    scope = dict(
+        capacity_id=value.capacity_id,
+        owner_id=value.owner_id,
+        workload_id=value.workload_id,
+    )
+    await runtime.provision_catalog(value)
+    for key in ("owner_id", "workload_id"):
+        with pytest.raises(PodCapacityConflictError):
+            await runtime.poll_catalog_readiness(**{**scope, key: "other"})
+    runtime.request_cancellation(value.capacity_id)
+    stopped = await runtime.poll_catalog_readiness(**scope)
+    assert stopped.state is PodCapacityState.CANCEL_REQUESTED
+    with pytest.raises(RunPodManagerError, match="not ready"):
+        await runtime.submit_catalog_workload(**scope, payload={})
+    assert not transport.submit_calls
+    assert not transport.health_calls
+    assert len(provider.create_calls) == 1
+    await runtime.reconcile()
+    assert provider.terminate_calls == ["pod-catalog-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", [False, True])
+async def test_cancellation_or_stop_during_health_cannot_promote_or_submit(
+    tmp_path, stop
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    class BlockingHealth(FakeWorkloadTransport):
+        async def health(self, base_url):
+            entered.set()
+            await finish.wait()
+
+    transport = BlockingHealth()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    await runtime.provision_catalog(value)
+    task = asyncio.create_task(
+        runtime.poll_catalog_readiness(
+            capacity_id=value.capacity_id,
+            owner_id=value.owner_id,
+            workload_id=value.workload_id,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    if stop:
+        runtime.request_cancellation(value.capacity_id)
+        finish.set()
+        assert (await task).state is PodCapacityState.CANCEL_REQUESTED
+        await runtime.reconcile()
+    else:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert provider.terminate_calls == ["pod-catalog-1"]
+    assert runtime.repository.get(value.capacity_id).state is not PodCapacityState.READY
+    assert not transport.submit_calls
+
+
+@pytest.mark.asyncio
+async def test_readiness_timeout_terminates_without_replacement(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    runtime = service(
+        tmp_path, clock, provider, FakeCapabilityStore(clock), FakeWorkloadTransport()
+    )
+    value = request(clock)
+    await runtime.provision_catalog(value)
+    clock.value += timedelta(seconds=31)
+    with pytest.raises(PodCapacityLifecycleError, match="readiness timeout"):
+        await runtime.poll_catalog_readiness(
+            capacity_id=value.capacity_id,
+            owner_id=value.owner_id,
+            workload_id=value.workload_id,
+        )
+    assert provider.terminate_calls == ["pod-catalog-1"]
+    assert len(provider.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_while_loading_capability_prevents_submission(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    class BlockingCapabilityStore(FakeCapabilityStore):
+        async def load(self, attempt_id):
+            entered.set()
+            await finish.wait()
+            return await super().load(attempt_id)
+
+    runtime = service(
+        tmp_path, clock, provider, BlockingCapabilityStore(clock), transport
+    )
+    value = request(clock)
+    await runtime.acquire_catalog(value)
+    task = asyncio.create_task(
+        runtime.submit_catalog_workload(
+            capacity_id=value.capacity_id,
+            owner_id=value.owner_id,
+            workload_id=value.workload_id,
+            payload={},
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    runtime.request_cancellation(value.capacity_id)
+    finish.set()
+    with pytest.raises(RunPodManagerError, match="not ready"):
+        await task
+    assert not transport.submit_calls
+
+
+@pytest.mark.asyncio
+async def test_readiness_cas_retry_does_not_overwrite_concurrent_stop(
+    tmp_path, monkeypatch
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    await runtime.provision_catalog(value)
+    original = runtime.repository.compare_and_set
+
+    def racing_cas(lease, *, changes):
+        if changes.get("state") is PodCapacityState.READY:
+            runtime.request_cancellation(value.capacity_id)
+        return original(lease, changes=changes)
+
+    monkeypatch.setattr(runtime.repository, "compare_and_set", racing_cas)
+    observed = await runtime.poll_catalog_readiness(
+        capacity_id=value.capacity_id,
+        owner_id=value.owner_id,
+        workload_id=value.workload_id,
+    )
+    assert observed.state is PodCapacityState.CANCEL_REQUESTED
+    assert observed.evidence.lifecycle.worker_ready_at is None
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_poll_is_one_shot_and_health_cannot_cross_deadline(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+
+    class ColdTransport(FakeWorkloadTransport):
+        async def health(self, base_url):
+            if not self.health_calls:
+                self.health_calls.append(base_url)
+                raise CatalogPodTransportError("worker is cold")
+            clock.value += timedelta(seconds=31)
+
+    transport = ColdTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    await runtime.provision_catalog(value)
+    scope = dict(
+        capacity_id=value.capacity_id,
+        owner_id=value.owner_id,
+        workload_id=value.workload_id,
+    )
+    before = clock()
+    assert (
+        await runtime.poll_catalog_readiness(**scope)
+    ).state is PodCapacityState.STARTING
+    assert clock() == before  # The one-shot poll never sleeps/retries health.
+    with pytest.raises(PodCapacityLifecycleError, match="readiness timeout"):
+        await runtime.poll_catalog_readiness(**scope)
+    assert provider.terminate_calls == ["pod-catalog-1"]
+
+
+@pytest.mark.asyncio
+async def test_capability_io_cannot_extend_creation_authorization(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+
+    class SlowCapabilityStore(FakeCapabilityStore):
+        async def load_or_create(self, attempt_id, expires_at):
+            result = await super().load_or_create(attempt_id, expires_at)
+            clock.value += timedelta(seconds=61)
+            return result
+
+    runtime = service(
+        tmp_path, clock, provider, SlowCapabilityStore(clock), FakeWorkloadTransport()
+    )
+    with pytest.raises(RunPodManagerError, match="expired before creation"):
+        await runtime.provision_catalog(request(clock))
+    assert not provider.create_calls
 
 
 @pytest.mark.asyncio

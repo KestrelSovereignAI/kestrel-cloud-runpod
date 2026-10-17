@@ -115,6 +115,11 @@ async def test_cancelled_start_waits_for_inflight_v2_mutation_to_resolve() -> No
     await asyncio.sleep(0)
     assert task.done() is False
 
+    for _ in range(3):
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+
     finish.set()
     with pytest.raises(asyncio.CancelledError):
         await task
