@@ -13,9 +13,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   resource identities fail clearly instead of returning partial cleanup evidence.
 - Quote and revalidate Serverless using `price.serverless`, independently of
   Pod cloud rates. Missing pool rates cannot authorize paid placement.
-- Rebuild private Ollama runtime `1.1.1` with Go `1.26.9`, patched network
-  dependencies, and Ubuntu's fixed OpenSSL packages. Keep fixed high/critical
-  vulnerability findings blocking publication of the exact image.
+- Rebuild private Ollama runtime `1.1.1` with Go `1.26.9`, patched Go module
+  dependencies, and Ubuntu's fixed OpenSSL packages. Pin the linked
+  `klauspost/compress` module to `1.20.2` to fix CVE-2026-63209
+  (GHSA-259r-337f-4rfw) and GHSA-fpmh-frq8-7rj8, and verify that exact linked
+  version at build time. Audit upstream advisories as well as scanner results;
+  fixed high/critical findings block publication of the exact image.
 
 ## [0.10.0] - 2026-08-11
 
