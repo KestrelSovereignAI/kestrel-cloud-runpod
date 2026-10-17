@@ -23,6 +23,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   after capability loading. Readiness cannot promote an attempt after its
   deadline. Serverless create/delete and Pod mutation threads finish before
   cancellation releases their caller's custody.
+- Prevent late workload observations (including CAS retries) from reviving
+  durable cancellation. Cleanup capability grace never extends the deadline
+  for a new workload submission.
 
 ## [0.10.3] - 2026-10-17
 

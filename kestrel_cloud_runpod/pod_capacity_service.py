@@ -735,13 +735,13 @@ class PodCapacityLeaseService:
         lease = self._required(cleanup_token)
         if lease.is_terminal:
             return lease
-        return self.repository.compare_and_set(
-            lease,
-            changes={
-                "state": TrainingPodState.CANCEL_REQUESTED,
-                "last_heartbeat_at": self._now(),
-            },
-        )
+        changes: dict[str, Any] = {
+            "state": TrainingPodState.CANCEL_REQUESTED,
+            "last_heartbeat_at": self._now(),
+        }
+        if lease.is_catalog_attempt:
+            changes["workload_state"] = CatalogPodWorkloadState.CANCEL_REQUESTED
+        return self.repository.compare_and_set(lease, changes=changes)
 
     async def submit_catalog_workload(
         self,
@@ -753,20 +753,12 @@ class PodCapacityLeaseService:
     ) -> CatalogPodWorkloadObservation:
         """Submit one opaque request; identical replay is worker-idempotent."""
 
-        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
-            raise RunPodManagerError(
-                f"Pod capacity '{capacity_id}' is not ready for workload submission"
-            )
+        lease = self._submission_lease(capacity_id, owner_id, workload_id)
         spec = self._capacity_spec(lease)
         capability = await self._load_capability(spec)
         # Capability I/O can yield while Stop persists its intent. Never submit
         # using the state snapshot from before that await.
-        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
-            raise RunPodManagerError(
-                f"Pod capacity '{capacity_id}' is not ready for workload submission"
-            )
+        lease = self._submission_lease(capacity_id, owner_id, workload_id)
         observation = await self._require_workload_transport().submit(
             base_url=self._route(lease),
             attempt_id=spec.request.attempt_id,
@@ -1751,8 +1743,29 @@ class PodCapacityLeaseService:
             }:
                 lifecycle["workload_terminal_at"] = observed_at
         return self._transition_with_evidence(
-            lease, changes=changes, lifecycle=lifecycle
+            lease,
+            changes=changes,
+            lifecycle=lifecycle,
+            expected_states=frozenset(
+                {
+                    TrainingPodState.READY,
+                    TrainingPodState.JOB_SUBMITTED,
+                    TrainingPodState.JOB_COMPLETED,
+                }
+            ),
         )
+
+    def _submission_lease(
+        self, capacity_id: str, owner_id: str, workload_id: str
+    ) -> TrainingPodLease:
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
+            raise RunPodManagerError(
+                f"Pod capacity '{capacity_id}' is not ready for workload submission"
+            )
+        if self._now() >= lease.hard_deadline:
+            raise RunPodManagerError("Catalog Pod submission hard deadline has expired")
+        return lease
 
     def _catalog_lease(
         self, capacity_id: str, owner_id: str, workload_id: str

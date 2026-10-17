@@ -267,6 +267,66 @@ async def test_capability_io_cannot_extend_creation_authorization(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("during_cas", [False, True])
+async def test_late_workload_acceptance_cannot_revive_durable_stop(
+    tmp_path, monkeypatch, during_cas
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    value = request(clock)
+
+    class StoppingTransport(FakeWorkloadTransport):
+        async def submit(self, **values):
+            if not during_cas:
+                runtime.request_cancellation(value.capacity_id)
+            return await super().submit(**values)
+
+    transport = StoppingTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    await runtime.acquire_catalog(value)
+    if during_cas:
+        original = runtime.repository.compare_and_set
+
+        def racing_cas(lease, *, changes):
+            if changes.get("workload_state") is CatalogPodWorkloadState.RUNNING:
+                runtime.request_cancellation(value.capacity_id)
+            return original(lease, changes=changes)
+
+        monkeypatch.setattr(runtime.repository, "compare_and_set", racing_cas)
+    await runtime.submit_catalog_workload(
+        capacity_id=value.capacity_id,
+        owner_id=value.owner_id,
+        workload_id=value.workload_id,
+        payload={},
+    )
+    current = runtime.repository.get(value.capacity_id)
+    assert current.state is PodCapacityState.CANCEL_REQUESTED
+    assert current.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED
+    await runtime.reconcile()
+    assert provider.terminate_calls == ["pod-catalog-1"]
+
+
+@pytest.mark.asyncio
+async def test_submission_hard_deadline_is_not_extended_by_cleanup_capability(tmp_path):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    value = request(clock)
+    await runtime.acquire_catalog(value)
+    clock.value = value.hard_deadline
+    assert value.bearer_expires_at > clock()
+    with pytest.raises(RunPodManagerError, match="hard deadline"):
+        await runtime.submit_catalog_workload(
+            capacity_id=value.capacity_id,
+            owner_id=value.owner_id,
+            workload_id=value.workload_id,
+            payload={},
+        )
+    assert not transport.submit_calls
+
+
+@pytest.mark.asyncio
 async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path) -> None:
     clock = MutableClock()
     provider = FakeCapacityProvider(clock)
