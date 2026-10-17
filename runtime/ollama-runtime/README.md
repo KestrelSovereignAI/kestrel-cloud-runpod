@@ -72,6 +72,12 @@ The official binary is overwritten in the final filesystem, and both installed
 OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
 The build refuses toolchain auto-upgrades; the unchanged security gate must
 pass for the actual image, including its operating-system packages.
+The linked compression module is also checked explicitly at build time:
+`github.com/klauspost/compress` is pinned to `1.20.2`, fixing the upstream
+[S2 dictionary overflow](https://github.com/klauspost/compress/security/advisories/GHSA-259r-337f-4rfw)
+and [two-block zstd panic](https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8).
+The upstream advisory audit supplements the image scanner; an absent scanner
+finding is not an exception for a known upstream high-severity issue.
 
 ```bash
 docker buildx build --platform linux/amd64 \

@@ -190,11 +190,13 @@ fails closed before catalog selection. Update these values when storage size,
 region, model size, transfer behavior, retry allowance, or Runpod pricing
 changes.
 
-Runpod's beta v2 catalog currently reports the PRO 6000 MIG 1g.24gb and
-2g.48gb products as available for Serverless while returning `pool = null`.
-The same v2 create contract requires a canonical GPU pool ID. Kestrel therefore
-rejects those offers before creation and never guesses a pool from a marketing
-name or GPU ID; see [#21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21).
+The GA catalog observed on 2026-10-17 maps PRO 6000 MIG 1g.24gb to
+`AMPERE_24` and 2g.48gb to `ADA_48_PRO`. Both pools also contain other GPU
+types; these IDs do not guarantee MIG or Blackwell placement. Finite
+Serverless quotes require an unambiguous GPU-to-pool mapping and reject
+shared pools before creation. Missing pool IDs are rejected too; Kestrel
+never guesses one from a marketing name or GPU ID. See
+[#21](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/21).
 A separately valid Pod offer may still be quoted explicitly as Pod capacity.
 
 The route endpoint and bearer are reconstructed from a fresh authenticated

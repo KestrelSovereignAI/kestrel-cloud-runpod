@@ -151,6 +151,7 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "OLLAMA_COMMIT=eec8e0b9458b8a01be0c216a9cc53eefde24ef50" in dockerfile
     for fixed_module in (
         "github.com/buger/jsonparser@v1.1.2",
+        "github.com/klauspost/compress@v1.20.2",
         "golang.org/x/crypto@v0.57.0",
         "golang.org/x/image@v0.45.0",
         "golang.org/x/mod@v0.41.0",
@@ -161,6 +162,9 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "golang:1.26.9-alpine3.23@sha256:" in dockerfile
     assert "golang:1.26.9-bookworm@sha256:" in dockerfile
     assert "ENV GOTOOLCHAIN=local" in dockerfile
+    assert "go version -m /out/ollama" in dockerfile
+    assert '"github.com/klauspost/compress" {print $3}' in dockerfile
+    assert "= v1.20.2" in dockerfile
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
     assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.9\n")
     assert "USER 0:0" in dockerfile

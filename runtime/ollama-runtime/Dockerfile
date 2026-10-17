@@ -26,6 +26,7 @@ WORKDIR /src/ollama
 # with fixed, explicit module versions and the patched Go toolchain.
 RUN go get \
       github.com/buger/jsonparser@v1.1.2 \
+      github.com/klauspost/compress@v1.20.2 \
       golang.org/x/crypto@v0.57.0 \
       golang.org/x/image@v0.45.0 \
       golang.org/x/mod@v0.41.0 \
@@ -34,7 +35,8 @@ RUN go get \
     && go mod download \
     && CGO_ENABLED=1 go build -buildvcs=false -trimpath -buildmode=pie \
       -ldflags="-s -w -buildid= -X=github.com/ollama/ollama/version.Version=0.32.5 -X=github.com/ollama/ollama/server.mode=release" \
-      -o /out/ollama .
+      -o /out/ollama . \
+    && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "github.com/klauspost/compress" {print $3}')" = v1.20.2
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
 ARG RUNTIME_VERSION=1.1.1
