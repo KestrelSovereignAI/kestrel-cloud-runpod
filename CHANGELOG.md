@@ -2,6 +2,16 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.12.1] - 2026-10-17
+
+### Fixed
+
+- Both catalog Pod and private Ollama lease repositories now share one SQLite
+  connection owner that closes after successful operations, failed setup,
+  rollback, and commit failure. WAL, explicit transaction, CAS, and historical
+  migration behavior is unchanged; connection lifetime no longer depends on
+  garbage collection. CI rejects resource and unraisable-exception warnings.
+
 ## [0.12.0] - 2026-10-17
 
 ### Added
