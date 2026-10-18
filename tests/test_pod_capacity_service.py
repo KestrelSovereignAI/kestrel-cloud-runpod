@@ -356,6 +356,7 @@ async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path) -> N
         ),
         "CONTAINER_DIGEST": "sha256:" + "a" * 64,
         "CATALOG_POD_IMAGE_DIGEST": "sha256:" + "a" * 64,
+        "CATALOG_POD_REQUEST_SHA256": catalog_request.request_sha256,
     }
     public = runtime.repository.get(catalog_request.capacity_id).to_public_dict()
     assert TOKEN not in str(public)

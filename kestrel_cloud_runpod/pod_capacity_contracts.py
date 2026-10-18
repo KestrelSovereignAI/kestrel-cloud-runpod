@@ -1650,7 +1650,9 @@ class CatalogArtifactHandoffEvidence:
         )
 
 
-def canonical_catalog_acknowledgement(payload: Mapping[str, Any]) -> str:
+def canonical_catalog_acknowledgement(
+    payload: Mapping[str, Any], *, context: str = "acknowledgement"
+) -> str:
     """Snapshot opaque JSON without retaining it in durable SDK state."""
 
     try:
@@ -1658,9 +1660,52 @@ def canonical_catalog_acknowledgement(payload: Mapping[str, Any]) -> str:
             dict(payload), sort_keys=True, separators=(",", ":"), allow_nan=False
         )
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Catalog acknowledgement must be canonicalizable JSON"
-        ) from exc
+        raise ValueError(f"Catalog {context} must be canonicalizable JSON") from exc
+
+
+def snapshot_catalog_handoff_recovery(
+    payload: Mapping[str, Any],
+    *,
+    attempt_id: str,
+    request_sha256: str,
+    image_digest: str | None = None,
+) -> dict[str, Any]:
+    """Bind opaque private recovery JSON without decoding its schema or HMAC.
+
+    The private worker authenticates the full result/receipt/ACK. This boundary
+    checks only public transport identities and never persists the result.
+    """
+    snapshot = json.loads(
+        canonical_catalog_acknowledgement(payload, context="handoff recovery")
+    )
+    if set(snapshot) != {"handoff", "acknowledgement"}:
+        raise ValueError("Catalog handoff recovery fields differ")
+    handoff, ack = snapshot["handoff"], snapshot["acknowledgement"]
+    if not isinstance(handoff, Mapping) or not isinstance(ack, Mapping):
+        raise TypeError("Catalog handoff recovery envelope is invalid")
+    for name in ("result_sha256", "receipt_sha256", "acknowledgement_sha256"):
+        _sha256(ack.get(name), f"recovery {name}")
+    receipt, result = handoff.get("receipt"), handoff.get("result")
+    if (
+        type(handoff.get("protocol_version")) is not int
+        or handoff["protocol_version"] != 1
+        or not isinstance(receipt, Mapping)
+        or not isinstance(result, Mapping)
+    ):
+        raise ValueError("Catalog handoff recovery protocol is invalid")
+    if (
+        receipt.get("attempt_id") != attempt_id
+        or receipt.get("request_sha256") != request_sha256
+        or result.get("dispatch_attempt_id") != attempt_id
+        or result.get("request_sha256") != request_sha256
+        or ack.get("attempt_id") != attempt_id
+        or ack.get("request_sha256") != request_sha256
+        or receipt.get("result_sha256") != ack.get("result_sha256")
+        or receipt.get("receipt_sha256") != ack.get("receipt_sha256")
+        or (image_digest is not None and receipt.get("image_digest") != image_digest)
+    ):
+        raise ValueError("Catalog handoff recovery binding does not match")
+    return snapshot
 
 
 @dataclass(frozen=True)
@@ -1982,6 +2027,7 @@ _FORBIDDEN_WORKLOAD_ENV = frozenset(
         "CATALOG_POD_BEARER_TOKEN",
         "CATALOG_POD_BEARER_EXPIRES_AT",
         "CATALOG_POD_IMAGE_DIGEST",
+        "CATALOG_POD_REQUEST_SHA256",
         "CONTAINER_DIGEST",
     }
 )

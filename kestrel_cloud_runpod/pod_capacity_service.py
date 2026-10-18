@@ -43,6 +43,7 @@ from .pod_capacity_contracts import (
     fallback_training_cleanup_token,
     iso_datetime,
     sanitize_training_error,
+    snapshot_catalog_handoff_recovery,
 )
 from .pod_capacity_provider import (
     PodCapacityCreatedMismatchError,
@@ -259,6 +260,7 @@ class PodCapacityLeaseService:
             "CATALOG_POD_BEARER_EXPIRES_AT": iso_datetime(capability.expires_at),
             "CONTAINER_DIGEST": image_digest,
             "CATALOG_POD_IMAGE_DIGEST": image_digest,
+            "CATALOG_POD_REQUEST_SHA256": request.request_sha256,
         }
         return await self._acquire(
             internal, environment=environment, wait_for_ready=wait_for_ready
@@ -961,6 +963,60 @@ class PodCapacityLeaseService:
             )
         )
 
+    async def recover_catalog_result(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+        recovery: Mapping[str, Any],
+    ) -> TrainingPodLease:
+        """Restore an accepted handoff after runner replacement; never resubmit.
+
+        Private host acceptance is required before calling this operation. The
+        payload remains opaque and is never retained in the SDK repository.
+        Cached actual proof is historical replay, not fresh remote authority.
+        """
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        spec = self._capacity_spec(lease)
+        if spec.request.artifact_handoff_protocol_version != 1:
+            raise RunPodManagerError(
+                "Historical catalog capacity cannot recover a handoff"
+            )
+        payload = snapshot_catalog_handoff_recovery(
+            recovery,
+            attempt_id=spec.request.attempt_id,
+            request_sha256=spec.request.request_sha256,
+            image_digest=spec.request.image_reference.rsplit("@", 1)[1],
+        )
+        return await await_owned_effect(
+            self._acknowledge_catalog_result(
+                capacity_id=capacity_id,
+                owner_id=owner_id,
+                workload_id=workload_id,
+                payload=payload["acknowledgement"],
+                recovery_payload=payload,
+            )
+        )
+
+    def _require_catalog_ack_admission(
+        self, lease: TrainingPodLease, *, before_dispatch: bool = False
+    ) -> None:
+        if (
+            lease.is_terminal
+            or lease.state is not TrainingPodState.JOB_COMPLETED
+            or not self._catalog_result_ready(lease)
+        ):
+            raise RunPodManagerError(
+                "Catalog Pod acknowledgement was stopped before dispatch"
+                if before_dispatch
+                else "Catalog Pod result cannot be acknowledged in its current state"
+            )
+        if self._now() >= lease.hard_deadline:
+            raise RunPodManagerError(
+                "Catalog Pod acknowledgement hard deadline has expired"
+            )
+
     async def _acknowledge_catalog_result(
         self,
         *,
@@ -968,6 +1024,7 @@ class PodCapacityLeaseService:
         owner_id: str,
         workload_id: str,
         payload: Mapping[str, Any],
+        recovery_payload: Mapping[str, Any] | None = None,
     ) -> TrainingPodLease:
         while True:
             lease = self._catalog_lease(capacity_id, owner_id, workload_id)
@@ -985,14 +1042,7 @@ class PodCapacityLeaseService:
             # Replay must precede credentials, route, deadline and terminal checks.
             if intent.remote_ack_observed_at is not None:
                 return lease
-            if (
-                lease.is_terminal
-                or lease.state is not TrainingPodState.JOB_COMPLETED
-                or not self._catalog_result_ready(lease)
-            ):
-                raise RunPodManagerError(
-                    "Catalog Pod result cannot be acknowledged in its current state"
-                )
+            self._require_catalog_ack_admission(lease)
             try:
                 lease = self.repository.compare_and_set(
                     lease, changes={"artifact_handoff_json": intent}
@@ -1003,19 +1053,19 @@ class PodCapacityLeaseService:
         spec = self._capacity_spec(lease)
         capability = await self._load_capability(spec)
         current = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if (
-            current.state is not TrainingPodState.JOB_COMPLETED
-            or not self._catalog_result_ready(current)
-        ):
-            raise RunPodManagerError(
-                "Catalog Pod acknowledgement was stopped before dispatch"
-            )
-        observation = await self._require_workload_transport().acknowledge(
+        self._require_catalog_ack_admission(current, before_dispatch=True)
+        transport = self._require_workload_transport()
+        operation = (
+            transport.acknowledge
+            if recovery_payload is None
+            else transport.recover_handoff
+        )
+        observation = await operation(
             base_url=self._route(current),
             attempt_id=spec.request.attempt_id,
             request_sha256=spec.request.request_sha256,
             bearer_token=capability.bearer_token,
-            payload=payload,
+            payload=payload if recovery_payload is None else recovery_payload,
         )
         if observation.state is not CatalogPodWorkloadState.ACKNOWLEDGED:
             raise TrainingPodConflictError(

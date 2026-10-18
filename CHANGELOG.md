@@ -2,6 +2,25 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.12.0] - 2026-10-17
+
+### Added
+
+- `recover_catalog_result(..., recovery=opaque_private_recovery)` restores an
+  already accepted signed handoff after runner process replacement, using only
+  the authenticated artifact-only recovery route. It shares exact durable ACK
+  intent, actual-response proof, cancellation ownership, and cached-proof replay
+  with the ordinary ACK lifecycle. No execution/provision fallback, private
+  dependency, result persistence, or fresh credentials are introduced.
+- Derive and reserve `CATALOG_POD_REQUEST_SHA256` from the sealed request so the
+  private recovery-capable worker can verify its immutable request binding.
+
+### Fixed
+
+- Check the hard deadline for fresh ACK and recovery before intent admission
+  and again after capability loading. Cached actual proof still replays after
+  expiry/Stop/teardown for historical bookkeeping; intent alone never does.
+
 ## [0.11.0] - 2026-10-17
 
 ### Changed
