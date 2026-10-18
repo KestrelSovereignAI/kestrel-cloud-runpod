@@ -85,6 +85,8 @@ class CatalogPodWorkloadState(str, Enum):
     RUNNING = "running"
     CANCEL_REQUESTED = "cancel_requested"
     SUCCEEDED = "succeeded"
+    AWAITING_ACK = "awaiting_ack"
+    ACKNOWLEDGED = "acknowledged"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -411,8 +413,16 @@ class CatalogPodCapacityRequest:
     idle_timeout_seconds: int
     cleanup_grace_seconds: int
     attempt_environment: Mapping[str, str]
+    artifact_handoff_protocol_version: int | None = 1
 
     def __post_init__(self) -> None:
+        if self.artifact_handoff_protocol_version is not None and (
+            type(self.artifact_handoff_protocol_version) is not int
+            or self.artifact_handoff_protocol_version != 1
+        ):
+            raise ValueError(
+                "Catalog Pod artifact handoff protocol must be 1 or legacy null"
+            )
         for name, value in (
             ("capacity_id", self.capacity_id),
             ("cleanup_family_id", self.cleanup_family_id),
@@ -500,6 +510,13 @@ class CatalogPodCapacityRequest:
             "cleanup_grace_seconds": self.cleanup_grace_seconds,
             "attempt_environment_keys": sorted(self.attempt_environment),
         }
+        # Historical stored leases have no protocol field. Preserve their
+        # exact fingerprint/name for observation and cleanup; never infer an
+        # acknowledgement or upgrade their authority by parsing them.
+        if self.artifact_handoff_protocol_version is not None:
+            payload["artifact_handoff_protocol_version"] = (
+                self.artifact_handoff_protocol_version
+            )
         return _json_sha256(payload)
 
 
@@ -523,7 +540,7 @@ class PodCapacitySpec:
 
     def to_dict(self) -> dict[str, Any]:
         request = self.request
-        return {
+        payload: dict[str, Any] = {
             "request": {
                 "capacity_id": request.capacity_id,
                 "cleanup_family_id": request.cleanup_family_id,
@@ -553,11 +570,19 @@ class PodCapacitySpec:
             "capability_expires_at": iso_datetime(self.capability_expires_at),
             "attempt_environment_sha256": self.attempt_environment_sha256,
         }
+        if request.artifact_handoff_protocol_version is not None:
+            payload["request"]["artifact_handoff_protocol_version"] = (
+                request.artifact_handoff_protocol_version
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> PodCapacitySpec:
         request_value = _required_mapping(value, "request")
         request = CatalogPodCapacityRequest(
+            artifact_handoff_protocol_version=request_value.get(
+                "artifact_handoff_protocol_version"
+            ),
             capacity_id=_required_string(request_value, "capacity_id"),
             cleanup_family_id=_required_string(request_value, "cleanup_family_id"),
             owner_id=_required_string(request_value, "owner_id"),
@@ -1506,6 +1531,139 @@ class TrainingPodRequest:
 
 
 @dataclass(frozen=True)
+class CatalogArtifactHandoffEvidence:
+    """Content-free transport binding, never a private receipt or signature.
+
+    ACK intent fingerprints the complete opaque host payload. Only authenticated
+    worker observation may set remote_ack_observed_at; intent is not observation.
+    """
+
+    attempt_id: str
+    request_sha256: str
+    result_sha256: str
+    receipt_sha256: str
+    acknowledgement_sha256: str | None = None
+    acknowledgement_payload_sha256: str | None = None
+    remote_ack_observed_at: datetime | None = None
+    host_confirmation_declared_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _safe_identifier(self.attempt_id, "handoff attempt_id")
+        for name in ("request_sha256", "result_sha256", "receipt_sha256"):
+            _sha256(getattr(self, name), f"handoff {name}")
+        intent = (self.acknowledgement_sha256, self.acknowledgement_payload_sha256)
+        if any(value is not None for value in intent):
+            for value in intent:
+                _sha256(value, "handoff acknowledgement digest")
+        if self.remote_ack_observed_at is not None:
+            require_aware(self.remote_ack_observed_at, "remote_ack_observed_at")
+            if self.acknowledgement_sha256 is None:
+                raise ValueError("Remote acknowledgement requires persisted ACK intent")
+        if self.host_confirmation_declared_at is not None:
+            require_aware(
+                self.host_confirmation_declared_at, "host_confirmation_declared_at"
+            )
+            if self.remote_ack_observed_at is None:
+                raise ValueError(
+                    "Host confirmation requires observed remote acknowledgement"
+                )
+
+    def bind_acknowledgement(
+        self, payload: Mapping[str, Any]
+    ) -> CatalogArtifactHandoffEvidence:
+        """Bind opaque bytes; private host/worker alone validate their schema/HMAC."""
+
+        for name in ("attempt_id", "request_sha256", "result_sha256", "receipt_sha256"):
+            if payload.get(name) != getattr(self, name):
+                raise ValueError("Catalog acknowledgement binding does not match")
+        ack_sha = payload.get("acknowledgement_sha256")
+        _sha256(ack_sha, "handoff acknowledgement_sha256")
+        payload_sha = hashlib.sha256(
+            canonical_catalog_acknowledgement(payload).encode()
+        ).hexdigest()
+        if self.acknowledgement_sha256 is not None and (
+            ack_sha != self.acknowledgement_sha256
+            or payload_sha != self.acknowledgement_payload_sha256
+        ):
+            raise ValueError(
+                "Catalog acknowledgement intent was already bound differently"
+            )
+        return CatalogArtifactHandoffEvidence(
+            self.attempt_id,
+            self.request_sha256,
+            self.result_sha256,
+            self.receipt_sha256,
+            ack_sha,
+            payload_sha,
+            self.remote_ack_observed_at,
+            self.host_confirmation_declared_at,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "request_sha256": self.request_sha256,
+            "result_sha256": self.result_sha256,
+            "receipt_sha256": self.receipt_sha256,
+            "acknowledgement_sha256": self.acknowledgement_sha256,
+            "acknowledgement_payload_sha256": self.acknowledgement_payload_sha256,
+            "remote_ack_observed_at": iso_datetime(self.remote_ack_observed_at)
+            if self.remote_ack_observed_at
+            else None,
+            "host_confirmation_declared_at": iso_datetime(
+                self.host_confirmation_declared_at
+            )
+            if self.host_confirmation_declared_at
+            else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CatalogArtifactHandoffEvidence:
+        _exact_keys(
+            value,
+            {
+                "attempt_id",
+                "request_sha256",
+                "result_sha256",
+                "receipt_sha256",
+                "acknowledgement_sha256",
+                "acknowledgement_payload_sha256",
+                "remote_ack_observed_at",
+                "host_confirmation_declared_at",
+            },
+            "catalog artifact handoff evidence",
+        )
+        return cls(
+            **{
+                **value,
+                "remote_ack_observed_at": datetime.fromisoformat(
+                    value["remote_ack_observed_at"]
+                )
+                if value["remote_ack_observed_at"] is not None
+                else None,
+                "host_confirmation_declared_at": datetime.fromisoformat(
+                    value["host_confirmation_declared_at"]
+                )
+                if value["host_confirmation_declared_at"] is not None
+                else None,
+            }
+        )
+
+
+def canonical_catalog_acknowledgement(payload: Mapping[str, Any]) -> str:
+    """Snapshot opaque JSON without retaining it in durable SDK state."""
+
+    try:
+        return json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Catalog acknowledgement must be canonicalizable JSON"
+        ) from exc
+
+
+@dataclass(frozen=True)
 class TrainingPodLease:
     """Durable ownership, workload, and teardown state for one Pod use."""
 
@@ -1540,6 +1698,40 @@ class TrainingPodLease:
     billing_receipt: PodBillingReceipt | None = None
     terminated_at: datetime | None = None
     evidence: PodCapacityEvidence | None = None
+    artifact_handoff: CatalogArtifactHandoffEvidence | None = None
+
+    def __post_init__(self) -> None:
+        if self.artifact_handoff is not None:
+            if (
+                self.capacity_spec is None
+                or self.capacity_spec.request.artifact_handoff_protocol_version != 1
+            ):
+                raise ValueError(
+                    "Artifact handoff evidence requires an explicit protocol-1 lease"
+                )
+            request = self.capacity_spec.request
+            if (
+                self.artifact_handoff.attempt_id != request.attempt_id
+                or self.artifact_handoff.request_sha256 != request.request_sha256
+            ):
+                raise ValueError(
+                    "Artifact handoff evidence does not match the stored lease"
+                )
+        if self.workload_state in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }:
+            if self.artifact_handoff is None:
+                raise ValueError(
+                    "Catalog handoff phase requires persisted artifact evidence"
+                )
+            if (
+                self.workload_state is CatalogPodWorkloadState.ACKNOWLEDGED
+                and self.artifact_handoff.remote_ack_observed_at is None
+            ):
+                raise ValueError(
+                    "Catalog acknowledged phase requires observed remote proof"
+                )
 
     @property
     def is_terminal(self) -> bool:
@@ -1580,8 +1772,23 @@ class TrainingPodLease:
     def terminal_success_evidence_complete(self) -> bool:
         """Success is proven only after teardown and authoritative full billing."""
 
-        return (
+        protocol = (
+            self.capacity_spec.request.artifact_handoff_protocol_version
+            if self.capacity_spec
+            else None
+        )
+        success = (
             self.workload_state is CatalogPodWorkloadState.SUCCEEDED
+            if protocol is None
+            else (
+                self.workload_state is CatalogPodWorkloadState.ACKNOWLEDGED
+                and self.artifact_handoff is not None
+                and self.artifact_handoff.remote_ack_observed_at is not None
+                and self.artifact_handoff.host_confirmation_declared_at is not None
+            )
+        )
+        return (
+            success
             and self.settlement_ready
             and self.evidence is not None
             and self.evidence.is_complete
@@ -1624,6 +1831,9 @@ class TrainingPodLease:
                 else None
             ),
             "evidence": self.evidence.to_dict() if self.evidence is not None else None,
+            "artifact_handoff": self.artifact_handoff.to_dict()
+            if self.artifact_handoff
+            else None,
             "terminal_success_evidence_complete": (
                 self.terminal_success_evidence_complete
             ),
@@ -1636,6 +1846,7 @@ class TrainingPodLease:
                     "workload_kind": self.capacity_spec.request.workload_kind,
                     "request_sha256": self.capacity_spec.request.request_sha256,
                     "parameters_sha256": (self.capacity_spec.request.parameters_sha256),
+                    "artifact_handoff_protocol_version": self.capacity_spec.request.artifact_handoff_protocol_version,
                     "quote": self.capacity_spec.request.quote.to_dict(),
                 }
                 if self.capacity_spec is not None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
@@ -15,6 +16,7 @@ from .effect_custody import await_owned_effect
 from .models import GPUProfile, RunPodAmbiguousResultError, RunPodManagerError
 from .pod_capacity_contracts import (
     TRAINING_PROFILE_IDS,
+    CatalogArtifactHandoffEvidence,
     CatalogAttemptCapability,
     CatalogAttemptCapabilityStore,
     CatalogPodCapacityRequest,
@@ -37,6 +39,7 @@ from .pod_capacity_contracts import (
     TrainingPodSource,
     TrainingPodState,
     attempt_environment_sha256,
+    canonical_catalog_acknowledgement,
     fallback_training_cleanup_token,
     iso_datetime,
     sanitize_training_error,
@@ -181,6 +184,11 @@ class PodCapacityLeaseService:
     ) -> TrainingPodLease:
 
         self._require_workload_transport()
+        if request.artifact_handoff_protocol_version != 1:
+            raise RunPodManagerError(
+                "New catalog capacity requires artifact handoff protocol 1; "
+                "historical capacity is observation and cleanup only"
+            )
         existing = self.repository.get(request.capacity_id)
         if existing is not None:
             existing_spec = self._capacity_spec(existing)
@@ -275,6 +283,13 @@ class PodCapacityLeaseService:
         environment: Mapping[str, str] | None,
         wait_for_ready: bool,
     ) -> TrainingPodLease:
+        if (
+            request.capacity_spec is not None
+            and request.capacity_spec.request.artifact_handoff_protocol_version != 1
+        ):
+            raise RunPodManagerError(
+                "Historical catalog capacity cannot be acquired for new work"
+            )
         lease, inserted = self.repository.reserve(request)
         if not inserted:
             if lease.state is TrainingPodState.READY:
@@ -668,6 +683,7 @@ class PodCapacityLeaseService:
         if not provider_job_id:
             raise ValueError("Training provider_job_id must be non-empty")
         lease = self._required(cleanup_token)
+        self._require_legacy_training_mutation(lease)
         if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
             raise RunPodManagerError(
                 f"Training cleanup token '{cleanup_token}' is not ready for submission"
@@ -702,6 +718,7 @@ class PodCapacityLeaseService:
 
     def record_status(self, cleanup_token: str, status: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)
+        self._require_legacy_training_mutation(lease)
         if lease.is_terminal:
             return lease
         normalized = status.strip().lower()
@@ -717,6 +734,7 @@ class PodCapacityLeaseService:
 
     def record_result_retrieved(self, cleanup_token: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)
+        self._require_legacy_training_mutation(lease)
         if lease.state not in {
             TrainingPodState.JOB_SUBMITTED,
             TrainingPodState.JOB_COMPLETED,
@@ -819,7 +837,7 @@ class PodCapacityLeaseService:
         """Return an opaque result replay without acknowledging or tearing it down."""
 
         lease = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
+        if not self._catalog_result_ready(lease):
             raise RunPodManagerError("Catalog Pod result is not ready")
         spec = self._capacity_spec(lease)
         capability = await self._load_capability(spec)
@@ -829,11 +847,26 @@ class PodCapacityLeaseService:
             attempt_id=spec.request.attempt_id,
             request_sha256=spec.request.request_sha256,
             bearer_token=capability.bearer_token,
+            artifact_handoff_protocol_version=spec.request.artifact_handoff_protocol_version,
         )
         current = self._required(capacity_id)
         if current.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
             await self.release(capacity_id, reason="late result after cancellation")
             raise RunPodManagerError("Cancelled catalog attempt cannot accept a result")
+        if spec.request.artifact_handoff_protocol_version == 1:
+            receipt = payload.get("receipt")
+            handoff = current.artifact_handoff
+            if (
+                not isinstance(receipt, Mapping)
+                or handoff is None
+                or any(
+                    receipt.get(name) != getattr(handoff, name)
+                    for name in ("result_sha256", "receipt_sha256")
+                )
+            ):
+                raise TrainingPodConflictError(
+                    "Catalog result receipt differs from observed handoff"
+                )
         return payload
 
     def record_catalog_worker_evidence(
@@ -862,7 +895,7 @@ class PodCapacityLeaseService:
             raise TrainingPodConflictError(
                 "Catalog worker evidence does not match the exact attempt binding"
             )
-        if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
+        if not self._catalog_result_ready(lease):
             raise RunPodManagerError(
                 "Catalog worker evidence cannot be accepted before workload success"
             )
@@ -895,20 +928,159 @@ class PodCapacityLeaseService:
         capacity_id: str,
         owner_id: str,
         workload_id: str,
+        acknowledgement: Mapping[str, Any] | None = None,
     ) -> TrainingPodLease:
-        """Acknowledge durable host persistence, then terminate disposable capacity."""
+        """Deliver the host ACK and persist remote proof, WITHOUT protocol-1 teardown.
+
+        The private host must durably accept/validate the signed artifact first.
+        It must then confirm this ACK in its own database before calling
+        release_catalog_result(). Historical leases retain their old cleanup API.
+        """
 
         lease = self._catalog_lease(capacity_id, owner_id, workload_id)
-        if lease.workload_state is not CatalogPodWorkloadState.SUCCEEDED:
+        if self._capacity_spec(lease).request.artifact_handoff_protocol_version is None:
+            if acknowledgement is not None:
+                raise RunPodManagerError(
+                    "Historical catalog capacity cannot accept a protocol-1 ACK"
+                )
+            return await self.release_catalog_result(
+                capacity_id=capacity_id, owner_id=owner_id, workload_id=workload_id
+            )
+        if acknowledgement is None:
+            raise RunPodManagerError(
+                "Catalog artifact handoff requires the exact host acknowledgement"
+            )
+        # Snapshot nested opaque JSON before any await; caller mutation cannot
+        # change the bytes after their persisted intent has been admitted.
+        payload = json.loads(canonical_catalog_acknowledgement(acknowledgement))
+        return await await_owned_effect(
+            self._acknowledge_catalog_result(
+                capacity_id=capacity_id,
+                owner_id=owner_id,
+                workload_id=workload_id,
+                payload=payload,
+            )
+        )
+
+    async def _acknowledge_catalog_result(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+        payload: Mapping[str, Any],
+    ) -> TrainingPodLease:
+        while True:
+            lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+            evidence = lease.artifact_handoff
+            if evidence is None:
+                raise RunPodManagerError(
+                    "Catalog result has no observed artifact handoff"
+                )
+            try:
+                intent = evidence.bind_acknowledgement(payload)
+            except ValueError as exc:
+                raise TrainingPodConflictError(
+                    "Catalog acknowledgement does not match the exact persisted handoff"
+                ) from exc
+            # Replay must precede credentials, route, deadline and terminal checks.
+            if intent.remote_ack_observed_at is not None:
+                return lease
+            if (
+                lease.is_terminal
+                or lease.state is not TrainingPodState.JOB_COMPLETED
+                or not self._catalog_result_ready(lease)
+            ):
+                raise RunPodManagerError(
+                    "Catalog Pod result cannot be acknowledged in its current state"
+                )
+            try:
+                lease = self.repository.compare_and_set(
+                    lease, changes={"artifact_handoff_json": intent}
+                )
+                break
+            except TrainingPodConflictError:
+                continue
+        spec = self._capacity_spec(lease)
+        capability = await self._load_capability(spec)
+        current = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if (
+            current.state is not TrainingPodState.JOB_COMPLETED
+            or not self._catalog_result_ready(current)
+        ):
+            raise RunPodManagerError(
+                "Catalog Pod acknowledgement was stopped before dispatch"
+            )
+        observation = await self._require_workload_transport().acknowledge(
+            base_url=self._route(current),
+            attempt_id=spec.request.attempt_id,
+            request_sha256=spec.request.request_sha256,
+            bearer_token=capability.bearer_token,
+            payload=payload,
+        )
+        if observation.state is not CatalogPodWorkloadState.ACKNOWLEDGED:
+            raise TrainingPodConflictError(
+                "Catalog Pod did not acknowledge the exact host intent"
+            )
+        return self._record_catalog_observation(capacity_id, observation)
+
+    async def release_catalog_result(
+        self,
+        *,
+        capacity_id: str,
+        owner_id: str,
+        workload_id: str,
+        host_confirmed_acknowledgement_sha256: str | None = None,
+    ) -> TrainingPodLease:
+        """Declare durable host ACK confirmation, then tear down disposable capacity.
+
+        The caller owns its database commit; this SDK can verify only the exact
+        matching remote ACK proof. Stop/deadline cleanup uses release() instead.
+        """
+
+        lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        protocol = self._capacity_spec(lease).request.artifact_handoff_protocol_version
+        if protocol == 1:
+            evidence = lease.artifact_handoff
+            if (
+                evidence is None
+                or evidence.remote_ack_observed_at is None
+                or host_confirmed_acknowledgement_sha256
+                != evidence.acknowledgement_sha256
+            ):
+                raise TrainingPodConflictError(
+                    "Catalog result release requires the exact durably confirmed remote acknowledgement"
+                )
+        elif host_confirmed_acknowledgement_sha256 is not None:
+            raise TrainingPodConflictError(
+                "Historical catalog result has no protocol-1 acknowledgement"
+            )
+        if not self._catalog_result_ready(lease):
             raise RunPodManagerError(
                 "Catalog Pod result cannot be acknowledged before success"
             )
         if lease.is_terminal:
+            if protocol == 1 and evidence.host_confirmation_declared_at is None:
+                raise TrainingPodConflictError(
+                    "Catalog host confirmation was not declared before cleanup"
+                )
             return lease
         if lease.state is TrainingPodState.JOB_COMPLETED:
+            confirmation = (
+                {
+                    "artifact_handoff_json": replace(
+                        evidence,
+                        host_confirmation_declared_at=evidence.host_confirmation_declared_at
+                        or self._now(),
+                    )
+                }
+                if protocol == 1
+                else {}
+            )
             lease = self.repository.compare_and_set(
                 lease,
                 changes={
+                    **confirmation,
                     "state": TrainingPodState.RESULT_RETRIEVED,
                     "last_heartbeat_at": self._now(),
                     "last_provider_error": None,
@@ -921,7 +1093,13 @@ class PodCapacityLeaseService:
             raise RunPodManagerError(
                 "Catalog Pod result acknowledgement is inconsistent with lease state"
             )
-        return await self.release(capacity_id, reason="catalog result acknowledged")
+        elif protocol == 1 and evidence.host_confirmation_declared_at is None:
+            raise TrainingPodConflictError(
+                "Catalog host confirmation was not declared before cleanup"
+            )
+        return await self.release(
+            capacity_id, reason="catalog result durably confirmed by host"
+        )
 
     async def cancel_catalog_workload(
         self,
@@ -1604,6 +1782,7 @@ class PodCapacityLeaseService:
         worker: CatalogWorkerEvidence | object = _EVIDENCE_UNSET,
         billing: PodBillingReceipt | None | object = _EVIDENCE_UNSET,
         expected_states: frozenset[TrainingPodState] | None = None,
+        retry_on_conflict: bool = True,
     ) -> TrainingPodLease:
         """CAS state and first-observation evidence without stale overwrites."""
 
@@ -1667,6 +1846,8 @@ class PodCapacityLeaseService:
             try:
                 return self.repository.compare_and_set(current, changes=persisted)
             except TrainingPodConflictError:
+                if not retry_on_conflict:
+                    raise
                 current = self._required(lease.cleanup_token)
         return current
 
@@ -1698,11 +1879,34 @@ class PodCapacityLeaseService:
         *,
         submitted: bool = False,
     ) -> TrainingPodLease:
-        lease = self._required(capacity_id)
-        if lease.is_terminal:
-            return lease
-        if lease.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
-            return lease
+        while True:
+            lease = self._required(capacity_id)
+            changes, lifecycle = self._catalog_observation_changes(
+                lease, observation, submitted=submitted
+            )
+            if not changes:
+                return lease
+            try:
+                if lease.is_terminal:
+                    # Stop may finish teardown while an admitted ACK is in flight.
+                    # Preserve the observed fact without reviving any workload.
+                    return self.repository.compare_and_set(lease, changes=changes)
+                return self._transition_with_evidence(
+                    lease,
+                    changes=changes,
+                    lifecycle=lifecycle,
+                    retry_on_conflict=False,
+                )
+            except TrainingPodConflictError:
+                continue
+
+    def _catalog_observation_changes(
+        self,
+        lease: TrainingPodLease,
+        observation: CatalogPodWorkloadObservation,
+        *,
+        submitted: bool,
+    ) -> tuple[dict[str, Any], dict[str, datetime]]:
         spec = self._capacity_spec(lease)
         if (
             observation.attempt_id != spec.request.attempt_id
@@ -1712,7 +1916,83 @@ class PodCapacityLeaseService:
                 "Catalog workload observation does not match the exact attempt binding"
             )
         observed_at = self._now()
+        protocol = spec.request.artifact_handoff_protocol_version
+        handoff = lease.artifact_handoff
+        if protocol == 1 and observation.state is CatalogPodWorkloadState.SUCCEEDED:
+            raise TrainingPodConflictError(
+                "Protocol-1 workload success requires an artifact handoff"
+            )
+        if protocol is None and observation.state in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }:
+            raise TrainingPodConflictError(
+                "Historical workload cannot be upgraded by an observed payload"
+            )
+        if observation.state in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }:
+            observed_binding = CatalogArtifactHandoffEvidence(
+                observation.attempt_id,
+                spec.request.request_sha256,
+                observation.result_sha256,
+                observation.receipt_sha256,
+            )
+            if handoff is not None and (
+                handoff.result_sha256 != observed_binding.result_sha256
+                or handoff.receipt_sha256 != observed_binding.receipt_sha256
+            ):
+                raise TrainingPodConflictError(
+                    "Catalog Pod observed artifact handoff changed"
+                )
+            handoff = handoff or observed_binding
+            if observation.state is CatalogPodWorkloadState.ACKNOWLEDGED:
+                if (
+                    handoff.acknowledgement_sha256 is None
+                    or handoff.acknowledgement_sha256
+                    != observation.acknowledgement_sha256
+                ):
+                    raise TrainingPodConflictError(
+                        "Catalog Pod ACK lacks matching persisted host intent"
+                    )
+                handoff = replace(
+                    handoff,
+                    remote_ack_observed_at=handoff.remote_ack_observed_at
+                    or observed_at,
+                )
+        proof_changes = (
+            {"artifact_handoff_json": handoff}
+            if handoff != lease.artifact_handoff
+            else {}
+        )
+        if (
+            lease.is_terminal
+            or lease.state
+            not in {
+                TrainingPodState.READY,
+                TrainingPodState.JOB_SUBMITTED,
+                TrainingPodState.JOB_COMPLETED,
+            }
+            or lease.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED
+        ):
+            return proof_changes, {}
+        # Delayed polls cannot regress a completed handoff or restart the job.
+        rank = {
+            CatalogPodWorkloadState.NOT_SUBMITTED: 0,
+            CatalogPodWorkloadState.IDLE: 0,
+            CatalogPodWorkloadState.RUNNING: 1,
+            CatalogPodWorkloadState.SUCCEEDED: 2,
+            CatalogPodWorkloadState.AWAITING_ACK: 2,
+            CatalogPodWorkloadState.ACKNOWLEDGED: 3,
+        }
+        if (
+            observation.state in rank
+            and rank.get(lease.workload_state, 4) > rank[observation.state]
+        ):
+            return proof_changes, {}
         changes: dict[str, Any] = {
+            **proof_changes,
             "workload_state": observation.state,
             "workload_error_type": observation.error_type,
             "last_provider_error": None,
@@ -1727,7 +2007,11 @@ class PodCapacityLeaseService:
                 provider_job_id=observation.attempt_id,
             )
             lifecycle["workload_running_at"] = observed_at
-        elif observation.state is CatalogPodWorkloadState.SUCCEEDED:
+        elif observation.state in {
+            CatalogPodWorkloadState.SUCCEEDED,
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }:
             changes.update(
                 state=TrainingPodState.JOB_COMPLETED,
                 provider_job_id=observation.attempt_id,
@@ -1744,23 +2028,36 @@ class PodCapacityLeaseService:
                 CatalogPodWorkloadState.CANCELLED,
             }:
                 lifecycle["workload_terminal_at"] = observed_at
-        return self._transition_with_evidence(
-            lease,
-            changes=changes,
-            lifecycle=lifecycle,
-            expected_states=frozenset(
-                {
-                    TrainingPodState.READY,
-                    TrainingPodState.JOB_SUBMITTED,
-                    TrainingPodState.JOB_COMPLETED,
-                }
-            ),
-        )
+        return changes, lifecycle
+
+    @staticmethod
+    def _catalog_result_ready(lease: TrainingPodLease) -> bool:
+        spec = PodCapacityLeaseService._capacity_spec(lease)
+        if spec.request.artifact_handoff_protocol_version is None:
+            return lease.workload_state is CatalogPodWorkloadState.SUCCEEDED
+        return lease.workload_state in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }
+
+    @staticmethod
+    def _require_legacy_training_mutation(lease: TrainingPodLease) -> None:
+        if (
+            lease.capacity_spec is not None
+            and lease.capacity_spec.request.artifact_handoff_protocol_version == 1
+        ):
+            raise RunPodManagerError(
+                "Protocol-1 catalog work requires the authenticated catalog lifecycle"
+            )
 
     def _submission_lease(
         self, capacity_id: str, owner_id: str, workload_id: str
     ) -> TrainingPodLease:
         lease = self._catalog_lease(capacity_id, owner_id, workload_id)
+        if self._capacity_spec(lease).request.artifact_handoff_protocol_version != 1:
+            raise RunPodManagerError(
+                "Historical catalog capacity cannot accept new workload submissions"
+            )
         if lease.state not in {TrainingPodState.READY, TrainingPodState.JOB_SUBMITTED}:
             raise RunPodManagerError(
                 f"Pod capacity '{capacity_id}' is not ready for workload submission"

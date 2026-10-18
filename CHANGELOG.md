@@ -2,6 +2,37 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.11.0] - 2026-10-17
+
+### Changed
+
+- New catalog Pod requests bind artifact handoff protocol 1 into both durable
+  identities. The transport returns the opaque signed receipt/result envelope
+  and understands `awaiting_ack` and `acknowledged` worker phases. Private
+  artifact schemas and HMAC validation remain exclusively in the private host
+  and worker packages; no private dependency is published here.
+- `acknowledge_catalog_result(..., acknowledgement=opaque_host_ack)` now sends
+  the authenticated runner ACK and persists exact, content-free ACK intent and
+  observed proof **without teardown** for protocol-1 leases. After confirming
+  that proof in its own durable database, the host calls
+  `release_catalog_result(..., host_confirmed_acknowledgement_sha256=...)`.
+  That declaration is recorded atomically with the cleanup-driving transition.
+- Additive SQLite schema 4 preserves historical catalog identities and their
+  old result/cleanup behavior. Historical leases cannot authorize new capacity
+  or workload submission, including through generic acquisition.
+
+### Fixed
+
+- Bind both runner image-digest environment variables to the immutable pinned
+  image, preventing a private runner configuration failure at startup.
+- Preserve ACK intent through ambiguous HTTP outcomes and join ACK delivery
+  through durable local evidence under repeated cancellation. Authenticated
+  status can recover a lost ACK response only against an exact prior intent.
+  Cached proof replays after expiry/revocation without loading credentials.
+- Prevent stale polls and CAS retries from regressing an acknowledged phase,
+  or a late ACK from reviving durable Stop. Stop/deadline cleanup never invents
+  acknowledgment, durable host confirmation, or successful completion evidence.
+
 ## [0.10.4] - 2026-10-17
 
 ### Added

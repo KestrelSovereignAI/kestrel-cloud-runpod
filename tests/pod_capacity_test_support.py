@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -21,7 +21,6 @@ from kestrel_cloud_runpod.models import (
     RunPodManagerError,
 )
 from kestrel_cloud_runpod.pod_capacity_contracts import (
-    pod_cost_usd,
     CatalogAttemptCapability,
     CatalogPodCapacityRequest,
     CatalogPodWorkloadState,
@@ -29,6 +28,7 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodCapacityConstraints,
     PodCapacityQuote,
     PodRealizedPlacement,
+    pod_cost_usd,
 )
 from kestrel_cloud_runpod.pod_capacity_provider import (
     CreatedPodCapacity,
@@ -42,8 +42,22 @@ from kestrel_cloud_runpod.pod_transport import CatalogPodWorkloadObservation
 
 TOKEN = "catalog-pod-token-" + "x" * 40
 REQUEST_SHA = "b" * 64
+RESULT_SHA = "d" * 64
+RECEIPT_SHA = "e" * 64
+ACK_SHA = "f" * 64
 PARAMETERS_SHA = "c" * 64
 IMAGE = "ghcr.io/kestrel/catalog-worker@sha256:" + "a" * 64
+
+
+def acknowledgement() -> dict[str, Any]:
+    return {
+        "attempt_id": "attempt:catalog-run-0001",
+        "request_sha256": REQUEST_SHA,
+        "result_sha256": RESULT_SHA,
+        "receipt_sha256": RECEIPT_SHA,
+        "acknowledgement_sha256": ACK_SHA,
+        "opaque_private_signature": "not-public-or-persisted-by-sdk",
+    }
 
 
 class MutableClock:
@@ -288,11 +302,21 @@ class FakeWorkloadTransport:
         self.submit_calls: list[Mapping[str, Any]] = []
         self.status_value = CatalogPodWorkloadState.RUNNING
         self.result_payload: Mapping[str, Any] = {
-            "dispatch_attempt_id": "attempt:catalog-run-0001",
-            "request_sha256": REQUEST_SHA,
-            "artifact": {"disposition": "stored"},
+            "protocol_version": 1,
+            "receipt": {
+                "attempt_id": "attempt:catalog-run-0001",
+                "request_sha256": REQUEST_SHA,
+                "result_sha256": RESULT_SHA,
+                "receipt_sha256": RECEIPT_SHA,
+            },
+            "result": {
+                "dispatch_attempt_id": "attempt:catalog-run-0001",
+                "request_sha256": REQUEST_SHA,
+                "artifact": {"disposition": "stored"},
+            },
         }
         self.cancel_calls = 0
+        self.acknowledgement_calls: list[Mapping[str, Any]] = []
 
     async def health(self, base_url: str) -> None:
         self.health_calls.append(base_url)
@@ -308,6 +332,10 @@ class FakeWorkloadTransport:
         )
 
     async def status(self, **values):
+        handoff = self.status_value in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        }
         return CatalogPodWorkloadObservation(
             attempt_id=values["attempt_id"],
             request_sha256=values["request_sha256"],
@@ -315,11 +343,22 @@ class FakeWorkloadTransport:
             error_type=(
                 "CatalogExecutionError" if self.status_value.value == "failed" else None
             ),
-            result_available=self.status_value is CatalogPodWorkloadState.SUCCEEDED,
+            result_available=handoff
+            or self.status_value is CatalogPodWorkloadState.SUCCEEDED,
+            result_sha256=RESULT_SHA if handoff else None,
+            receipt_sha256=RECEIPT_SHA if handoff else None,
+            acknowledgement_sha256=ACK_SHA
+            if self.status_value is CatalogPodWorkloadState.ACKNOWLEDGED
+            else None,
         )
 
     async def result(self, **values):
         return dict(self.result_payload)
+
+    async def acknowledge(self, **values):
+        self.acknowledgement_calls.append(values["payload"])
+        self.status_value = CatalogPodWorkloadState.ACKNOWLEDGED
+        return await self.status(**values)
 
     async def cancel(self, **values):
         self.cancel_calls += 1

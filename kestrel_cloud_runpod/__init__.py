@@ -67,6 +67,7 @@ from .ollama_contracts import (
 )
 from .ollama_service import OllamaLeaseService
 from .pod_capacity_contracts import (
+    CatalogArtifactHandoffEvidence,
     CatalogAttemptCapability,
     CatalogAttemptCapabilityStore,
     CatalogPodCapacityRequest,
@@ -159,12 +160,12 @@ except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
 __all__ = [
-    "await_owned_effect",
     "RUNPOD_V2_OPENAPI_SHA256",
     "RUNPOD_V2_OPENAPI_SOURCE_URL",
     "SERVERLESS_CAPACITY_CONTRACT_VERSION",
     "SERVERLESS_CAPACITY_SCHEMA_VERSION",
     "Availability",
+    "CatalogArtifactHandoffEvidence",
     "CatalogAttemptCapability",
     "CatalogAttemptCapabilityStore",
     "CatalogPodCapacityRequest",
@@ -258,6 +259,7 @@ __all__ = [
     "TrainingPodSource",
     "TrainingPodState",
     "__version__",
+    "await_owned_effect",
     "maximum_serverless_cold_starts",
     "pod_capacity_database_path",
     "pod_cost_usd",
