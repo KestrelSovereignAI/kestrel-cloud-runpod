@@ -19,9 +19,12 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodCapacityEvidence,
     PodCapacitySpec,
     PodRealizedPlacement,
+    TrainingPodRequest,
+    TrainingPodSource,
     attempt_environment_sha256,
     pod_cost_usd,
 )
+from kestrel_cloud_runpod.pod_capacity_repository import SQLitePodCapacityRepository
 
 
 def test_request_binds_exact_parameter_digest_quote_cost_and_image() -> None:
@@ -116,7 +119,9 @@ def test_new_handoff_protocol_is_persisted_and_changes_capacity_identity() -> No
     )
 
 
-def test_old_stored_spec_keeps_its_exact_pre_handoff_fingerprint_and_name() -> None:
+def test_old_stored_spec_keeps_its_exact_pre_handoff_fingerprint_and_name(
+    tmp_path,
+) -> None:
     legacy = request(MutableClock(), artifact_handoff_protocol_version=None)
     spec = PodCapacitySpec(
         request=legacy,
@@ -139,6 +144,36 @@ def test_old_stored_spec_keeps_its_exact_pre_handoff_fingerprint_and_name() -> N
     )
     assert recovered.request.resource_name == "kestrel-cap-fd981e568508-637318f7bb78"
     assert recovered.to_dict() == encoded
+    training = TrainingPodRequest(
+        cleanup_token=legacy.capacity_id,
+        root_cleanup_token=legacy.cleanup_family_id,
+        companion_id=legacy.owner_id,
+        profile_id=legacy.profile_id,
+        source=TrainingPodSource.CREATED,
+        resource_name=legacy.resource_name,
+        provider_pod_id=None,
+        created_at=legacy.created_at,
+        readiness_deadline=legacy.readiness_deadline,
+        hard_deadline=legacy.hard_deadline,
+        capacity_spec=recovered,
+    )
+    # Independently captured by executing the exact 0.10.4 baseline contract,
+    # including its whole-spec second identity layer (not the current code).
+    assert (
+        training.fingerprint
+        == "a80c1314bb78ff2a0d41238c7d6d69e6dc85f76b5b8885e3345b71c3e6da57e0"
+    )
+    repository = SQLitePodCapacityRepository(tmp_path / "legacy.sqlite3")
+    original, _ = repository.reserve(training)
+    with repository._connect() as connection:
+        connection.execute(
+            "ALTER TABLE pod_capacity_leases DROP COLUMN artifact_handoff_json"
+        )
+        connection.execute("PRAGMA user_version = 3")
+    migrated = SQLitePodCapacityRepository(repository.path).get(legacy.capacity_id)
+    assert migrated == original
+    assert migrated.request_fingerprint == training.fingerprint
+    assert migrated.capacity_spec.request.resource_name == legacy.resource_name
 
 
 @pytest.mark.parametrize("invalid", [True, 0, 2, "1"])
