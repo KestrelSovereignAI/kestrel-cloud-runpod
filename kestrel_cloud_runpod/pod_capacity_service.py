@@ -809,8 +809,8 @@ class PodCapacityLeaseService:
             request_sha256=spec.request.request_sha256,
             bearer_token=capability.bearer_token,
         )
-        current = self._required(capacity_id)
-        if current.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
+        updated = self._record_catalog_observation(capacity_id, observation)
+        if updated.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED:
             await self.release(capacity_id, reason="cancelled catalog attempt")
             return CatalogPodWorkloadObservation(
                 attempt_id=observation.attempt_id,
@@ -819,7 +819,6 @@ class PodCapacityLeaseService:
                 error_type=None,
                 result_available=False,
             )
-        updated = self._record_catalog_observation(capacity_id, observation)
         if updated.workload_state in {
             CatalogPodWorkloadState.FAILED,
             CatalogPodWorkloadState.CANCELLED,

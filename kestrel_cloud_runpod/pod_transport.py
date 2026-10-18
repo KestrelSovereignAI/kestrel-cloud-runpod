@@ -54,6 +54,7 @@ class CatalogPodWorkloadObservation:
             CatalogPodWorkloadState.ACKNOWLEDGED,
         } and (
             not self.result_available
+            or self.request_sha256 is None
             or self.result_sha256 is None
             or self.receipt_sha256 is None
         ):

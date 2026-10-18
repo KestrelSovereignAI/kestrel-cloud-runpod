@@ -191,6 +191,7 @@ async def test_transport_forwards_opaque_ack_and_requires_exact_authenticated_pr
     [
         {"attempt_id": "attempt:other"},
         {"request_sha256": "a" * 64},
+        {"request_sha256": None},
         {"result_sha256": "a" * 64},
         {"receipt_sha256": "a" * 64},
         {"acknowledgement_sha256": "a" * 64},
@@ -243,6 +244,30 @@ async def test_ack_http_error_never_echoes_private_receipt(status):
             payload=acknowledgement(),
         )
     assert TOKEN not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_ack_cannot_accept_omitted_request_hash():
+    payload = {
+        "attempt_id": ATTEMPT,
+        "state": "acknowledged",
+        "error_type": None,
+        "result_available": True,
+        "result_sha256": RESULT_SHA,
+        "receipt_sha256": RECEIPT_SHA,
+        "acknowledgement_sha256": ACK_SHA,
+    }
+    transport = CatalogPodWorkloadTransport(
+        http_transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    )
+    with pytest.raises(CatalogPodTransportError):
+        await transport.acknowledge(
+            base_url=BASE,
+            attempt_id=ATTEMPT,
+            request_sha256=REQUEST_SHA,
+            bearer_token=SecretStr(TOKEN),
+            payload=acknowledgement(),
+        )
 
 
 @pytest.mark.asyncio

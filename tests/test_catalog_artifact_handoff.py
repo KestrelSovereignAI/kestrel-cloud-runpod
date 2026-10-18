@@ -289,6 +289,57 @@ async def test_stop_during_capability_load_prevents_ack_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_status_recovery_preserves_ack_fact_when_stop_wins_in_flight(tmp_path):
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    class RecoveringAck(FakeWorkloadTransport):
+        block_status = False
+
+        async def acknowledge(self, **values):
+            await super().acknowledge(**values)
+            raise CatalogPodTransportError("lost remote ACK response")
+
+        async def status(self, **values):
+            observation = await super().status(**values)
+            if self.block_status:
+                entered.set()
+                await finish.wait()
+            return observation
+
+    runtime, scope, clock, provider, store, transport = await pending(
+        tmp_path, RecoveringAck()
+    )
+    with pytest.raises(CatalogPodTransportError):
+        await runtime.acknowledge_catalog_result(
+            **scope, acknowledgement=acknowledgement()
+        )
+    transport.block_status = True
+    task = asyncio.create_task(runtime.observe_catalog_workload(**scope))
+    await asyncio.wait_for(entered.wait(), 5)
+    provider.billing_receipt = final_receipt(clock)
+    runtime.request_cancellation(scope["capacity_id"])
+    finish.set()
+    outward = await task
+    assert outward.state is CatalogPodWorkloadState.CANCEL_REQUESTED
+    saved = runtime.repository.get(scope["capacity_id"])
+    assert saved.is_terminal
+    assert saved.workload_state is CatalogPodWorkloadState.CANCEL_REQUESTED
+    assert saved.artifact_handoff.remote_ack_observed_at == clock()
+    assert saved.artifact_handoff.host_confirmation_declared_at is None
+    assert saved.terminal_success_evidence_complete is False
+    assert store.revoked == [saved.capacity_spec.request.attempt_id]
+    restarted = service(tmp_path, clock, provider, store, transport)
+    assert (
+        await restarted.acknowledge_catalog_result(
+            **scope, acknowledgement=acknowledgement()
+        )
+        == saved
+    )
+    assert len(transport.acknowledgement_calls) == 1
+    assert len(provider.terminate_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_unbound_or_changed_remote_hashes_cannot_authorize_cleanup(tmp_path):
     runtime, scope, _clock, provider, _store, transport = await pending(tmp_path)
     transport.status_value = CatalogPodWorkloadState.ACKNOWLEDGED
