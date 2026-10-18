@@ -83,6 +83,7 @@ CATALOG_POD_ATTEMPT_ID=<attempt>
 CATALOG_POD_BEARER_TOKEN=<scoped random bearer>
 CATALOG_POD_BEARER_EXPIRES_AT=<aware timestamp>
 CONTAINER_DIGEST=sha256:<immutable image digest>
+CATALOG_POD_IMAGE_DIGEST=sha256:<the same immutable image digest>
 ```
 
 Database and Runpod control-plane credentials are rejected from attempt
@@ -93,18 +94,38 @@ exposes none of those capability fields.
 
 The worker interface is deliberately small: anonymous `GET /health`, then
 bearer-authenticated `POST /v1/catalog/jobs/{attempt}`, `GET` status, `GET
-/result`, and `POST /cancel`. The body/result are opaque mappings. Cloud checks
+/result`, `POST /acknowledgement`, and `POST /cancel`. The body/result are opaque mappings. Cloud checks
 only the attempt and request-hash bindings needed to prevent cross-attempt
 delivery; the private package validates the complete schema and artifact
 receipt.
 
 `retrieve_catalog_result()` is an authenticated, non-destructive replay. The
-private host strict-decodes and durably commits that opaque result first, then
-calls `acknowledge_catalog_result()` with the same capacity/owner/workload
-identity. Acknowledgement is the destructive boundary: it records
-`RESULT_RETRIEVED`, permanently terminates the disposable Pod, and begins
-billing reconciliation. A crash before the private database commit can replay
-the worker result after restart; cloud never persists the private payload.
+private host validates and durably accepts the protocol-1 signed receipt/result
+envelope first. It then calls `acknowledge_catalog_result(acknowledgement=...)`
+with the same capacity/owner/workload identity. The SDK fingerprints the complete
+opaque ACK mapping before POST and persists only content-free binding digests.
+It records remote acknowledgment only after an authenticated exact-bound worker
+response/status, retaining `JOB_COMPLETED` without teardown. The host commits
+that observation in its private database, then calls
+`release_catalog_result(host_confirmed_acknowledgement_sha256=...)`. This
+explicit host declaration is the destructive boundary: it atomically records
+the declaration and `RESULT_RETRIEVED`, permanently terminates the disposable
+Pod, and begins billing reconciliation. A crash before the private database
+commit can replay the worker result or exact ACK after restart; cloud never
+persists the private payload, signed receipt, signed ACK or bearer token.
+An already-observed exact ACK replays before credential loading, even after
+expiry/revocation. An ACK timeout remains `JOB_COMPLETED` and retryable, not a
+cleanup-driving error state. Authenticated `acknowledged` status can recover a
+lost response only if it matches a previously persisted complete ACK intent.
+Stale phases cannot regress ACK or revive Stop; late ACK proof remains a fact
+even if Stop has already begun cleanup, never a new success declaration.
+
+New request fingerprints explicitly bind protocol 1. SQLite schema 4 adds
+nullable content-free handoff evidence. Historical protocol absence is omitted
+from both legacy fingerprint layers and preserved through decoding; observing
+a new-shaped payload cannot upgrade it. Historical owned leases retain their
+old result and cleanup behavior, but neither generic nor catalog acquisition
+nor submission can use them as new-work authority.
 The host then polls the owner/workload-bound `get_catalog_capacity()` method
 until the returned canonical lease is settlement-ready; it does not reach into
 the capacity repository or infer actual cost from estimates.
@@ -143,8 +164,10 @@ have explicit provenance and are not silently reordered into the host clock.
 Rows migrated from an older schema return `evidence = null`; migration never
 fabricates historical timestamps.
 
-`terminal_success_evidence_complete` becomes true only for a succeeded
-workload after worker evidence is durable, Runpod confirms termination, and an
+`terminal_success_evidence_complete` becomes true only for an acknowledged
+protocol-1 workload with actual remote ACK evidence and an explicit durable-host
+confirmation declaration (or an explicitly legacy succeeded workload), after
+worker evidence is durable, Runpod confirms termination, and an
 authoritative billing interval covers that stop. The public serializer omits
 the workload route, bearer/capability metadata, private image reference,
 prompts, responses, artifacts, signed URLs, weights, and raw worker/provider

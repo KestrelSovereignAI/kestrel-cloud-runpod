@@ -7,12 +7,14 @@ from decimal import Decimal
 
 import pytest
 from pod_capacity_test_support import (
+    ACK_SHA,
     REQUEST_SHA,
     TOKEN,
     FakeCapabilityStore,
     FakeCapacityProvider,
     FakeWorkloadTransport,
     MutableClock,
+    acknowledgement,
     final_receipt,
     request,
     service,
@@ -27,7 +29,11 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodCapacityBillingState,
     PodCapacityConflictError,
     PodCapacityLifecycleError,
+    PodCapacitySpec,
     PodCapacityState,
+    TrainingPodRequest,
+    TrainingPodSource,
+    attempt_environment_sha256,
 )
 from kestrel_cloud_runpod.pod_capacity_provider import (
     PodCapacityCreatedMismatchError,
@@ -45,11 +51,11 @@ async def test_provision_and_poll_share_lifecycle_without_waiting_or_recreating(
     transport = FakeWorkloadTransport()
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     lease = await runtime.provision_catalog(value)
     assert lease.state is PodCapacityState.STARTING
     assert lease.provider_pod_id == "pod-catalog-1"
@@ -74,11 +80,11 @@ async def test_readiness_poll_validates_scope_and_never_revives_stop(tmp_path):
     transport = FakeWorkloadTransport()
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     await runtime.provision_catalog(value)
     for key in ("owner_id", "workload_id"):
         with pytest.raises(PodCapacityConflictError):
@@ -232,11 +238,11 @@ async def test_unhealthy_poll_is_one_shot_and_health_cannot_cross_deadline(tmp_p
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
     await runtime.provision_catalog(value)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     before = clock()
     assert (
         await runtime.poll_catalog_readiness(**scope)
@@ -349,11 +355,77 @@ async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path) -> N
             catalog_request.bearer_expires_at.isoformat()
         ),
         "CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "CATALOG_POD_IMAGE_DIGEST": "sha256:" + "a" * 64,
     }
     public = runtime.repository.get(catalog_request.capacity_id).to_public_dict()
     assert TOKEN not in str(public)
     assert "private/model" not in str(public)
     assert public["capacity"]["request_sha256"] == REQUEST_SHA
+
+
+@pytest.mark.asyncio
+async def test_legacy_protocol_cannot_authorize_new_paid_capacity(tmp_path) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    legacy = request(clock, artifact_handoff_protocol_version=None)
+    with pytest.raises(
+        RunPodManagerError, match="requires artifact handoff protocol 1"
+    ):
+        await runtime.provision_catalog(legacy)
+    assert not provider.create_calls
+    assert runtime.repository.get(legacy.capacity_id) is None
+
+
+@pytest.mark.asyncio
+async def test_historical_stored_capacity_cannot_authorize_a_new_submission(
+    tmp_path,
+) -> None:
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    transport = FakeWorkloadTransport()
+    runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
+    legacy = request(clock, artifact_handoff_protocol_version=None)
+    spec = PodCapacitySpec(
+        request=legacy,
+        capability_secret_id="secret:catalog-capability-0001",
+        capability_token_sha256="a" * 64,
+        capability_expires_at=legacy.bearer_expires_at,
+        attempt_environment_sha256=attempt_environment_sha256(
+            legacy.attempt_environment
+        ),
+    )
+    old, _created = runtime.repository.reserve(
+        TrainingPodRequest(
+            cleanup_token=legacy.capacity_id,
+            root_cleanup_token=legacy.cleanup_family_id,
+            companion_id=legacy.owner_id,
+            profile_id=legacy.profile_id,
+            source=TrainingPodSource.CREATED,
+            resource_name=legacy.resource_name,
+            provider_pod_id=None,
+            created_at=legacy.created_at,
+            readiness_deadline=legacy.readiness_deadline,
+            hard_deadline=legacy.hard_deadline,
+            capacity_spec=spec,
+        )
+    )
+    with pytest.raises(
+        RunPodManagerError, match="Historical catalog capacity cannot accept"
+    ):
+        await runtime.submit_catalog_workload(
+            capacity_id=legacy.capacity_id,
+            owner_id=legacy.owner_id,
+            workload_id=legacy.workload_id,
+            payload={
+                "dispatch_attempt_id": legacy.attempt_id,
+                "request_sha256": legacy.request_sha256,
+            },
+        )
+    assert runtime.repository.get(legacy.capacity_id) == old
+    assert not transport.submit_calls
+    assert not provider.create_calls
 
 
 @pytest.mark.asyncio
@@ -508,7 +580,7 @@ async def test_submit_success_result_replays_until_ack_then_billing_reconciles(
     assert submitted.state is CatalogPodWorkloadState.RUNNING
     assert transport.submit_calls == [opaque]
 
-    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    transport.status_value = CatalogPodWorkloadState.AWAITING_ACK
     observed = await runtime.observe_catalog_workload(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
@@ -535,6 +607,14 @@ async def test_submit_success_result_replays_until_ack_then_billing_reconciles(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
         workload_id=catalog_request.workload_id,
+        acknowledgement=acknowledgement(),
+    )
+    assert not provider.terminate_calls
+    await runtime.release_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        host_confirmed_acknowledgement_sha256=ACK_SHA,
     )
     pending = runtime.repository.get(catalog_request.capacity_id)
     assert pending.state is PodCapacityState.RELEASING
@@ -566,7 +646,7 @@ async def test_result_replays_after_host_restart_until_durable_ack(tmp_path) -> 
             "request_sha256": catalog_request.request_sha256,
         },
     )
-    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    transport.status_value = CatalogPodWorkloadState.AWAITING_ACK
     await first_process.observe_catalog_workload(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
@@ -591,6 +671,14 @@ async def test_result_replays_after_host_restart_until_durable_ack(tmp_path) -> 
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
         workload_id=catalog_request.workload_id,
+        acknowledgement=acknowledgement(),
+    )
+    assert provider.terminate_calls == []
+    await restarted.release_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        host_confirmed_acknowledgement_sha256=ACK_SHA,
     )
     assert provider.terminate_calls == ["pod-catalog-1"]
 
@@ -613,7 +701,7 @@ async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path) ->
             "request_sha256": catalog_request.request_sha256,
         },
     )
-    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    transport.status_value = CatalogPodWorkloadState.AWAITING_ACK
     await first_process.observe_catalog_workload(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
@@ -623,12 +711,19 @@ async def test_restart_finishes_teardown_after_ack_transition_crash(tmp_path) ->
     async def interrupted_release(*_args, **_kwargs):
         raise asyncio.CancelledError
 
+    await first_process.acknowledge_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        acknowledgement=acknowledgement(),
+    )
     first_process.release = interrupted_release
     with pytest.raises(asyncio.CancelledError):
-        await first_process.acknowledge_catalog_result(
+        await first_process.release_catalog_result(
             capacity_id=catalog_request.capacity_id,
             owner_id=catalog_request.owner_id,
             workload_id=catalog_request.workload_id,
+            host_confirmed_acknowledgement_sha256=ACK_SHA,
         )
     acknowledged = first_process.repository.get(catalog_request.capacity_id)
     assert acknowledged.state is PodCapacityState.RESULT_RETRIEVED
@@ -808,7 +903,7 @@ async def test_result_transport_interruption_preserves_retryable_success(
             "request_sha256": catalog_request.request_sha256,
         },
     )
-    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    transport.status_value = CatalogPodWorkloadState.AWAITING_ACK
     await runtime.observe_catalog_workload(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
@@ -822,7 +917,7 @@ async def test_result_transport_interruption_preserves_retryable_success(
             workload_id=catalog_request.workload_id,
         )
     durable = runtime.repository.get(catalog_request.capacity_id)
-    assert durable.workload_state is CatalogPodWorkloadState.SUCCEEDED
+    assert durable.workload_state is CatalogPodWorkloadState.AWAITING_ACK
     assert durable.state is PodCapacityState.JOB_COMPLETED
     assert provider.terminate_calls == []
 

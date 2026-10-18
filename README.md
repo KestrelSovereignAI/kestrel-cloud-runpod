@@ -312,9 +312,16 @@ private GitHub-only dependencies in their owning repositories. Health is
 anonymous and content-free. Submit, status, result, and cancellation are
 attempt-bound and bearer-authenticated. Result retrieval is non-destructive and
 replayable after its attempt and request hashes match. The private host must
-strict-decode and durably commit that result before calling
-`acknowledge_catalog_result(capacity_id=..., owner_id=..., workload_id=...)`.
-Only acknowledgement permanently terminates the Pod. `RELEASED` is not
+strict-decode and durably accept the signed protocol-1 receipt/result envelope
+before calling `acknowledge_catalog_result(capacity_id=..., owner_id=...,
+workload_id=..., acknowledgement=opaque_host_ack)`. This sends the runner's
+authenticated `/acknowledgement` request and persists exact content-free ACK
+intent and remote observation; **it does not terminate the Pod**. The host then
+durably confirms that exact acknowledgment in its private database and calls
+`release_catalog_result(..., host_confirmed_acknowledgement_sha256=...)`.
+Only this separate host declaration drives successful-result teardown.
+Historical leases retain their explicitly legacy result/ack-cleanup behavior,
+but cannot authorize new acquisition or submission. `RELEASED` is not
 recorded until `/billing/pods` supplies final authoritative cost (or v2
 definitively rejected creation, which records zero).
 

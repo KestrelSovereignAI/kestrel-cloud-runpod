@@ -14,6 +14,7 @@ from typing import Any
 
 from .models import RunPodManagerError
 from .pod_capacity_contracts import (
+    CatalogArtifactHandoffEvidence,
     CatalogPodWorkloadState,
     PodBillingReceipt,
     PodCapacityBillingState,
@@ -54,6 +55,7 @@ class SQLitePodCapacityRepository:
             "billing_receipt_json",
             "terminated_at",
             "evidence_json",
+            "artifact_handoff_json",
         }
     )
 
@@ -162,6 +164,7 @@ class SQLitePodCapacityRepository:
                 "billing_receipt_json": "TEXT",
                 "terminated_at": "TEXT",
                 "evidence_json": "TEXT",
+                "artifact_handoff_json": "TEXT",
             }
             for name, definition in generic_columns.items():
                 if name not in columns:
@@ -210,7 +213,7 @@ class SQLitePodCapacityRepository:
                 "idx_training_pods_cleanup_family",
             ):
                 connection.execute(f"DROP INDEX IF EXISTS {legacy_index}")
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
 
     def reserve(self, request: TrainingPodRequest) -> tuple[TrainingPodLease, bool]:
         """Persist an acquisition claim before any provider network operation."""
@@ -495,6 +498,13 @@ def _lease_from_row(row: sqlite3.Row) -> TrainingPodLease:
             else None
         ),
         evidence=evidence,
+        artifact_handoff=(
+            CatalogArtifactHandoffEvidence.from_dict(
+                json.loads(row["artifact_handoff_json"])
+            )
+            if row["artifact_handoff_json"] is not None
+            else None
+        ),
     )
 
 
@@ -523,7 +533,7 @@ def _db_value(value: Any) -> Any:
         return int(value)
     if isinstance(value, PodBillingReceipt):
         return json.dumps(value.to_dict(), sort_keys=True, separators=(",", ":"))
-    if isinstance(value, PodCapacityEvidence):
+    if isinstance(value, (PodCapacityEvidence, CatalogArtifactHandoffEvidence)):
         return json.dumps(value.to_dict(), sort_keys=True, separators=(",", ":"))
     return value
 

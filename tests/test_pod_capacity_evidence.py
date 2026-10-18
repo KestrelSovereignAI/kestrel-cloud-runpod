@@ -10,12 +10,14 @@ from datetime import timedelta
 
 import pytest
 from pod_capacity_test_support import (
+    ACK_SHA,
     IMAGE,
     REQUEST_SHA,
     FakeCapabilityStore,
     FakeCapacityProvider,
     FakeWorkloadTransport,
     MutableClock,
+    acknowledgement,
     final_receipt,
     request,
     service,
@@ -76,7 +78,7 @@ async def successful_workload(tmp_path):
         },
     )
     clock.value += timedelta(seconds=1)
-    transport.status_value = CatalogPodWorkloadState.SUCCEEDED
+    transport.status_value = CatalogPodWorkloadState.AWAITING_ACK
     await runtime.observe_catalog_workload(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
@@ -118,10 +120,19 @@ async def test_realized_lifecycle_worker_and_billing_evidence_survive_restart(
     assert replay.evidence == recorded.evidence
 
     clock.value += timedelta(seconds=1)
-    pending = await runtime.acknowledge_catalog_result(
+    acknowledged = await runtime.acknowledge_catalog_result(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
         workload_id=catalog_request.workload_id,
+        acknowledgement=acknowledgement(),
+    )
+    assert acknowledged.artifact_handoff.remote_ack_observed_at == clock()
+    assert not provider.terminate_calls
+    pending = await runtime.release_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        host_confirmed_acknowledgement_sha256=ACK_SHA,
     )
     assert pending.billing_state is PodCapacityBillingState.PENDING
     assert pending.evidence is not None
@@ -322,6 +333,13 @@ async def test_public_projection_is_content_free_and_omits_capabilities(
         capacity_id=catalog_request.capacity_id,
         owner_id=catalog_request.owner_id,
         workload_id=catalog_request.workload_id,
+        acknowledgement=acknowledgement(),
+    )
+    await runtime.release_catalog_result(
+        capacity_id=catalog_request.capacity_id,
+        owner_id=catalog_request.owner_id,
+        workload_id=catalog_request.workload_id,
+        host_confirmed_acknowledgement_sha256=ACK_SHA,
     )
     lease = runtime.repository.get(catalog_request.capacity_id)
     assert lease is not None
@@ -386,7 +404,7 @@ async def test_v2_catalog_row_migrates_with_explicit_missing_evidence(tmp_path) 
             for row in connection.execute("PRAGMA table_info(pod_capacity_leases)")
         }
         assert "evidence_json" in columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_lifecycle_timestamp_order_and_worker_startup_split_are_validated() -> None:

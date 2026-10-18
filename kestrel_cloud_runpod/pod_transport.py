@@ -32,6 +32,42 @@ class CatalogPodWorkloadObservation:
     state: CatalogPodWorkloadState
     error_type: str | None
     result_available: bool
+    result_sha256: str | None = None
+    receipt_sha256: str | None = None
+    acknowledgement_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.result_sha256,
+            self.receipt_sha256,
+            self.acknowledgement_sha256,
+        ):
+            if value is not None:
+                try:
+                    _sha256(value)
+                except ValueError as exc:
+                    raise CatalogPodTransportError(
+                        "Catalog Pod status digest is invalid"
+                    ) from exc
+        if self.state in {
+            CatalogPodWorkloadState.AWAITING_ACK,
+            CatalogPodWorkloadState.ACKNOWLEDGED,
+        } and (
+            not self.result_available
+            or self.request_sha256 is None
+            or self.result_sha256 is None
+            or self.receipt_sha256 is None
+        ):
+            raise CatalogPodTransportError(
+                "Catalog Pod handoff status is missing result/receipt evidence"
+            )
+        if (
+            self.state is CatalogPodWorkloadState.ACKNOWLEDGED
+            and self.acknowledgement_sha256 is None
+        ):
+            raise CatalogPodTransportError(
+                "Catalog Pod acknowledged status is missing ACK evidence"
+            )
 
 
 class CatalogPodWorkloadTransport:
@@ -121,6 +157,7 @@ class CatalogPodWorkloadTransport:
         attempt_id: str,
         request_sha256: str,
         bearer_token: SecretStr,
+        artifact_handoff_protocol_version: int | None = 1,
     ) -> Mapping[str, Any]:
         response = await self._request(
             "GET",
@@ -137,14 +174,86 @@ class CatalogPodWorkloadTransport:
                 f"Catalog Pod result returned HTTP {response.status_code}"
             )
         payload = _json_object(response, "result")
-        if (
-            payload.get("dispatch_attempt_id") != attempt_id
-            or payload.get("request_sha256") != request_sha256
+        if artifact_handoff_protocol_version is None:
+            bindings = (payload,)
+        elif (
+            type(artifact_handoff_protocol_version) is int
+            and artifact_handoff_protocol_version == 1
+        ):
+            if (
+                type(payload.get("protocol_version")) is not int
+                or payload["protocol_version"] != 1
+            ):
+                raise CatalogPodTransportError(
+                    "Catalog Pod result protocol does not match the lease"
+                )
+            receipt, result = payload.get("receipt"), payload.get("result")
+            if not isinstance(receipt, Mapping) or not isinstance(result, Mapping):
+                raise CatalogPodTransportError(
+                    "Catalog Pod result handoff envelope is invalid"
+                )
+            if (
+                receipt.get("attempt_id") != attempt_id
+                or receipt.get("request_sha256") != request_sha256
+            ):
+                raise CatalogPodTransportConflictError(
+                    "Catalog Pod receipt does not match the lease"
+                )
+            bindings = (result,)
+        else:
+            raise CatalogPodTransportError("Catalog Pod result protocol is unsupported")
+        if any(
+            binding.get("dispatch_attempt_id") != attempt_id
+            or binding.get("request_sha256") != request_sha256
+            for binding in bindings
         ):
             raise CatalogPodTransportConflictError(
                 "Catalog Pod result is not bound to the leased attempt"
             )
         return dict(payload)
+
+    async def acknowledge(
+        self,
+        *,
+        base_url: str,
+        attempt_id: str,
+        request_sha256: str,
+        bearer_token: SecretStr,
+        payload: Mapping[str, Any],
+    ) -> CatalogPodWorkloadObservation:
+        """Forward the private host's opaque signed ACK; never implement its HMAC."""
+
+        if (
+            payload.get("attempt_id") != attempt_id
+            or payload.get("request_sha256") != request_sha256
+        ):
+            raise CatalogPodTransportConflictError(
+                "Catalog Pod ACK does not match the lease"
+            )
+        response = await self._request(
+            "POST",
+            base_url,
+            _job_path(attempt_id) + "/acknowledgement",
+            bearer=bearer_token,
+            json_payload=payload,
+        )
+        if response.status_code == 409:
+            raise CatalogPodTransportConflictError(
+                "Catalog Pod rejected the artifact acknowledgement"
+            )
+        if response.status_code != 200:
+            raise CatalogPodTransportError(
+                f"Catalog Pod acknowledgement returned HTTP {response.status_code}"
+            )
+        observation = _observation(response, attempt_id, request_sha256)
+        if observation.state is not CatalogPodWorkloadState.ACKNOWLEDGED or any(
+            getattr(observation, name) != payload.get(name)
+            for name in ("result_sha256", "receipt_sha256", "acknowledgement_sha256")
+        ):
+            raise CatalogPodTransportConflictError(
+                "Catalog Pod ACK observation does not match the exact host intent"
+            )
+        return observation
 
     async def cancel(
         self,
@@ -242,6 +351,9 @@ def _observation(
         state=state,
         error_type=raw_error,
         result_available=result_available,
+        result_sha256=payload.get("result_sha256"),
+        receipt_sha256=payload.get("receipt_sha256"),
+        acknowledgement_sha256=payload.get("acknowledgement_sha256"),
     )
 
 
