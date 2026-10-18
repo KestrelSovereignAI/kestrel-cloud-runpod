@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from copy import deepcopy
 from datetime import timedelta
 
@@ -389,7 +390,7 @@ async def test_v2_catalog_row_migrates_with_explicit_missing_evidence(tmp_path) 
     catalog_request = request(clock)
     await runtime.acquire_catalog(catalog_request)
     database = runtime.repository.path
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("ALTER TABLE pod_capacity_leases DROP COLUMN evidence_json")
         connection.execute("PRAGMA user_version = 2")
 
@@ -398,7 +399,7 @@ async def test_v2_catalog_row_migrates_with_explicit_missing_evidence(tmp_path) 
     assert legacy is not None
     assert legacy.evidence is None
     assert legacy.to_public_dict()["evidence"] is None
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(pod_capacity_leases)")

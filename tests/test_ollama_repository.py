@@ -1,6 +1,7 @@
 """Persistence, idempotency, and restart tests for Ollama leases."""
 
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 
 import pytest
@@ -49,13 +50,13 @@ def test_repository_additively_upgrades_compute_only_lease_schema(tmp_path):
         "maximum_concurrent_workers",
         "maximum_billable_seconds",
     )
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         for name in added:
             connection.execute(f"ALTER TABLE ollama_leases DROP COLUMN {name}")
 
     SQLiteOllamaLeaseRepository(database)
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(ollama_leases)")
         }
