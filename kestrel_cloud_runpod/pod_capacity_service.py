@@ -242,13 +242,15 @@ class PodCapacityLeaseService:
             hard_deadline=request.hard_deadline,
             capacity_spec=capacity_spec,
         )
+        image_digest = request.image_reference.rsplit("@", 1)[1]
         environment = {
             **dict(request.attempt_environment),
             "CATALOG_WORKER_MODE": "pod",
             "CATALOG_POD_ATTEMPT_ID": request.attempt_id,
             "CATALOG_POD_BEARER_TOKEN": capability.bearer_token.get_secret_value(),
             "CATALOG_POD_BEARER_EXPIRES_AT": iso_datetime(capability.expires_at),
-            "CONTAINER_DIGEST": request.image_reference.rsplit("@", 1)[1],
+            "CONTAINER_DIGEST": image_digest,
+            "CATALOG_POD_IMAGE_DIGEST": image_digest,
         }
         return await self._acquire(
             internal, environment=environment, wait_for_ready=wait_for_ready

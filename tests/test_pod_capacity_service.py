@@ -45,11 +45,11 @@ async def test_provision_and_poll_share_lifecycle_without_waiting_or_recreating(
     transport = FakeWorkloadTransport()
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     lease = await runtime.provision_catalog(value)
     assert lease.state is PodCapacityState.STARTING
     assert lease.provider_pod_id == "pod-catalog-1"
@@ -74,11 +74,11 @@ async def test_readiness_poll_validates_scope_and_never_revives_stop(tmp_path):
     transport = FakeWorkloadTransport()
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     await runtime.provision_catalog(value)
     for key in ("owner_id", "workload_id"):
         with pytest.raises(PodCapacityConflictError):
@@ -232,11 +232,11 @@ async def test_unhealthy_poll_is_one_shot_and_health_cannot_cross_deadline(tmp_p
     runtime = service(tmp_path, clock, provider, FakeCapabilityStore(clock), transport)
     value = request(clock)
     await runtime.provision_catalog(value)
-    scope = dict(
-        capacity_id=value.capacity_id,
-        owner_id=value.owner_id,
-        workload_id=value.workload_id,
-    )
+    scope = {
+        "capacity_id": value.capacity_id,
+        "owner_id": value.owner_id,
+        "workload_id": value.workload_id,
+    }
     before = clock()
     assert (
         await runtime.poll_catalog_readiness(**scope)
@@ -349,6 +349,7 @@ async def test_acquire_injects_attempt_env_and_persists_no_secret(tmp_path) -> N
             catalog_request.bearer_expires_at.isoformat()
         ),
         "CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "CATALOG_POD_IMAGE_DIGEST": "sha256:" + "a" * 64,
     }
     public = runtime.repository.get(catalog_request.capacity_id).to_public_dict()
     assert TOKEN not in str(public)

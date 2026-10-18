@@ -83,6 +83,7 @@ CATALOG_POD_ATTEMPT_ID=<attempt>
 CATALOG_POD_BEARER_TOKEN=<scoped random bearer>
 CATALOG_POD_BEARER_EXPIRES_AT=<aware timestamp>
 CONTAINER_DIGEST=sha256:<immutable image digest>
+CATALOG_POD_IMAGE_DIGEST=sha256:<the same immutable image digest>
 ```
 
 Database and Runpod control-plane credentials are rejected from attempt

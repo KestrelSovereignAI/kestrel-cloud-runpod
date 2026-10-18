@@ -49,6 +49,7 @@ def test_request_binds_exact_parameter_digest_quote_cost_and_image() -> None:
         "RUNPOD_CONTROL_PLANE_API_KEY",
         "RUNPOD_SERVERLESS_API_KEY",
         "CATALOG_POD_BEARER_TOKEN",
+        "CATALOG_POD_IMAGE_DIGEST",
         "CONTAINER_DIGEST",
     ],
 )
@@ -218,12 +219,12 @@ def test_terminated_pod_reporting_zero_cost_is_adoptable():
         gpu_count=1,
         cloud=single.constraints.cloud,
         data_center_id="US-TX-3",
-        hourly_rate_usd=Decimal("0"),
+        hourly_rate_usd=Decimal(0),
         observed_at=clock(),
     )
 
     realized.validate_against(single)
-    assert realized.hourly_rate_usd == Decimal("0")
+    assert realized.hourly_rate_usd == Decimal(0)
 
 
 def test_evidence_records_the_accepted_rate_in_whole_pod_units():
