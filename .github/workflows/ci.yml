@@ -168,5 +168,5 @@ jobs:
           uv venv --python ${{ matrix.python-version }} .venv
           . .venv/bin/activate
           uv pip install -e '.[test]'
-          uv run --no-sync pytest tests/ -v --tb=short -m "not cloud_resource"
+          uv run --no-sync pytest tests/ -v --tb=short -m "not cloud_resource" -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning
         timeout-minutes: 8

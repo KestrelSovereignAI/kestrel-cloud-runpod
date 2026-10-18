@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -29,6 +30,7 @@ from .pod_capacity_contracts import (
     TrainingPodState,
     iso_datetime,
 )
+from .sqlite_store import lease_database_connection
 
 
 class SQLitePodCapacityRepository:
@@ -66,13 +68,8 @@ class SQLitePodCapacityRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
+        return lease_database_connection(self.path)
 
     def _initialize(self) -> None:
         with self._connect() as connection:

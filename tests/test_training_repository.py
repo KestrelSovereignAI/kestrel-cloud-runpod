@@ -1,6 +1,7 @@
 """Persistence, CAS, restart, and cross-process exclusion tests."""
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,7 @@ def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(
     child_token = fallback_training_cleanup_token(root_token, "training-h100")
     request = training_request(clock, token=child_token, profile_id="training-h100")
     database = tmp_path / "legacy.sqlite3"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE training_pod_leases (
@@ -126,7 +127,7 @@ def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(
 
     assert migrated is not None
     assert migrated.root_cleanup_token == child_token
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -215,7 +216,7 @@ def test_versioned_table_migration_preserves_every_lifecycle_shape(
         lease = repository.compare_and_set(lease, changes=changes)
         expected[lease.cleanup_token] = lease
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
             "ALTER TABLE pod_capacity_leases RENAME TO training_pod_leases"
         )
