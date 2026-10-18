@@ -320,6 +320,26 @@ intent and remote observation; **it does not terminate the Pod**. The host then
 durably confirms that exact acknowledgment in its private database and calls
 `release_catalog_result(..., host_confirmed_acknowledgement_sha256=...)`.
 Only this separate host declaration drives successful-result teardown.
+If the runner process was replaced after private host acceptance but before
+actual remote ACK proof was persisted, call
+`recover_catalog_result(..., recovery=opaque_private_recovery)` instead of
+resubmitting execution. This uses only the authenticated `/handoff-recovery`
+route with the private host's existing envelope and exact ACK. The SDK derives
+and reserves `CATALOG_POD_REQUEST_SHA256` from the sealed capacity request; user
+environment overrides are rejected. The worker image must implement that
+artifact-only recovery protocol before the host enables it. The SDK never
+imports the private schema, stores the result, mints a recovery credential,
+provisions replacement capacity, or submits execution as a fallback.
+
+Fresh ACK and recovery both require the original live lease, unexpired Pod
+capability, and hard deadline, checked again immediately before transport.
+Cancellation-owned tails persist any genuine late proof without reviving Stop.
+Identical cached actual ACK proof replays before credential/deadline/terminal
+checks so historical host confirmation can finish after expiry or teardown;
+persisted ACK intent alone is never sufficient. This does not authorize new
+execution, publication, or spending. CPU transport/state tests are not live
+GPU or benchmark evidence.
+
 Historical leases retain their explicitly legacy result/ack-cleanup behavior,
 but cannot authorize new acquisition or submission. `RELEASED` is not
 recorded until `/billing/pods` supplies final authoritative cost (or v2

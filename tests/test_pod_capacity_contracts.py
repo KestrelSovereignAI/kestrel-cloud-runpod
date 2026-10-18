@@ -53,6 +53,7 @@ def test_request_binds_exact_parameter_digest_quote_cost_and_image() -> None:
         "RUNPOD_SERVERLESS_API_KEY",
         "CATALOG_POD_BEARER_TOKEN",
         "CATALOG_POD_IMAGE_DIGEST",
+        "CATALOG_POD_REQUEST_SHA256",
         "CONTAINER_DIGEST",
     ],
 )

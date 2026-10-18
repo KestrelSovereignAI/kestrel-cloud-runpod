@@ -12,7 +12,10 @@ import httpx
 from pydantic import SecretStr
 
 from .models import RunPodManagerError
-from .pod_capacity_contracts import CatalogPodWorkloadState
+from .pod_capacity_contracts import (
+    CatalogPodWorkloadState,
+    snapshot_catalog_handoff_recovery,
+)
 
 
 class CatalogPodTransportError(RunPodManagerError):
@@ -223,9 +226,58 @@ class CatalogPodWorkloadTransport:
     ) -> CatalogPodWorkloadObservation:
         """Forward the private host's opaque signed ACK; never implement its HMAC."""
 
+        return await self._acknowledge(
+            base_url=base_url,
+            attempt_id=attempt_id,
+            request_sha256=request_sha256,
+            bearer_token=bearer_token,
+            payload=payload,
+            acknowledgement=payload,
+            path="/acknowledgement",
+        )
+
+    async def recover_handoff(
+        self,
+        *,
+        base_url: str,
+        attempt_id: str,
+        request_sha256: str,
+        bearer_token: SecretStr,
+        payload: Mapping[str, Any],
+    ) -> CatalogPodWorkloadObservation:
+        """Carry an already accepted private envelope and ACK, never execution."""
+        try:
+            recovery = snapshot_catalog_handoff_recovery(
+                payload, attempt_id=attempt_id, request_sha256=request_sha256
+            )
+        except (TypeError, ValueError) as exc:
+            raise CatalogPodTransportConflictError(
+                "Catalog recovery does not match the lease"
+            ) from exc
+        return await self._acknowledge(
+            base_url=base_url,
+            attempt_id=attempt_id,
+            request_sha256=request_sha256,
+            bearer_token=bearer_token,
+            payload=recovery,
+            acknowledgement=recovery["acknowledgement"],
+            path="/handoff-recovery",
+        )
+
+    async def _acknowledge(
+        self,
+        *,
+        base_url: str,
+        attempt_id: str,
+        request_sha256: str,
+        bearer_token: SecretStr,
+        payload: Mapping[str, Any],
+        acknowledgement: Mapping[str, Any],
+        path: str,
+    ) -> CatalogPodWorkloadObservation:
         if (
-            payload.get("attempt_id") != attempt_id
-            or payload.get("request_sha256") != request_sha256
+            acknowledgement.get("attempt_id") != attempt_id
+            or acknowledgement.get("request_sha256") != request_sha256
         ):
             raise CatalogPodTransportConflictError(
                 "Catalog Pod ACK does not match the lease"
@@ -233,7 +285,7 @@ class CatalogPodWorkloadTransport:
         response = await self._request(
             "POST",
             base_url,
-            _job_path(attempt_id) + "/acknowledgement",
+            _job_path(attempt_id) + path,
             bearer=bearer_token,
             json_payload=payload,
         )
@@ -247,7 +299,7 @@ class CatalogPodWorkloadTransport:
             )
         observation = _observation(response, attempt_id, request_sha256)
         if observation.state is not CatalogPodWorkloadState.ACKNOWLEDGED or any(
-            getattr(observation, name) != payload.get(name)
+            getattr(observation, name) != acknowledgement.get(name)
             for name in ("result_sha256", "receipt_sha256", "acknowledgement_sha256")
         ):
             raise CatalogPodTransportConflictError(
