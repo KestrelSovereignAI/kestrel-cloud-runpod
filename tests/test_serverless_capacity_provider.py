@@ -37,6 +37,7 @@ from kestrel_cloud_runpod.models import (
     Availability,
     BillingPage,
     RunPodAmbiguousResultError,
+    RunPodAPIError,
     RunPodManagerError,
     ServerlessJob,
 )
@@ -155,6 +156,7 @@ class _PlannedControl:
         self.create_error: RunPodManagerError | None = None
         self.create_requests: list[object] = []
         self.delete_calls: list[str] = []
+        self.deleted = False
         self.delete_error: RunPodAmbiguousResultError | None = None
         self.worker_page: dict[str, object] = {
             "workers": [],
@@ -192,6 +194,14 @@ class _PlannedControl:
         self.get_calls.append(endpoint_id)
         if self.get_error is not None:
             raise self.get_error
+        if self.deleted:
+            raise RunPodAPIError(
+                title="Not Found",
+                detail="endpoint absent in protocol fixture",
+                status_code=404,
+                method="GET",
+                resource=f"/serverless/{endpoint_id}",
+            )
         return self.readback
 
     def list_endpoint_workers(self, endpoint_id: str):
@@ -200,6 +210,7 @@ class _PlannedControl:
 
     def delete_endpoint(self, endpoint_id: str):
         self.delete_calls.append(endpoint_id)
+        self.deleted = True
         if self.delete_error is not None:
             raise self.delete_error
 

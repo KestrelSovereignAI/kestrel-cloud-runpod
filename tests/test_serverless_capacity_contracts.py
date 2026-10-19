@@ -15,6 +15,7 @@ from serverless_capacity_test_support import (
     attempt,
     constraints,
     endpoint_spec,
+    legacy_planned_authority,
     planned_endpoint,
     profile,
     quote,
@@ -31,8 +32,13 @@ from kestrel_cloud_runpod.serverless_capacity_contracts import (
     ServerlessAmbiguousWindowBillingReceipt,
     ServerlessBillingReceipt,
     ServerlessCapacityQuote,
+    ServerlessEndpointCleanupIntent,
+    ServerlessEndpointCleanupReceipt,
     ServerlessEndpointHourCost,
     ServerlessEndpointSpec,
+    iso_datetime,
+    json_sha256,
+    require_aware,
     serverless_worker_cost_usd,
 )
 
@@ -49,6 +55,196 @@ def test_endpoint_spec_round_trip_is_canonical_and_digest_protected() -> None:
     planned = planned_endpoint(spec=item)
     assert PlannedServerlessEndpoint.from_dict(planned.to_dict()) == planned
     assert "endpoint_id" not in planned.to_dict()
+
+
+def _cleanup_intent():
+    activation = legacy_planned_authority()[2]
+    return ServerlessEndpointCleanupIntent(
+        schema_version=1,
+        contract_version=activation.contract_version,
+        activation=activation,
+        workers_zero_observed_at=activation.readback_at + timedelta(seconds=1),
+        delete_started_at=activation.readback_at + timedelta(seconds=2),
+    )
+
+
+@pytest.mark.parametrize("value", [None, "2026-10-19T12:00:00Z", 0, True, {}])
+def test_shared_aware_datetime_validator_rejects_non_datetimes_clearly(value):
+    with pytest.raises(TypeError, match="observation must be a datetime"):
+        require_aware(value, "observation")
+
+
+def _cleanup_receipt_payload(*, version=None, basis=None, reconciled=False):
+    intent = _cleanup_intent()
+    activation = intent.activation.to_dict()
+    identity = {
+        key: activation[key]
+        for key in (
+            "contract_version",
+            "provider_quote_id",
+            "quote_sha256",
+            "provider_activation_id",
+            "endpoint_name",
+            "endpoint_id",
+            "endpoint_spec_sha256",
+            "operation_digest",
+            "endpoint_readback_sha256",
+        )
+    }
+    identity.update(
+        {
+            "workers_zero_observed_at": iso_datetime(intent.workers_zero_observed_at),
+            "delete_started_at": iso_datetime(intent.delete_started_at),
+            "verified_absent_at": iso_datetime(
+                intent.delete_started_at + timedelta(seconds=1)
+            ),
+            "reconciled_after_delete_error": reconciled,
+        }
+    )
+    if version is not None:
+        identity.update({"cleanup_evidence_version": version, "cleanup_basis": basis})
+    return {
+        "schema_version": 1,
+        **identity,
+        "provider_cleanup_id": "runpod-serverless-cleanup:" + json_sha256(identity),
+    }
+
+
+def test_cleanup_intent_round_trip_is_original_authority_not_wire_or_zero_proof():
+    item = _cleanup_intent()
+    assert (
+        kestrel_cloud_runpod.ServerlessEndpointCleanupIntent
+        is ServerlessEndpointCleanupIntent
+    )
+    assert ServerlessEndpointCleanupIntent.from_dict(item.to_dict()) == item
+    assert item.to_dict()["activation"] == item.activation.to_dict()
+    item.validate_activation(item.activation)
+    assert "verified_absent_at" not in item.to_dict()
+    assert "delete_sent_at" not in item.to_dict()
+    with pytest.raises(RunPodManagerError, match="original activation"):
+        item.validate_activation(None)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", True),
+        ("schema_version", 2),
+        ("contract_version", "wrong"),
+        ("activation", None),
+        ("workers_zero_observed_at", None),
+        ("delete_started_at", None),
+    ],
+)
+def test_cleanup_intent_rejects_invalid_typed_authority(field, value):
+    with pytest.raises((TypeError, ValueError)):
+        replace(_cleanup_intent(), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "boundary", ["before_readback", "before_idle", "naive_idle", "naive_start"]
+)
+def test_cleanup_intent_requires_genuine_ordered_aware_observations(boundary):
+    item = _cleanup_intent()
+    changes = {
+        "before_readback": {
+            "workers_zero_observed_at": item.activation.readback_at
+            - timedelta(seconds=1)
+        },
+        "before_idle": {
+            "delete_started_at": item.workers_zero_observed_at - timedelta(seconds=1)
+        },
+        "naive_idle": {
+            "workers_zero_observed_at": item.workers_zero_observed_at.replace(
+                tzinfo=None
+            )
+        },
+        "naive_start": {
+            "delete_started_at": item.delete_started_at.replace(tzinfo=None)
+        },
+    }
+    with pytest.raises(ValueError):
+        replace(item, **changes[boundary])
+
+
+@pytest.mark.parametrize(
+    "change", ["extra", "missing", "digest", "nested_activation", "time"]
+)
+def test_cleanup_intent_codec_rejects_drift_or_unversioned_fields(change):
+    payload = _cleanup_intent().to_dict()
+    if change == "extra":
+        payload["delete_sent"] = True
+    elif change == "missing":
+        payload.pop("activation")
+    elif change == "digest":
+        payload["provider_cleanup_intent_id"] = (
+            "runpod-serverless-cleanup-intent:" + "0" * 64
+        )
+    elif change == "nested_activation":
+        payload["activation"] = {
+            **payload["activation"],
+            "endpoint_id": "foreign-endpoint",
+        }
+    else:
+        payload["delete_started_at"] = iso_datetime(
+            _cleanup_intent().delete_started_at + timedelta(seconds=1)
+        )
+    with pytest.raises((RunPodManagerError, ValueError, TypeError)):
+        ServerlessEndpointCleanupIntent.from_dict(payload)
+
+
+@pytest.mark.parametrize("reconciled", [False, True])
+def test_original_cleanup_receipt_codec_and_identity_remain_exact(reconciled):
+    payload = _cleanup_receipt_payload(reconciled=reconciled)
+    item = ServerlessEndpointCleanupReceipt.from_dict(payload)
+    assert item.cleanup_evidence_version == 1
+    assert item.cleanup_basis is None
+    assert item.to_dict() == payload
+
+
+@pytest.mark.parametrize(
+    "basis,reconciled",
+    [
+        ("delete_acknowledged", False),
+        ("ambiguous_delete_verified_absent", True),
+        ("interrupted_intent_verified_absent", False),
+    ],
+)
+def test_cleanup_v2_names_evidence_without_fabricating_delete_delivery(
+    basis, reconciled
+):
+    payload = _cleanup_receipt_payload(version=2, basis=basis, reconciled=reconciled)
+    item = ServerlessEndpointCleanupReceipt.from_dict(payload)
+    assert item.cleanup_evidence_version == 2
+    assert item.cleanup_basis == basis
+    assert item.to_dict() == payload
+    assert (
+        item.provider_cleanup_id
+        != _cleanup_receipt_payload(reconciled=reconciled)["provider_cleanup_id"]
+    )
+
+
+@pytest.mark.parametrize(
+    "version,basis,reconciled",
+    [
+        (1, "delete_acknowledged", False),
+        (True, "delete_acknowledged", False),
+        (3, "delete_acknowledged", False),
+        (2, "unknown", False),
+        (2, "delete_acknowledged", True),
+        (2, "ambiguous_delete_verified_absent", False),
+        (2, "interrupted_intent_verified_absent", True),
+    ],
+)
+def test_cleanup_v2_rejects_unsupported_or_contradictory_proof(
+    version, basis, reconciled
+):
+    with pytest.raises((RunPodManagerError, TypeError, ValueError)):
+        ServerlessEndpointCleanupReceipt.from_dict(
+            _cleanup_receipt_payload(
+                version=version, basis=basis, reconciled=reconciled
+            )
+        )
 
 
 def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
