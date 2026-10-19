@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -20,6 +20,7 @@ from .models import (
     EndpointResourceVersion,
     GPUOffer,
     RunPodAmbiguousResultError,
+    RunPodAPIError,
     RunPodManagerError,
     ServerlessJob,
     normalize_cuda_floor,
@@ -39,6 +40,7 @@ from .serverless_capacity_contracts import (
     ServerlessCapacityQuote,
     ServerlessCapacityQuoteRequest,
     ServerlessEndpointActivationReceipt,
+    ServerlessEndpointCleanupIntent,
     ServerlessEndpointCleanupReceipt,
     ServerlessEndpointHourCost,
     ServerlessEndpointProfile,
@@ -567,29 +569,86 @@ class RunpodServerlessCapacityProvider:
         activation: ServerlessEndpointActivationReceipt,
         *,
         prior_receipt: ServerlessEndpointCleanupReceipt | None = None,
+        prior_intent: ServerlessEndpointCleanupIntent | None = None,
+        persist_intent: Callable[
+            [ServerlessEndpointCleanupIntent],
+            Awaitable[ServerlessEndpointCleanupIntent],
+        ]
+        | None = None,
     ) -> ServerlessEndpointCleanupReceipt:
-        """Delete only the exact idle activated child and verify account absence."""
+        """Retain exact cleanup through reads, durable intent ACK and absence.
+
+        Stateful hosts must store/ACK the original intent before DELETE and
+        supply it on restart. The host owns cross-replica serialization and
+        must retain its outer owner through the final receipt COMMIT as well.
+        A caller's cancellation cannot abandon an already-admitted cleanup;
+        an intent callback that itself fails/cancels never authorizes DELETE.
+        """
+        return await await_owned_effect(
+            self._cleanup_planned_endpoint(
+                request,
+                quote,
+                activation,
+                prior_receipt=prior_receipt,
+                prior_intent=prior_intent,
+                persist_intent=persist_intent,
+            )
+        )
+
+    async def _cleanup_planned_endpoint(
+        self,
+        request: PlannedServerlessCapacityQuoteRequest,
+        quote: PlannedServerlessCapacityQuote,
+        activation: ServerlessEndpointActivationReceipt,
+        *,
+        prior_receipt: ServerlessEndpointCleanupReceipt | None,
+        prior_intent: ServerlessEndpointCleanupIntent | None,
+        persist_intent: Callable[
+            [ServerlessEndpointCleanupIntent],
+            Awaitable[ServerlessEndpointCleanupIntent],
+        ]
+        | None,
+    ) -> ServerlessEndpointCleanupReceipt:
 
         _validate_planned_request_binding(request, quote)
         activation.validate_quote(quote)
-        if prior_receipt is not None:
-            prior_receipt.validate_activation(activation)
-            resources = await asyncio.to_thread(self.control_client.list_endpoints)
-            if any(
-                item.id == activation.endpoint_id
-                or item.name == activation.endpoint_name
-                for item in resources
-            ):
+        if prior_intent is not None:
+            prior_intent.validate_activation(activation)
+            if prior_intent.delete_started_at > self._now():
                 raise ServerlessEndpointCleanupError(
-                    "Replayed Serverless cleanup found the deleted endpoint identity",
+                    "Serverless cleanup intent starts in the future",
                     endpoint_name=activation.endpoint_name,
                     endpoint_id=activation.endpoint_id,
                 )
+        if prior_receipt is not None:
+            prior_receipt.validate_activation(activation)
+            if prior_intent is not None and (
+                prior_receipt.workers_zero_observed_at
+                != prior_intent.workers_zero_observed_at
+                or prior_receipt.delete_started_at != prior_intent.delete_started_at
+            ):
+                raise ServerlessEndpointCleanupError(
+                    "Serverless cleanup receipt differs from its original intent",
+                    endpoint_name=activation.endpoint_name,
+                    endpoint_id=activation.endpoint_id,
+                )
+            await self._verify_cleanup_absence(activation)
             return prior_receipt
 
-        endpoint = await asyncio.to_thread(
-            self.control_client.get_endpoint, activation.endpoint_id
-        )
+        endpoint = await self._cleanup_endpoint_resource(activation)
+        if endpoint is None:
+            if prior_intent is None:
+                raise ServerlessEndpointCleanupError(
+                    "Missing Serverless endpoint requires original durable cleanup evidence",
+                    endpoint_name=activation.endpoint_name,
+                    endpoint_id=activation.endpoint_id,
+                )
+            verified_absent_at = await self._verify_cleanup_absence(activation)
+            return _cleanup_receipt(
+                prior_intent,
+                verified_absent_at=verified_absent_at,
+                basis="interrupted_intent_verified_absent",
+            )
         readback_digest = _validate_planned_endpoint_binding(
             endpoint,
             request.endpoint,
@@ -637,9 +696,25 @@ class RunpodServerlessCapacityProvider:
                 endpoint_name=activation.endpoint_name,
                 endpoint_id=activation.endpoint_id,
             )
-        workers_zero_observed_at = self._now()
-        delete_started_at = self._now()
-        reconciled = False
+        intent = prior_intent or ServerlessEndpointCleanupIntent(
+            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
+            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            activation=activation,
+            workers_zero_observed_at=self._now(),
+            delete_started_at=self._now(),
+        )
+        if persist_intent is not None:
+            acknowledged = await persist_intent(intent)
+            if (
+                not isinstance(acknowledged, ServerlessEndpointCleanupIntent)
+                or acknowledged != intent
+            ):
+                raise ServerlessEndpointCleanupError(
+                    "Serverless cleanup intent persistence was not acknowledged exactly",
+                    endpoint_name=activation.endpoint_name,
+                    endpoint_id=activation.endpoint_id,
+                )
+        basis = "delete_acknowledged"
         try:
             await await_owned_effect(
                 asyncio.to_thread(
@@ -647,13 +722,46 @@ class RunpodServerlessCapacityProvider:
                 )
             )
         except RunPodAmbiguousResultError:
-            reconciled = True
+            basis = "ambiguous_delete_verified_absent"
         except RunPodManagerError as exc:
             raise ServerlessEndpointCleanupError(
                 "Serverless endpoint delete failed before absence was ambiguous",
                 endpoint_name=activation.endpoint_name,
                 endpoint_id=activation.endpoint_id,
             ) from exc
+        verified_absent_at = await self._verify_cleanup_absence(activation)
+        return _cleanup_receipt(
+            intent, verified_absent_at=verified_absent_at, basis=basis
+        )
+
+    async def _cleanup_endpoint_resource(
+        self,
+        activation: ServerlessEndpointActivationReceipt,
+    ) -> EndpointResource | None:
+        """Only the exact-ID GET's typed 404 denotes a missing endpoint."""
+        try:
+            return await asyncio.to_thread(
+                self.control_client.get_endpoint, activation.endpoint_id
+            )
+        except RunPodAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            return None
+
+    async def _verify_cleanup_absence(
+        self, activation: ServerlessEndpointActivationReceipt
+    ) -> datetime:
+        """Require exact-ID not-found AND the complete name/ID inventory.
+
+        These are current provider observations, not a read-consistency promise
+        or proof that a historical DELETE was ever delivered.
+        """
+        if await self._cleanup_endpoint_resource(activation) is not None:
+            raise ServerlessEndpointCleanupError(
+                "Serverless endpoint remains present after cleanup",
+                endpoint_name=activation.endpoint_name,
+                endpoint_id=activation.endpoint_id,
+            )
         resources = await asyncio.to_thread(self.control_client.list_endpoints)
         if any(
             item.id == activation.endpoint_id or item.name == activation.endpoint_name
@@ -664,39 +772,7 @@ class RunpodServerlessCapacityProvider:
                 endpoint_name=activation.endpoint_name,
                 endpoint_id=activation.endpoint_id,
             )
-        verified_absent_at = self._now()
-        identity = {
-            "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
-            "provider_quote_id": quote.provider_quote_id,
-            "quote_sha256": quote.quote_sha256,
-            "provider_activation_id": activation.provider_activation_id,
-            "endpoint_name": activation.endpoint_name,
-            "endpoint_id": activation.endpoint_id,
-            "endpoint_spec_sha256": activation.endpoint_spec_sha256,
-            "operation_digest": activation.operation_digest,
-            "endpoint_readback_sha256": activation.endpoint_readback_sha256,
-            "workers_zero_observed_at": iso_datetime(workers_zero_observed_at),
-            "delete_started_at": iso_datetime(delete_started_at),
-            "verified_absent_at": iso_datetime(verified_absent_at),
-            "reconciled_after_delete_error": reconciled,
-        }
-        return ServerlessEndpointCleanupReceipt(
-            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
-            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
-            provider_cleanup_id=("runpod-serverless-cleanup:" + json_sha256(identity)),
-            provider_quote_id=quote.provider_quote_id,
-            quote_sha256=quote.quote_sha256,
-            provider_activation_id=activation.provider_activation_id,
-            endpoint_name=activation.endpoint_name,
-            endpoint_id=activation.endpoint_id,
-            endpoint_spec_sha256=activation.endpoint_spec_sha256,
-            operation_digest=activation.operation_digest,
-            endpoint_readback_sha256=activation.endpoint_readback_sha256,
-            workers_zero_observed_at=workers_zero_observed_at,
-            delete_started_at=delete_started_at,
-            verified_absent_at=verified_absent_at,
-            reconciled_after_delete_error=reconciled,
-        )
+        return self._now()
 
     async def validate_quote_for_submission(
         self,
@@ -1345,6 +1421,51 @@ class RunpodServerlessCapacityProvider:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("Serverless capacity clock must be timezone-aware")
         return value.astimezone(UTC)
+
+
+def _cleanup_receipt(
+    intent: ServerlessEndpointCleanupIntent,
+    *,
+    verified_absent_at: datetime,
+    basis: str,
+) -> ServerlessEndpointCleanupReceipt:
+    """One receipt constructor for acknowledged and recovered cleanup evidence."""
+    activation = intent.activation
+    binding = {
+        key: getattr(activation, key)
+        for key in (
+            "contract_version",
+            "provider_quote_id",
+            "quote_sha256",
+            "provider_activation_id",
+            "endpoint_name",
+            "endpoint_id",
+            "endpoint_spec_sha256",
+            "operation_digest",
+            "endpoint_readback_sha256",
+        )
+    }
+    reconciled = basis == "ambiguous_delete_verified_absent"
+    identity = {
+        **binding,
+        "workers_zero_observed_at": iso_datetime(intent.workers_zero_observed_at),
+        "delete_started_at": iso_datetime(intent.delete_started_at),
+        "verified_absent_at": iso_datetime(verified_absent_at),
+        "reconciled_after_delete_error": reconciled,
+        "cleanup_evidence_version": 2,
+        "cleanup_basis": basis,
+    }
+    return ServerlessEndpointCleanupReceipt(
+        schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
+        provider_cleanup_id="runpod-serverless-cleanup:" + json_sha256(identity),
+        **binding,
+        workers_zero_observed_at=intent.workers_zero_observed_at,
+        delete_started_at=intent.delete_started_at,
+        verified_absent_at=verified_absent_at,
+        reconciled_after_delete_error=reconciled,
+        cleanup_evidence_version=2,
+        cleanup_basis=basis,
+    )
 
 
 def _validate_request_binding(

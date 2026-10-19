@@ -2,6 +2,32 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.14.0] - 2026-10-19
+
+### Added
+
+- Original-authority `ServerlessEndpointCleanupIntent` with strict canonical
+  codec and an awaited exact persistence-ACK hook before any endpoint DELETE.
+  Hosts store it in their original aggregate and supply it after restart; the
+  SDK does not add a parallel resource manager, private dependency or ledger.
+- Cleanup evidence v2 explicitly distinguishes acknowledged deletion,
+  ambiguous deletion, and interrupted-intent current-absence recovery. An
+  intent is not a sent DELETE. Historical v1 receipt codecs/identities remain
+  unchanged; consumers of new receipts must understand the evidence basis.
+
+### Fixed
+
+- Recover a successfully deleted endpoint after lost host receipt persistence,
+  without inventing a job or historical provider error. Recovery and replay
+  require exact-ID typed 404 plus complete name/ID inventory. A present endpoint
+  requires fresh exact readback and zero-worker inventory before deletion.
+- Retain the entire cleanup read/intent-ACK/mutation/absence tail through
+  repeated caller cancellation. Failed, mismatched or self-cancelled intent ACK
+  sends no DELETE; hosts retain their outer owner through receipt COMMIT.
+- Reject non-datetime observations with a clear shared validation error.
+  Recovery-time absence may extend a billing interval; missing hours remain
+  unknown, never zero, and no cleanup evidence implies financial finality.
+
 ## [0.13.0] - 2026-10-19
 
 ### Added

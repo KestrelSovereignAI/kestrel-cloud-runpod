@@ -1148,8 +1148,103 @@ class ServerlessEndpointActivationReceipt:
 
 
 @dataclass(frozen=True)
+class ServerlessEndpointCleanupIntent:
+    """Original idle observation and cleanup-operation start, not a sent DELETE.
+
+    The host must durably acknowledge this exact immutable value before a
+    provider mutation. It neither proves present-day idle workers on retry nor
+    current absence, a wire request, zero cost, or financial finality.
+    """
+
+    schema_version: int
+    contract_version: str
+    activation: ServerlessEndpointActivationReceipt
+    workers_zero_observed_at: datetime
+    delete_started_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != SERVERLESS_CAPACITY_SCHEMA_VERSION
+        ):
+            raise ValueError("Serverless cleanup intent schema is unsupported")
+        if self.contract_version != SERVERLESS_CAPACITY_CONTRACT_VERSION:
+            raise ValueError("Serverless cleanup intent contract is unsupported")
+        if not isinstance(self.activation, ServerlessEndpointActivationReceipt):
+            raise TypeError(
+                "Serverless cleanup intent requires its original activation"
+            )
+        require_aware(self.workers_zero_observed_at, "workers_zero_observed_at")
+        require_aware(self.delete_started_at, "delete_started_at")
+        if (
+            not self.activation.readback_at
+            <= self.workers_zero_observed_at
+            <= self.delete_started_at
+        ):
+            raise ValueError("Serverless cleanup intent timestamps are inconsistent")
+
+    @property
+    def provider_cleanup_intent_id(self) -> str:
+        return "runpod-serverless-cleanup-intent:" + json_sha256(self._identity())
+
+    def _identity(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "contract_version": self.contract_version,
+            "activation": self.activation.to_dict(),
+            "workers_zero_observed_at": iso_datetime(self.workers_zero_observed_at),
+            "delete_started_at": iso_datetime(self.delete_started_at),
+        }
+
+    def validate_activation(
+        self, activation: ServerlessEndpointActivationReceipt
+    ) -> None:
+        if self.activation != activation:
+            raise RunPodManagerError(
+                "Serverless cleanup intent does not match its original activation"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._identity(),
+            "provider_cleanup_intent_id": self.provider_cleanup_intent_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ServerlessEndpointCleanupIntent:
+        _exact_keys(value, _CLEANUP_INTENT_FIELDS, "Serverless cleanup intent")
+        activation = value.get("activation")
+        if not isinstance(activation, Mapping):
+            raise RunPodManagerError(
+                "Stored Serverless cleanup intent activation is invalid"
+            )
+        parsed = cls(
+            schema_version=_required_int(value, "schema_version"),
+            contract_version=_required_string(value, "contract_version"),
+            activation=ServerlessEndpointActivationReceipt.from_dict(activation),
+            workers_zero_observed_at=parse_datetime(
+                _required_string(value, "workers_zero_observed_at")
+            ),
+            delete_started_at=parse_datetime(
+                _required_string(value, "delete_started_at")
+            ),
+        )
+        if value["provider_cleanup_intent_id"] != parsed.provider_cleanup_intent_id:
+            raise RunPodManagerError(
+                "Stored Serverless cleanup intent digest mismatches"
+            )
+        return parsed
+
+
+@dataclass(frozen=True)
 class ServerlessEndpointCleanupReceipt:
-    """Proof that the exact activated endpoint was idle, deleted, and absent."""
+    """Current absence bound to original cleanup custody, never cost finality.
+
+    Evidence v2 names its basis explicitly. Interrupted-intent recovery does
+    not claim a DELETE was sent/acknowledged or a DELETE error was observed.
+    ``delete_started_at`` is the cleanup operation's start, before durable ACK
+    and any wire mutation. Legacy v1 receipts retain their exact identity.
+    """
 
     schema_version: int
     contract_version: str
@@ -1166,6 +1261,8 @@ class ServerlessEndpointCleanupReceipt:
     delete_started_at: datetime
     verified_absent_at: datetime
     reconciled_after_delete_error: bool
+    cleanup_evidence_version: int = 1
+    cleanup_basis: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SERVERLESS_CAPACITY_SCHEMA_VERSION:
@@ -1198,13 +1295,28 @@ class ServerlessEndpointCleanupReceipt:
             raise ValueError("Serverless cleanup timestamps are inconsistent")
         if not isinstance(self.reconciled_after_delete_error, bool):
             raise TypeError("Serverless cleanup reconciliation flag must be boolean")
+        if type(
+            self.cleanup_evidence_version
+        ) is not int or self.cleanup_evidence_version not in {1, 2}:
+            raise ValueError("Serverless cleanup evidence version is unsupported")
+        if self.cleanup_evidence_version == 1:
+            if self.cleanup_basis is not None:
+                raise ValueError(
+                    "Legacy Serverless cleanup cannot claim a new evidence basis"
+                )
+        elif (self.cleanup_basis, self.reconciled_after_delete_error) not in {
+            ("delete_acknowledged", False),
+            ("ambiguous_delete_verified_absent", True),
+            ("interrupted_intent_verified_absent", False),
+        }:
+            raise ValueError("Serverless cleanup evidence basis is inconsistent")
         if self.provider_cleanup_id != (
             "runpod-serverless-cleanup:" + json_sha256(self._cleanup_identity())
         ):
             raise ValueError("Serverless cleanup identity digest is inconsistent")
 
     def _cleanup_identity(self) -> dict[str, Any]:
-        return {
+        identity = {
             "contract_version": self.contract_version,
             "provider_quote_id": self.provider_quote_id,
             "quote_sha256": self.quote_sha256,
@@ -1219,6 +1331,11 @@ class ServerlessEndpointCleanupReceipt:
             "verified_absent_at": iso_datetime(self.verified_absent_at),
             "reconciled_after_delete_error": self.reconciled_after_delete_error,
         }
+        if self.cleanup_evidence_version == 2:
+            identity.update(
+                {"cleanup_evidence_version": 2, "cleanup_basis": self.cleanup_basis}
+            )
+        return identity
 
     def validate_activation(
         self, activation: ServerlessEndpointActivationReceipt
@@ -1240,25 +1357,26 @@ class ServerlessEndpointCleanupReceipt:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
-            "contract_version": self.contract_version,
             "provider_cleanup_id": self.provider_cleanup_id,
-            "provider_quote_id": self.provider_quote_id,
-            "quote_sha256": self.quote_sha256,
-            "provider_activation_id": self.provider_activation_id,
-            "endpoint_name": self.endpoint_name,
-            "endpoint_id": self.endpoint_id,
-            "endpoint_spec_sha256": self.endpoint_spec_sha256,
-            "operation_digest": self.operation_digest,
-            "endpoint_readback_sha256": self.endpoint_readback_sha256,
-            "workers_zero_observed_at": iso_datetime(self.workers_zero_observed_at),
-            "delete_started_at": iso_datetime(self.delete_started_at),
-            "verified_absent_at": iso_datetime(self.verified_absent_at),
-            "reconciled_after_delete_error": self.reconciled_after_delete_error,
+            **self._cleanup_identity(),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ServerlessEndpointCleanupReceipt:
-        _exact_keys(value, _CLEANUP_RECEIPT_FIELDS, "Serverless cleanup receipt")
+        versioned = "cleanup_evidence_version" in value
+        fields = (
+            _CLEANUP_RECEIPT_FIELDS | {"cleanup_evidence_version", "cleanup_basis"}
+            if versioned
+            else _CLEANUP_RECEIPT_FIELDS
+        )
+        _exact_keys(value, fields, "Serverless cleanup receipt")
+        evidence_version = (
+            _required_int(value, "cleanup_evidence_version") if versioned else 1
+        )
+        if versioned and evidence_version != 2:
+            raise RunPodManagerError(
+                "Stored Serverless cleanup evidence version is unsupported"
+            )
         flag = value.get("reconciled_after_delete_error")
         if not isinstance(flag, bool):
             raise RunPodManagerError(
@@ -1288,6 +1406,10 @@ class ServerlessEndpointCleanupReceipt:
                 _required_string(value, "verified_absent_at")
             ),
             reconciled_after_delete_error=flag,
+            cleanup_evidence_version=evidence_version,
+            cleanup_basis=_required_string(value, "cleanup_basis")
+            if versioned
+            else None,
         )
 
 
@@ -2642,6 +2764,8 @@ def parse_datetime(value: str) -> datetime:
 
 
 def require_aware(value: datetime, name: str) -> None:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"Serverless capacity {name} must be timezone-aware")
 
@@ -2974,6 +3098,17 @@ _ACTIVATION_RECEIPT_FIELDS = frozenset(
     }
 )
 
+_CLEANUP_INTENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "contract_version",
+        "activation",
+        "workers_zero_observed_at",
+        "delete_started_at",
+        "provider_cleanup_intent_id",
+    }
+)
+
 _CLEANUP_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -3138,6 +3273,7 @@ __all__ = [
     "ServerlessCapacityQuote",
     "ServerlessCapacityQuoteRequest",
     "ServerlessEndpointActivationReceipt",
+    "ServerlessEndpointCleanupIntent",
     "ServerlessEndpointCleanupReceipt",
     "ServerlessEndpointHourCost",
     "ServerlessEndpointProfile",
