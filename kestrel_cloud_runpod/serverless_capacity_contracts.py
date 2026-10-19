@@ -1710,24 +1710,41 @@ def serverless_billing_hour_starts(
 ) -> tuple[datetime, ...]:
     """Return every UTC endpoint-hour bucket touched by a billable interval."""
 
-    require_aware(attempt_started_at, "attempt_started_at")
-    require_aware(billable_coverage_until, "billable_coverage_until")
-    start = attempt_started_at.astimezone(UTC)
-    coverage_until = billable_coverage_until.astimezone(UTC)
-    if coverage_until <= start:
-        raise ValueError("Serverless billable coverage interval is invalid")
-    if (coverage_until - start).total_seconds() > _MAX_BILLABLE_COVERAGE_SECONDS:
+    first, window_until = serverless_billing_hour_bounds(
+        attempt_started_at, billable_coverage_until
+    )
+    if (
+        billable_coverage_until.astimezone(UTC) - attempt_started_at.astimezone(UTC)
+    ).total_seconds() > _MAX_BILLABLE_COVERAGE_SECONDS:
         raise ValueError("Serverless billable coverage interval exceeds policy bounds")
-    first = start.replace(minute=0, second=0, microsecond=0)
-    window_until = coverage_until.replace(minute=0, second=0, microsecond=0)
-    if coverage_until != window_until:
-        window_until += timedelta(hours=1)
     hours: list[datetime] = []
     cursor = first
     while cursor < window_until:
         hours.append(cursor)
         cursor += timedelta(hours=1)
     return tuple(hours)
+
+
+def serverless_billing_hour_bounds(
+    started_at: datetime, coverage_until: datetime
+) -> tuple[datetime, datetime]:
+    """UTC hour bounds for actual coverage, independent of job authorization.
+
+    Historical endpoint cleanup may finish after a job's seven-day policy limit.
+    This helper grants no authority to extend that limit or create new work.
+    """
+
+    require_aware(started_at, "started_at")
+    require_aware(coverage_until, "coverage_until")
+    start = started_at.astimezone(UTC)
+    coverage_until = coverage_until.astimezone(UTC)
+    if coverage_until <= start:
+        raise ValueError("Serverless billable coverage interval is invalid")
+    first = start.replace(minute=0, second=0, microsecond=0)
+    window_until = coverage_until.replace(minute=0, second=0, microsecond=0)
+    if coverage_until != window_until:
+        window_until += timedelta(hours=1)
+    return first, window_until
 
 
 @dataclass(frozen=True)
@@ -2229,6 +2246,143 @@ class ServerlessEndpointHourCost:
 
 
 @dataclass(frozen=True)
+class ServerlessRetiredEndpointBillingReceipt:
+    """Observed full-lifecycle costs, not an invoice-finality or job receipt.
+
+    Endpoint-hour observations may overlap existing job/window receipts. Hosts
+    must reconcile by endpoint and UTC hour, with observation IDs identifying
+    revisions of that hour, rather than charge both aggregates.
+    Runpod v2 supplies no finalization marker; custody cannot be erased merely
+    because every currently reported hour is present.
+    """
+
+    schema_version: int
+    contract_version: str
+    activation: ServerlessEndpointActivationReceipt
+    cleanup: ServerlessEndpointCleanupReceipt
+    endpoint_hour_costs: tuple[ServerlessEndpointHourCost, ...]
+    reconciled_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != SERVERLESS_CAPACITY_SCHEMA_VERSION
+        ):
+            raise ValueError("Retired Serverless billing schema is unsupported")
+        if self.contract_version != SERVERLESS_CAPACITY_CONTRACT_VERSION:
+            raise ValueError("Retired Serverless billing contract is unsupported")
+        if not isinstance(self.activation, ServerlessEndpointActivationReceipt):
+            raise TypeError("Retired Serverless billing requires its activation")
+        if not isinstance(self.cleanup, ServerlessEndpointCleanupReceipt):
+            raise TypeError("Retired Serverless billing requires verified cleanup")
+        self.cleanup.validate_activation(self.activation)
+        if self.cleanup.workers_zero_observed_at < self.activation.readback_at:
+            raise ValueError("Serverless cleanup precedes activation readback")
+        require_aware(self.reconciled_at, "reconciled_at")
+        start, end = self.billing_window
+        if self.reconciled_at < end:
+            raise ValueError("Retired Serverless billing window is still open")
+        if (
+            not isinstance(self.endpoint_hour_costs, tuple)
+            or not self.endpoint_hour_costs
+        ):
+            raise ValueError("Retired Serverless billing requires endpoint-hour costs")
+        cursor = start
+        observed_ids: set[str] = set()
+        for item in self.endpoint_hour_costs:
+            if not isinstance(item, ServerlessEndpointHourCost):
+                raise TypeError("Retired Serverless endpoint-hour cost type is invalid")
+            if (
+                item.endpoint_id != self.activation.endpoint_id
+                or item.utc_hour_start != cursor
+                or item.provider_observation_id in observed_ids
+            ):
+                raise ValueError("Retired Serverless billing hours are inconsistent")
+            observed_ids.add(item.provider_observation_id)
+            cursor = item.utc_hour_end
+        if cursor != end:
+            raise ValueError("Retired Serverless billing does not cover its lifecycle")
+
+    @property
+    def billing_window(self) -> tuple[datetime, datetime]:
+        return serverless_billing_hour_bounds(
+            self.activation.create_started_at, self.cleanup.verified_absent_at
+        )
+
+    @property
+    def cost_totals(self) -> dict[str, Decimal]:
+        return serverless_endpoint_hour_cost_totals(self.endpoint_hour_costs)
+
+    @property
+    def actual_cost_usd(self) -> Decimal:
+        return self.cost_totals["actual_cost_usd"]
+
+    @property
+    def provider_finality_confirmed(self) -> bool:
+        return False
+
+    @property
+    def provider_billing_id(self) -> str:
+        return "runpod-retired-endpoint-billing:" + json_sha256(self._identity())
+
+    def _identity(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "contract_version": self.contract_version,
+            "cost_scope": "endpoint_lifecycle",
+            "provider_finality_confirmed": self.provider_finality_confirmed,
+            "activation": self.activation.to_dict(),
+            "cleanup": self.cleanup.to_dict(),
+            "endpoint_hour_costs": [
+                item.to_dict() for item in self.endpoint_hour_costs
+            ],
+            "cost_totals": {
+                key: decimal_text(amount) for key, amount in self.cost_totals.items()
+            },
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._identity(),
+            "provider_billing_id": self.provider_billing_id,
+            "reconciled_at": iso_datetime(self.reconciled_at),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, Any]
+    ) -> ServerlessRetiredEndpointBillingReceipt:
+        _exact_keys(value, _RETIRED_ENDPOINT_RECEIPT_FIELDS, "retired endpoint billing")
+        if (
+            value.get("cost_scope") != "endpoint_lifecycle"
+            or value.get("provider_finality_confirmed") is not False
+        ):
+            raise RunPodManagerError(
+                "Retired endpoint billing scope/finality is invalid"
+            )
+        activation = value.get("activation")
+        cleanup = value.get("cleanup")
+        if not isinstance(activation, Mapping) or not isinstance(cleanup, Mapping):
+            raise RunPodManagerError("Retired endpoint billing authority is invalid")
+        parsed = cls(
+            schema_version=_required_int(value, "schema_version"),
+            contract_version=_required_string(value, "contract_version"),
+            activation=ServerlessEndpointActivationReceipt.from_dict(activation),
+            cleanup=ServerlessEndpointCleanupReceipt.from_dict(cleanup),
+            endpoint_hour_costs=_required_endpoint_hour_costs(
+                value, "endpoint_hour_costs"
+            ),
+            reconciled_at=parse_datetime(_required_string(value, "reconciled_at")),
+        )
+        if (
+            value["provider_billing_id"] != parsed.provider_billing_id
+            or value["cost_totals"] != parsed.to_dict()["cost_totals"]
+        ):
+            raise RunPodManagerError("Retired endpoint billing digest/totals mismatch")
+        return parsed
+
+
+@dataclass(frozen=True)
 class ServerlessAmbiguousWindowBillingReceipt:
     """Authoritative endpoint-hour cost for an ambiguous submission window."""
 
@@ -2353,7 +2507,7 @@ class ServerlessAmbiguousWindowBillingReceipt:
             raise ValueError(
                 "Serverless ambiguous billing components do not equal total cost"
             )
-        derived_amounts = _endpoint_hour_cost_totals(self.endpoint_hour_costs)
+        derived_amounts = serverless_endpoint_hour_cost_totals(self.endpoint_hour_costs)
         if any(
             getattr(self, name) != derived_amounts[name]
             for name in _SERVERLESS_COST_FIELD_NAMES
@@ -2634,9 +2788,11 @@ def _ordered_hours_cover(
     )
 
 
-def _endpoint_hour_cost_totals(
+def serverless_endpoint_hour_cost_totals(
     values: tuple[ServerlessEndpointHourCost, ...],
 ) -> dict[str, Decimal]:
+    """Sum the canonical endpoint-hour component amounts without rounding."""
+
     return {
         name: sum((getattr(item, name) for item in values), start=Decimal(0))
         for name in _SERVERLESS_COST_FIELD_NAMES
@@ -2921,6 +3077,21 @@ _SERVERLESS_COST_FIELD_NAMES = (
     "actual_cost_usd",
 )
 
+_RETIRED_ENDPOINT_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "contract_version",
+        "cost_scope",
+        "provider_finality_confirmed",
+        "activation",
+        "cleanup",
+        "endpoint_hour_costs",
+        "cost_totals",
+        "provider_billing_id",
+        "reconciled_at",
+    }
+)
+
 _AMBIGUOUS_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -2971,11 +3142,14 @@ __all__ = [
     "ServerlessEndpointHourCost",
     "ServerlessEndpointProfile",
     "ServerlessEndpointSpec",
+    "ServerlessRetiredEndpointBillingReceipt",
     "decimal_text",
     "iso_datetime",
     "json_sha256",
     "parse_datetime",
     "require_aware",
+    "serverless_billing_hour_bounds",
     "serverless_billing_hour_starts",
+    "serverless_endpoint_hour_cost_totals",
     "serverless_worker_cost_usd",
 ]

@@ -43,11 +43,14 @@ from .serverless_capacity_contracts import (
     ServerlessEndpointHourCost,
     ServerlessEndpointProfile,
     ServerlessEndpointSpec,
+    ServerlessRetiredEndpointBillingReceipt,
     decimal_text,
     iso_datetime,
     json_sha256,
     parse_datetime,
+    serverless_billing_hour_bounds,
     serverless_billing_hour_starts,
+    serverless_endpoint_hour_cost_totals,
     serverless_worker_cost_usd,
 )
 
@@ -135,10 +138,17 @@ class RunpodServerlessCapacityProvider:
         control_client: RunpodControlPlaneClient,
         job_client: RunpodServerlessClient | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        billing_history_batch_hours: int = 24,
     ) -> None:
+        if (
+            type(billing_history_batch_hours) is not int
+            or billing_history_batch_hours < 1
+        ):
+            raise ValueError("billing_history_batch_hours must be a positive integer")
         self.control_client = control_client
         self.job_client = job_client
         self._clock = clock
+        self._billing_history_batch_hours = billing_history_batch_hours
 
     async def quote(
         self, request: ServerlessCapacityQuoteRequest
@@ -730,6 +740,74 @@ class RunpodServerlessCapacityProvider:
             )
         return quote
 
+    async def retired_endpoint_billing(
+        self,
+        request: PlannedServerlessCapacityQuoteRequest,
+        quote: PlannedServerlessCapacityQuote,
+        activation: ServerlessEndpointActivationReceipt,
+        cleanup: ServerlessEndpointCleanupReceipt,
+    ) -> ServerlessRetiredEndpointBillingReceipt | None:
+        """Read whole-lifecycle costs after teardown, without job/status calls.
+
+        Original historical authority is validated, never refreshed into spend
+        authority. Empty/incomplete history remains pending. Complete reported
+        history is an observation, not proof of invoice finality or permission
+        to erase settlement custody. Hosts must reconcile by endpoint and UTC
+        hour against previously accounted job/window costs, including revisions
+        to a previously observed hour; observation IDs are not extra charges.
+        """
+
+        _validate_planned_request_binding(request, quote)
+        activation.validate_quote(quote)
+        cleanup.validate_activation(activation)
+        if cleanup.workers_zero_observed_at < activation.readback_at:
+            raise RunPodManagerError("Serverless cleanup precedes activation readback")
+        window_from, window_until = serverless_billing_hour_bounds(
+            activation.create_started_at, cleanup.verified_absent_at
+        )
+        if self._now() < window_until:
+            return None
+        costs: list[ServerlessEndpointHourCost] = []
+        cursor = window_from
+        while cursor < window_until:
+            batch_until = min(
+                window_until,
+                cursor
+                + timedelta(
+                    hours=min(
+                        self._billing_history_batch_hours,
+                        (window_until - cursor) // timedelta(hours=1),
+                    )
+                ),
+            )
+            page = await await_owned_effect(
+                asyncio.to_thread(
+                    self.control_client.serverless_billing,
+                    start_time=iso_datetime(cursor),
+                    end_time=iso_datetime(batch_until),
+                    bucket_size="hour",
+                    endpoint_id=activation.endpoint_id,
+                )
+            )
+            observed = _authoritative_hour_costs(
+                page,
+                endpoint_id=activation.endpoint_id,
+                window_from=cursor,
+                window_until=batch_until,
+            )
+            if observed is None:
+                return None
+            costs.extend(observed)
+            cursor = batch_until
+        return ServerlessRetiredEndpointBillingReceipt(
+            schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
+            contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
+            activation=activation,
+            cleanup=cleanup,
+            endpoint_hour_costs=tuple(costs),
+            reconciled_at=self._now(),
+        )
+
     async def final_billing(
         self,
         attempt: ServerlessBillingAttempt,
@@ -867,7 +945,7 @@ class RunpodServerlessCapacityProvider:
         )
         if endpoint_hour_costs is None:
             return None
-        amounts = _sum_hour_costs(endpoint_hour_costs)
+        amounts = serverless_endpoint_hour_cost_totals(endpoint_hour_costs)
         identity = {
             "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
             "provider_quote_id": quote.provider_quote_id,
@@ -988,7 +1066,7 @@ class RunpodServerlessCapacityProvider:
         )
         if endpoint_hour_costs is None:
             return None
-        amounts = _sum_hour_costs(endpoint_hour_costs)
+        amounts = serverless_endpoint_hour_cost_totals(endpoint_hour_costs)
         actual_cost = amounts["actual_cost_usd"]
         capped_cost = min(actual_cost, window.accepted_cost_ceiling_usd)
         operator_loss = actual_cost - capped_cost
@@ -1832,19 +1910,12 @@ def _authoritative_hour_costs(
     if cursor < window_until:
         return None
     expected_totals = _amounts_from_mapping(totals, "billing totals")
-    summed = _sum_hour_costs(tuple(hourly_costs))
+    summed = serverless_endpoint_hour_cost_totals(tuple(hourly_costs))
     if summed != expected_totals:
         raise RunPodManagerError("Runpod billing totals do not equal its records")
     return tuple(hourly_costs)
 
 
-_AMOUNT_NAMES = (
-    "actual_cost_usd",
-    "gpu_cost_usd",
-    "cpu_cost_usd",
-    "disk_cost_usd",
-    "fee_cost_usd",
-)
 _AMOUNT_KEYS = {
     "actual_cost_usd": "totalAmount",
     "gpu_cost_usd": "gpuAmount",
@@ -1852,15 +1923,6 @@ _AMOUNT_KEYS = {
     "disk_cost_usd": "diskAmount",
     "fee_cost_usd": "feeAmount",
 }
-
-
-def _sum_hour_costs(
-    values: tuple[ServerlessEndpointHourCost, ...],
-) -> dict[str, Decimal]:
-    return {
-        name: sum((getattr(item, name) for item in values), start=Decimal(0))
-        for name in _AMOUNT_NAMES
-    }
 
 
 def _amounts_from_mapping(value: Mapping[str, Any], context: str) -> dict[str, Decimal]:

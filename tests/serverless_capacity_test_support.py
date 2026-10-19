@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from kestrel_cloud_runpod.models import (
     Availability,
@@ -35,6 +38,26 @@ from kestrel_cloud_runpod.serverless_capacity_contracts import (
 PARAMETERS_SHA256 = "a" * 64
 PROFILE_SHA256 = "b" * 64
 WORKER_REFERENCE = "ghcr.io/kestrelsovereignai/catalog-worker@sha256:" + "c" * 64
+
+
+def legacy_planned_authority():
+    """Original persisted authority, still valid for recovery but not new spend."""
+
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures/serverless-0.10.1-authority.json"
+        ).read_text()
+    )
+    value = replace(
+        planned_request(),
+        endpoint=PlannedServerlessEndpoint.from_dict(fixture["endpoint"]),
+    )
+    accepted = PlannedServerlessCapacityQuote.from_dict(fixture["quote"])
+    activation = ServerlessEndpointActivationReceipt.from_dict(fixture["activation"])
+    raw = fixture["readback"]
+    raw["gpu"].update({"minCudaVersion": None, "allowedCudaVersions": []})
+    raw["mounts"] = {"network": [], "global": []}
+    return value, accepted, activation, raw
 
 
 class MutableClock:
