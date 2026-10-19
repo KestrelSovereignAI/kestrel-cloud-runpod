@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-runpod"
-version = "0.14.0"
+version = "0.15.0"
 description = "RunPod GPU cloud provider for Kestrel Sovereign — provision pods, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -33,13 +33,13 @@ classifiers = [
 ]
 dependencies = [
     "kestrel-sovereign-sdk>=0.35.0,<1",
-    # Framework runtime dep: the manager uses kestrel_sovereign.config.load_config
-    # to load the standalone $KESTREL_HOME/runpod_config.toml.
-    "kestrel-sovereign>=0.13.1,<1",
+    # Canonical joined-operation and native terminal-evidence composition.
+    # Do not duplicate Core's ownership algorithm in the cloud adapter.
+    "kestrel-sovereign>=0.53.34,<1",
     # Direct runtime dep of signed_invocations (Ed25519 receipt signing and
     # verification).  Declared explicitly rather than leaned on transitively:
     # kestrel-sovereign-sdk already puts cryptography behind a `crypto` extra,
-    # so a future kestrel-sovereign inside `>=0.13.1,<1` doing the same would
+    # so a future kestrel-sovereign doing the same would
     # otherwise leave `import kestrel_cloud_runpod.signed_invocations` raising
     # ModuleNotFoundError.  Floor matches the SDK's, the lowest in the
     # ecosystem; Ed25519 has been present since 2.6.

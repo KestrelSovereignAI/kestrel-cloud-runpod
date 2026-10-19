@@ -2,6 +2,19 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.15.0] - 2026-10-19
+
+### Fixed
+
+- Reuse Core's canonical joined-operation owner instead of a second shield
+  loop. Repeated caller cancellation still cannot detach admitted effects or
+  receipt tails, and late effect failure keeps precedence while preserving
+  original cancellation and native denial/UNKNOWN evidence. Finite observations
+  do not mutate shared native source receipts or emit orphan shield diagnostics.
+- Retain the public arbitrary-Awaitable contract, including existing Tasks and
+  Futures. Require Core 0.53.34 for the tested ownership/composition contract;
+  this does not grant admission or change cleanup evidence/billing semantics.
+
 ## [0.14.0] - 2026-10-19
 
 ### Added
