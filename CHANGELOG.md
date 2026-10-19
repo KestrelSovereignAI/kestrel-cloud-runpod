@@ -2,6 +2,22 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.13.0] - 2026-10-19
+
+### Added
+
+- `retired_endpoint_billing` reads the full originally activated Serverless
+  endpoint lifecycle after verified teardown, without a job/status dependency
+  or synthetic submission. Bounded configurable queries reuse the canonical
+  strict hourly parser and component-cost aggregation. Historical costs are
+  not truncated to job authorization limits or an expired quote.
+- Typed content-free retired-endpoint receipts preserve original activation
+  and cleanup lineage, canonical hourly observations, exact derived totals,
+  and revision-sensitive identities. They explicitly do not confirm provider
+  invoice finality or authorize erasure of unresolved settlement custody.
+  Empty/incomplete history stays pending; hosts reconcile overlapping hours
+  and revised costs rather than charging receipt totals twice.
+
 ## [0.12.1] - 2026-10-17
 
 ### Fixed

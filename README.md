@@ -201,6 +201,32 @@ remains pending because v2 exposes no finalization marker; consumers never call
 the control-plane billing client directly or substitute an estimate for actual
 spend.
 
+After an activated endpoint is physically retired,
+`retired_endpoint_billing(original_request, original_quote, activation, cleanup)`
+reads only the global [`GET /billing/serverless`](https://docs.runpod.io/api-reference-v2/billing/get-serverless-billing-history)
+history. It needs no job, submission, or data-plane status read. The exact
+original activation and verified idle/delete/absence receipt bind the full
+lifecycle from create admission through verified absence, including startup,
+idle, and cleanup costs outside a finite job's authorization window. Expired
+historical quotes remain valid for this read-only recovery; they cannot
+authorize new spend. Queries use contiguous hour batches, configurable with
+`billing_history_batch_hours` (default 24), and reuse the same strict record,
+query, count, and component-total validation as ordinary job billing. An open
+last hour or any empty/incomplete batch remains pending, never an assumed zero.
+
+`ServerlessRetiredEndpointBillingReceipt` is an **endpoint-lifecycle observation**,
+not a per-job charge or provider invoice-finality proof:
+`provider_finality_confirmed` is always `false`. The API does not document a
+finalization marker or a guarantee of deleted-endpoint billing retention; if
+history becomes unavailable, reconciliation fails closed. The host must retain
+unresolved settlement/cleanup custody and apply its explicit final-settlement
+policy before erasing it. It must also reconcile overlapping job/window costs
+by endpoint and UTC hour, not add both receipt totals. A later provider cost
+revision changes that hour's observation ID and the lifecycle receipt ID; it
+is a revision of the same hour, not a second charge. Cost totals are derived
+without rounding from the canonical hourly records. No estimate, quote cap,
+automatic operator loss, or fabricated job is substituted for observed spend.
+
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 
 Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload IDs, the exact model, placement constraints, expected warm utilization, an idle timeout, hard deadline, and maximum spend. The service compares current Pod and Serverless catalog offers. Bursty traffic can use native load-balanced Serverless; sustained sessions can use a dedicated Pod. Queue Serverless is not selected for interactive streaming. `lease.public_route_url` remains `None` until both Runpod health and Ollama `/api/tags` prove the requested model is ready. An external scheduler must run `RunPodManager.reconcile_ollama_leases()` periodically so expiry and teardown retries survive requester crashes. The `kestrel-runpod-reconcile-ollama` command performs one fail-fast pass and is suitable for a timer or job runner.

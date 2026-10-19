@@ -133,7 +133,10 @@ from .serverless_capacity_contracts import (
     ServerlessEndpointHourCost,
     ServerlessEndpointProfile,
     ServerlessEndpointSpec,
+    ServerlessRetiredEndpointBillingReceipt,
+    serverless_billing_hour_bounds,
     serverless_billing_hour_starts,
+    serverless_endpoint_hour_cost_totals,
     serverless_worker_cost_usd,
 )
 from .serverless_capacity_provider import (
@@ -248,6 +251,7 @@ __all__ = [
     "ServerlessEndpointHourCost",
     "ServerlessEndpointProfile",
     "ServerlessEndpointSpec",
+    "ServerlessRetiredEndpointBillingReceipt",
     "TrainingPodCleanupError",
     "TrainingPodCleanupState",
     "TrainingPodConflictError",
@@ -263,6 +267,8 @@ __all__ = [
     "maximum_serverless_cold_starts",
     "pod_capacity_database_path",
     "pod_cost_usd",
+    "serverless_billing_hour_bounds",
     "serverless_billing_hour_starts",
+    "serverless_endpoint_hour_cost_totals",
     "serverless_worker_cost_usd",
 ]
