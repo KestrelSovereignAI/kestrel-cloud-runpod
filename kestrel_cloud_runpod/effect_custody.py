@@ -29,7 +29,7 @@ async def await_owned_effect(effect: Awaitable[_T]) -> _T:
     )
     from kestrel_sovereign.execution_custody import execution_terminal_error
 
-    if isinstance(effect, asyncio.Future):
+    if asyncio.isfuture(effect):
         # Already-admitted Tasks/Futures need no new Task allocation. Refusing
         # a surrogate join task cannot abandon the original physical effect.
         outcome = await await_owned_task(effect)

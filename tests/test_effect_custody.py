@@ -241,7 +241,7 @@ async def test_real_task_admission_refusal_closes_only_the_original_unstarted_ef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["existing_task", "existing_future"])
+@pytest.mark.parametrize("kind", ["existing_task", "existing_future", "future_like"])
 @pytest.mark.parametrize("failure", [False, True])
 async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admission_is_refused(kind, failure):
     from kestrel_sovereign._async_ownership import await_owned_task
@@ -252,6 +252,20 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     original = ValueError("original accepted effect failure")
     refused = []
 
+    class FutureLike:
+        """The standard asyncio Future-like protocol, backed by a REAL Future."""
+
+        _asyncio_future_blocking = False
+
+        def __init__(self, future):
+            self._future = future
+
+        def __await__(self):
+            return self._future.__await__()
+
+        def __getattr__(self, name):
+            return getattr(self._future, name)
+
     async def accepted():
         await release.wait()
         tail.append("original physical tail completed")
@@ -260,6 +274,9 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
         return "original accepted receipt"
 
     effect = asyncio.create_task(accepted()) if kind == "existing_task" else loop.create_future()
+    if kind == "future_like":
+        effect = FutureLike(effect)
+        assert asyncio.isfuture(effect) and not isinstance(effect, asyncio.Future)
     owner = asyncio.create_task(await_owned_effect(effect))
 
     def refuse(_loop, _coroutine, **_kwargs):
@@ -275,7 +292,7 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     finally:
         loop.set_task_factory(previous_factory)
         release.set()
-        if kind == "existing_future" and not effect.done():
+        if kind in {"existing_future", "future_like"} and not effect.done():
             if failure:
                 effect.set_exception(original)
             else:
