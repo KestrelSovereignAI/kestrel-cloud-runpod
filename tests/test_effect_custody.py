@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import inspect
 import threading
 
 import pytest
@@ -197,3 +198,97 @@ async def test_existing_awaitable_contract_is_not_narrowed_to_coroutines(kind):
     else:
         effect = ExistingAwaitable()
     assert await await_owned_effect(effect) == "exact existing effect receipt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["coroutine", "closeable_awaitable"])
+async def test_real_task_admission_refusal_closes_only_the_original_unstarted_effect(kind):
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    original = RuntimeError("original loop refused owned task admission")
+    body, closed = [], []
+    release = asyncio.Event()
+
+    async def coroutine():
+        body.append("effect body entered")
+        await release.wait()
+        return "existing accepted effect"
+
+    class CloseableAwaitable:
+        def __await__(self):
+            return coroutine().__await__()
+
+        def close(self):
+            closed.append("original unstarted close")
+
+    effect = coroutine() if kind == "coroutine" else CloseableAwaitable()
+
+    def refuse(_loop, _coroutine, **_kwargs):
+        raise original
+
+    try:
+        loop.set_task_factory(refuse)
+        with pytest.raises(RuntimeError) as caught:
+            await await_owned_effect(effect)
+        assert caught.value is original
+    finally:
+        loop.set_task_factory(previous_factory)
+        release.set()
+        if kind == "coroutine":
+            assert inspect.getcoroutinestate(effect) == inspect.CORO_CLOSED
+    assert body == []
+    assert closed == (["original unstarted close"] if kind == "closeable_awaitable" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["existing_task", "existing_future"])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admission_is_refused(kind, failure):
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    release, tail = asyncio.Event(), []
+    original = ValueError("original accepted effect failure")
+    refused = []
+
+    async def accepted():
+        await release.wait()
+        tail.append("original physical tail completed")
+        if failure:
+            raise original
+        return "original accepted receipt"
+
+    effect = asyncio.create_task(accepted()) if kind == "existing_task" else loop.create_future()
+    owner = asyncio.create_task(await_owned_effect(effect))
+
+    def refuse(_loop, _coroutine, **_kwargs):
+        refused.append("new task allocation attempted")
+        raise RuntimeError("new task admission refused")
+
+    try:
+        loop.set_task_factory(refuse)
+        for _ in range(3):
+            await asyncio.sleep(0)
+            assert not owner.done(), "an accepted original cannot lose its join to wrapper refusal"
+            owner.cancel("original existing-effect caller cancellation")
+    finally:
+        loop.set_task_factory(previous_factory)
+        release.set()
+        if kind == "existing_future" and not effect.done():
+            if failure:
+                effect.set_exception(original)
+            else:
+                effect.set_result("original accepted receipt")
+        effect_outcome = await await_owned_task(effect)
+        outcome = await await_owned_task(owner)
+    assert refused == [], "existing Task/Future needs no surrogate Task admission"
+    if kind == "existing_task":
+        assert tail == ["original physical tail completed"]
+    assert not effect.cancelled()
+    if failure:
+        assert effect_outcome.error is original and outcome.error is original
+    else:
+        assert effect_outcome.result == "original accepted receipt"
+        assert isinstance(outcome.error, asyncio.CancelledError)
+    assert any(isinstance(error, asyncio.CancelledError) for error in _original_errors(outcome.error))
