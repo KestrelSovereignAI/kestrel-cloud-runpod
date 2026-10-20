@@ -12,7 +12,6 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from .effect_custody import await_owned_effect
-
 from .models import (
     CloudType,
     ComputeProduct,
@@ -23,6 +22,7 @@ from .models import (
     RunPodManagerError,
 )
 from .placement import select_gpu
+from .pod_billing import read_exact_pod_billing
 from .pod_capacity_contracts import (
     PodBillingReceipt,
     PodCapacityQuote,
@@ -397,70 +397,15 @@ class RunpodPodCapacityProvider:
         terminated_at: datetime,
         realized_hourly_rate_usd: Decimal,
     ) -> PodBillingReceipt | None:
-        """Return final v2 billing only after the requested interval is covered."""
+        """Observe exact closed-hour costs through the shared Pod reader."""
 
-        page = await asyncio.to_thread(
-            self.provider.client.pod_billing,
-            start_time=iso_datetime(created_at),
-            end_time=iso_datetime(terminated_at),
-            bucket_size="hour",
+        return await read_exact_pod_billing(
+            self.provider.client,
             pod_id=pod_id,
-        )
-        query = page.metadata.get("query")
-        totals = page.metadata.get("totals")
-        if not isinstance(query, Mapping) or not isinstance(totals, Mapping):
-            raise RunPodManagerError("Runpod v2 Pod billing metadata is incomplete")
-        if query.get("podId") != pod_id:
-            raise RunPodManagerError("Runpod v2 Pod billing identity mismatch")
-        start_time = _provider_datetime(
-            query.get("startTime"), "billing query startTime"
-        )
-        end_time = _provider_datetime(query.get("endTime"), "billing query endTime")
-        if start_time > created_at or end_time < terminated_at:
-            raise RunPodManagerError(
-                "Runpod v2 Pod billing query did not cover the requested interval"
-            )
-        if not page.records:
-            return None
-        for record in page.records:
-            if record.get("podId") != pod_id:
-                raise RunPodManagerError(
-                    "Runpod v2 Pod billing record identity mismatch"
-                )
-        actual = _provider_decimal(totals.get("totalAmount"), "billing totalAmount")
-        billed_from = min(
-            _provider_datetime(record.get("startTime"), "billing startTime")
-            for record in page.records
-        )
-        billed_until = max(
-            _provider_datetime(record.get("endTime"), "billing endTime")
-            for record in page.records
-        )
-        if billed_from > created_at or billed_until < terminated_at:
-            return None
-        billed_seconds = max(0, int((billed_until - billed_from).total_seconds()))
-        billing_digest = hashlib.sha256(
-            f"{pod_id}\0{iso_datetime(billed_from)}\0{iso_datetime(billed_until)}\0{actual}".encode()
-        ).hexdigest()
-        return PodBillingReceipt(
-            provider_billing_id=f"runpod-billing:{billing_digest}",
-            provider_pod_id=pod_id,
-            billed_from=billed_from,
-            billed_until=billed_until,
-            billed_seconds=billed_seconds,
-            # The REALIZED whole-Pod rate, not the accepted one. actual_cost_usd
-            # beside it is realized spend, and two independent checks require
-            # this to equal evidence.realized_placement.hourly_rate_usd - while
-            # the placement itself is only required to come in at or under the
-            # accepted rate. Recording the accepted rate made settlement
-            # unreachable for an ordinary price drop and for the terminal
-            # cost of 0.0 the v2 spec documents: billing never became
-            # authoritative, the scoped capability was never revoked, and the
-            # owner's reservation was held indefinitely. The accepted rate is
-            # already preserved in PodCapacityEvidence.accepted_hourly_rate_usd.
-            hourly_price_usd=realized_hourly_rate_usd,
-            actual_cost_usd=actual,
-            reconciled_at=self._now(),
+            created_at=created_at,
+            terminated_at=terminated_at,
+            realized_hourly_rate_usd=realized_hourly_rate_usd,
+            clock=self._now,
         )
 
     def _now(self) -> datetime:
@@ -620,18 +565,6 @@ def _realized_placement(
             "Created Pod placement does not match accepted quote"
         ) from exc
     return realized
-
-
-def _provider_datetime(value: Any, name: str) -> datetime:
-    if not isinstance(value, str):
-        raise RunPodManagerError(f"Runpod v2 {name} is missing")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise RunPodManagerError(f"Runpod v2 {name} is invalid") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise RunPodManagerError(f"Runpod v2 {name} is not timezone-aware")
-    return parsed.astimezone(UTC)
 
 
 def _provider_decimal(value: Any, name: str) -> Decimal:

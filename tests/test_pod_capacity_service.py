@@ -27,6 +27,7 @@ from kestrel_cloud_runpod.models import (
 from kestrel_cloud_runpod.pod_capacity_contracts import (
     CatalogPodWorkloadState,
     PodCapacityBillingState,
+    PodCapacityCleanupState,
     PodCapacityConflictError,
     PodCapacityLifecycleError,
     PodCapacitySpec,
@@ -491,6 +492,8 @@ async def test_ambiguous_create_never_retries_and_delayed_visibility_is_adopted(
     assert terminated.state is PodCapacityState.RELEASING
     assert terminated.billing_state is PodCapacityBillingState.PENDING
     assert provider.terminate_calls == ["pod-catalog-1"]
+    persisted_rate = terminated.evidence.realized_placement.hourly_rate_usd
+    provider.realized = replace(provider.realized, hourly_rate_usd=Decimal("0.39"))
 
     provider.billing_receipt = final_receipt(clock)
     await runtime.reconcile()
@@ -499,11 +502,13 @@ async def test_ambiguous_create_never_retries_and_delayed_visibility_is_adopted(
     assert billed.state is PodCapacityState.RELEASED
     assert billed.settlement_ready is True
     assert billed.billing_receipt.actual_cost_usd == Decimal("0.061")
+    assert provider.billing_rates
+    assert all(rate == persisted_rate for rate in provider.billing_rates)
     assert store.revoked == [catalog_request.attempt_id]
 
 
 @pytest.mark.asyncio
-async def test_known_created_mismatch_is_durably_terminated_and_billed(
+async def test_known_created_mismatch_is_cleaned_up_but_billing_stays_unresolved(
     tmp_path,
 ) -> None:
     clock = MutableClock()
@@ -519,17 +524,33 @@ async def test_known_created_mismatch_is_durably_terminated_and_billed(
     with pytest.raises(PodCapacityLifecycleError) as raised:
         await runtime.acquire_catalog(catalog_request)
 
+    assert provider.billing_calls == []
+    assert provider.billing_rates == []
     assert raised.value.billing_risk is False
     assert provider.terminate_calls == ["pod-mismatched-1"]
     durable = runtime.repository.get(catalog_request.capacity_id)
     assert durable.provider_pod_id == "pod-mismatched-1"
-    assert durable.settlement_ready is True
-    assert durable.billing_receipt.provider_pod_id == "pod-mismatched-1"
-    assert store.revoked == [catalog_request.attempt_id]
+    assert durable.state is PodCapacityState.RELEASING
+    assert durable.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert durable.terminated_at is not None
+    assert durable.billing_state is PodCapacityBillingState.UNRESOLVED
+    assert durable.billing_receipt is None
+    assert durable.settlement_ready is False
+    assert durable.evidence.billing is None
+    assert durable.evidence.lifecycle.billing_reconciled_at is None
+    assert store.revoked == []
+    restarted = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    await restarted.reconcile()
+    durable = restarted.repository.get(catalog_request.capacity_id)
+    assert durable.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert durable.billing_state is PodCapacityBillingState.UNRESOLVED
+    assert durable.billing_receipt is None and not durable.settlement_ready
+    assert provider.terminate_calls == ["pod-mismatched-1"]
+    assert provider.billing_calls == provider.billing_rates == []
 
 
 @pytest.mark.asyncio
-async def test_missing_realized_placement_is_durably_terminated_and_billed(
+async def test_missing_realized_placement_is_cleaned_up_but_billing_stays_unresolved(
     tmp_path,
 ) -> None:
     clock = MutableClock()
@@ -543,15 +564,95 @@ async def test_missing_realized_placement_is_durably_terminated_and_billed(
     with pytest.raises(PodCapacityLifecycleError) as raised:
         await runtime.acquire_catalog(catalog_request)
 
+    assert provider.billing_calls == []
+    assert provider.billing_rates == []
     assert raised.value.billing_risk is False
     assert provider.terminate_calls == ["pod-catalog-1"]
     durable = runtime.repository.get(catalog_request.capacity_id)
     assert durable is not None
     assert durable.provider_pod_id == "pod-catalog-1"
-    assert durable.settlement_ready is True
+    assert durable.state is PodCapacityState.RELEASING
+    assert durable.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert durable.terminated_at is not None
+    assert durable.billing_state is PodCapacityBillingState.UNRESOLVED
+    assert durable.billing_receipt is None
+    assert durable.settlement_ready is False
     assert durable.evidence is not None
     assert durable.evidence.realized_placement is None
-    assert store.revoked == [catalog_request.attempt_id]
+    assert durable.evidence.billing is None
+    assert durable.evidence.lifecycle.billing_reconciled_at is None
+    assert store.revoked == []
+    restarted = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    await restarted.reconcile()
+    durable = restarted.repository.get(catalog_request.capacity_id)
+    assert durable.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert durable.billing_state is PodCapacityBillingState.UNRESOLVED
+    assert durable.billing_receipt is None and not durable.settlement_ready
+    assert provider.terminate_calls == ["pod-catalog-1"]
+    assert provider.billing_calls == provider.billing_rates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realized_rate", [Decimal(0), Decimal("0.38"), Decimal("0.4")])
+async def test_billing_uses_exact_original_durable_realized_rate_after_restart(
+    tmp_path, realized_rate
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    provider.realized = replace(provider.realized, hourly_rate_usd=realized_rate)
+    store = FakeCapabilityStore(clock)
+    runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    catalog_request = request(clock)
+    acquired = await runtime.acquire_catalog(catalog_request)
+    assert acquired.evidence.realized_placement.hourly_rate_usd == realized_rate
+    provider.realized = replace(provider.realized, hourly_rate_usd=Decimal("0.39"))
+    provider.billing_receipt = final_receipt(clock)
+
+    restarted = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    released = await restarted.release(catalog_request.capacity_id, reason="test")
+
+    assert released.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert released.billing_state is PodCapacityBillingState.AUTHORITATIVE
+    assert released.settlement_ready
+    assert released.billing_receipt.hourly_price_usd == realized_rate
+    assert provider.billing_rates == [realized_rate]
+    assert released.billing_receipt.actual_cost_usd == Decimal("0.061")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_evidence", [False, True])
+async def test_missing_or_foreign_durable_placement_cannot_authorize_billing(
+    tmp_path, missing_evidence
+):
+    clock = MutableClock()
+    provider = FakeCapacityProvider(clock)
+    store = FakeCapabilityStore(clock)
+    runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    catalog_request = request(clock)
+    acquired = await runtime.acquire_catalog(catalog_request)
+    evidence = (
+        None
+        if missing_evidence
+        else replace(
+            acquired.evidence,
+            realized_placement=replace(
+                acquired.evidence.realized_placement, provider_pod_id="other-pod"
+            ),
+        )
+    )
+    runtime.repository.compare_and_set(acquired, changes={"evidence_json": evidence})
+    provider.billing_receipt = final_receipt(clock)
+    restarted = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+
+    unresolved = await restarted.release(catalog_request.capacity_id, reason="test")
+
+    assert unresolved.provider_pod_id == "pod-catalog-1"
+    assert unresolved.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert unresolved.terminated_at is not None
+    assert unresolved.billing_state is PodCapacityBillingState.UNRESOLVED
+    assert unresolved.billing_receipt is None and not unresolved.settlement_ready
+    assert provider.terminate_calls == ["pod-catalog-1"]
+    assert provider.billing_calls == provider.billing_rates == []
 
 
 @pytest.mark.asyncio

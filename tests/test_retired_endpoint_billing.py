@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -265,6 +266,126 @@ async def _retire(billing_server, *, after=timedelta(minutes=5)):
     state["calls"].clear()
     clock.value = cleanup.verified_absent_at + timedelta(hours=2)
     return state, provider, clock, request, quote, activation, cleanup
+
+
+@pytest.mark.asyncio
+async def test_native_serverless_billing_preserves_complete_official_envelope(
+    billing_server,
+):
+    state, provider, _clock, request, quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    start, until = serverless_billing_hour_bounds(
+        activation.create_started_at, cleanup.verified_absent_at
+    )
+    page = await asyncio.to_thread(
+        provider.control_client.serverless_billing,
+        start_time=iso_datetime(start),
+        end_time=iso_datetime(until),
+        bucket_size="hour",
+        endpoint_id=activation.endpoint_id,
+    )
+    assert set(page.metadata) == {
+        "query",
+        "recordCount",
+        "uniqueServerlessCount",
+        "totals",
+    }
+    assert page.metadata["recordCount"] == len(page.records) == 1
+    assert page.metadata["uniqueServerlessCount"] == 1
+    assert set(page.records[0]) == {
+        "serverlessId",
+        "startTime",
+        "endTime",
+        "totalAmount",
+        "gpuAmount",
+        "cpuAmount",
+        "diskAmount",
+        "feeAmount",
+    }
+    assert set(page.metadata["totals"]) == {
+        "totalAmount",
+        "gpuAmount",
+        "cpuAmount",
+        "diskAmount",
+        "feeAmount",
+    }
+    receipt = await provider.retired_endpoint_billing(
+        request, quote, activation, cleanup
+    )
+    assert receipt.actual_cost_usd == Decimal("0.26")
+    assert receipt.endpoint_hour_costs[0].disk_cost_usd == Decimal("0.02")
+    assert all(path == "/v2/billing/serverless" for _, path, _ in state["calls"])
+
+
+@pytest.mark.asyncio
+async def test_native_serverless_billing_never_discards_unsupported_root_pagination(
+    billing_server,
+):
+    state, provider, _clock, request, quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    state["mutation"] = lambda body: body.update(
+        pagination={"hasNextPage": True, "nextCursor": "not-exhausted"}
+    )
+    with pytest.raises(RunPodManagerError, match="envelope|pagination"):
+        await provider.retired_endpoint_billing(request, quote, activation, cleanup)
+
+
+@pytest.mark.asyncio
+async def test_native_equivalent_api_amounts_keep_serverless_hour_and_lifecycle_identity(
+    billing_server,
+):
+    state, provider, _clock, request, quote, activation, cleanup = await _retire(
+        billing_server
+    )
+
+    def spell_amounts(body, *, floating):
+        for amounts in (*body["records"], body["metadata"]["totals"]):
+            amounts.update(
+                totalAmount=1.0 if floating else 1,
+                gpuAmount=1.0 if floating else 1,
+                cpuAmount=-0.0 if floating else 0,
+                diskAmount=0.0 if floating else 0,
+                feeAmount=0.0 if floating else 0,
+            )
+
+    state["mutation"] = lambda body: spell_amounts(body, floating=False)
+    first = await provider.retired_endpoint_billing(request, quote, activation, cleanup)
+    state["mutation"] = lambda body: spell_amounts(body, floating=True)
+    equivalent = await provider.retired_endpoint_billing(
+        request, quote, activation, cleanup
+    )
+    assert first.actual_cost_usd == equivalent.actual_cost_usd == Decimal(1)
+    assert first.endpoint_hour_costs[0].provider_observation_id == (
+        equivalent.endpoint_hour_costs[0].provider_observation_id
+    )
+    assert first.provider_billing_id == equivalent.provider_billing_id
+    assert first.to_dict() == equivalent.to_dict()
+
+
+def test_published_v015_numeric_spellings_replay_without_rewriting_original_digests():
+    source = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "serverless_billing_v015_numeric_wire.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert source["source_commit"] == "a71d8e7cbed2dd543d82dd12f2f391394a405f2e"
+    assert source["package_version"] == "0.15.0"
+    first, equivalent = source["receipts"]
+    assert first["provider_billing_id"] != equivalent["provider_billing_id"]
+    assert first["endpoint_hour_costs"][0]["cpu_cost_usd"] == "0"
+    assert equivalent["endpoint_hour_costs"][0]["cpu_cost_usd"] == "-0.0"
+    for original in source["receipts"]:
+        replay = ServerlessRetiredEndpointBillingReceipt.from_dict(original)
+        assert replay.to_dict() == original
+        assert replay.provider_billing_id == original["provider_billing_id"]
+        assert (
+            replay.endpoint_hour_costs[0].to_dict()
+            == original["endpoint_hour_costs"][0]
+        )
 
 
 @pytest.mark.asyncio

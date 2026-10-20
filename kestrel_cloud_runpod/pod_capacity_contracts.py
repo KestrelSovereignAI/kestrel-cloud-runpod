@@ -632,7 +632,7 @@ class PodCapacitySpec:
 
 @dataclass(frozen=True)
 class PodBillingReceipt:
-    """Content-free final provider billing evidence for one exact Pod."""
+    """Content-free provider cost observation for one exact Pod, not invoice finality."""
 
     provider_billing_id: str
     provider_pod_id: str | None

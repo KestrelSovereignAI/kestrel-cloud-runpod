@@ -66,6 +66,7 @@ from .ollama_contracts import (
     maximum_serverless_cold_starts,
 )
 from .ollama_service import OllamaLeaseService
+from .pod_billing import read_exact_pod_billing
 from .pod_capacity_contracts import (
     CatalogArtifactHandoffEvidence,
     CatalogAttemptCapability,
@@ -269,6 +270,7 @@ __all__ = [
     "maximum_serverless_cold_starts",
     "pod_capacity_database_path",
     "pod_cost_usd",
+    "read_exact_pod_billing",
     "serverless_billing_hour_bounds",
     "serverless_billing_hour_starts",
     "serverless_endpoint_hour_cost_totals",

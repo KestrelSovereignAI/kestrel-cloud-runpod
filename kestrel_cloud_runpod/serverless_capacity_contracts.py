@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
+from .billing import billing_hour_bounds, exact_decimal_sum
 from .models import (
     Availability,
     CloudType,
@@ -1858,15 +1859,7 @@ def serverless_billing_hour_bounds(
 
     require_aware(started_at, "started_at")
     require_aware(coverage_until, "coverage_until")
-    start = started_at.astimezone(UTC)
-    coverage_until = coverage_until.astimezone(UTC)
-    if coverage_until <= start:
-        raise ValueError("Serverless billable coverage interval is invalid")
-    first = start.replace(minute=0, second=0, microsecond=0)
-    window_until = coverage_until.replace(minute=0, second=0, microsecond=0)
-    if coverage_until != window_until:
-        window_until += timedelta(hours=1)
-    return first, window_until
+    return billing_hour_bounds(started_at, coverage_until)
 
 
 @dataclass(frozen=True)
@@ -2038,11 +2031,13 @@ class ServerlessBillingReceipt:
             ("actual_cost_usd", self.actual_cost_usd),
         ):
             _nonnegative_decimal(value, name)
-        if self.actual_cost_usd != (
-            self.gpu_cost_usd
-            + self.cpu_cost_usd
-            + self.disk_cost_usd
-            + self.fee_cost_usd
+        if self.actual_cost_usd != exact_decimal_sum(
+            (
+                self.gpu_cost_usd,
+                self.cpu_cost_usd,
+                self.disk_cost_usd,
+                self.fee_cost_usd,
+            )
         ):
             raise ValueError("Serverless billing components do not equal total cost")
         observed_job_ms = sum(
@@ -2324,11 +2319,13 @@ class ServerlessEndpointHourCost:
             ("actual_cost_usd", self.actual_cost_usd),
         ):
             _nonnegative_decimal(value, name)
-        if self.actual_cost_usd != (
-            self.gpu_cost_usd
-            + self.cpu_cost_usd
-            + self.disk_cost_usd
-            + self.fee_cost_usd
+        if self.actual_cost_usd != exact_decimal_sum(
+            (
+                self.gpu_cost_usd,
+                self.cpu_cost_usd,
+                self.disk_cost_usd,
+                self.fee_cost_usd,
+            )
         ):
             raise ValueError(
                 "Serverless endpoint-hour cost components do not equal total"
@@ -2620,11 +2617,13 @@ class ServerlessAmbiguousWindowBillingReceipt:
             ("operator_loss_usd", self.operator_loss_usd),
         ):
             _nonnegative_decimal(value, name)
-        if self.actual_cost_usd != (
-            self.gpu_cost_usd
-            + self.cpu_cost_usd
-            + self.disk_cost_usd
-            + self.fee_cost_usd
+        if self.actual_cost_usd != exact_decimal_sum(
+            (
+                self.gpu_cost_usd,
+                self.cpu_cost_usd,
+                self.disk_cost_usd,
+                self.fee_cost_usd,
+            )
         ):
             raise ValueError(
                 "Serverless ambiguous billing components do not equal total cost"
@@ -2641,7 +2640,9 @@ class ServerlessAmbiguousWindowBillingReceipt:
             self.actual_cost_usd, self.accepted_cost_ceiling_usd
         ):
             raise ValueError("Serverless ambiguous capped cost is inconsistent")
-        if self.operator_loss_usd != self.actual_cost_usd - self.capped_cost_usd:
+        if self.operator_loss_usd != exact_decimal_sum(
+            (self.actual_cost_usd, self.capped_cost_usd.copy_negate())
+        ):
             raise ValueError("Serverless ambiguous operator loss is inconsistent")
 
     def to_dict(self) -> dict[str, Any]:
@@ -2918,7 +2919,7 @@ def serverless_endpoint_hour_cost_totals(
     """Sum the canonical endpoint-hour component amounts without rounding."""
 
     return {
-        name: sum((getattr(item, name) for item in values), start=Decimal(0))
+        name: exact_decimal_sum(getattr(item, name) for item in values)
         for name in _SERVERLESS_COST_FIELD_NAMES
     }
 

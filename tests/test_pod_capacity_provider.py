@@ -13,6 +13,7 @@ from pod_capacity_test_support import (
     request,
 )
 
+from kestrel_cloud_runpod.billing import billing_hour_bounds
 from kestrel_cloud_runpod.models import (
     Availability,
     BillingPage,
@@ -57,6 +58,44 @@ def _spec(clock: MutableClock) -> PodCapacitySpec:
         capability_token_sha256="a" * 64,
         capability_expires_at=item.bearer_expires_at,
         attempt_environment_sha256=attempt_environment_sha256(item.attempt_environment),
+    )
+
+
+def _billing_history(created, terminated, amount, *, partial=False) -> BillingPage:
+    first, until = billing_hour_bounds(created, terminated)
+    amounts = {
+        "totalAmount": amount or 0,
+        "gpuAmount": amount or 0,
+        "cpuAmount": 0,
+        "diskAmount": 0,
+    }
+    records = (
+        ()
+        if amount is None
+        else (
+            {
+                "podId": "pod-catalog-1",
+                "startTime": first.isoformat(),
+                "endTime": (
+                    until - timedelta(seconds=1) if partial else until
+                ).isoformat(),
+                **amounts,
+            },
+        )
+    )
+    return BillingPage(
+        records=records,
+        metadata={
+            "query": {
+                "podId": "pod-catalog-1",
+                "bucketSize": "hour",
+                "startTime": first.isoformat(),
+                "endTime": until.isoformat(),
+            },
+            "recordCount": len(records),
+            "uniquePodCount": 1 if records else 0,
+            "totals": amounts,
+        },
     )
 
 
@@ -236,35 +275,8 @@ async def test_final_billing_waits_for_records_then_returns_content_free_receipt
     terminated = clock()
     created = terminated - timedelta(minutes=10)
     pages = [
-        BillingPage(
-            records=(),
-            metadata={
-                "query": {
-                    "podId": "pod-catalog-1",
-                    "startTime": created.isoformat(),
-                    "endTime": terminated.isoformat(),
-                },
-                "totals": {"totalAmount": 0},
-            },
-        ),
-        BillingPage(
-            records=(
-                {
-                    "podId": "pod-catalog-1",
-                    "startTime": created.isoformat(),
-                    "endTime": terminated.isoformat(),
-                    "totalAmount": 0.061,
-                },
-            ),
-            metadata={
-                "query": {
-                    "podId": "pod-catalog-1",
-                    "startTime": created.isoformat(),
-                    "endTime": terminated.isoformat(),
-                },
-                "totals": {"totalAmount": 0.061},
-            },
-        ),
+        _billing_history(created, terminated, None),
+        _billing_history(created, terminated, 0.061),
     ]
     client = SimpleNamespace(pod_billing=lambda **_: pages.pop(0))
     provider = RunpodPodCapacityProvider(SimpleNamespace(client=client), clock=clock)
@@ -288,7 +300,8 @@ async def test_final_billing_waits_for_records_then_returns_content_free_receipt
     )
     assert receipt is not None
     assert receipt.actual_cost_usd == Decimal("0.061")
-    assert receipt.billed_seconds == 600
+    # Provider buckets cover a full hour, not 600 seconds of GPU activity.
+    assert receipt.billed_seconds == 3600
     assert receipt.provider_billing_id.startswith("runpod-billing:")
     assert hashlib.sha256(b"private").hexdigest() not in str(receipt)
 
@@ -299,25 +312,7 @@ async def test_final_billing_waits_until_records_cover_termination() -> None:
     spec = _spec(clock)
     terminated = clock()
     created = terminated - timedelta(minutes=10)
-    partial_end = terminated - timedelta(seconds=1)
-    page = BillingPage(
-        records=(
-            {
-                "podId": "pod-catalog-1",
-                "startTime": created.isoformat(),
-                "endTime": partial_end.isoformat(),
-                "totalAmount": 0.06,
-            },
-        ),
-        metadata={
-            "query": {
-                "podId": "pod-catalog-1",
-                "startTime": created.isoformat(),
-                "endTime": terminated.isoformat(),
-            },
-            "totals": {"totalAmount": 0.06},
-        },
-    )
+    page = _billing_history(created, terminated, 0.06, partial=True)
     provider = RunpodPodCapacityProvider(
         SimpleNamespace(client=SimpleNamespace(pod_billing=lambda **_: page)),
         clock=clock,
@@ -352,24 +347,7 @@ async def test_receipt_records_the_realized_rate_not_the_accepted_one(
     terminated = clock()
     created = terminated - timedelta(seconds=600)
     clock.value += timedelta(seconds=1)
-    page = BillingPage(
-        records=(
-            {
-                "podId": "pod-catalog-1",
-                "startTime": created.isoformat(),
-                "endTime": terminated.isoformat(),
-                "totalAmount": 0.061,
-            },
-        ),
-        metadata={
-            "query": {
-                "podId": "pod-catalog-1",
-                "startTime": created.isoformat(),
-                "endTime": terminated.isoformat(),
-            },
-            "totals": {"totalAmount": 0.061},
-        },
-    )
+    page = _billing_history(created, terminated, 0.061)
     client = SimpleNamespace(pod_billing=lambda **_: page)
     provider = RunpodPodCapacityProvider(SimpleNamespace(client=client), clock=clock)
 

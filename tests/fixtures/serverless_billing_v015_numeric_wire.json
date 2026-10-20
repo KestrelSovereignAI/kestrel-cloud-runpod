@@ -1,0 +1,136 @@
+{
+  "package_version": "0.15.0",
+  "receipts": [
+    {
+      "activation": {
+        "activated_at": "2026-08-03T10:00:00+00:00",
+        "contract_version": "serverless-capacity-v1",
+        "create_started_at": "2026-08-03T10:00:00+00:00",
+        "endpoint_id": "endpoint-planned-01",
+        "endpoint_name": "kestrel-selfie-run-0001",
+        "endpoint_readback_sha256": "f63726de6213136cffc3a16a8a5f96e641494e95ee26ff4db8ac7f9cfba31596",
+        "endpoint_spec_sha256": "a83b38bb215bbcf8957e393040564255e06e4044126902b1d1a95acec895af7e",
+        "operation_digest": "eb37c75054b321071617042673dae19d4927999bf99b89755f6c2f87576b1f44",
+        "plan_id": "selfie-run-0001",
+        "plan_sha256": "5bb971828d85909a950e8cf293001172e0e8541f310a5ef1351fd62fac191b57",
+        "provider_activation_id": "runpod-serverless-activation:1f877cd4602999b09b64d1870183e46f7ea58e1c1b2b9f6cdc8bef1994316a02",
+        "provider_quote_id": "runpod-serverless-plan:d9ba20e3544858d9253bb5f32d0d76107c25a08f90134d0c5d62b4cdf7b4a1fd",
+        "quote_sha256": "a4b744029692a4ac62a83a009e1c14e7611e2979a9e603f0e31a3dd2edf0c257",
+        "readback_at": "2026-08-03T10:00:00+00:00",
+        "reconciled_after_ambiguous_create": false,
+        "schema_version": 1
+      },
+      "cleanup": {
+        "cleanup_basis": "delete_acknowledged",
+        "cleanup_evidence_version": 2,
+        "contract_version": "serverless-capacity-v1",
+        "delete_started_at": "2026-08-03T10:05:00+00:00",
+        "endpoint_id": "endpoint-planned-01",
+        "endpoint_name": "kestrel-selfie-run-0001",
+        "endpoint_readback_sha256": "f63726de6213136cffc3a16a8a5f96e641494e95ee26ff4db8ac7f9cfba31596",
+        "endpoint_spec_sha256": "a83b38bb215bbcf8957e393040564255e06e4044126902b1d1a95acec895af7e",
+        "operation_digest": "eb37c75054b321071617042673dae19d4927999bf99b89755f6c2f87576b1f44",
+        "provider_activation_id": "runpod-serverless-activation:1f877cd4602999b09b64d1870183e46f7ea58e1c1b2b9f6cdc8bef1994316a02",
+        "provider_cleanup_id": "runpod-serverless-cleanup:fba952881c195d5e0dcb9121bbb561ae036286572123fd11c791ae8736c8b5da",
+        "provider_quote_id": "runpod-serverless-plan:d9ba20e3544858d9253bb5f32d0d76107c25a08f90134d0c5d62b4cdf7b4a1fd",
+        "quote_sha256": "a4b744029692a4ac62a83a009e1c14e7611e2979a9e603f0e31a3dd2edf0c257",
+        "reconciled_after_delete_error": false,
+        "schema_version": 1,
+        "verified_absent_at": "2026-08-03T10:05:00+00:00",
+        "workers_zero_observed_at": "2026-08-03T10:05:00+00:00"
+      },
+      "contract_version": "serverless-capacity-v1",
+      "cost_scope": "endpoint_lifecycle",
+      "cost_totals": {
+        "actual_cost_usd": "1",
+        "cpu_cost_usd": "0",
+        "disk_cost_usd": "0",
+        "fee_cost_usd": "0",
+        "gpu_cost_usd": "1"
+      },
+      "endpoint_hour_costs": [
+        {
+          "actual_cost_usd": "1",
+          "cpu_cost_usd": "0",
+          "disk_cost_usd": "0",
+          "endpoint_id": "endpoint-planned-01",
+          "fee_cost_usd": "0",
+          "gpu_cost_usd": "1",
+          "provider_observation_id": "runpod-serverless-hour:cdb4fb08ff5da06a4693c6a50689c15745cd4bf159f00d69c2364965eadcba29",
+          "utc_hour_end": "2026-08-03T11:00:00+00:00",
+          "utc_hour_start": "2026-08-03T10:00:00+00:00"
+        }
+      ],
+      "provider_billing_id": "runpod-retired-endpoint-billing:8a4212c3cbbc07fc2d7de49d4c3158a4eed90a660cfe91fd9ff11f7527d5a89e",
+      "provider_finality_confirmed": false,
+      "reconciled_at": "2026-08-03T12:05:00+00:00",
+      "schema_version": 1
+    },
+    {
+      "activation": {
+        "activated_at": "2026-08-03T10:00:00+00:00",
+        "contract_version": "serverless-capacity-v1",
+        "create_started_at": "2026-08-03T10:00:00+00:00",
+        "endpoint_id": "endpoint-planned-01",
+        "endpoint_name": "kestrel-selfie-run-0001",
+        "endpoint_readback_sha256": "f63726de6213136cffc3a16a8a5f96e641494e95ee26ff4db8ac7f9cfba31596",
+        "endpoint_spec_sha256": "a83b38bb215bbcf8957e393040564255e06e4044126902b1d1a95acec895af7e",
+        "operation_digest": "eb37c75054b321071617042673dae19d4927999bf99b89755f6c2f87576b1f44",
+        "plan_id": "selfie-run-0001",
+        "plan_sha256": "5bb971828d85909a950e8cf293001172e0e8541f310a5ef1351fd62fac191b57",
+        "provider_activation_id": "runpod-serverless-activation:1f877cd4602999b09b64d1870183e46f7ea58e1c1b2b9f6cdc8bef1994316a02",
+        "provider_quote_id": "runpod-serverless-plan:d9ba20e3544858d9253bb5f32d0d76107c25a08f90134d0c5d62b4cdf7b4a1fd",
+        "quote_sha256": "a4b744029692a4ac62a83a009e1c14e7611e2979a9e603f0e31a3dd2edf0c257",
+        "readback_at": "2026-08-03T10:00:00+00:00",
+        "reconciled_after_ambiguous_create": false,
+        "schema_version": 1
+      },
+      "cleanup": {
+        "cleanup_basis": "delete_acknowledged",
+        "cleanup_evidence_version": 2,
+        "contract_version": "serverless-capacity-v1",
+        "delete_started_at": "2026-08-03T10:05:00+00:00",
+        "endpoint_id": "endpoint-planned-01",
+        "endpoint_name": "kestrel-selfie-run-0001",
+        "endpoint_readback_sha256": "f63726de6213136cffc3a16a8a5f96e641494e95ee26ff4db8ac7f9cfba31596",
+        "endpoint_spec_sha256": "a83b38bb215bbcf8957e393040564255e06e4044126902b1d1a95acec895af7e",
+        "operation_digest": "eb37c75054b321071617042673dae19d4927999bf99b89755f6c2f87576b1f44",
+        "provider_activation_id": "runpod-serverless-activation:1f877cd4602999b09b64d1870183e46f7ea58e1c1b2b9f6cdc8bef1994316a02",
+        "provider_cleanup_id": "runpod-serverless-cleanup:fba952881c195d5e0dcb9121bbb561ae036286572123fd11c791ae8736c8b5da",
+        "provider_quote_id": "runpod-serverless-plan:d9ba20e3544858d9253bb5f32d0d76107c25a08f90134d0c5d62b4cdf7b4a1fd",
+        "quote_sha256": "a4b744029692a4ac62a83a009e1c14e7611e2979a9e603f0e31a3dd2edf0c257",
+        "reconciled_after_delete_error": false,
+        "schema_version": 1,
+        "verified_absent_at": "2026-08-03T10:05:00+00:00",
+        "workers_zero_observed_at": "2026-08-03T10:05:00+00:00"
+      },
+      "contract_version": "serverless-capacity-v1",
+      "cost_scope": "endpoint_lifecycle",
+      "cost_totals": {
+        "actual_cost_usd": "1.0",
+        "cpu_cost_usd": "0.0",
+        "disk_cost_usd": "0.0",
+        "fee_cost_usd": "0.0",
+        "gpu_cost_usd": "1.0"
+      },
+      "endpoint_hour_costs": [
+        {
+          "actual_cost_usd": "1.0",
+          "cpu_cost_usd": "-0.0",
+          "disk_cost_usd": "0.0",
+          "endpoint_id": "endpoint-planned-01",
+          "fee_cost_usd": "0.0",
+          "gpu_cost_usd": "1.0",
+          "provider_observation_id": "runpod-serverless-hour:4856b1caacce8a4a14a50d320489ae738e2acb50a553cbe10ddd2f3589e95149",
+          "utc_hour_end": "2026-08-03T11:00:00+00:00",
+          "utc_hour_start": "2026-08-03T10:00:00+00:00"
+        }
+      ],
+      "provider_billing_id": "runpod-retired-endpoint-billing:38b99398b85a82c13cc86201ee49b62656d67f6fc1825c566ea09107ff40b2dc",
+      "provider_finality_confirmed": false,
+      "reconciled_at": "2026-08-03T12:05:00+00:00",
+      "schema_version": 1
+    }
+  ],
+  "source_commit": "a71d8e7cbed2dd543d82dd12f2f391394a405f2e"
+}
