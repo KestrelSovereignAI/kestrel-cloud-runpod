@@ -15,7 +15,6 @@ from ollama_test_support import (
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseAuthorizationError,
-    accrued_cost,
     OllamaLeaseConflictError,
     OllamaLeaseReadinessError,
     OllamaLeaseState,
@@ -23,6 +22,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaResourceType,
     OllamaTeardownState,
     ProvisionedOllamaResource,
+    accrued_cost,
     provision_attempt_id,
     resource_name,
 )
@@ -347,7 +347,7 @@ async def test_release_does_not_orphan_late_ambiguous_creation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_uncertain_creation_is_not_declared_absent_before_reconcile_window(
+async def test_uncertain_creation_is_not_declared_absent_after_reconcile_window(
     tmp_path,
 ):
     clock = MutableClock()
@@ -366,7 +366,9 @@ async def test_uncertain_creation_is_not_declared_absent_before_reconcile_window
     clock.advance(11)
     results = await service.reconcile()
 
-    assert results[0].state is OllamaLeaseState.TERMINATED
+    assert results[0].state is OllamaLeaseState.RELEASING
+    assert results[0].creation_uncertain is True
+    assert results[0].teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
     assert provider.teardown_calls == 0
 
 

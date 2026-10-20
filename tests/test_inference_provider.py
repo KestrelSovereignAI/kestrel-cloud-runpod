@@ -573,19 +573,26 @@ class _FailingProvisionProvider(FakeOllamaProvider):
 
 
 @pytest.mark.asyncio
-async def test_failed_acquire_is_sanitized_and_durable(tmp_path):
+async def test_uncertain_acquire_is_sanitized_durable_and_not_final_failure(tmp_path):
     clock = MutableClock()
     capacity = _FailingProvisionProvider(serverless_plan())
-    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    adapter, service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
     request = _request(clock)
     quote = await adapter.quote(request)
 
-    failed = await adapter.acquire(request, quote)
+    pending = await adapter.acquire(request, quote)
 
-    assert failed.state is InferenceLeaseState.FAILED
-    assert failed.failure is not None
-    assert "secret.invalid" not in failed.failure.message
-    assert "hidden" not in failed.failure.message
+    assert pending.state is InferenceLeaseState.PENDING
+    assert pending.failure is None
+    assert pending.route is None
+    durable = service.repository.get(pending.lease_id)
+    assert durable.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert durable.creation_uncertain is True
+    assert durable.last_provider_error
+    assert "secret.invalid" not in durable.last_provider_error
+    assert "hidden" not in durable.last_provider_error
+    assert "secret.invalid" not in repr(pending)
+    assert "hidden" not in repr(pending)
 
 
 @pytest.mark.asyncio

@@ -11,9 +11,9 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .effect_custody import await_owned_effect
 from .models import (
     ComputeProduct,
-    RunPodAmbiguousResultError,
     RunPodManagerError,
 )
 from .ollama_contracts import (
@@ -194,22 +194,30 @@ class OllamaLeaseService:
             selected_gpu_name=plan.placement.gpu_name,
             catalog_observed_at=plan.placement.catalog_observed_at,
         )
+        return await await_owned_effect(
+            self._provision_effect(lease, request, plan, provider_name)
+        )
+
+    async def _provision_effect(
+        self,
+        lease: OllamaLease,
+        request: OllamaLeaseRequest,
+        plan: OllamaPlacementPlan,
+        provider_name: str,
+    ) -> OllamaLease:
+        """Keep the original admitted create and its durable receipt together."""
+
         try:
             resource = await self.provider.provision(
                 request=request, plan=plan, resource_name=provider_name
             )
-        except RunPodAmbiguousResultError as exc:
+        except RunPodManagerError as exc:
+            # A response decoding/placement failure can happen AFTER the
+            # provider accepted POST. Only planning failures before this
+            # admitted effect prove that no create was attempted.
             self._transition(
                 lease,
                 OllamaLeaseState.RECONCILE_REQUIRED,
-                last_provider_error=sanitize_provider_error(exc),
-            )
-            raise
-        except RunPodManagerError as exc:
-            self._transition(
-                lease,
-                OllamaLeaseState.FAILED,
-                creation_uncertain=False,
                 last_provider_error=sanitize_provider_error(exc),
             )
             raise
@@ -595,6 +603,11 @@ class OllamaLeaseService:
             lease,
             changes={"teardown_attempts": lease.teardown_attempts + 1},
         )
+        return await await_owned_effect(self._teardown_effect(lease, reason=reason))
+
+    async def _teardown_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:
+        """Join physical deletion, exact absence readback and receipt persistence."""
+
         try:
             await self.provider.teardown(resource_from_lease(lease))
         except RunPodManagerError as exc:
@@ -658,21 +671,16 @@ class OllamaLeaseService:
                     "last_provider_error": None,
                 },
             )
-        if self._now() < lease.readiness_deadline:
-            return self.repository.compare_and_set(
-                lease,
-                changes={
-                    "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
-                    "last_provider_error": (
-                        f"{reason}: awaiting ambiguous creation reconciliation"
-                    ),
-                },
-            )
+        # Neither elapsed time nor even a complete empty inventory says that
+        # the original POST was rejected. A late accepted create must remain
+        # discoverable after every readiness, idle and hard deadline.
         return self.repository.compare_and_set(
             lease,
             changes={
-                "creation_uncertain": False,
-                "last_provider_error": None,
+                "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
+                "last_provider_error": (
+                    f"{reason}: awaiting ambiguous creation reconciliation"
+                ),
             },
         )
 
