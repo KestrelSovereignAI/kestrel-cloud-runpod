@@ -26,13 +26,35 @@ the same container settings and `RunpodControlPlaneClient.create_pod` path.
 CPU requests reject GPU/CUDA options, persistent container mounts and global
 networking. A single explicit network-volume mount is supported.
 
-These request types are provider primitives. CPU catalog selection, accepted
-quotes, durable environment custody, browser transport and visual conformance
-remain tracked in [#43](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/43).
+These request types are provider primitives. Accepted quotes, durable environment
+custody, browser transport and visual conformance remain tracked in
+[#43](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/43).
 The existing GPU tools, inference profiles and capacity service remain GPU-only.
 `PodResource.cost_per_hr` is `None` when the provider omits its rate; a reported
 zero remains zero. A malformed successful create response requires reconciliation
 and never authorizes automatic replay.
+
+## CPU catalog discovery
+
+`RunpodControlPlaneClient.list_cpus(product=ComputeProduct.POD, vcpu_count=4)`
+reads the v2 CPU catalog with availability scoped to that exact product/count.
+The immutable snapshot retains its observation time, flavor bounds, RAM ratios,
+separate Pod/Serverless rates and per-datacenter stock. Unknown stock or price
+stays unknown; example prices are never defaults.
+
+`snapshot.match_pod(request, now=..., max_age=...)` checks a CPU request against
+those facts. It requires explicit datacenters, a matching secure Pod query,
+a supported flavor/count, fresh observations and sufficient stock in every
+requested datacenter. It refuses a mismatch instead of selecting another region,
+product or flavor. The returned compute rate is per Pod, multiplied by vCPUs;
+it excludes disk, storage, transfer and other charges. RAM is derived from the
+flavor ratio. Calculations are independent of ambient decimal precision.
+
+A catalog match is neither a reservation nor an accepted spend quote. Placement
+may change after observation, and network-volume attachment compatibility needs
+separate validation. The environment provider must still acquire fresh all-in
+pricing, authorization and durable cleanup custody before provisioning.
+No CPU provisioning tool is registered by this package yet.
 
 ## Configuration
 

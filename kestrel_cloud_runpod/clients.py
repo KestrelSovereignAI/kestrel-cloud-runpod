@@ -14,6 +14,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from .cpu_catalog import CpuCatalogSnapshot, validate_cpu_query
 from .models import (
     CONTROL_PLANE_BASE_URL,
     SERVERLESS_DATA_PLANE_BASE_URL,
@@ -399,6 +400,27 @@ class RunpodControlPlaneClient:
             self.transport.request_json("GET", f"/catalog/gpus/{_segment(gpu_id)}")
         )
         return GPUOffer.from_dict(payload)
+
+    def list_cpus(
+        self, *, product: ComputeProduct, vcpu_count: int
+    ) -> CpuCatalogSnapshot:
+        """Read stock for one explicit product/count, preserving query context."""
+        validate_cpu_query(product, vcpu_count)
+        observed_at = datetime.now(timezone.utc)
+        payload = _required_payload(
+            self.transport.request_json(
+                "GET",
+                "/catalog/cpus",
+                params={
+                    "include": "AVAILABILITY",
+                    "product": product.value,
+                    "vcpuCount": vcpu_count,
+                },
+            )
+        )
+        return CpuCatalogSnapshot.from_response(
+            payload, product=product, vcpu_count=vcpu_count, observed_at=observed_at
+        )
 
     def create_pod(self, request: PodCreateRequest | CpuPodCreateRequest) -> PodResource:
         payload = self.transport.request_json(

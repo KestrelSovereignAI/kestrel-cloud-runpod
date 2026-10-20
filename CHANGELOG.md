@@ -2,6 +2,16 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.17.0] - 2026-10-20
+
+### Added
+
+- Add typed v2 CPU catalog reads with explicit product/count context, immutable
+  stock and price facts, and request-start observation time.
+- Match CPU Pod requests against fresh flavor/count/datacenter stock without
+  fallback or paid creation. Preserve unknown rates and calculate compute-only
+  cost and RAM independently of ambient decimal precision.
+
 ## [0.16.0] - 2026-10-20
 
 ### Added
