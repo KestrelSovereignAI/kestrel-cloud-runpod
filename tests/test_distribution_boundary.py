@@ -1,5 +1,7 @@
 """Build real archives with unrelated local metadata and inspect their bytes."""
 
+import base64
+import csv
 import hashlib
 import io
 import shutil
@@ -141,6 +143,137 @@ def test_real_archive_envelope_verifier_and_cli(native_distribution):
         verify_distribution(artifact, source_root=root)
     checked = _run_gate(root, output)
     assert checked.returncode == 0, checked.stdout + checked.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["dependencies", "entry_points", "wheel_tag", "record", "sdist_dependencies"],
+)
+def test_install_metadata_cannot_drift_with_valid_source_and_record(
+    native_distribution, tmp_path, mutation
+):
+    root, output = native_distribution
+    source = next(
+        output.glob("*.tar.gz" if mutation == "sdist_dependencies" else "*.whl")
+    )
+    verify_distribution(source, source_root=root)
+    changed = tmp_path / "install-metadata" / source.name
+    changed.parent.mkdir()
+    if mutation == "sdist_dependencies":
+        with tarfile.open(source) as archive:
+            entries = []
+            for member in archive.getmembers():
+                with archive.extractfile(member) as stream:
+                    entries.append((member, stream.read()))
+        with tarfile.open(changed, "w:gz") as archive:
+            for member, value in entries:
+                if member.name.endswith("/PKG-INFO"):
+                    assert b"Requires-Dist:" in value
+                    value = b"\n".join(
+                        line
+                        for line in value.split(b"\n")
+                        if not line.startswith(b"Requires-Dist:")
+                    )
+                member.size = len(value)
+                archive.addfile(member, io.BytesIO(value))
+    else:
+        with zipfile.ZipFile(source) as archive:
+            entries = {
+                entry.filename: (entry, archive.read(entry.filename))
+                for entry in archive.infolist()
+            }
+        metadata = next(name for name in entries if name.endswith("/METADATA"))
+        folder = metadata.rsplit("/", 1)[0]
+        target = {
+            "dependencies": metadata,
+            "entry_points": folder + "/entry_points.txt",
+            "wheel_tag": folder + "/WHEEL",
+            "record": folder + "/RECORD",
+        }[mutation]
+        info, value = entries[target]
+        if mutation == "dependencies":
+            assert b"Requires-Dist:" in value
+            value = b"\n".join(
+                line
+                for line in value.split(b"\n")
+                if not line.startswith(b"Requires-Dist:")
+            )
+        elif mutation == "wheel_tag":
+            assert b"Tag: py3-none-any" in value
+            value = value.replace(
+                b"Tag: py3-none-any", b"Tag: py3-none-missing_platform"
+            )
+        else:
+            value = b""
+        entries[target] = info, value
+        if mutation != "record":
+            # Preserve valid RECORD hashes, so a checksum-only patch cannot
+            # falsely satisfy the semantic metadata corruption regressions.
+            record = io.StringIO(newline="")
+            writer = csv.writer(record, lineterminator="\n")
+            for name, (_entry, body) in entries.items():
+                if name.endswith("/RECORD"):
+                    writer.writerow((name, "", ""))
+                else:
+                    digest = (
+                        base64.urlsafe_b64encode(hashlib.sha256(body).digest())
+                        .rstrip(b"=")
+                        .decode("ascii")
+                    )
+                    writer.writerow((name, "sha256=" + digest, len(body)))
+            info, _value = entries[folder + "/RECORD"]
+            entries[folder + "/RECORD"] = info, record.getvalue().encode("utf-8")
+        with zipfile.ZipFile(changed, "w") as archive:
+            for entry, value in entries.values():
+                archive.writestr(entry, value)
+    with pytest.raises(ValueError, match="install metadata"):
+        verify_distribution(changed, source_root=root)
+
+
+def test_metadata_frontend_absence_refuses_without_backend_fallback(
+    native_distribution, monkeypatch
+):
+    root, output = native_distribution
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(ValueError, match="Canonical install metadata build failed"):
+        verify_distribution(next(output.glob("*.whl")), source_root=root)
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout"])
+def test_native_frontend_failure_refuses_install_metadata(
+    native_distribution, tmp_path, monkeypatch, failure
+):
+    root, output = native_distribution
+    verify_distribution(next(output.glob("*.whl")), source_root=root)
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    executable = frontend / "uv"
+    operation = (
+        "import sys; sys.exit(17)"
+        if failure == "exit"
+        else "import time; time.sleep(5)"
+    )
+    executable.write_text(f"#!{sys.executable}\n{operation}\n", encoding="utf-8")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(frontend))
+    if failure == "timeout":
+        # Only bound the genuine child process's wait; never synthesize its
+        # result/error or bypass native subprocess cleanup.
+        original_run = subprocess.run
+
+        def bounded_run(*args, **kwargs):
+            return original_run(*args, **{**kwargs, "timeout": 0.1})
+
+        monkeypatch.setattr(subprocess, "run", bounded_run)
+    with pytest.raises(
+        ValueError, match="Canonical install metadata build failed"
+    ) as error:
+        verify_distribution(next(output.glob("*.whl")), source_root=root)
+    if failure == "exit":
+        assert isinstance(error.value.__cause__, subprocess.CalledProcessError)
+        assert error.value.__cause__.returncode == 17
+    else:
+        assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
 
 
 @pytest.mark.parametrize("marker", ["uv_marker", "modified_marker", "linked_marker"])

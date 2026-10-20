@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import stat
+import subprocess
 import tarfile
+import tempfile
 import tomllib
 import zipfile
 from collections.abc import Callable, Mapping
@@ -67,6 +69,16 @@ def verify_distribution(artifact: Path, *, source_root: Path) -> None:
             ):
                 raise ValueError("Wheel license differs from canonical root license")
             _check_metadata(archive.read(f"{metadata}/METADATA"), project)
+            _check_install_metadata(
+                artifact_name=artifact.name,
+                source_root=source_root,
+                kind="wheel",
+                expected_names=tuple(
+                    f"{metadata}/{item}"
+                    for item in ("METADATA", "WHEEL", "RECORD", "entry_points.txt")
+                ),
+                read=archive.read,
+            )
         return
 
     if artifact.name != f"{name}-{version}.tar.gz":
@@ -96,6 +108,13 @@ def verify_distribution(artifact: Path, *, source_root: Path) -> None:
 
         _check_bytes(expected_bytes, read)
         _check_metadata(read("PKG-INFO"), project)
+        _check_install_metadata(
+            artifact_name=artifact.name,
+            source_root=source_root,
+            kind="sdist",
+            expected_names=(prefix + "PKG-INFO",),
+            read=lambda name: read(name.removeprefix(prefix)),
+        )
 
 
 def _check_bytes(expected: Mapping[str, bytes], read: Callable[[str], bytes]) -> None:
@@ -109,6 +128,61 @@ def _check_metadata(value: bytes, project: Mapping[str, object]) -> None:
         project["version"]
     ]:
         raise ValueError("Archive metadata differs from canonical project identity")
+
+
+def _check_install_metadata(
+    *,
+    artifact_name: str,
+    source_root: Path,
+    kind: str,
+    expected_names: tuple[str, ...],
+    read: Callable[[str], bytes],
+) -> None:
+    """Use the actual configured build tool, not another metadata serializer.
+
+    The independent finite envelope/source checks still constrain what the
+    backend may collect. Rebuilding only supplies canonical generated install
+    metadata, including dependency/entry-point declarations and RECORD hashes.
+    The same uv frontend resolves the source's declared build-system backend;
+    the gate needs no globally installed or separately chosen metadata backend.
+    """
+    with tempfile.TemporaryDirectory(prefix="runpod-canonical-metadata-") as temporary:
+        try:
+            subprocess.run(
+                [
+                    "uv",
+                    "build",
+                    "--wheel" if kind == "wheel" else "--sdist",
+                    "--out-dir",
+                    temporary,
+                ],
+                cwd=source_root,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+            )
+        except (
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            raise ValueError("Canonical install metadata build failed") from error
+        canonical = Path(temporary) / artifact_name
+        if kind == "wheel":
+            with zipfile.ZipFile(canonical) as archive:
+                if any(read(name) != archive.read(name) for name in expected_names):
+                    raise ValueError(
+                        "Archive install metadata differs from canonical build"
+                    )
+        else:
+            with tarfile.open(canonical, "r:gz") as archive:
+                for name in expected_names:
+                    with archive.extractfile(name) as stream:
+                        if read(name) != stream.read():
+                            raise ValueError(
+                                "Archive install metadata differs from canonical build"
+                            )
 
 
 def main() -> None:
