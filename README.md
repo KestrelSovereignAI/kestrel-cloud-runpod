@@ -24,7 +24,8 @@ Construct requests with keyword arguments. CPU requests specify `cpu_id` and
 `vcpu_count`; Runpod assigns RAM from the selected flavor. Both variants share
 the same container settings and `RunpodControlPlaneClient.create_pod` path.
 CPU requests reject GPU/CUDA options, persistent container mounts and global
-networking. A single explicit network-volume mount is supported.
+networking. Only a single explicit network-volume mount is supported;
+global-volume mounts are intentionally unsupported by this request type.
 
 These request types are provider primitives. Accepted quotes, durable environment
 custody, browser transport and visual conformance remain tracked in
@@ -32,7 +33,9 @@ custody, browser transport and visual conformance remain tracked in
 The existing GPU tools, inference profiles and capacity service remain GPU-only.
 `PodResource.cost_per_hr` is `None` when the provider omits its rate; a reported
 zero remains zero. A malformed successful create response requires reconciliation
-and never authorizes automatic replay.
+and never authorizes automatic replay. Unexpected success statuses also retain
+creation custody. Malformed inventory entries refuse the complete read, so
+reconciliation remains pending rather than silently treating a resource as absent.
 
 ## CPU catalog discovery
 

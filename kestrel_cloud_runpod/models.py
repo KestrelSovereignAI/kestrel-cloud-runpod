@@ -295,7 +295,7 @@ class _PodContainerRequest:
     disk_gb: int = 50
     ports: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict, repr=False)
-    args: Optional[str] = None
+    args: Optional[str] = field(default=None, repr=False)
     registry_id: Optional[str] = None
     data_center_ids: tuple[str, ...] = ()
     mounts: Optional[Mapping[str, Any]] = None

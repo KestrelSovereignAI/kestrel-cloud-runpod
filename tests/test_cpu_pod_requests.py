@@ -79,6 +79,7 @@ def test_cpu_and_gpu_requests_use_the_same_pinned_schema():
     assert wire["dataCenterIds"] == ["US-TX-3"] and wire["ports"] == ["8000/http"]
     assert wire["disk"] == 20 and wire["globalNetworking"] is False
     assert "not-in-repr" not in repr(cpu)
+    assert "python worker.py" not in repr(cpu)
     assert gpu.to_payload()["gpu"] == {
         "id": "gpu-id",
         "count": 1,
@@ -217,7 +218,11 @@ def test_invalid_success_receipt_keeps_creation_uncertain():
 
     def handler(request):
         calls.append(request)
-        return httpx.Response(201, json=pod(cost=-1, env={"PRIVATE": "must-not-leak"}))
+        return httpx.Response(
+            201,
+            json=pod(cost=-1, env={"PRIVATE": "must-not-leak"}),
+            headers={"Retry-After": "3"},
+        )
 
     with (
         closing(
@@ -230,6 +235,7 @@ def test_invalid_success_receipt_keeps_creation_uncertain():
         client.create_pod(cpu_request())
     assert len(calls) == 1 and result.value.reconcile_required
     assert "must-not-leak" not in str(result.value)
+    assert result.value.rate_limit.retry_after_seconds == 3
 
 
 @pytest.mark.parametrize("body", [b"", b"[]", b"not json", b"{}"])
@@ -354,4 +360,46 @@ def test_parsed_receipt_recursion_keeps_create_custody(monkeypatch):
     ):
         monkeypatch.setattr(client.transport, "request_json", response)
         client.create_pod(cpu_request())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [200, 202, 204, 206])
+def test_unexpected_success_status_preserves_mutation_custody(status):
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(status, json=pod())
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="synthetic", http_transport=httpx.MockTransport(handler)
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError),
+    ):
+        client.create_pod(cpu_request())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status,ambiguous", [(201, True), (500, True), (422, False)])
+def test_decoder_recursion_preserves_http_outcome_classification(status, ambiguous):
+    body = b"[" * 200000 + b"0" + b"]" * 200000
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(status, content=body)
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="synthetic", http_transport=httpx.MockTransport(handler)
+            )
+        ) as client,
+        pytest.raises(RunPodAPIError) as result,
+    ):
+        client.create_pod(cpu_request())
+    assert isinstance(result.value, RunPodAmbiguousResultError) is ambiguous
     assert len(calls) == 1

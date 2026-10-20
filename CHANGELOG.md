@@ -22,7 +22,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   share one transport while retaining distinct compute constraints.
 - Preserve missing Pod rates as `None`; reject negative, non-finite and
   unrepresentable rates. Invalid successful create receipts, including deeply
-  nested JSON, remain ambiguous and require reconciliation before retrying.
+  nested JSON or unexpected HTTP success statuses, remain ambiguous and require
+  reconciliation before retrying. Hide container environment and arguments in
+  request representations.
 
 ## [0.15.1] - 2026-10-20
 

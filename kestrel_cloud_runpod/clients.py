@@ -294,7 +294,9 @@ class RunpodTransport:
                 self._sleep(_retry_delay(response.headers, attempt))
                 attempt += 1
                 continue
-            if ambiguous_on_failure and response.status_code >= 500:
+            if ambiguous_on_failure and (
+                200 <= response.status_code < 300 or response.status_code >= 500
+            ):
                 problem = _problem_from_response(response)
                 raise RunPodAmbiguousResultError(
                     title=problem["title"],
@@ -441,6 +443,7 @@ class RunpodControlPlaneClient:
                 status_code=201,
                 method="POST",
                 resource="/pods",
+                rate_limit=self.transport.last_rate_limit,
             ) from None
 
     def get_pod(self, pod_id: str) -> PodResource:
@@ -827,7 +830,7 @@ def _problem_from_response(response: httpx.Response) -> dict[str, Any]:
     errors: tuple[str, ...] = ()
     try:
         payload = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         payload = None
     if isinstance(payload, Mapping):
         if isinstance(payload.get("title"), str):
