@@ -2,6 +2,30 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.16.0] - 2026-10-20
+
+### Added
+
+- Add an explicit CPU Pod request variant through the canonical v2 client and
+  shared container envelope. Require a CPU flavor and valid vCPU count; refuse
+  GPU/CUDA settings, persistent container mounts and global networking.
+- Check CPU request shape against the pinned v2 schema, including the existing
+  create/inspect/delete and lost-response paths, without live cloud calls.
+- Add typed CPU catalog reads and explicit Pod matching against fresh,
+  product/count-specific stock, flavor bounds and requested datacenters.
+  Preserve unknown rates; compute rate and RAM calculations do not depend on
+  ambient decimal precision. Catalog matches do not authorize spending.
+
+### Changed
+
+- Pod request constructors use keyword arguments. GPU and CPU provisioning
+  share one transport while retaining distinct compute constraints.
+- Preserve missing Pod rates as `None`; reject negative, non-finite and
+  unrepresentable rates. Invalid successful create receipts, including deeply
+  nested JSON or unexpected HTTP success statuses, remain ambiguous and require
+  reconciliation before retrying. Hide container environment and arguments in
+  request representations.
+
 ## [0.15.1] - 2026-10-20
 
 ### Fixed

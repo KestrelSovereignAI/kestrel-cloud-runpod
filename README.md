@@ -16,6 +16,49 @@ registered as `runpod` in
 `kestrel_sovereign.inference_lease_providers`; Kestrel core interacts only with
 the public SDK lease contract and never imports this package.
 
+## CPU Pod requests
+
+The low-level v2 client accepts `PodCreateRequest` for GPU Pods and
+`CpuPodCreateRequest` for CPU Pods, both from `kestrel_cloud_runpod.models`.
+Construct requests with keyword arguments. CPU requests specify `cpu_id` and
+`vcpu_count`; Runpod assigns RAM from the selected flavor. Both variants share
+the same container settings and `RunpodControlPlaneClient.create_pod` path.
+CPU requests reject GPU/CUDA options, persistent container mounts and global
+networking. Only a single explicit network-volume mount is supported;
+global-volume mounts are intentionally unsupported by this request type.
+
+These request types are provider primitives. Accepted quotes, durable environment
+custody, browser transport and visual conformance remain tracked in
+[#43](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/43).
+The existing GPU tools, inference profiles and capacity service remain GPU-only.
+`PodResource.cost_per_hr` is `None` when the provider omits its rate; a reported
+zero remains zero. A malformed successful create response requires reconciliation
+and never authorizes automatic replay. Unexpected success statuses also retain
+creation custody. Malformed inventory entries refuse the complete read, so
+reconciliation remains pending rather than silently treating a resource as absent.
+
+## CPU catalog discovery
+
+`RunpodControlPlaneClient.list_cpus(product=ComputeProduct.POD, vcpu_count=4)`
+reads the v2 CPU catalog with availability scoped to that exact product/count.
+The immutable snapshot retains its observation time, flavor bounds, RAM ratios,
+separate Pod/Serverless rates and per-datacenter stock. Unknown stock or price
+stays unknown; example prices are never defaults.
+
+`snapshot.match_pod(request, now=..., max_age=...)` checks a CPU request against
+those facts. It requires explicit datacenters, a matching secure Pod query,
+a supported flavor/count, fresh observations and sufficient stock in every
+requested datacenter. It refuses a mismatch instead of selecting another region,
+product or flavor. The returned compute rate is per Pod, multiplied by vCPUs;
+it excludes disk, storage, transfer and other charges. RAM is derived from the
+flavor ratio. Calculations are independent of ambient decimal precision.
+
+A catalog match is neither a reservation nor an accepted spend quote. Placement
+may change after observation, and network-volume attachment compatibility needs
+separate validation. The environment provider must still acquire fresh all-in
+pricing, authorization and durable cleanup custody before provisioning.
+No CPU provisioning tool is registered by this package yet.
+
 ## Configuration
 
 | Variable | Description |

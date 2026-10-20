@@ -14,12 +14,14 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from .cpu_catalog import CpuCatalogSnapshot, validate_cpu_query
 from .models import (
     CONTROL_PLANE_BASE_URL,
     SERVERLESS_DATA_PLANE_BASE_URL,
     BillingPage,
     CloudType,
     ComputeProduct,
+    CpuPodCreateRequest,
     EndpointCreateRequest,
     EndpointResource,
     EndpointResourceVersion,
@@ -111,10 +113,11 @@ class RunpodTransport:
         )
         if response.status_code == 204 or not response.content:
             return None
+        error_type = RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise RunPodAPIError(
+        except (ValueError, RecursionError) as exc:
+            raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
                 status_code=response.status_code,
@@ -123,7 +126,7 @@ class RunpodTransport:
                 rate_limit=self.last_rate_limit,
             ) from exc
         if not isinstance(payload, Mapping):
-            raise RunPodAPIError(
+            raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
                 status_code=response.status_code,
@@ -291,7 +294,9 @@ class RunpodTransport:
                 self._sleep(_retry_delay(response.headers, attempt))
                 attempt += 1
                 continue
-            if ambiguous_on_failure and response.status_code >= 500:
+            if ambiguous_on_failure and (
+                200 <= response.status_code < 300 or response.status_code >= 500
+            ):
                 problem = _problem_from_response(response)
                 raise RunPodAmbiguousResultError(
                     title=problem["title"],
@@ -398,17 +403,48 @@ class RunpodControlPlaneClient:
         )
         return GPUOffer.from_dict(payload)
 
-    def create_pod(self, request: PodCreateRequest) -> PodResource:
+    def list_cpus(
+        self, *, product: ComputeProduct, vcpu_count: int
+    ) -> CpuCatalogSnapshot:
+        """Read stock for one explicit product/count, preserving query context."""
+        validate_cpu_query(product, vcpu_count)
+        observed_at = datetime.now(timezone.utc)
         payload = _required_payload(
             self.transport.request_json(
-                "POST",
-                "/pods",
-                json_body=request.to_payload(),
-                expected_statuses=(201,),
-                ambiguous_on_failure=True,
+                "GET",
+                "/catalog/cpus",
+                params={
+                    "include": "AVAILABILITY",
+                    "product": product.value,
+                    "vcpuCount": vcpu_count,
+                },
             )
         )
-        return PodResource.from_dict(payload)
+        return CpuCatalogSnapshot.from_response(
+            payload, product=product, vcpu_count=vcpu_count, observed_at=observed_at
+        )
+
+    def create_pod(self, request: PodCreateRequest | CpuPodCreateRequest) -> PodResource:
+        payload = self.transport.request_json(
+            "POST",
+            "/pods",
+            json_body=request.to_payload(),
+            expected_statuses=(201,),
+            ambiguous_on_failure=True,
+        )
+        try:
+            return PodResource.from_dict(_required_payload(payload))
+        except (RunPodManagerError, RecursionError):
+            # A malformed success receipt cannot turn a paid create into a
+            # known failure. The caller retains custody and reconciles it.
+            raise RunPodAmbiguousResultError(
+                title="Unverified Pod creation response",
+                detail="The successful create response was invalid; reconcile before retrying",
+                status_code=201,
+                method="POST",
+                resource="/pods",
+                rate_limit=self.transport.last_rate_limit,
+            ) from None
 
     def get_pod(self, pod_id: str) -> PodResource:
         payload = _required_payload(
@@ -794,7 +830,7 @@ def _problem_from_response(response: httpx.Response) -> dict[str, Any]:
     errors: tuple[str, ...] = ()
     try:
         payload = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         payload = None
     if isinstance(payload, Mapping):
         if isinstance(payload.get("title"), str):
