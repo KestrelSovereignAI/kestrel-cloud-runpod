@@ -145,6 +145,7 @@ from .serverless_capacity_provider import (
     RunpodServerlessCapacityProvider,
     ServerlessEndpointActivationError,
     ServerlessEndpointCleanupError,
+    read_exact_serverless_billing,
 )
 from .training_contracts import (
     TrainingPodCleanupError,
@@ -271,6 +272,7 @@ __all__ = [
     "pod_capacity_database_path",
     "pod_cost_usd",
     "read_exact_pod_billing",
+    "read_exact_serverless_billing",
     "serverless_billing_hour_bounds",
     "serverless_billing_hour_starts",
     "serverless_endpoint_hour_cost_totals",

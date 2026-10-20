@@ -175,6 +175,16 @@ the complete normalized source record; aggregate receipt amounts are validated
 as sums of that sequence. Frinz can therefore map the evidence losslessly to its
 provider-neutral ambiguous-window receipt and never reaches through Cloud to the
 Runpod control client.
+
+`read_exact_serverless_billing()` exposes that same endpoint-hour observation
+path without catalog-only jobs, quotes or activation DTOs, for original Ollama
+inference leases. It requires the original endpoint ID, creation time and
+verified-absence time, waits for every touched UTC hour to close, and reads
+bounded batches with the same exact record/query/component checks. Empty or
+incomplete history returns pending, never an inferred zero. Catalog retired
+endpoint receipts delegate to this reader; neither API grants cleanup/spend
+authority or invoice finality. Each caller must keep the original evidence and
+its own durable selection/correction policy before applying costs.
 See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
 [job-state metrics](https://docs.runpod.io/serverless/endpoints/job-states).
 

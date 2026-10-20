@@ -47,10 +47,12 @@ from .serverless_capacity_contracts import (
     ServerlessEndpointProfile,
     ServerlessEndpointSpec,
     ServerlessRetiredEndpointBillingReceipt,
+    _safe_identifier,
     decimal_text,
     iso_datetime,
     json_sha256,
     parse_datetime,
+    require_aware,
     serverless_billing_hour_bounds,
     serverless_billing_hour_starts,
     serverless_endpoint_hour_cost_totals,
@@ -839,49 +841,22 @@ class RunpodServerlessCapacityProvider:
         cleanup.validate_activation(activation)
         if cleanup.workers_zero_observed_at < activation.readback_at:
             raise RunPodManagerError("Serverless cleanup precedes activation readback")
-        window_from, window_until = serverless_billing_hour_bounds(
-            activation.create_started_at, cleanup.verified_absent_at
+        costs = await read_exact_serverless_billing(
+            self.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=self._now,
+            batch_hours=self._billing_history_batch_hours,
         )
-        if self._now() < window_until:
+        if costs is None:
             return None
-        costs: list[ServerlessEndpointHourCost] = []
-        cursor = window_from
-        while cursor < window_until:
-            batch_until = min(
-                window_until,
-                cursor
-                + timedelta(
-                    hours=min(
-                        self._billing_history_batch_hours,
-                        (window_until - cursor) // timedelta(hours=1),
-                    )
-                ),
-            )
-            page = await await_owned_effect(
-                asyncio.to_thread(
-                    self.control_client.serverless_billing,
-                    start_time=iso_datetime(cursor),
-                    end_time=iso_datetime(batch_until),
-                    bucket_size="hour",
-                    endpoint_id=activation.endpoint_id,
-                )
-            )
-            observed = _authoritative_hour_costs(
-                page,
-                endpoint_id=activation.endpoint_id,
-                window_from=cursor,
-                window_until=batch_until,
-            )
-            if observed is None:
-                return None
-            costs.extend(observed)
-            cursor = batch_until
         return ServerlessRetiredEndpointBillingReceipt(
             schema_version=SERVERLESS_CAPACITY_SCHEMA_VERSION,
             contract_version=SERVERLESS_CAPACITY_CONTRACT_VERSION,
             activation=activation,
             cleanup=cleanup,
-            endpoint_hour_costs=tuple(costs),
+            endpoint_hour_costs=costs,
             reconciled_at=self._now(),
         )
 
@@ -1927,6 +1902,65 @@ def _validate_terminal_job(
             raise RunPodManagerError(f"Serverless job {name} is unsafe")
 
 
+async def read_exact_serverless_billing(
+    client: RunpodControlPlaneClient,
+    *,
+    endpoint_id: str,
+    created_at: datetime,
+    verified_absent_at: datetime,
+    clock: Callable[[], datetime],
+    batch_hours: int,
+) -> tuple[ServerlessEndpointHourCost, ...] | None:
+    """Observe complete closed-hour endpoint costs without catalog-only DTOs.
+
+    This read grants no spending or cleanup authority. The caller retains its
+    original resource identity, creation intent and verified absence evidence.
+    Missing hours stay pending; observations replace overlapping costs rather
+    than becoming additional charges, and do not establish invoice finality.
+    """
+
+    _safe_identifier(endpoint_id, "billing endpoint_id")
+    if type(batch_hours) is not int or batch_hours < 1:
+        raise ValueError("billing history batch_hours must be a positive integer")
+    window_from, window_until = serverless_billing_hour_bounds(
+        created_at, verified_absent_at
+    )
+    now = clock()
+    require_aware(now, "Serverless billing observation clock")
+    if now < window_until:
+        return None
+    costs: list[ServerlessEndpointHourCost] = []
+    cursor = window_from
+    while cursor < window_until:
+        batch_until = min(
+            window_until,
+            cursor
+            + timedelta(
+                hours=min(batch_hours, (window_until - cursor) // timedelta(hours=1))
+            ),
+        )
+        page = await await_owned_effect(
+            asyncio.to_thread(
+                client.serverless_billing,
+                start_time=iso_datetime(cursor),
+                end_time=iso_datetime(batch_until),
+                bucket_size="hour",
+                endpoint_id=endpoint_id,
+            )
+        )
+        observed = _authoritative_hour_costs(
+            page,
+            endpoint_id=endpoint_id,
+            window_from=cursor,
+            window_until=batch_until,
+        )
+        if observed is None:
+            return None
+        costs.extend(observed)
+        cursor = batch_until
+    return tuple(costs)
+
+
 def _authoritative_hour_costs(
     page: BillingPage,
     *,
@@ -2107,4 +2141,5 @@ __all__ = [
     "RunpodServerlessCapacityProvider",
     "ServerlessEndpointActivationError",
     "ServerlessEndpointCleanupError",
+    "read_exact_serverless_billing",
 ]
