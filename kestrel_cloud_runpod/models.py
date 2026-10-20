@@ -580,6 +580,10 @@ class BillingPage:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "BillingPage":
+        if set(value) != {"records", "metadata"}:
+            raise RunPodManagerError(
+                "Invalid v2 billing envelope fields or unsupported pagination"
+            )
         records = value.get("records")
         metadata = value.get("metadata")
         if not isinstance(records, list) or not isinstance(metadata, Mapping):

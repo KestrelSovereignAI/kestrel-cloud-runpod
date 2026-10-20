@@ -203,15 +203,46 @@ success can therefore never be returned for promotion.
 After v2 confirms termination, the lease remains `RELEASING` with billing
 `PENDING`. A cheap external timer calls `reconcile()`; no resident in-process
 owner is required. The service filters `/billing/pods` by the exact Pod ID and
-persists a content-free provider billing ID, interval, billed seconds, accepted
+persists a content-free provider billing ID, interval, billed seconds, realized
 hourly price, and `actual_cost_usd`. Only then does the catalog lease become
 `RELEASED` and settlement-ready. A definitive pre-provider rejection records
 an authoritative zero; an ambiguous create with no visible Pod remains
 nonterminal and must not release a Frinz reservation as zero.
 
+If the original durable realized placement is missing, failed validation, or
+belongs to another Pod, physical teardown still completes but billing remains
+`UNRESOLVED`. The service makes no authoritative billing call, creates no
+receipt and cannot become settlement-ready. An accepted quote is never a
+substitute for the realized rate. The lifecycle error's `billing_risk` flag
+describes possibly still-active capacity, not historical unsettled money:
+confirmed teardown can truthfully report `False` while billing is unresolved.
+
 Frinz compares the authoritative actual cost with the accepted ceiling. An
 over-ceiling bill is retained as evidence but settlement remains fail-closed;
 cloud never owns or mutates the funds ledger.
+
+`read_exact_pod_billing()` is the single read/normalization path used by training
+and available to inference hosts that can prove their original Pod ID, creation,
+verified termination and realized rate. It requires complete closed UTC hours,
+exact query/resource identity, contiguous non-overlapping records, complete
+record counts and exact GPU/CPU/disk totals. Empty, missing or still-open hours
+remain pending; malformed, foreign or unsupported paginated history fails
+clearly. The current official v2 billing route has no pagination protocol.
+
+The wire shape of `PodBillingReceipt` is unchanged. New observation identities
+bind every normalized hour and component, not only the grand total; poll time
+and row order do not change that identity. Existing selected receipts are not
+rewritten. Later revised history is a correction observation referencing the
+original selection, never an additional charge or proof of invoice finality.
+`billed_seconds` describes the provider bucket coverage, not active GPU time or
+a precise allocation duration. Actual cost comes from the validated records,
+never hourly rate multiplied by elapsed wall time.
+
+Private Ollama's durable lease currently lacks the original verified termination
+and realized-rate custody needed by this reader. Its automatic observed-billing
+adapter remains gated on that explicit lifecycle provenance; offered rates,
+estimates, a refreshed timestamp or a synthetic training capacity spec do not
+substitute for it.
 
 ## Repository deployment invariant
 

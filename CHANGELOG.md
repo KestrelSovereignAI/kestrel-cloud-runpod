@@ -2,6 +2,25 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [0.15.1] - 2026-10-20
+
+### Fixed
+
+- Normalize exact-Pod billing once through closed, contiguous UTC-hour records
+  with strict identity/count/component/total validation. Missing history stays
+  pending; gaps can no longer settle from minimum/maximum timestamps alone.
+- Bind observation identity to every normalized hour/component revision while
+  retaining the existing Pod receipt wire shape. Repeated poll timestamps do
+  not manufacture new identities or claim provider invoice finality.
+- Normalize equivalent API numeric spellings and signed zero for new Pod and
+  Serverless observations, without rewriting historical receipt wire/digests.
+- Share UTC bounds and exact signed Decimal/component arithmetic with Serverless
+  billing, preserving small corrections across large amount ranges. The Ollama
+  adapter still requires original durable lifecycle/rate provenance.
+- Keep catalog billing unresolved after exact cleanup when original realized
+  placement/rate evidence is unavailable. Never replace it with the accepted
+  quote or emit a settlement-ready receipt without that provenance.
+
 ## [0.15.0] - 2026-10-19
 
 ### Fixed

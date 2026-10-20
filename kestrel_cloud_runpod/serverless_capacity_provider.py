@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .billing import billing_amounts, exact_decimal_sum
 from .clients import RunpodControlPlaneClient, RunpodServerlessClient
 from .effect_custody import await_owned_effect
 from .models import (
@@ -1145,7 +1146,7 @@ class RunpodServerlessCapacityProvider:
         amounts = serverless_endpoint_hour_cost_totals(endpoint_hour_costs)
         actual_cost = amounts["actual_cost_usd"]
         capped_cost = min(actual_cost, window.accepted_cost_ceiling_usd)
-        operator_loss = actual_cost - capped_cost
+        operator_loss = exact_decimal_sum((actual_cost, capped_cost.copy_negate()))
         identity = {
             "contract_version": SERVERLESS_CAPACITY_CONTRACT_VERSION,
             "provider_quote_id": quote.provider_quote_id,
@@ -2047,18 +2048,12 @@ _AMOUNT_KEYS = {
 
 
 def _amounts_from_mapping(value: Mapping[str, Any], context: str) -> dict[str, Decimal]:
-    amounts = {
-        name: _decimal(value.get(key), f"{context}.{key}")
-        for name, key in _AMOUNT_KEYS.items()
-    }
-    if amounts["actual_cost_usd"] != (
-        amounts["gpu_cost_usd"]
-        + amounts["cpu_cost_usd"]
-        + amounts["disk_cost_usd"]
-        + amounts["fee_cost_usd"]
-    ):
-        raise RunPodManagerError(f"{context} cost components do not equal total")
-    return amounts
+    amounts = billing_amounts(
+        value,
+        components=("gpuAmount", "cpuAmount", "diskAmount", "feeAmount"),
+        context=context,
+    )
+    return {name: amounts[key] for name, key in _AMOUNT_KEYS.items()}
 
 
 def _mapping(value: Any, context: str) -> Mapping[str, Any]:

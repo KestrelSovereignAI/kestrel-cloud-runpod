@@ -1760,19 +1760,26 @@ class PodCapacityLeaseService:
                 raise RunPodManagerError(
                     "Terminated catalog Pod omitted its durable termination time"
                 )
+            realized = (
+                lease.evidence.realized_placement
+                if lease.evidence is not None
+                else None
+            )
+            if realized is None or realized.provider_pod_id != lease.provider_pod_id:
+                return self.repository.compare_and_set(
+                    lease,
+                    changes={
+                        "billing_state": PodCapacityBillingState.UNRESOLVED,
+                        "last_provider_error": "RealizedPlacementBillingUnresolved",
+                    },
+                )
             spec = self._capacity_spec(lease)
             receipt = await self.provider.final_billing(
                 lease.provider_pod_id,
                 capacity_spec=spec,
                 created_at=lease.created_at,
                 terminated_at=lease.terminated_at,
-                realized_hourly_rate_usd=(
-                    lease.evidence.realized_placement.hourly_rate_usd
-                    if lease.evidence is not None
-                    and lease.evidence.realized_placement is not None
-                    else spec.request.quote.hourly_cost_usd
-                    * Decimal(spec.request.quote.constraints.gpu_count)
-                ),
+                realized_hourly_rate_usd=realized.hourly_rate_usd,
             )
             if receipt is None:
                 if lease.billing_state is PodCapacityBillingState.PENDING:
@@ -1792,12 +1799,7 @@ class PodCapacityLeaseService:
                 raise RunPodManagerError(
                     "Provider billing receipt does not cover confirmed Pod teardown"
                 )
-            if (
-                lease.evidence is not None
-                and lease.evidence.realized_placement is not None
-                and receipt.hourly_price_usd
-                != lease.evidence.realized_placement.hourly_rate_usd
-            ):
+            if receipt.hourly_price_usd != realized.hourly_rate_usd:
                 raise RunPodManagerError(
                     "Provider billing rate does not match realized Pod rate"
                 )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from serverless_capacity_test_support import (
@@ -368,6 +368,31 @@ def test_ambiguous_window_and_receipt_round_trip_are_content_free() -> None:
         marker in encoded
         for marker in ("prompt", "response", "signed_url", "image", '"raw"')
     )
+    with localcontext() as context:
+        context.prec = 5
+        precise_loss = Decimal("0.99999999999999999999999999999")
+        corrected = replace(
+            receipt,
+            accepted_cost_ceiling_usd=Decimal("1e-29"),
+            gpu_cost_usd=Decimal(1),
+            disk_cost_usd=Decimal(0),
+            fee_cost_usd=Decimal(0),
+            actual_cost_usd=Decimal(1),
+            capped_cost_usd=Decimal("1e-29"),
+            operator_loss_usd=precise_loss,
+            endpoint_hour_costs=(
+                replace(
+                    receipt.endpoint_hour_costs[0],
+                    gpu_cost_usd=Decimal(1),
+                    disk_cost_usd=Decimal(0),
+                    fee_cost_usd=Decimal(0),
+                    actual_cost_usd=Decimal(1),
+                ),
+            ),
+        )
+        assert corrected.operator_loss_usd == precise_loss
+        with pytest.raises(ValueError, match="operator loss"):
+            replace(corrected, operator_loss_usd=Decimal(1))
 
 
 @pytest.mark.parametrize(

@@ -1355,13 +1355,24 @@ async def test_ambiguous_window_billing_waits_for_closed_complete_buckets() -> N
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss() -> None:
+@pytest.mark.parametrize(
+    "gpu,disk,fee,total,expected_loss",
+    [
+        (0.047, 0.001, 0.002, 0.050, Decimal("0.0145")),
+        (1e100, 0, 0, 1e100, Decimal("9" * 100 + ".9645")),
+    ],
+)
+async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss(
+    gpu, disk, fee, total, expected_loss
+) -> None:
     clock = MutableClock()
     clock.value += timedelta(hours=1)
     page = _billing_page(
         extra_record={
-            "totalAmount": 0.050,
-            "gpuAmount": 0.047,
+            "totalAmount": total,
+            "gpuAmount": gpu,
+            "diskAmount": disk,
+            "feeAmount": fee,
         }
     )
     page = replace(
@@ -1369,11 +1380,11 @@ async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss() ->
         metadata={
             **page.metadata,
             "totals": {
-                "totalAmount": 0.050,
-                "gpuAmount": 0.047,
+                "totalAmount": total,
+                "gpuAmount": gpu,
                 "cpuAmount": 0.0,
-                "diskAmount": 0.001,
-                "feeAmount": 0.002,
+                "diskAmount": disk,
+                "feeAmount": fee,
             },
         },
     )
@@ -1388,9 +1399,9 @@ async def test_ambiguous_window_billing_caps_consumer_cost_and_records_loss() ->
     )
 
     assert receipt is not None
-    assert receipt.actual_cost_usd == Decimal("0.05")
+    assert receipt.actual_cost_usd == Decimal(str(total))
     assert receipt.capped_cost_usd == accepted.cost_ceiling_usd
-    assert receipt.operator_loss_usd == Decimal("0.0145")
+    assert receipt.operator_loss_usd == expected_loss
 
 
 @pytest.mark.asyncio
