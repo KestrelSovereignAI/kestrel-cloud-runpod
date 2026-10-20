@@ -279,6 +279,29 @@ resource identity and cost/expiry policy, never the addressable endpoint or
 credential. A restarted adapter re-observes that same deterministic resource,
 so it can reconstruct the route without provisioning a duplicate.
 
+Create and teardown mutations stay joined to their original durable receipt
+tail even if the caller cancels repeatedly. An ambiguous or undecodable create
+response remains discoverable after every deadline; elapsed time and an empty
+inventory never prove that the original create was rejected. Teardown succeeds
+only after an authenticated exact-ID GET reports 404, not merely because the
+delete/action request was acknowledged. A present resource, authentication
+failure or unavailable read keeps teardown pending for reconciliation.
+
+Every `OllamaCapacityProvider` implements the pure, no-I/O
+`validate_runtime_request()` contract. Both quoting and the canonical lease
+service call it for a concrete selected mode; the service does so before
+provisioning admission, including direct manager acquisition and AUTO mode.
+Invalid immutable-image/model/credential configuration therefore fails with
+zero provisioning attempts and no uncertain-create debt. All errors after
+admission still retain uncertain-create custody rather than infer no resource.
+
+These physical lifecycle safeguards are not observed financial evidence.
+Catalog offer prices and cold-start estimates remain estimates. Durable
+original realized-rate/readback provenance, immutable verified-absence receipts
+and resumable closed-hour billing are required before reporting actual Ollama
+lifecycle cost; historical rows must remain unknown rather than gain invented
+rates, timestamps or debit authority.
+
 Legacy `manage_gpu` commands are operator-only Pod controls. They do not mutate
 or report LLM routing; the provider-neutral coordinator owns the sole active
 route and drains it before provider release.

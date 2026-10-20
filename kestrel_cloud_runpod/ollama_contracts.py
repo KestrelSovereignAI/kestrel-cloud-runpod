@@ -532,6 +532,10 @@ class OllamaLease:
 
 
 class OllamaCapacityProvider(Protocol):
+    def validate_runtime_request(self, request: OllamaLeaseRequest) -> None:
+        """Validate a concrete-mode runtime request without provider I/O."""
+        ...
+
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan: ...
 
     async def provision(

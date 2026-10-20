@@ -11,6 +11,7 @@ from kestrel_cloud_runpod.models import (
     CloudType,
     ComputeProduct,
     PlacementDecision,
+    RunPodManagerError,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
@@ -148,6 +149,10 @@ class FakeOllamaProvider:
             resource_name="unset",
         )
         self.find_result: ProvisionedOllamaResource | None = None
+
+    def validate_runtime_request(self, request: OllamaLeaseRequest) -> None:
+        if request.mode is OllamaLeaseMode.AUTO:
+            raise RunPodManagerError("Runtime preflight requires a concrete mode")
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         del request

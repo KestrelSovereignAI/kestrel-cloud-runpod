@@ -440,6 +440,13 @@ class RunpodOllamaCapacityProvider:
         )
 
     async def teardown(self, resource: ProvisionedOllamaResource) -> None:
+        """Request teardown, then require the exact resource GET to be absent.
+
+        An acknowledged asynchronous action (or its own 404) is not a physical
+        absence observation. Authentication and transient errors stay retryable.
+        The service retains this whole effect and its durable terminal write.
+        """
+
         try:
             if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
                 await asyncio.to_thread(
@@ -452,6 +459,20 @@ class RunpodOllamaCapacityProvider:
         except RunPodAPIError as exc:
             if exc.status_code != 404:
                 raise
+        read_resource = (
+            self.client.get_endpoint
+            if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+            else self.client.get_pod
+        )
+        try:
+            await asyncio.to_thread(read_resource, resource.provider_resource_id)
+        except RunPodAPIError as exc:
+            if exc.status_code == 404:
+                return
+            raise
+        raise RunPodManagerError(
+            "Original Ollama resource is still present after teardown; reconcile it"
+        )
 
     async def _healthy(self, url: str, *, bearer_token: str | None) -> bool:
         try:

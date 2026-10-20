@@ -60,32 +60,8 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
       - name: Build sdist + wheel
         run: uv build
-      - name: Inspect wheel contents
-        run: |
-          set -e
-          WHEEL=$(ls dist/*.whl | head -1)
-          echo "Inspecting $WHEEL"
-          uv run --no-project python -c "
-          import zipfile, sys
-          z = zipfile.ZipFile('$WHEEL')
-          names = z.namelist()
-          forbidden = [n for n in names if n.startswith('kestrel_sovereign/') or n.startswith('kestrel_sdk/')]
-          if forbidden:
-              print('ERROR: wheel contains framework/SDK content:', forbidden, file=sys.stderr)
-              sys.exit(1)
-          required = [
-              'kestrel_cloud_runpod/__init__.py',
-              'kestrel_cloud_runpod/feature.py',
-              'kestrel_cloud_runpod/manager.py',
-              'kestrel_cloud_runpod/core.py',
-              'kestrel_cloud_runpod/inference_provider.py',
-          ]
-          missing = [m for m in required if m not in names]
-          if missing:
-              print('ERROR: wheel missing expected files:', missing, file=sys.stderr)
-              sys.exit(1)
-          print(f'Wheel OK ({len(names)} entries)')
-          "
+      - name: Verify exact wheel and sdist envelope and source bytes
+        run: uv run --no-project python scripts/check_distribution.py --dist dist
 
   install-check:
     runs-on: ubuntu-latest

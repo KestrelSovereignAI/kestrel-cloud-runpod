@@ -1,11 +1,20 @@
 """Runpod v2 adapter tests with in-memory HTTP/control-plane doubles."""
 
+import json
+import threading
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
-from ollama_test_support import MutableClock, make_request, non_compute_cost_policy
+from ollama_test_support import (
+    MutableClock,
+    make_request,
+    non_compute_cost_policy,
+    serverless_plan,
+)
 
+from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.models import (
     Availability,
     ComputeProduct,
@@ -19,6 +28,7 @@ from kestrel_cloud_runpod.models import (
 )
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
+    OllamaLeaseState,
     OllamaResourceType,
     ProvisionedOllamaResource,
 )
@@ -27,7 +37,9 @@ from kestrel_cloud_runpod.ollama_provider import (
     RunpodOllamaDeployment,
     _pod_base_url,
 )
+from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.ollama_runtime import OLLAMA_RUNTIME_IMAGE_REPOSITORY
+from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 
 _TEST_DIGEST = "sha256:" + "a" * 64
 _TEST_IMAGE = f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@{_TEST_DIGEST}"
@@ -88,6 +100,7 @@ class _ControlClient:
         self.pod_request = None
         self.actions = []
         self.delete_error = None
+        self.absent = set()
         self.endpoint = EndpointResource(
             id="endpoint-1",
             name="resource",
@@ -125,9 +138,11 @@ class _ControlClient:
 
     def get_endpoint(self, endpoint_id):
         assert endpoint_id == "endpoint-1"
+        self._require_present(endpoint_id)
         return self.endpoint
 
     def get_pod(self, pod_id):
+        self._require_present(pod_id)
         return PodResource(
             id=pod_id,
             name="resource",
@@ -146,11 +161,22 @@ class _ControlClient:
 
     def delete_endpoint(self, endpoint_id):
         if self.delete_error:
+            if self.delete_error.status_code == 404:
+                self.absent.add(endpoint_id)
             raise self.delete_error
         self.actions.append((endpoint_id, "delete"))
+        self.absent.add(endpoint_id)
 
     def pod_action(self, pod_id, action):
         self.actions.append((pod_id, action))
+        if action == "terminate":
+            self.absent.add(pod_id)
+
+    def _require_present(self, resource_id):
+        if resource_id in self.absent:
+            raise RunPodAPIError(
+                title="Not found", detail="Exact resource is absent", status_code=404,
+            )
 
 
 def _provider(
@@ -573,6 +599,135 @@ async def test_teardown_treats_already_absent_resource_as_success():
             resource_name="endpoint",
         )
     )
+
+
+@pytest.fixture
+def native_teardown():
+    state = {"calls": [], "delete_status": 204, "read_status": 404}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def respond(self, *, action):
+            assert self.headers["Authorization"] == "Bearer local-loopback-only"
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            state["calls"].append((self.command, self.path))
+            status = state["delete_status"] if action else state["read_status"]
+            body = b"" if status == 204 else json.dumps({
+                "id": "original-1", "name": "original", "status": "RUNNING",
+                "type": "LOAD_BALANCER", "gpu": {"id": "gpu-1", "count": 1},
+                "cost": 0.5, "cloud": "SECURE", "dataCenterId": "US-TX-3",
+            }).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_DELETE(self):
+            self.respond(action=True)
+
+        def do_POST(self):
+            self.respond(action=True)
+
+        def do_GET(self):
+            self.respond(action=False)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    client = RunpodControlPlaneClient(
+        api_key="local-loopback-only",
+        base_url=f"http://127.0.0.1:{server.server_port}/v2",
+        max_safe_retries=0,
+    )
+    try:
+        yield _provider(client=client), state
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_type", list(OllamaResourceType))
+@pytest.mark.parametrize("read_status", [200, 401, 404, 503])
+async def test_native_teardown_requires_exact_authenticated_absence(
+    native_teardown, resource_type, read_status,
+):
+    provider, state = native_teardown
+    state["read_status"] = read_status
+    resource = ProvisionedOllamaResource(resource_type, "original-1", "original")
+    if read_status == 404:
+        await provider.teardown(resource)
+    else:
+        with pytest.raises(RunPodManagerError):
+            await provider.teardown(resource)
+    path = "/v2/serverless/original-1" if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT else "/v2/pods/original-1"
+    action = ("DELETE", path) if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT else ("POST", path + "/action")
+    assert state["calls"] == [action, ("GET", path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [OllamaLeaseMode.AUTO, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER])
+@pytest.mark.parametrize("invalid", ["image", "allowlist", "credential"])
+async def test_native_precreate_validation_never_admits_uncertain_capacity(
+    native_teardown, tmp_path, monkeypatch, mode, invalid
+):
+    provider, state = native_teardown
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    if invalid == "image":
+        monkeypatch.setenv("TEST_OLLAMA_IMAGE", "unreviewed:latest")
+    elif invalid == "allowlist":
+        provider.deployment.profile.env = {
+            "KESTREL_OLLAMA_ALLOWED_MODELS": f"different:8b@{_TEST_DIGEST}"
+        }
+    else:
+        provider = _provider(client=provider.client, serverless_api_key=None)
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "precreate.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode)
+    with pytest.raises(RunPodManagerError):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    lease = repository.get(request.lease_id)
+    assert lease.state is OllamaLeaseState.FAILED
+    assert lease.provision_attempts == 0
+    assert lease.provisioning_started_at is None
+    assert lease.provision_attempt_id is None
+    assert lease.creation_uncertain is False
+    assert lease.provider_resource_id is None
+    assert state["calls"] == []
+    clock.advance(10_000)
+    for _ in range(3):
+        await service.reconcile()
+    assert repository.get(request.lease_id).creation_uncertain is False
+    assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_native_delete_404_is_not_absence_if_exact_get_still_finds_resource(
+    native_teardown,
+):
+    provider, state = native_teardown
+    state.update(delete_status=404, read_status=200)
+    with pytest.raises(RunPodManagerError, match="still present"):
+        await provider.teardown(ProvisionedOllamaResource(
+            OllamaResourceType.SERVERLESS_ENDPOINT, "original-1", "original",
+        ))
+    assert state["calls"] == [
+        ("DELETE", "/v2/serverless/original-1"),
+        ("GET", "/v2/serverless/original-1"),
+    ]
 
 
 @pytest.mark.asyncio

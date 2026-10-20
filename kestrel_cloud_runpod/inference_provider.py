@@ -149,7 +149,7 @@ class RunpodInferenceLeaseProvider:
                 max_total_cost=request.max_total_cost_usd,
             )
             try:
-                _validate_runtime_preflight(runtime.service, internal_request)
+                runtime.service.provider.validate_runtime_request(internal_request)
                 plan = await runtime.service.provider.plan(internal_request)
                 runtime.service.validate_plan(internal_request, plan)
             except RunPodManagerError:
@@ -257,7 +257,7 @@ class RunpodInferenceLeaseProvider:
                 now=now,
             )
             try:
-                _validate_runtime_preflight(runtime.service, internal_request)
+                runtime.service.provider.validate_runtime_request(internal_request)
                 plan = await runtime.service.provider.plan(internal_request)
                 runtime.service.validate_plan(internal_request, plan)
             except RunPodManagerError as exc:
@@ -1038,14 +1038,6 @@ def _bind_request_to_quoted_placement(
             allowed_gpu_pools=((gpu_pool,) if gpu_pool is not None else ()),
         ),
     )
-
-
-def _validate_runtime_preflight(
-    service: OllamaLeaseService, request: OllamaLeaseRequest
-) -> None:
-    provider = service.provider
-    if isinstance(provider, RunpodOllamaCapacityProvider):
-        provider.validate_runtime_request(request)
 
 
 __all__ = ["RunpodInferenceLeaseProvider"]
