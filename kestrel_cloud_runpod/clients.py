@@ -116,7 +116,7 @@ class RunpodTransport:
         error_type = RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
         try:
             payload = response.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
@@ -432,7 +432,7 @@ class RunpodControlPlaneClient:
         )
         try:
             return PodResource.from_dict(_required_payload(payload))
-        except RunPodManagerError:
+        except (RunPodManagerError, RecursionError):
             # A malformed success receipt cannot turn a paid create into a
             # known failure. The caller retains custody and reconciles it.
             raise RunPodAmbiguousResultError(

@@ -300,3 +300,58 @@ def test_invalid_pod_rate_is_not_a_usable_price(rate):
 
 def test_explicit_zero_rate_remains_zero():
     assert PodResource.from_dict(pod(cost=0)).cost_per_hr == 0
+
+
+@pytest.mark.parametrize("depth", [2000, 40000])
+def test_deep_success_json_keeps_create_custody(depth):
+    body = (
+        b'{"id":"p","name":"cpu","status":"RUNNING","extra":'
+        + b'{"x":' * depth
+        + b"0"
+        + b"}" * depth
+        + b"}"
+    )
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(201, content=body)
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="synthetic", http_transport=httpx.MockTransport(handler)
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError),
+    ):
+        client.create_pod(cpu_request())
+    assert len(calls) == 1
+
+
+def test_parsed_receipt_recursion_keeps_create_custody(monkeypatch):
+    # Exercise the post-decode sanitizer on every supported Python version;
+    # JSON decoder recursion thresholds differ between 3.11 and 3.14.
+    raw = pod()
+    cursor = raw
+    for _ in range(2000):
+        child = {}
+        cursor["extra"] = child
+        cursor = child
+    calls = []
+
+    def response(*args, **kwargs):
+        calls.append((args, kwargs))
+        return raw
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="synthetic", http_transport=httpx.MockTransport(lambda _: None)
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError),
+    ):
+        monkeypatch.setattr(client.transport, "request_json", response)
+        client.create_pod(cpu_request())
+    assert len(calls) == 1

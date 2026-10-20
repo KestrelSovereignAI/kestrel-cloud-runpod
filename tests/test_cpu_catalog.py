@@ -339,3 +339,20 @@ def test_catalog_time_includes_request_latency(monkeypatch):
     assert catalog.observed_at == NOW
     with pytest.raises(RunPodManagerError, match="stale"):
         match(catalog, now=clock[0])
+
+
+def test_missing_price_object_preserves_unknown():
+    raw = offer()
+    raw.pop("price")
+    catalog = snapshot(raw=raw)
+    assert catalog.offers[0].secure_price_per_vcpu is None
+    with pytest.raises(RunPodManagerError, match="rate is unknown"):
+        match(catalog)
+
+
+def test_mutated_request_cannot_bypass_cpu_syntax_during_matching():
+    mounts = {"network": [{"volumeId": "v", "path": "/workspace"}]}
+    pod_request = request(mounts=mounts)
+    mounts["persistent"] = {"size": 1, "path": "/other"}
+    with pytest.raises(ValueError, match="CPU Pod"):
+        match(pod_request=pod_request)
