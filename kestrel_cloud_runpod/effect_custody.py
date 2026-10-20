@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from typing import TypeVar
+from typing import TypeVar, cast
 
 _T = TypeVar("_T")
 
@@ -23,15 +23,24 @@ async def await_owned_effect(effect: Awaitable[_T]) -> _T:
     Process death still requires reconciliation from the persisted intent.
     """
 
-    task = asyncio.ensure_future(effect)
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-    result = task.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+    from kestrel_sovereign._async_ownership import (
+        await_owned_operation,
+        await_owned_task,
+    )
+    from kestrel_sovereign.execution_custody import execution_terminal_error
+
+    if asyncio.isfuture(effect):
+        # Already-admitted Tasks/Futures need no new Task allocation. Refusing
+        # a surrogate join task cannot abandon the original physical effect.
+        outcome = await await_owned_task(effect)
+    else:
+        # Core retains the EXACT unstarted close boundary on admission refusal.
+        # A redundant coroutine wrapper would hide that original from cleanup.
+        outcome = await await_owned_operation(effect, retain_originals=True)
+    terminal = execution_terminal_error(
+        outcome.error, outcome.cancellation,
+        retain_originals=True, isolate_control_originals=True,
+    )
+    if terminal is not None:
+        raise terminal
+    return cast(_T, outcome.result)
