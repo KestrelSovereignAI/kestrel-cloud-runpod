@@ -1,0 +1,302 @@
+"""CPU/GPU wire variants through the existing v2 transport; no cloud calls."""
+
+import json
+from contextlib import closing
+from pathlib import Path
+
+import httpx
+import pytest
+from jsonschema import Draft202012Validator
+
+from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
+from kestrel_cloud_runpod.models import (
+    CpuPodCreateRequest,
+    PodCreateRequest,
+    PodResource,
+    RunPodAmbiguousResultError,
+    RunPodAPIError,
+    RunPodManagerError,
+)
+from scripts.check_runpod_openapi import load_openapi
+
+
+def cpu_request(**overrides):
+    return CpuPodCreateRequest(
+        **{
+            "name": "cpu-browser",
+            "image": "registry.example/browser@sha256:" + "a" * 64,
+            "cpu_id": "cpu5c",
+            "vcpu_count": 4,
+            **overrides,
+        }
+    )
+
+
+def pod(**overrides):
+    return {
+        "id": "cpu-pod",
+        "name": "cpu-browser",
+        "status": "PROVISIONING",
+        "gpu": None,
+        "cpu": {"id": "cpu5c", "vcpuCount": 4, "memory": 8},
+        "cost": 0.2,
+        **overrides,
+    }
+
+
+def test_cpu_and_gpu_requests_use_the_same_pinned_schema():
+    root = Path(__file__).resolve().parents[1]
+    document = load_openapi((root / "vendor/runpod-v2-openapi.yaml").read_text())
+    validator = Draft202012Validator(
+        {
+            "$ref": "#/components/schemas/CreatePodRequest",
+            "components": document["components"],
+        }
+    )
+    cpu = cpu_request(
+        ports=("8000/http",),
+        env={"PRIVATE": "not-in-repr"},
+        args="python worker.py",
+        registry_id="registry",
+        data_center_ids=("US-TX-3",),
+        disk_gb=20,
+        mounts={"network": [{"volumeId": "owned-volume", "path": "/workspace"}]},
+    )
+    gpu = PodCreateRequest(
+        name="gpu", image="image", gpu_id="gpu-id", min_cuda_version="12"
+    )
+    for request, kind in ((cpu, "cpu"), (gpu, "gpu")):
+        payload = request.to_payload()
+        validator.validate(payload)
+        assert {"cpu", "gpu"} & payload.keys() == {kind}
+    wire = cpu.to_payload()
+    assert wire["cpu"] == {"id": "cpu5c", "vcpuCount": 4}
+    assert wire["mounts"] == {
+        "network": [{"volumeId": "owned-volume", "path": "/workspace"}]
+    }
+    assert wire["env"] == {"PRIVATE": "not-in-repr"}
+    assert wire["args"] == "python worker.py" and wire["registry"] == "registry"
+    assert wire["dataCenterIds"] == ["US-TX-3"] and wire["ports"] == ["8000/http"]
+    assert wire["disk"] == 20 and wire["globalNetworking"] is False
+    assert "not-in-repr" not in repr(cpu)
+    assert gpu.to_payload()["gpu"] == {
+        "id": "gpu-id",
+        "count": 1,
+        "minCudaVersion": "12.0",
+    }
+
+
+@pytest.mark.parametrize("count", [0, 1, 3, 6, -2, True, False, 4.0, "4", None])
+def test_invalid_cpu_counts_are_refused_before_any_transport(count):
+    with pytest.raises(ValueError, match="vcpu_count"):
+        cpu_request(vcpu_count=count)
+
+
+@pytest.mark.parametrize("count", [2, 4, 8, 64])
+def test_cpu_count_is_explicit_without_requesting_ram(count):
+    assert cpu_request(vcpu_count=count).to_payload()["cpu"] == {
+        "id": "cpu5c",
+        "vcpuCount": count,
+    }
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"gpu_id": "gpu"},
+        {"gpu_count": 1},
+        {"min_cuda_version": "12"},
+        {"memory": 8},
+    ],
+)
+def test_gpu_and_ram_constraints_cannot_be_added_to_cpu_variant(fields):
+    with pytest.raises(TypeError):
+        cpu_request(**fields)
+
+
+@pytest.mark.parametrize("cpu_id", [None, "", 5, False])
+def test_cpu_flavor_is_required(cpu_id):
+    with pytest.raises(ValueError, match="cpu_id"):
+        cpu_request(cpu_id=cpu_id)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"global_networking": True},
+        {"global_networking": 0},
+        {"mounts": {"persistent": {"size": 10, "path": "/workspace"}}},
+        {"mounts": {"persistent": None}},
+        {"mounts": {"global": []}},
+        {"mounts": {"unknown": []}},
+        {"mounts": []},
+        {"mounts": {"network": None}},
+        {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
+        {"mounts": {"network": [{"volumeId": "v"}]}},
+        {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
+        {"mounts": {"network": [{"volumeId": "v", "path": "/v", "extra": True}]}},
+    ],
+)
+def test_cpu_rejects_unsupported_networking_and_storage(fields):
+    with pytest.raises(ValueError, match="CPU Pod"):
+        cpu_request(**fields)
+
+
+def test_mutated_mount_mapping_is_refused_before_sending():
+    mounts = {"network": [{"volumeId": "v", "path": "/workspace"}]}
+    request = cpu_request(mounts=mounts)
+    mounts["persistent"] = {"size": 1, "path": "/other"}
+    calls = []
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="unit-test",
+                http_transport=httpx.MockTransport(lambda req: calls.append(req)),
+            )
+        ) as client,
+        pytest.raises(ValueError, match="CPU Pod"),
+    ):
+        client.create_pod(request)
+    assert calls == []
+
+
+def test_cpu_create_inspect_and_delete_use_existing_v2_transport():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            assert json.loads(request.content)["cpu"] == {"id": "cpu5c", "vcpuCount": 4}
+            assert "gpu" not in json.loads(request.content)
+            return httpx.Response(201, json=pod(env={"PRIVATE": "must-not-leak"}))
+        if request.method == "GET":
+            return httpx.Response(200, json=pod(status="RUNNING"))
+        assert request.method == "DELETE"
+        return httpx.Response(204)
+
+    with closing(
+        RunpodControlPlaneClient(
+            api_key="unit-test", http_transport=httpx.MockTransport(handler)
+        )
+    ) as client:
+        created = client.create_pod(cpu_request())
+        assert created.gpu_id is None and created.gpu_count == 0
+        assert created.raw["cpu"] == {"id": "cpu5c", "vcpuCount": 4, "memory": 8}
+        assert "must-not-leak" not in repr(created)
+        assert client.get_pod(created.id).status == "RUNNING"
+        client.delete_pod(created.id)
+    assert [request.url.path for request in calls] == [
+        "/v2/pods",
+        "/v2/pods/cpu-pod",
+        "/v2/pods/cpu-pod",
+    ]
+    assert all(request.url.host == "api.runpod.io" for request in calls)
+
+
+def test_lost_cpu_create_response_remains_unknown_without_replay():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("lost response", request=request)
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="unit-test", http_transport=httpx.MockTransport(handler)
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError),
+    ):
+        client.create_pod(cpu_request())
+    assert len(calls) == 1
+
+
+def test_invalid_success_receipt_keeps_creation_uncertain():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(201, json=pod(cost=-1, env={"PRIVATE": "must-not-leak"}))
+
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="unit-test", http_transport=httpx.MockTransport(handler)
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError) as result,
+    ):
+        client.create_pod(cpu_request())
+    assert len(calls) == 1 and result.value.reconcile_required
+    assert "must-not-leak" not in str(result.value)
+
+
+@pytest.mark.parametrize("body", [b"", b"[]", b"not json", b"{}"])
+def test_malformed_success_keeps_create_custody(body):
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="unit-test",
+                http_transport=httpx.MockTransport(
+                    lambda req: httpx.Response(201, content=body)
+                ),
+            )
+        ) as client,
+        pytest.raises(RunPodAmbiguousResultError),
+    ):
+        client.create_pod(cpu_request())
+
+
+def test_known_provider_refusal_stays_a_known_refusal():
+    with (
+        closing(
+            RunpodControlPlaneClient(
+                api_key="unit-test",
+                http_transport=httpx.MockTransport(
+                    lambda req: httpx.Response(
+                        422,
+                        json={
+                            "title": "Invalid request",
+                            "detail": "CPU unavailable",
+                            "status": 422,
+                        },
+                    )
+                ),
+            )
+        ) as client,
+        pytest.raises(RunPodAPIError) as result,
+    ):
+        client.create_pod(cpu_request())
+    assert not isinstance(result.value, RunPodAmbiguousResultError)
+
+
+@pytest.mark.parametrize("count", [0, -1, True, False, 1.5, "1", None])
+def test_gpu_variant_keeps_positive_integer_counts(count):
+    with pytest.raises(ValueError, match="gpu_count"):
+        PodCreateRequest(name="gpu", image="image", gpu_id="gpu", gpu_count=count)
+
+
+@pytest.mark.parametrize("size", [0, -1, True, 1.0, "1", None])
+def test_shared_disk_size_is_a_positive_integer(size):
+    with pytest.raises(ValueError, match="disk_gb"):
+        cpu_request(disk_gb=size)
+
+
+@pytest.mark.parametrize("gpu", [None, {"id": "gpu", "count": 1}])
+def test_missing_rate_remains_unknown_for_every_pod(gpu):
+    response = pod(gpu=gpu)
+    response.pop("cost")
+    if gpu is not None:
+        response.pop("cpu")
+    assert PodResource.from_dict(response).cost_per_hr is None
+
+
+@pytest.mark.parametrize("rate", [-1, float("inf"), float("nan"), 10**400, True, "0.2"])
+def test_invalid_pod_rate_is_not_a_usable_price(rate):
+    with pytest.raises(RunPodManagerError, match="Pod.cost"):
+        PodResource.from_dict(pod(cost=rate))
+
+
+def test_explicit_zero_rate_remains_zero():
+    assert PodResource.from_dict(pod(cost=0)).cost_per_hr == 0

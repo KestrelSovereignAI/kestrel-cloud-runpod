@@ -20,6 +20,7 @@ from .models import (
     BillingPage,
     CloudType,
     ComputeProduct,
+    CpuPodCreateRequest,
     EndpointCreateRequest,
     EndpointResource,
     EndpointResourceVersion,
@@ -111,10 +112,11 @@ class RunpodTransport:
         )
         if response.status_code == 204 or not response.content:
             return None
+        error_type = RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RunPodAPIError(
+            raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
                 status_code=response.status_code,
@@ -123,7 +125,7 @@ class RunpodTransport:
                 rate_limit=self.last_rate_limit,
             ) from exc
         if not isinstance(payload, Mapping):
-            raise RunPodAPIError(
+            raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
                 status_code=response.status_code,
@@ -398,17 +400,26 @@ class RunpodControlPlaneClient:
         )
         return GPUOffer.from_dict(payload)
 
-    def create_pod(self, request: PodCreateRequest) -> PodResource:
-        payload = _required_payload(
-            self.transport.request_json(
-                "POST",
-                "/pods",
-                json_body=request.to_payload(),
-                expected_statuses=(201,),
-                ambiguous_on_failure=True,
-            )
+    def create_pod(self, request: PodCreateRequest | CpuPodCreateRequest) -> PodResource:
+        payload = self.transport.request_json(
+            "POST",
+            "/pods",
+            json_body=request.to_payload(),
+            expected_statuses=(201,),
+            ambiguous_on_failure=True,
         )
-        return PodResource.from_dict(payload)
+        try:
+            return PodResource.from_dict(_required_payload(payload))
+        except RunPodManagerError:
+            # A malformed success receipt cannot turn a paid create into a
+            # known failure. The caller retains custody and reconciles it.
+            raise RunPodAmbiguousResultError(
+                title="Unverified Pod creation response",
+                detail="The successful create response was invalid; reconcile before retrying",
+                status_code=201,
+                method="POST",
+                resource="/pods",
+            ) from None
 
     def get_pod(self, pod_id: str) -> PodResource:
         payload = _required_payload(

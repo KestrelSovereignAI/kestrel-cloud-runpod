@@ -1,5 +1,6 @@
 """Typed contracts for the Runpod v2 control and data planes."""
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -284,37 +285,32 @@ class PlacementDecision:
     requirements: PlacementRequirements
 
 
-@dataclass(frozen=True)
-class PodCreateRequest:
-    """Typed subset of the v2 CreatePodRequest used by Kestrel."""
+@dataclass(frozen=True, kw_only=True)
+class _PodContainerRequest:
+    """One container envelope for both v2 Pod compute variants."""
 
     name: str
     image: str
-    gpu_id: str
-    gpu_count: int = 1
     cloud: CloudType = CloudType.SECURE
     disk_gb: int = 50
     ports: tuple[str, ...] = ()
-    env: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict, repr=False)
     args: Optional[str] = None
     registry_id: Optional[str] = None
     data_center_ids: tuple[str, ...] = ()
     mounts: Optional[Mapping[str, Any]] = None
     global_networking: bool = False
-    min_cuda_version: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not self.name or not self.image or not self.gpu_id:
-            raise ValueError("Pod name, image, and gpu_id are required")
-        if self.gpu_count < 1 or self.disk_gb < 1:
-            raise ValueError("Pod gpu_count and disk_gb must be positive")
-        normalize_cuda_floor(self.min_cuda_version)
+        if not self.name or not self.image:
+            raise ValueError("Pod name and image are required")
+        if type(self.disk_gb) is not int or self.disk_gb < 1:
+            raise ValueError("Pod disk_gb must be a positive integer")
 
-    def to_payload(self) -> Dict[str, Any]:
+    def _container_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "name": self.name,
             "image": self.image,
-            "gpu": {"id": self.gpu_id, "count": self.gpu_count},
             "cloud": self.cloud.value,
             "disk": self.disk_gb,
             "ports": list(self.ports),
@@ -329,10 +325,79 @@ class PodCreateRequest:
             payload["dataCenterIds"] = list(self.data_center_ids)
         if self.mounts is not None:
             payload["mounts"] = dict(self.mounts)
+        return payload
+
+
+@dataclass(frozen=True, kw_only=True)
+class PodCreateRequest(_PodContainerRequest):
+    """GPU Pod variant; CPU requests cannot carry these GPU constraints."""
+
+    gpu_id: str
+    gpu_count: int = 1
+    min_cuda_version: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.gpu_id:
+            raise ValueError("Pod gpu_id is required")
+        if type(self.gpu_count) is not int or self.gpu_count < 1:
+            raise ValueError("Pod gpu_count must be a positive integer")
+        normalize_cuda_floor(self.min_cuda_version)
+
+    def to_payload(self) -> Dict[str, Any]:
+        self.__post_init__()
+        payload = self._container_payload()
+        payload["gpu"] = {"id": self.gpu_id, "count": self.gpu_count}
         if self.min_cuda_version is not None:
             payload["gpu"]["minCudaVersion"] = normalize_cuda_floor(
                 self.min_cuda_version
             )
+        return payload
+
+
+@dataclass(frozen=True, kw_only=True)
+class CpuPodCreateRequest(_PodContainerRequest):
+    """CPU Pod wire request, not a capacity quote or visual capability grant.
+
+    The caller still selects a currently offered flavor/count and owns paid
+    resource custody. RAM is assigned by Runpod, never requested here. CPU Pods
+    have no GPU/CUDA settings, persistent container mount or global networking.
+    """
+
+    cpu_id: str
+    vcpu_count: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not isinstance(self.cpu_id, str) or not self.cpu_id:
+            raise ValueError("Pod cpu_id is required")
+        count = self.vcpu_count
+        if type(count) is not int or count < 2 or count & (count - 1):
+            raise ValueError("Pod vcpu_count must be a power of two of at least 2")
+        if self.global_networking is not False:
+            raise ValueError("CPU Pods do not support global networking")
+        if self.mounts is not None:
+            if not isinstance(self.mounts, Mapping) or set(self.mounts) - {"network"}:
+                raise ValueError("CPU Pods support only an explicit network mount")
+            network = self.mounts.get("network", [])
+            if not isinstance(network, list) or len(network) > 1:
+                raise ValueError("CPU Pods support at most one network mount")
+            for mount in network:
+                if (
+                    not isinstance(mount, Mapping)
+                    or set(mount) != {"volumeId", "path"}
+                    or not all(
+                        isinstance(mount[key], str) and mount[key]
+                        for key in ("volumeId", "path")
+                    )
+                ):
+                    raise ValueError("CPU Pod network mount requires volumeId and path")
+
+    def to_payload(self) -> Dict[str, Any]:
+        # Caller-owned mount mappings may have changed since construction.
+        self.__post_init__()
+        payload = self._container_payload()
+        payload["cpu"] = {"id": self.cpu_id, "vcpuCount": self.vcpu_count}
         return payload
 
 
@@ -499,7 +564,7 @@ class PodResource:
     status: str
     gpu_id: Optional[str]
     gpu_count: int
-    cost_per_hr: float
+    cost_per_hr: Optional[float]
     raw: Mapping[str, Any]
 
     @classmethod
@@ -507,13 +572,19 @@ class PodResource:
         gpu = value.get("gpu") or {}
         if not isinstance(gpu, Mapping):
             raise RunPodManagerError("Invalid v2 Pod.gpu response")
+        try:
+            cost = _optional_number(value.get("cost"), "Pod.cost")
+        except OverflowError:
+            raise RunPodManagerError("Invalid Pod.cost response") from None
+        if cost is not None and (not math.isfinite(cost) or cost < 0):
+            raise RunPodManagerError("Invalid Pod.cost response")
         return cls(
             id=_string(value, "id", "Pod"),
             name=_string(value, "name", "Pod"),
             status=_string(value, "status", "Pod"),
             gpu_id=_optional_string(gpu.get("id"), "Pod.gpu.id"),
             gpu_count=_optional_integer(gpu.get("count"), "Pod.gpu.count") or 0,
-            cost_per_hr=_optional_number(value.get("cost"), "Pod.cost") or 0.0,
+            cost_per_hr=cost,
             raw=sanitize_resource_payload(value),
         )
 
