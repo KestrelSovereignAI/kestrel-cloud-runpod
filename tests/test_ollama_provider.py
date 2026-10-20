@@ -7,7 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
-from ollama_test_support import MutableClock, make_request, non_compute_cost_policy
+from ollama_test_support import (
+    MutableClock,
+    make_request,
+    non_compute_cost_policy,
+    serverless_plan,
+)
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.models import (
@@ -23,6 +28,7 @@ from kestrel_cloud_runpod.models import (
 )
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
+    OllamaLeaseState,
     OllamaResourceType,
     ProvisionedOllamaResource,
 )
@@ -31,7 +37,9 @@ from kestrel_cloud_runpod.ollama_provider import (
     RunpodOllamaDeployment,
     _pod_base_url,
 )
+from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.ollama_runtime import OLLAMA_RUNTIME_IMAGE_REPOSITORY
+from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 
 _TEST_DIGEST = "sha256:" + "a" * 64
 _TEST_IMAGE = f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@{_TEST_DIGEST}"
@@ -661,6 +669,49 @@ async def test_native_teardown_requires_exact_authenticated_absence(
     path = "/v2/serverless/original-1" if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT else "/v2/pods/original-1"
     action = ("DELETE", path) if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT else ("POST", path + "/action")
     assert state["calls"] == [action, ("GET", path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [OllamaLeaseMode.AUTO, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER])
+@pytest.mark.parametrize("invalid", ["image", "allowlist", "credential"])
+async def test_native_precreate_validation_never_admits_uncertain_capacity(
+    native_teardown, tmp_path, monkeypatch, mode, invalid
+):
+    provider, state = native_teardown
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    if invalid == "image":
+        monkeypatch.setenv("TEST_OLLAMA_IMAGE", "unreviewed:latest")
+    elif invalid == "allowlist":
+        provider.deployment.profile.env = {
+            "KESTREL_OLLAMA_ALLOWED_MODELS": f"different:8b@{_TEST_DIGEST}"
+        }
+    else:
+        provider = _provider(client=provider.client, serverless_api_key=None)
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "precreate.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode)
+    with pytest.raises(RunPodManagerError):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    lease = repository.get(request.lease_id)
+    assert lease.state is OllamaLeaseState.FAILED
+    assert lease.provision_attempts == 0
+    assert lease.provisioning_started_at is None
+    assert lease.provision_attempt_id is None
+    assert lease.creation_uncertain is False
+    assert lease.provider_resource_id is None
+    assert state["calls"] == []
+    clock.advance(10_000)
+    for _ in range(3):
+        await service.reconcile()
+    assert repository.get(request.lease_id).creation_uncertain is False
+    assert state["calls"] == []
 
 
 @pytest.mark.asyncio

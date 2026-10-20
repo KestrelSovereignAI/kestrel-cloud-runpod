@@ -287,6 +287,14 @@ only after an authenticated exact-ID GET reports 404, not merely because the
 delete/action request was acknowledged. A present resource, authentication
 failure or unavailable read keeps teardown pending for reconciliation.
 
+Every `OllamaCapacityProvider` implements the pure, no-I/O
+`validate_runtime_request()` contract. Both quoting and the canonical lease
+service call it for a concrete selected mode; the service does so before
+provisioning admission, including direct manager acquisition and AUTO mode.
+Invalid immutable-image/model/credential configuration therefore fails with
+zero provisioning attempts and no uncertain-create debt. All errors after
+admission still retain uncertain-create custody rather than infer no resource.
+
 These physical lifecycle safeguards are not observed financial evidence.
 Catalog offer prices and cold-start estimates remain estimates. Durable
 original realized-rate/readback provenance, immutable verified-absence receipts

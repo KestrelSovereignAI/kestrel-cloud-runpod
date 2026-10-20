@@ -155,6 +155,9 @@ class OllamaLeaseService:
         try:
             plan = plan or await self.provider.plan(request)
             self.validate_plan(request, plan)
+            # This is still REQUESTED: proven deterministic validation failures
+            # must not create uncertainty or admit a billable provider effect.
+            self.provider.validate_runtime_request(replace(request, mode=plan.mode))
         except RunPodManagerError as exc:
             self._transition(
                 lease,
