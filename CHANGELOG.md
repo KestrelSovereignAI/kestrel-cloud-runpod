@@ -11,9 +11,15 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   receipt tails, and late effect failure keeps precedence while preserving
   original cancellation and native denial/UNKNOWN evidence. Finite observations
   do not mutate shared native source receipts or emit orphan shield diagnostics.
-- Retain the public arbitrary-Awaitable contract, including existing Tasks and
-  Futures. Require Core 0.53.34 for the tested ownership/composition contract;
-  this does not grant admission or change cleanup evidence/billing semantics.
+- Retain the public arbitrary-Awaitable contract, including already-admitted
+  Tasks, slots-only Future-like producers and read-only native Future subclasses,
+  even when new Task allocation is refused. Require Core 0.53.35 for its canonical
+  protocol-only joining and accepted-Task publication custody. This does not
+  grant admission or change cleanup evidence/billing semantics.
+- Require pytest-asyncio 1.4 for test installations: its upstream fix for #724
+  closes the default-loop lifecycle gap when synchronous CLI tests call
+  `asyncio.run()` after async cases. Strict warning checks remain enabled;
+  this is a test-only dependency floor, not a runtime cancellation workaround.
 
 ## [0.14.0] - 2026-10-19
 

@@ -35,7 +35,7 @@ dependencies = [
     "kestrel-sovereign-sdk>=0.35.0,<1",
     # Canonical joined-operation and native terminal-evidence composition.
     # Do not duplicate Core's ownership algorithm in the cloud adapter.
-    "kestrel-sovereign>=0.53.34,<1",
+    "kestrel-sovereign>=0.53.35,<1",
     # Direct runtime dep of signed_invocations (Ed25519 receipt signing and
     # verification).  Declared explicitly rather than leaned on transitively:
     # kestrel-sovereign-sdk already puts cryptography behind a `crypto` extra,
@@ -52,7 +52,9 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=1.1.0",
+    # 1.4 fixes the default-loop leak after synchronous asyncio.run callers
+    # follow async tests/fixtures (upstream pytest-asyncio #724).
+    "pytest-asyncio>=1.4.0",
     "PyYAML>=6.0.2,<7",
     "jsonschema>=4.23.0,<5",
 ]

@@ -4,10 +4,24 @@ import asyncio
 import gc
 import inspect
 import threading
+from importlib.metadata import requires
 
 import pytest
+from packaging.requirements import Requirement
 
 from kestrel_cloud_runpod import await_owned_effect
+
+
+def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
+    dependencies = [Requirement(value) for value in requires("kestrel-cloud-runpod")]
+    core, = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    assert "0.53.34" not in core.specifier
+    assert "0.53.35" in core.specifier
+    test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
+    assert test_loop.marker.evaluate({"extra": "test"})
+    assert not test_loop.marker.evaluate({"extra": ""})
+    assert "1.3.0" not in test_loop.specifier
+    assert "1.4.0" in test_loop.specifier
 
 
 def _original_errors(error):
@@ -241,7 +255,7 @@ async def test_real_task_admission_refusal_closes_only_the_original_unstarted_ef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["existing_task", "existing_future", "future_like"])
+@pytest.mark.parametrize("kind", ["existing_task", "existing_future", "future_like", "readonly_future"])
 @pytest.mark.parametrize("failure", [False, True])
 async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admission_is_refused(kind, failure):
     from kestrel_sovereign._async_ownership import await_owned_task
@@ -255,6 +269,7 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     class FutureLike:
         """The standard asyncio Future-like protocol, backed by a REAL Future."""
 
+        __slots__ = ("_future",)
         _asyncio_future_blocking = False
 
         def __init__(self, future):
@@ -266,6 +281,12 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
         def __getattr__(self, name):
             return getattr(self._future, name)
 
+    class ReadOnlyFuture(asyncio.Future):
+        def __setattr__(self, name, value):
+            if name.startswith("_kestrel_"):
+                raise AttributeError("foreign Future does not admit private Core metadata")
+            return super().__setattr__(name, value)
+
     async def accepted():
         await release.wait()
         tail.append("original physical tail completed")
@@ -273,7 +294,12 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
             raise original
         return "original accepted receipt"
 
-    effect = asyncio.create_task(accepted()) if kind == "existing_task" else loop.create_future()
+    if kind == "existing_task":
+        effect = asyncio.create_task(accepted())
+    elif kind == "readonly_future":
+        effect = ReadOnlyFuture(loop=loop)
+    else:
+        effect = loop.create_future()
     if kind == "future_like":
         effect = FutureLike(effect)
         assert asyncio.isfuture(effect) and not isinstance(effect, asyncio.Future)
@@ -292,13 +318,15 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     finally:
         loop.set_task_factory(previous_factory)
         release.set()
-        if kind in {"existing_future", "future_like"} and not effect.done():
+        if kind in {"existing_future", "future_like", "readonly_future"} and not effect.done():
             if failure:
                 effect.set_exception(original)
             else:
                 effect.set_result("original accepted receipt")
-        effect_outcome = await await_owned_task(effect)
-        outcome = await await_owned_task(owner)
+        try:
+            effect_outcome = await await_owned_task(effect)
+        finally:
+            outcome = await await_owned_task(owner)
     assert refused == [], "existing Task/Future needs no surrogate Task admission"
     if kind == "existing_task":
         assert tail == ["original physical tail completed"]
