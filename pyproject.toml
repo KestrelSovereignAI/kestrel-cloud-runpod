@@ -51,6 +51,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    # Real source/wheel build regressions run the configured backend directly.
+    "hatchling",
     "pytest>=8.0.0",
     # 1.4 fixes the default-loop leak after synchronous asyncio.run callers
     # follow async tests/fixtures (upstream pytest-asyncio #724).
@@ -83,7 +85,8 @@ build-backend = "hatchling.build"
 packages = ["kestrel_cloud_runpod"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_cloud_runpod/**/*", "README.md", "LICENSE", "pyproject.toml"]
+# Exact root paths, not basename globs that also select nested environments.
+only-include = ["kestrel_cloud_runpod", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
