@@ -259,6 +259,231 @@ async def test_retired_endpoint_billing_needs_no_job_or_live_endpoint(billing_se
     assert "job_id" not in receipt.to_dict()
 
 
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_needs_no_catalog_authority(billing_server):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, request, quote, activation, cleanup = await _retire(
+        billing_server, after=timedelta(hours=3, minutes=5)
+    )
+    original = await provider.retired_endpoint_billing(
+        request, quote, activation, cleanup
+    )
+    state["calls"].clear()
+    # The generic read accepts only the original endpoint identity and times;
+    # inference callers do not fabricate training jobs/quotes/activations.
+    costs = await read_exact_serverless_billing(
+        provider.control_client,
+        endpoint_id=activation.endpoint_id,
+        created_at=activation.create_started_at,
+        verified_absent_at=cleanup.verified_absent_at,
+        clock=clock,
+        batch_hours=2,
+    )
+    assert costs == original.endpoint_hour_costs
+    assert len(costs) == 4
+    assert len(state["calls"]) == 2
+    assert all(
+        method == "GET" and path == "/v2/billing/serverless"
+        for method, path, _query in state["calls"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_waits_for_closed_hour(billing_server):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    clock.value = cleanup.verified_absent_at
+    assert (
+        await read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=clock,
+            batch_hours=2,
+        )
+        is None
+    )
+    assert state["calls"] == []
+
+
+@pytest.mark.parametrize("batch_hours", [0, -1, True, "24", None])
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_invalid_batch_before_io(
+    billing_server, batch_hours
+):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        await read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=clock,
+            batch_hours=batch_hours,
+        )
+    assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_never_exposes_partial_history(billing_server):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server, after=timedelta(hours=3, minutes=5)
+    )
+
+    def omit_second_batch(body):
+        if len(state["calls"]) == 2:
+            body["records"] = []
+            body["metadata"]["recordCount"] = 0
+            body["metadata"]["uniqueServerlessCount"] = 0
+            body["metadata"]["totals"] = dict.fromkeys(body["metadata"]["totals"], 0)
+
+    state["mutation"] = omit_second_batch
+    assert (
+        await read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=clock,
+            batch_hours=2,
+        )
+        is None
+    )
+    assert len(state["calls"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_repeated_cancel_joins_native_http(
+    billing_server,
+):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    state["mode"] = "blocked"
+    task = asyncio.create_task(
+        read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=clock,
+            batch_hours=2,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(state["entered"].wait, 5)
+        for _ in range(4):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+    finally:
+        state["release"].set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(state["calls"]) == 1
+
+
+@pytest.mark.parametrize("endpoint_id", ["", None, True, "bad/id", "bad id"])
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_invalid_identity_before_io(
+    billing_server, endpoint_id
+):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    with pytest.raises(ValueError, match="safe identifier"):
+        await read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=endpoint_id,
+            created_at=activation.create_started_at,
+            verified_absent_at=cleanup.verified_absent_at,
+            clock=clock,
+            batch_hours=2,
+        )
+    assert state["calls"] == []
+
+
+@pytest.mark.parametrize("change", ["clock", "naive_start", "reversed"])
+@pytest.mark.asyncio
+async def test_generic_serverless_billing_invalid_time_before_io(
+    billing_server, change
+):
+    from kestrel_cloud_runpod import read_exact_serverless_billing
+
+    state, provider, clock, _request, _quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    started = activation.create_started_at
+    ended = cleanup.verified_absent_at
+    if change == "clock":
+        clock.value = clock.value.replace(tzinfo=None)
+    elif change == "naive_start":
+        started = started.replace(tzinfo=None)
+    else:
+        ended = started
+    with pytest.raises(ValueError, match="timezone-aware|interval"):
+        await read_exact_serverless_billing(
+            provider.control_client,
+            endpoint_id=activation.endpoint_id,
+            created_at=started,
+            verified_absent_at=ended,
+            clock=clock,
+            batch_hours=2,
+        )
+    assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_retired_endpoint_uses_the_same_generic_billing_reader(
+    billing_server, monkeypatch
+):
+    from kestrel_cloud_runpod import serverless_capacity_provider
+
+    state, provider, _clock, request, quote, activation, cleanup = await _retire(
+        billing_server
+    )
+    calls = []
+
+    async def pending(client, **kwargs):
+        calls.append((client, kwargs))
+
+    monkeypatch.setattr(
+        serverless_capacity_provider, "read_exact_serverless_billing", pending
+    )
+    assert (
+        await provider.retired_endpoint_billing(request, quote, activation, cleanup)
+        is None
+    )
+    assert calls == [
+        (
+            provider.control_client,
+            {
+                "endpoint_id": activation.endpoint_id,
+                "created_at": activation.create_started_at,
+                "verified_absent_at": cleanup.verified_absent_at,
+                "clock": provider._now,
+                "batch_hours": 24,
+            },
+        )
+    ]
+    assert state["calls"] == []
+
+
 async def _retire(billing_server, *, after=timedelta(minutes=5)):
     state, provider, clock, request, quote, activation = billing_server
     clock.value = activation.readback_at + after
