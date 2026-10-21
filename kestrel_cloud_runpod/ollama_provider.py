@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from .billing import exact_decimal_integer_scale
-from .clients import RunpodControlPlaneClient
+from .clients import RunpodControlPlaneClient, is_retryable_runpod_api_error
 from .models import (
     Availability,
     ComputeProduct,
@@ -39,8 +39,11 @@ from .ollama_contracts import (
     OllamaCleanupBasis,
     OllamaCleanupIntent,
     OllamaCleanupReceipt,
+    OllamaLeaseAuthorizationError,
+    OllamaLeaseConflictError,
     OllamaLeaseMode,
     OllamaLeaseRequest,
+    OllamaLeaseTeardownError,
     OllamaLifecycleBillingObservation,
     OllamaNonComputeCostComponent,
     OllamaNonComputeCostPolicy,
@@ -77,6 +80,20 @@ from .serverless_capacity_contracts import serverless_endpoint_hour_cost_totals
 from .serverless_capacity_provider import read_exact_serverless_billing
 
 RUNPOD_SERVERLESS_MAX_IDLE_TIMEOUT_SECONDS = 3600
+
+
+def _raise_teardown_api_error(error: RunPodAPIError) -> None:
+    """Translate only canonical provider retry/auth outcomes after exact I/O."""
+
+    if error.status_code in {401, 403}:
+        raise OllamaLeaseAuthorizationError(
+            "Runpod rejected Ollama cleanup authorization"
+        ) from error
+    if is_retryable_runpod_api_error(error):
+        raise OllamaLeaseTeardownError(
+            "Runpod Ollama cleanup remains retryable"
+        ) from error
+    raise error.with_traceback(error.__traceback__)
 
 
 @dataclass(frozen=True)
@@ -657,16 +674,17 @@ class RunpodOllamaCapacityProvider:
         """Request teardown, then require the exact resource GET to be absent.
 
         An acknowledged asynchronous action (or its own 404) is not a physical
-        absence observation. Authentication and transient errors stay retryable.
-        The service retains this whole effect and its durable terminal write.
+        absence observation. Authentication failures are blockers. Canonical
+        transient transport outcomes and a still-present exact resource use
+        the provider's retry disposition for durable service reconciliation.
         """
 
-        if (
-            resource.resource_type is not cleanup_intent.resource_type
-            or resource.provider_resource_id != cleanup_intent.provider_resource_id
-            or resource.resource_name != cleanup_intent.resource_name
-        ):
-            raise RunPodManagerError("Ollama cleanup resource is unbound")
+        try:
+            cleanup_intent.validate_resource(resource)
+        except ValueError as exc:
+            raise OllamaLeaseConflictError(
+                "Ollama cleanup resource is unbound"
+            ) from exc
         delete_acknowledged = True
         try:
             if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
@@ -679,7 +697,7 @@ class RunpodOllamaCapacityProvider:
                 )
         except RunPodAPIError as exc:
             if exc.status_code != 404:
-                raise
+                _raise_teardown_api_error(exc)
             delete_acknowledged = False
         read_resource = (
             self.client.get_endpoint
@@ -701,8 +719,8 @@ class RunpodOllamaCapacityProvider:
                 )
                 receipt.validate_intent(cleanup_intent)
                 return receipt
-            raise
-        raise RunPodManagerError(
+            _raise_teardown_api_error(exc)
+        raise OllamaLeaseTeardownError(
             "Original Ollama resource is still present after teardown; reconcile it"
         )
 

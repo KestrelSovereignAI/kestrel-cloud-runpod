@@ -20,7 +20,9 @@ def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     (core,) = [value for value in dependencies if value.name == "kestrel-sovereign"]
     assert "0.53.34" not in core.specifier
     assert "0.53.36" not in core.specifier
-    assert "0.53.37" in core.specifier
+    assert "0.53.37" not in core.specifier
+    assert "0.53.40" not in core.specifier
+    assert "0.53.41" in core.specifier
     test_dependencies = [
         Requirement(value) for value in project["optional-dependencies"]["test"]
     ]

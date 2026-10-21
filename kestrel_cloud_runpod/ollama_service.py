@@ -8,7 +8,7 @@ import logging
 import math
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Never
@@ -23,6 +23,7 @@ from .models import (
 )
 from .ollama_contracts import (
     OllamaCapacityProvider,
+    OllamaCleanupIntent,
     OllamaLease,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -60,28 +61,58 @@ from .ollama_repository import SQLiteOllamaLeaseRepository, request_from_lease
 logger = logging.getLogger(__name__)
 
 
-def _is_recoverable_cleanup_setup_failure(error: BaseException) -> bool:
-    """Return whether every leaf permits already-proven cleanup to continue.
+@dataclass(frozen=True)
+class _CleanupEffectOutcome:
+    """One provider effect joined to its exact durable retry outcome."""
 
-    A mixed exception group is recoverable only when every leaf is either a
-    native execution-control outcome or one of SQLite's two transient locking
-    conditions.  Structural, authority, and unclassified failures must take
-    precedence over recoverable siblings; they stop further provider I/O while
-    the original exception object is retained for final composition.
+    lease: OllamaLease
+    provider_failure: OllamaLeaseTeardownError | None = None
+
+
+def _is_recoverable_cleanup_setup_failure(error: BaseException) -> bool:
+    """Return whether every explicit node permits proven cleanup to continue.
+
+    Groups are structural containers, while their members and explicit causes
+    remain evidence. Every non-group node must directly be native execution
+    control or one of SQLite's two transient locking conditions. Structural,
+    authority, and unclassified failures take precedence without changing the
+    original graph.
     """
 
-    if isinstance(error, BaseExceptionGroup):
-        return all(
-            _is_recoverable_cleanup_setup_failure(child) for child in error.exceptions
-        )
-    if is_execution_control_error(error):
-        return True
-    if not isinstance(error, sqlite3.OperationalError):
-        return False
-    error_code = getattr(error, "sqlite_errorcode", None)
-    if not isinstance(error_code, int) or isinstance(error_code, bool):
-        return False
-    return error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+            continue
+        if is_execution_control_error(current, recursive=False):
+            continue
+        if not isinstance(current, sqlite3.OperationalError):
+            return False
+        error_code = getattr(current, "sqlite_errorcode", None)
+        if not isinstance(error_code, int) or isinstance(error_code, bool):
+            return False
+        if error_code & 0xFF not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return False
+    return True
+
+
+def _validate_cleanup_resource(
+    resource: ProvisionedOllamaResource,
+    cleanup_intent: OllamaCleanupIntent,
+) -> None:
+    """Translate the canonical cleanup binding into a service conflict."""
+
+    try:
+        cleanup_intent.validate_resource(resource)
+    except ValueError as exc:
+        raise OllamaLeaseConflictError("Ollama cleanup resource is unbound") from exc
 
 
 def _raise_cleanup_failures(
@@ -1246,9 +1277,10 @@ class OllamaLeaseService:
             for kind, provider_resource_id in pending:
                 attempted.add((kind, provider_resource_id))
                 try:
+                    outcome: _CleanupEffectOutcome | None = None
                     if kind == "primary":
                         if current.cleanup_receipt is None:
-                            current = await self._teardown_effect(
+                            outcome = await self._teardown_effect(
                                 current, reason=reason
                             )
                     else:
@@ -1265,15 +1297,22 @@ class OllamaLeaseService:
                                 f"Lease '{lease.lease_id}' lost cleanup authority"
                             )
                         if target.cleanup_receipt is None:
-                            current = await self._teardown_additional_effect(
+                            outcome = await self._teardown_additional_effect(
                                 current,
                                 provider_resource_id=provider_resource_id,
                                 reason=reason,
                             )
+                    if outcome is not None:
+                        current = outcome.lease
+                        if outcome.provider_failure is not None:
+                            failures.append(outcome.provider_failure)
                 except BaseException as exc:  # noqa: BLE001
-                    # Preserve cancellation/control evidence until every joined
-                    # resource has had its independently owned cleanup attempt.
                     failures.append(exc)
+                    if not _is_recoverable_cleanup_setup_failure(exc):
+                        stop_cleanup = True
+                if stop_cleanup:
+                    lease = current
+                    break
                 if can_refresh:
                     try:
                         current = self.repository.latest_cleanup_lineage(lineage)
@@ -1297,47 +1336,83 @@ class OllamaLeaseService:
             _raise_cleanup_failures("Multiple Ollama cleanup effects failed", failures)
         return lease
 
-    async def _teardown_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:
+    def _record_retryable_cleanup_outcome(
+        self,
+        lease: OllamaLease,
+        *,
+        provider_resource_id: str,
+        provider_failure: OllamaLeaseTeardownError,
+        reason: str,
+        additional: bool,
+    ) -> _CleanupEffectOutcome:
+        """Persist one provider-declared retry without broadening authority."""
+
+        source_failure = provider_failure.__cause__
+        if not isinstance(source_failure, RunPodManagerError):
+            source_failure = provider_failure
+        now = self._now()
+        changes = {
+            "provider_resource_id": provider_resource_id,
+            "now": now,
+            "accrued_estimated_cost": accrued_cost(lease, now),
+            "termination_reason": reason,
+            "provider_error": (f"{reason}: {sanitize_provider_error(source_failure)}"),
+            "retry_at": now + timedelta(seconds=self.poll_interval_seconds),
+        }
+        try:
+            if additional:
+                durable = self.repository.record_additional_cleanup_outcome(
+                    lease, **changes
+                )
+            else:
+                durable = self.repository.record_teardown_outcome(lease, **changes)
+        except BaseException as persistence_error:  # noqa: BLE001
+            raise BaseExceptionGroup(
+                (
+                    "Ollama additional teardown and outcome persistence both failed"
+                    if additional
+                    else "Ollama teardown and outcome persistence both failed"
+                ),
+                [provider_failure, persistence_error],
+            ) from None
+        return _CleanupEffectOutcome(durable, provider_failure)
+
+    async def _teardown_effect(
+        self, lease: OllamaLease, *, reason: str
+    ) -> _CleanupEffectOutcome:
         """Join physical deletion, exact absence readback and receipt persistence."""
 
-        try:
-            resource = resource_from_lease(lease)
-            cleanup_intent = lease.cleanup_intent
-            if cleanup_intent is None:
-                raise OllamaLeaseTeardownError(
-                    f"Ollama lease '{lease.lease_id}' cleanup intent disappeared"
-                )
-            cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
-        except RunPodManagerError as exc:
-            provider_failure = OllamaLeaseTeardownError(
-                f"Ollama lease '{lease.lease_id}' teardown remains retryable"
+        resource = resource_from_lease(lease)
+        cleanup_intent = lease.cleanup_intent
+        if cleanup_intent is None:
+            raise OllamaLeaseTeardownError(
+                f"Ollama lease '{lease.lease_id}' cleanup intent disappeared"
             )
-            provider_failure.__cause__ = exc
-            try:
-                self.repository.record_teardown_outcome(
-                    lease,
-                    provider_resource_id=resource.provider_resource_id,
-                    now=self._now(),
-                    accrued_estimated_cost=accrued_cost(lease, self._now()),
-                    termination_reason=reason,
-                    provider_error=f"{reason}: {sanitize_provider_error(exc)}",
-                    retry_at=self._now()
-                    + timedelta(seconds=self.poll_interval_seconds),
-                )
-            except BaseException as persistence_error:  # noqa: BLE001
-                raise BaseExceptionGroup(
-                    "Ollama teardown and outcome persistence both failed",
-                    [provider_failure, persistence_error],
-                ) from None
-            raise provider_failure from exc
-        return self.repository.record_teardown_outcome(
-            lease,
-            provider_resource_id=resource.provider_resource_id,
-            now=self._now(),
-            accrued_estimated_cost=accrued_cost(lease, self._now()),
-            termination_reason=reason,
-            cleanup_receipt=cleanup_receipt,
-            billing_next_check_at=self._now(),
+        _validate_cleanup_resource(resource, cleanup_intent)
+        try:
+            cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
+        except OllamaLeaseTeardownError as exc:
+            if type(exc) is not OllamaLeaseTeardownError:
+                raise
+            return self._record_retryable_cleanup_outcome(
+                lease,
+                provider_resource_id=resource.provider_resource_id,
+                provider_failure=exc,
+                reason=reason,
+                additional=False,
+            )
+        except RunPodManagerError:
+            raise
+        return _CleanupEffectOutcome(
+            self.repository.record_teardown_outcome(
+                lease,
+                provider_resource_id=resource.provider_resource_id,
+                now=self._now(),
+                accrued_estimated_cost=accrued_cost(lease, self._now()),
+                termination_reason=reason,
+                cleanup_receipt=cleanup_receipt,
+                billing_next_check_at=self._now(),
+            )
         )
 
     async def _teardown_additional_effect(
@@ -1346,7 +1421,7 @@ class OllamaLeaseService:
         *,
         provider_resource_id: str,
         reason: str,
-    ) -> OllamaLease:
+    ) -> _CleanupEffectOutcome:
         """Join cleanup of one separately retained original POST ACK."""
 
         lease = self.repository.record_additional_cleanup_intent(
@@ -1370,37 +1445,30 @@ class OllamaLeaseService:
             provider_resource_id=target.provider_resource_id,
             resource_name=target.resource_name,
         )
+        _validate_cleanup_resource(resource, cleanup_intent)
         try:
             cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
-        except RunPodManagerError as exc:
-            provider_failure = OllamaLeaseTeardownError(
-                f"Ollama lease '{lease.lease_id}' additional teardown remains retryable"
+        except OllamaLeaseTeardownError as exc:
+            if type(exc) is not OllamaLeaseTeardownError:
+                raise
+            return self._record_retryable_cleanup_outcome(
+                lease,
+                provider_resource_id=provider_resource_id,
+                provider_failure=exc,
+                reason=reason,
+                additional=True,
             )
-            provider_failure.__cause__ = exc
-            try:
-                self.repository.record_additional_cleanup_outcome(
-                    lease,
-                    provider_resource_id=provider_resource_id,
-                    now=self._now(),
-                    accrued_estimated_cost=accrued_cost(lease, self._now()),
-                    termination_reason=reason,
-                    provider_error=f"{reason}: {sanitize_provider_error(exc)}",
-                    retry_at=self._now()
-                    + timedelta(seconds=self.poll_interval_seconds),
-                )
-            except BaseException as persistence_error:  # noqa: BLE001
-                raise BaseExceptionGroup(
-                    "Ollama additional teardown and outcome persistence both failed",
-                    [provider_failure, persistence_error],
-                ) from None
-            raise provider_failure from exc
-        return self.repository.record_additional_cleanup_outcome(
-            lease,
-            provider_resource_id=provider_resource_id,
-            now=self._now(),
-            accrued_estimated_cost=accrued_cost(lease, self._now()),
-            termination_reason=reason,
-            cleanup_receipt=cleanup_receipt,
+        except RunPodManagerError:
+            raise
+        return _CleanupEffectOutcome(
+            self.repository.record_additional_cleanup_outcome(
+                lease,
+                provider_resource_id=provider_resource_id,
+                now=self._now(),
+                accrued_estimated_cost=accrued_cost(lease, self._now()),
+                termination_reason=reason,
+                cleanup_receipt=cleanup_receipt,
+            )
         )
 
     async def _resolve_uncertain_release(

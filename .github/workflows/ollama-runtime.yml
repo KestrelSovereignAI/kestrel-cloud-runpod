@@ -104,6 +104,10 @@ jobs:
           VOLUME="ollama-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TOKEN="runtime-integration-0123456789abcdef0123456789abcdef"
           EXPIRES_AT="$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')"
+          TELEMETRY_BINDING_SHA256="$(
+            printf '%s' "$TOKEN|$EXPIRES_AT|dedicated_pod|/workspace/ollama" |
+              sha256sum | awk '{print $1}'
+          )"
           cleanup() {
             docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
             docker volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -118,6 +122,7 @@ jobs:
             --env "KESTREL_OLLAMA_REQUIRED_MODEL=registry.invalid/model:v1" \
             --env "KESTREL_OLLAMA_MODE=dedicated_pod" \
             --env "KESTREL_OLLAMA_MODEL_STORAGE_PATH=/workspace/ollama" \
+            --env "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256=$TELEMETRY_BINDING_SHA256" \
             "$RUNTIME_IMAGE_REF" >/dev/null
           PROVED=false
           for _ in $(seq 1 100); do

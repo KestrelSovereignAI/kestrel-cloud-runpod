@@ -1216,12 +1216,32 @@ class OllamaCleanupIntent:
             raise ValueError("Ollama cleanup intent does not bind provisioning")
         if receipt is not None:
             receipt.validate_intent(intent)
-            if self.provider_resource_id != receipt.provider_resource_id:
-                raise ValueError("Ollama cleanup intent does not bind its receipt")
+            try:
+                self.validate_resource(
+                    ProvisionedOllamaResource(
+                        resource_type=receipt.resource_type,
+                        provider_resource_id=receipt.provider_resource_id,
+                        resource_name=receipt.resource_name,
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "Ollama cleanup intent does not bind its receipt"
+                ) from exc
         if self.provisioning_receipt_id is not None and (
             receipt is None or self.provisioning_receipt_id != receipt.receipt_id
         ):
             raise ValueError("Ollama cleanup intent does not bind its receipt")
+
+    def validate_resource(self, resource: ProvisionedOllamaResource) -> None:
+        """Require the exact typed resource authorized by this cleanup intent."""
+
+        if not isinstance(resource, ProvisionedOllamaResource) or (
+            self.resource_type is not resource.resource_type
+            or self.provider_resource_id != resource.provider_resource_id
+            or self.resource_name != resource.resource_name
+        ):
+            raise ValueError("Ollama cleanup intent does not bind its resource")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2520,7 +2540,16 @@ class OllamaCapacityProvider(Protocol):
         self,
         resource: ProvisionedOllamaResource,
         cleanup_intent: OllamaCleanupIntent,
-    ) -> OllamaCleanupReceipt: ...
+    ) -> OllamaCleanupReceipt:
+        """Return exact absence or raise an exact retry/blocker disposition.
+
+        Only an exact ``OllamaLeaseTeardownError`` denotes a provider attempt
+        that may be durably retried while other independently owned cleanup is
+        joined. Authorization, authority, unknown subclasses, and every other
+        manager error remain structural blockers.
+        """
+
+        ...
 
     async def observe_lifecycle_billing(
         self,

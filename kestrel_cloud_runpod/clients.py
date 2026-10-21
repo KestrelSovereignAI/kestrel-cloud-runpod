@@ -43,6 +43,26 @@ _RATE_LIMIT_RESET_RE = re.compile(r"(?:^|[,;]\s*)reset=(\d+(?:\.\d+)?)", re.IGNO
 DEFAULT_USER_AGENT = "kestrel-cloud-runpod/v2"
 
 
+def _is_retryable_runpod_status(status_code: int | None) -> bool:
+    return status_code in _RETRYABLE_STATUSES
+
+
+def is_retryable_runpod_api_error(error: RunPodAPIError) -> bool:
+    """Classify one exact API outcome for durable reconciliation.
+
+    A missing status is retryable only when the canonical client retained its
+    original HTTPX failure as the explicit cause.  This prevents callers from
+    manufacturing retry authority with a nullable status alone.  This result
+    does not grant permission to repeat an arbitrary HTTP method.
+    """
+
+    if type(error) not in {RunPodAPIError, RunPodAmbiguousResultError}:
+        return False
+    if _is_retryable_runpod_status(error.status_code):
+        return True
+    return error.status_code is None and isinstance(error.__cause__, httpx.HTTPError)
+
+
 class RunpodTransport:
     """Synchronous JSON transport shared by both Runpod v2 services."""
 
@@ -288,7 +308,7 @@ class RunpodTransport:
                 return response
             if (
                 safe_to_retry
-                and response.status_code in _RETRYABLE_STATUSES
+                and _is_retryable_runpod_status(response.status_code)
                 and attempt < self.max_safe_retries
             ):
                 self._sleep(_retry_delay(response.headers, attempt))

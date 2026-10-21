@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -41,10 +42,12 @@ from kestrel_cloud_runpod.models import (
 )
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaCleanupIntent,
+    OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
+    OllamaLifecycleBillingState,
     OllamaProvisioningMismatchError,
     OllamaResourceType,
     OllamaTeardownState,
@@ -714,6 +717,38 @@ async def test_teardown_treats_already_absent_resource_as_success():
     await provider.teardown(resource, _cleanup_intent(resource))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["typed_transport", "statusless", "malformed"])
+async def test_teardown_retry_disposition_requires_canonical_transport_evidence(case):
+    client = _ControlClient()
+    api_error = RunPodAPIError(
+        title="Runpod transport failed" if case != "malformed" else "Invalid response",
+        detail="bounded test",
+        status_code=200 if case == "malformed" else None,
+    )
+    if case == "typed_transport":
+        request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/test")
+        api_error.__cause__ = httpx.ConnectError("connection failed", request=request)
+    elif case == "malformed":
+        api_error.__cause__ = ValueError("invalid JSON")
+    client.delete_error = api_error
+    provider = _provider(client=client)
+    resource = ProvisionedOllamaResource(
+        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+        provider_resource_id="endpoint-1",
+        resource_name="endpoint",
+    )
+
+    if case == "typed_transport":
+        with pytest.raises(OllamaLeaseTeardownError) as caught:
+            await provider.teardown(resource, _cleanup_intent(resource))
+        assert caught.value.__cause__ is api_error
+    else:
+        with pytest.raises(RunPodAPIError) as caught:
+            await provider.teardown(resource, _cleanup_intent(resource))
+        assert caught.value is api_error
+
+
 @pytest.fixture
 def native_teardown():
     state = {"calls": [], "delete_status": 204, "read_status": 404}
@@ -780,6 +815,7 @@ def native_teardown():
 def native_provisioning():
     state = {
         "calls": [],
+        "billing_calls": [],
         "request": None,
         "readback": None,
         "drop_on_get": (),
@@ -866,6 +902,58 @@ def native_provisioning():
                 self.respond(201, state["readback"])
 
         def do_GET(self):
+            path = urlsplit(self.path)
+            if path.path == "/v2/billing/serverless":
+                query = {key: values[0] for key, values in parse_qs(path.query).items()}
+                state["calls"].append((self.command, path.path))
+                state["billing_calls"].append(query)
+                start = datetime.fromisoformat(query["startTime"])
+                end = datetime.fromisoformat(query["endTime"])
+                records = []
+                while start < end:
+                    records.append(
+                        {
+                            "startTime": start.isoformat().replace("+00:00", "Z"),
+                            "endTime": (start + timedelta(hours=1))
+                            .isoformat()
+                            .replace("+00:00", "Z"),
+                            "serverlessId": "endpoint-evidence-1",
+                            "gpuAmount": 0.04,
+                            "cpuAmount": 0.01,
+                            "diskAmount": 0.02,
+                            "feeAmount": 0.03,
+                            "totalAmount": 0.10,
+                        }
+                    )
+                    start += timedelta(hours=1)
+                totals = {
+                    key: float(
+                        sum(
+                            (Decimal(str(record[key])) for record in records),
+                            Decimal(0),
+                        )
+                    )
+                    for key in (
+                        "gpuAmount",
+                        "cpuAmount",
+                        "diskAmount",
+                        "feeAmount",
+                        "totalAmount",
+                    )
+                }
+                self.respond(
+                    200,
+                    {
+                        "records": records,
+                        "metadata": {
+                            "query": query,
+                            "recordCount": len(records),
+                            "uniqueServerlessCount": 1 if records else 0,
+                            "totals": totals,
+                        },
+                    },
+                )
+                return
             if self.path == "/v2/serverless":
                 state["calls"].append((self.command, self.path))
                 self.respond(
@@ -1028,6 +1116,150 @@ async def test_native_late_valid_receipt_survives_receiptless_completed_cleanup(
     assert durable.cleanup_receipt == closed.cleanup_receipt
     assert durable.route_url is None
     assert state["calls"].count(("DELETE", "/v2/serverless/endpoint-evidence-1")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reconcile_path", "enrollment_exclusion"),
+    [
+        ("direct", None),
+        ("timer", None),
+        ("direct", "cleanup_incomplete"),
+    ],
+)
+async def test_native_late_first_receipt_enrolls_completed_cleanup_for_billing(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+    reconcile_path,
+    enrollment_exclusion,
+):
+    """Only an exactly closed single-resource lifecycle enrolls billing."""
+
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    clock = MutableClock()
+    provider._clock = clock
+    original_observe = provider.observe_provisioning
+    first_readback_entered = asyncio.Event()
+    first_readback_finished = asyncio.Event()
+    readbacks = 0
+
+    async def delayed_first_readback(*args, **kwargs):
+        nonlocal readbacks
+        readbacks += 1
+        if readbacks == 1:
+            receipt = await original_observe(*args, **kwargs)
+            first_readback_entered.set()
+            await first_readback_finished.wait()
+            return receipt
+        state["read_status"] = 503
+        try:
+            return await original_observe(*args, **kwargs)
+        finally:
+            state["read_status"] = None
+
+    provider.observe_provisioning = delayed_first_readback
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"late-first-billing-{reconcile_path}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    acquire = asyncio.create_task(
+        service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    )
+    try:
+        await first_readback_entered.wait()
+        clock.advance(3700)
+        if enrollment_exclusion == "cleanup_incomplete":
+
+            async def fail_cleanup(*_args, **_kwargs):
+                raise OllamaLeaseTeardownError(
+                    "injected exact cleanup remains retryable"
+                )
+
+            monkeypatch.setattr(provider, "teardown", fail_cleanup)
+            with pytest.raises(OllamaLeaseTeardownError):
+                await service.release(
+                    request.lease_id,
+                    owner_id=request.owner_id,
+                    workload_id=request.workload_id,
+                )
+            closed = repository.get(request.lease_id)
+            assert closed is not None
+            assert closed.state is OllamaLeaseState.RELEASING
+            assert closed.cleanup_intent is not None
+            assert closed.cleanup_receipt is None
+        else:
+            closed = await service.release(
+                request.lease_id,
+                owner_id=request.owner_id,
+                workload_id=request.workload_id,
+            )
+            assert closed.state is OllamaLeaseState.TERMINATED
+            assert closed.cleanup_intent is not None
+            assert closed.cleanup_intent.provisioning_receipt_id is None
+            assert closed.cleanup_receipt is not None
+        assert closed.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+    finally:
+        first_readback_finished.set()
+
+    if enrollment_exclusion == "cleanup_incomplete":
+        with pytest.raises(OllamaLeaseTeardownError):
+            await acquire
+        completed = repository.get(request.lease_id)
+        assert completed is not None
+    else:
+        completed = await acquire
+    assert completed.provisioning_receipt is not None
+    assert completed.cleanup_intent == closed.cleanup_intent
+    assert completed.cleanup_receipt == closed.cleanup_receipt
+    assert completed.max_authorized_cost == request.max_authorized_cost
+    assert state["billing_calls"] == []
+
+    if enrollment_exclusion is not None:
+        assert completed.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+        assert completed.billing_next_check_at is None
+        if enrollment_exclusion == "cleanup_incomplete":
+            assert completed.state is OllamaLeaseState.RELEASING
+            assert completed.cleanup_receipt is None
+        return
+
+    assert completed.state is OllamaLeaseState.TERMINATED
+
+    clock.advance(7200)
+    if reconcile_path == "direct":
+        reconciled = await service.reconcile_lease(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+    else:
+        matches = [
+            item
+            for item in await service.reconcile()
+            if item.lease_id == request.lease_id
+        ]
+        reconciled = matches[0] if matches else repository.get(request.lease_id)
+
+    assert len(state["billing_calls"]) == 1
+    if reconcile_path == "timer":
+        assert len(matches) == 1
+    assert reconciled is not None
+    assert reconciled.lifecycle_billing_state is OllamaLifecycleBillingState.SELECTED
+    assert reconciled.max_authorized_cost == request.max_authorized_cost
+    assert reconciled.cleanup_intent == closed.cleanup_intent
+    assert reconciled.cleanup_receipt == closed.cleanup_receipt
 
 
 @pytest.mark.asyncio
@@ -2407,9 +2639,35 @@ class _TwoTargetCleanupProvider(FakeOllamaProvider):
     async def teardown(self, resource, cleanup_intent):
         self.teardown_resource_ids.append(resource.provider_resource_id)
         if resource.provider_resource_id in self.failed_resource_ids:
-            raise RunPodManagerError(
-                f"teardown failed for {resource.provider_resource_id}"
+            scope = (
+                "teardown"
+                if resource.provider_resource_id == "provider-001"
+                else "additional teardown"
             )
+            raise OllamaLeaseTeardownError(
+                f"{scope} remains retryable for {resource.provider_resource_id}"
+            )
+        return await super().teardown(resource, cleanup_intent)
+
+
+class _UnknownCleanupContractError(RunPodManagerError):
+    """A structural provider-contract failure unknown to the service."""
+
+
+class _UnknownTeardownContractError(OllamaLeaseTeardownError):
+    """A teardown subclass cannot manufacture the exact retry disposition."""
+
+
+class _StructuralCleanupProvider(FakeOllamaProvider):
+    def __init__(self, error_type):
+        super().__init__(serverless_plan())
+        self.error_type = error_type
+        self.teardown_resource_ids = []
+
+    async def teardown(self, resource, cleanup_intent):
+        self.teardown_resource_ids.append(resource.provider_resource_id)
+        if resource.provider_resource_id == "provider-001":
+            raise self.error_type("structural cleanup failure")
         return await super().teardown(resource, cleanup_intent)
 
 
@@ -2445,12 +2703,26 @@ async def _ready_two_target_cleanup(tmp_path, provider, *, database_name):
     return clock, service, with_late_ack
 
 
-async def _claimed_two_target_cleanup(tmp_path, provider):
+async def _claimed_two_target_cleanup(
+    tmp_path,
+    provider,
+    *,
+    admission_provider=None,
+    database_name="two-target-cleanup.sqlite3",
+):
     clock, service, with_late_ack = await _ready_two_target_cleanup(
         tmp_path,
-        provider,
-        database_name="two-target-cleanup.sqlite3",
+        admission_provider or provider,
+        database_name=database_name,
     )
+    if admission_provider is not None:
+        service = OllamaLeaseService(
+            repository=service.repository,
+            provider=provider,
+            poll_interval_seconds=1,
+            clock=clock,
+            sleep=clock.sleep,
+        )
     repository = service.repository
     releasing = repository.compare_and_set(
         with_late_ack,
@@ -2475,6 +2747,94 @@ def _all_nested_errors(error):
             nested for child in error.exceptions for nested in _all_nested_errors(child)
         ]
     return [error]
+
+
+def _explicit_error_graph(error):
+    pending = [error]
+    visited = set()
+    errors = []
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        errors.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    return errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_native_cleanup_auth_failure_stops_before_second_owned_target(
+    tmp_path,
+    native_teardown,
+    status_code,
+):
+    """A provider authentication failure must stop later billable cleanup I/O."""
+
+    provider, state = native_teardown
+    state["delete_status"] = status_code
+    service, claimed = await _claimed_two_target_cleanup(
+        tmp_path,
+        provider,
+        admission_provider=FakeOllamaProvider(serverless_plan()),
+        database_name=f"cleanup-auth-{status_code}.sqlite3",
+    )
+
+    try:
+        await service._teardown_all_effects(claimed, reason="test auth blocker")
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+    else:
+        pytest.fail("provider authentication failure was not retained")
+
+    graph = _explicit_error_graph(caught)
+    api_errors = [error for error in graph if isinstance(error, RunPodAPIError)]
+    assert len(api_errors) == 1
+    assert api_errors[0].status_code == status_code
+    assert state["calls"] == [("DELETE", "/v2/serverless/provider-001")]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.RELEASING
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        OllamaLeaseConflictError,
+        _UnknownCleanupContractError,
+        _UnknownTeardownContractError,
+    ],
+)
+async def test_native_structural_cleanup_failure_stops_before_second_owned_target(
+    tmp_path,
+    error_type,
+):
+    """Unknown manager subclasses are blockers, not implicit provider retries."""
+
+    provider = _StructuralCleanupProvider(error_type)
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+
+    try:
+        await service._teardown_all_effects(claimed, reason="test structural blocker")
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+    else:
+        pytest.fail("structural cleanup failure was not retained")
+
+    assert any(isinstance(error, error_type) for error in _explicit_error_graph(caught))
+    assert provider.teardown_resource_ids == ["provider-001"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.RELEASING
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
 
 
 def _fail_repository_stage_once(
@@ -2564,6 +2924,46 @@ def _native_sqlite_programming_error(tmp_path):
     raise AssertionError("SQLite did not produce ProgrammingError")
 
 
+def _native_sqlite_trigger_integrity_error(tmp_path, *, database_name):
+    """Produce SQLite's genuine constraint-trigger integrity failure."""
+
+    database = tmp_path / database_name
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE evidence (id INTEGER PRIMARY KEY);
+            CREATE TRIGGER reject_evidence
+            BEFORE INSERT ON evidence
+            BEGIN
+                SELECT RAISE(ABORT, 'injected native integrity blocker');
+            END;
+            """
+        )
+        try:
+            connection.execute("INSERT INTO evidence VALUES (1)")
+        except sqlite3.IntegrityError as error:
+            assert error.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+            return error
+    raise AssertionError("SQLite did not produce SQLITE_CONSTRAINT_TRIGGER")
+
+
+def _install_cleanup_receipt_integrity_trigger(repository):
+    """Reject the first primary cleanup receipt in the real lease ledger."""
+
+    with closing(sqlite3.connect(repository.path)) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_primary_cleanup_receipt
+            BEFORE UPDATE OF cleanup_receipt_json ON ollama_leases
+            WHEN NEW.cleanup_receipt_json IS NOT OLD.cleanup_receipt_json
+            BEGIN
+                SELECT RAISE(ABORT, 'injected primary cleanup receipt blocker');
+            END
+            """
+        )
+        connection.commit()
+
+
 def _cleanup_blocker(tmp_path, blocker_kind):
     """Build exact blocker leaves/groups for cleanup classification tests."""
 
@@ -2625,6 +3025,29 @@ def _contains_exception_identity(error, expected):
             _contains_exception_identity(child, expected) for child in error.exceptions
         )
     return False
+
+
+def _cleanup_explicit_cause_graph(tmp_path, *, carrier_kind, cause_cycle):
+    """Build one real integrity cause behind an otherwise permitted carrier."""
+
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    control = ExecutionCommitOutcomeError("unknown")
+    if carrier_kind == "control":
+        carrier = control
+    else:
+        carrier = BaseExceptionGroup(
+            "cleanup carrier with one control member",
+            [control],
+        )
+    integrity = _native_sqlite_trigger_integrity_error(
+        tmp_path,
+        database_name=f"explicit-cause-{carrier_kind}-{cause_cycle}.sqlite3",
+    )
+    carrier.__cause__ = integrity
+    if cause_cycle:
+        integrity.__cause__ = carrier
+    return carrier, control, integrity
 
 
 def _inject_cleanup_stage_once(
@@ -2800,6 +3223,244 @@ async def test_native_cleanup_recoverable_leaf_group_joins_known_targets(
     )
     assert _contains_exception_identity(caught, recoverable)
     assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+
+
+@pytest.mark.asyncio
+async def test_native_cleanup_outcome_integrity_blocks_later_provider_io(tmp_path):
+    """An uncommitted absence receipt cannot authorize another DELETE."""
+
+    provider = _TwoTargetCleanupProvider()
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    _install_cleanup_receipt_integrity_trigger(service.repository)
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test native cleanup receipt blocker",
+        )
+    except BaseException as error:  # noqa: BLE001 - exact native error is evidence
+        caught = error
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("native cleanup receipt blocker was not retained")
+
+    integrity = [
+        failure for failure in failures if isinstance(failure, sqlite3.IntegrityError)
+    ]
+    assert len(integrity) == 1
+    assert integrity[0].sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    assert _contains_exception_identity(caught, integrity[0])
+    assert provider.teardown_resource_ids == ["provider-001"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocker_kind", "expected_type"),
+    [
+        ("nested_control_and_integrity", sqlite3.IntegrityError),
+        ("control_and_conflict", OllamaLeaseConflictError),
+        ("control_and_unexpected", ValueError),
+    ],
+)
+async def test_nested_cleanup_outcome_blocker_stops_later_provider_io(
+    tmp_path,
+    monkeypatch,
+    blocker_kind,
+    expected_type,
+):
+    """Every effect/outcome graph is classified before the next target."""
+
+    provider = _TwoTargetCleanupProvider()
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    blocker, _ = _cleanup_blocker(tmp_path, blocker_kind)
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        "record_teardown_outcome",
+        "unused exact blocker carrier",
+        error=blocker,
+    )
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test nested cleanup outcome blocker",
+        )
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("nested cleanup outcome blocker was not retained")
+
+    assert _contains_exception_identity(caught, blocker)
+    assert any(isinstance(failure, expected_type) for failure in failures)
+    assert provider.teardown_resource_ids == ["provider-001"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause_cycle", [False, True])
+async def test_explicit_control_cause_cannot_make_integrity_carrier_recoverable(
+    tmp_path,
+    monkeypatch,
+    cause_cycle,
+):
+    """A direct structural carrier outranks a nested native-control cause."""
+
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name=f"explicit-control-cause-{cause_cycle}.sqlite3",
+    )
+    blocker = _native_sqlite_trigger_integrity_error(
+        tmp_path,
+        database_name=f"native-trigger-carrier-{cause_cycle}.sqlite3",
+    )
+    control = ExecutionCommitOutcomeError("unknown")
+    blocker.__cause__ = control
+    if cause_cycle:
+        control.__cause__ = blocker
+    _inject_cleanup_stage_once(
+        monkeypatch,
+        service.repository,
+        provider,
+        stage="claim",
+        error=blocker,
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+    else:
+        pytest.fail("integrity carrier with explicit control cause was not retained")
+
+    assert _contains_exception_identity(caught, blocker)
+    assert blocker.__cause__ is control
+    if cause_cycle:
+        assert control.__cause__ is blocker
+    assert provider.teardown_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_native_cleanup_outcome_busy_keeps_joining_known_targets(
+    tmp_path,
+    monkeypatch,
+):
+    """A genuine transient SQLite outcome error remains a cleanup permit."""
+
+    provider = _TwoTargetCleanupProvider()
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    transient = _native_sqlite_operational_error(tmp_path, "busy")
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        "record_teardown_outcome",
+        "unused transient outcome error",
+        error=transient,
+    )
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test transient cleanup outcome",
+        )
+    except BaseException as error:  # noqa: BLE001 - identity is asserted
+        caught = error
+    else:
+        pytest.fail("transient cleanup outcome failure was not retained")
+
+    assert _contains_exception_identity(caught, transient)
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "carrier_kind", "cause_cycle"),
+    [
+        ("claim", "group", False),
+        ("claim", "control", True),
+        ("outcome", "group", True),
+        ("outcome", "control", False),
+    ],
+)
+async def test_cleanup_integrity_explicit_cause_blocks_later_provider_io(
+    tmp_path,
+    monkeypatch,
+    stage,
+    carrier_kind,
+    cause_cycle,
+):
+    """A permitted carrier cannot hide its structural explicit cause."""
+
+    provider = _TwoTargetCleanupProvider()
+    carrier, control, integrity = _cleanup_explicit_cause_graph(
+        tmp_path,
+        carrier_kind=carrier_kind,
+        cause_cycle=cause_cycle,
+    )
+    if stage == "claim":
+        _, service, lease = await _ready_two_target_cleanup(
+            tmp_path,
+            provider,
+            database_name=f"explicit-cause-{stage}-{carrier_kind}.sqlite3",
+        )
+        _inject_cleanup_stage_once(
+            monkeypatch,
+            service.repository,
+            provider,
+            stage="claim",
+            error=carrier,
+        )
+    else:
+        service, lease = await _claimed_two_target_cleanup(tmp_path, provider)
+        _fail_repository_stage_once(
+            monkeypatch,
+            service.repository,
+            "record_teardown_outcome",
+            "unused explicit-cause carrier",
+            error=carrier,
+        )
+
+    try:
+        if stage == "claim":
+            await service.release(
+                lease.lease_id,
+                owner_id=lease.owner_id,
+                workload_id=lease.workload_id,
+            )
+        else:
+            await service._teardown_all_effects(
+                lease,
+                reason="test explicit-cause cleanup blocker",
+            )
+    except BaseException as error:  # noqa: BLE001 - identity graph is asserted
+        caught = error
+    else:
+        pytest.fail("explicit-cause cleanup blocker was not retained")
+
+    assert _contains_exception_identity(caught, carrier)
+    assert carrier.__cause__ is integrity
+    assert integrity.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    if carrier_kind == "group":
+        assert carrier.exceptions == (control,)
+    else:
+        assert carrier is control
+    if cause_cycle:
+        assert integrity.__cause__ is carrier
+    assert provider.teardown_resource_ids == (
+        [] if stage == "claim" else ["provider-001"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3010,16 +3671,21 @@ async def test_native_control_and_unclassified_claim_failure_retain_both_without
 
 
 @pytest.mark.asyncio
-async def test_native_provider_and_outcome_persistence_failures_keep_other_cleanup(
+async def test_uncoded_outcome_persistence_blocker_stops_other_cleanup(
     tmp_path, monkeypatch
 ):
     provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
     service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    persistence = sqlite3.OperationalError(
+        "injected primary uncoded outcome persistence"
+    )
+    assert not hasattr(persistence, "sqlite_errorcode")
     _fail_repository_stage_once(
         monkeypatch,
         service.repository,
         "record_teardown_outcome",
-        "injected primary outcome persistence",
+        "unused uncoded persistence blocker",
+        error=persistence,
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
@@ -3027,15 +3693,12 @@ async def test_native_provider_and_outcome_persistence_failures_keep_other_clean
 
     failures = _all_nested_errors(caught.value)
     assert any("teardown remains retryable" in str(error) for error in failures)
-    assert any(
-        isinstance(error, sqlite3.OperationalError)
-        and "outcome persistence" in str(error)
-        for error in failures
-    )
-    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    assert _contains_exception_identity(caught.value, persistence)
+    assert provider.teardown_resource_ids == ["provider-001"]
     durable = service.repository.get(claimed.lease_id)
     assert durable is not None
-    assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
 
 
 @pytest.mark.asyncio
@@ -3334,14 +3997,22 @@ async def test_cleanup_claim_failure_composes_with_prior_provider_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("failed_resource_id", "record_method"),
+    ("failed_resource_id", "record_method", "expected_resource_ids"),
     [
-        ("provider-001", "record_teardown_outcome"),
-        ("late-original-ack", "record_additional_cleanup_outcome"),
+        ("provider-001", "record_teardown_outcome", ["provider-001"]),
+        (
+            "late-original-ack",
+            "record_additional_cleanup_outcome",
+            ["provider-001", "late-original-ack"],
+        ),
     ],
 )
 async def test_cleanup_provider_and_outcome_cas_failures_are_both_retained(
-    tmp_path, monkeypatch, failed_resource_id, record_method
+    tmp_path,
+    monkeypatch,
+    failed_resource_id,
+    record_method,
+    expected_resource_ids,
 ):
     provider = _TwoTargetCleanupProvider(failed_resource_ids={failed_resource_id})
     service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
@@ -3356,10 +4027,18 @@ async def test_cleanup_provider_and_outcome_cas_failures_are_both_retained(
     with pytest.raises(BaseExceptionGroup) as caught:
         await service._teardown_all_effects(claimed, reason="test cleanup")
 
-    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    assert provider.teardown_resource_ids == expected_resource_ids
     messages = _group_messages(caught.value)
     assert any("teardown remains retryable" in message for message in messages)
     assert any("outcome CAS failed" in message for message in messages)
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    if failed_resource_id == "provider-001":
+        assert durable.cleanup_receipt is None
+        assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+    else:
+        assert durable.cleanup_receipt is not None
+        assert durable.additional_cleanup_targets[0].cleanup_receipt is None
 
 
 class _BlockingDeleteClient(_ControlClient):
@@ -4027,20 +4706,33 @@ async def test_pod_readback_never_invents_missing_or_stopped_realized_rate(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resource_type", list(OllamaResourceType))
-@pytest.mark.parametrize("read_status", [200, 401, 404, 503])
+@pytest.mark.parametrize(
+    ("read_status", "expected_error"),
+    [
+        (200, OllamaLeaseTeardownError),
+        (401, OllamaLeaseAuthorizationError),
+        (403, OllamaLeaseAuthorizationError),
+        (404, None),
+        (503, OllamaLeaseTeardownError),
+    ],
+)
 async def test_native_teardown_requires_exact_authenticated_absence(
     native_teardown,
     resource_type,
     read_status,
+    expected_error,
 ):
     provider, state = native_teardown
     state["read_status"] = read_status
     resource = ProvisionedOllamaResource(resource_type, "original-1", "original")
-    if read_status == 404:
+    if expected_error is None:
         await provider.teardown(resource, _cleanup_intent(resource))
     else:
-        with pytest.raises(RunPodManagerError):
+        with pytest.raises(expected_error) as caught:
             await provider.teardown(resource, _cleanup_intent(resource))
+        if read_status in {401, 403, 503}:
+            assert isinstance(caught.value.__cause__, RunPodAPIError)
+            assert caught.value.__cause__.status_code == read_status
     path = (
         "/v2/serverless/original-1"
         if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
@@ -4052,6 +4744,58 @@ async def test_native_teardown_requires_exact_authenticated_absence(
         else ("POST", path + "/action")
     )
     assert state["calls"] == [action, ("GET", path)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("resource_type", OllamaResourceType.POD),
+        ("provider_resource_id", "different-resource"),
+        ("resource_name", "different-name"),
+    ],
+)
+def test_cleanup_intent_validates_one_exact_resource(field, value):
+    resource = ProvisionedOllamaResource(
+        OllamaResourceType.SERVERLESS_ENDPOINT,
+        "original-1",
+        "original",
+    )
+    cleanup_intent = _cleanup_intent(resource)
+
+    cleanup_intent.validate_resource(resource)
+    with pytest.raises(ValueError, match="does not bind its resource"):
+        cleanup_intent.validate_resource(replace(resource, **{field: value}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("resource_type", OllamaResourceType.POD),
+        ("provider_resource_id", "different-resource"),
+        ("resource_name", "different-name"),
+    ],
+)
+async def test_native_teardown_rejects_unbound_resource_before_provider_io(
+    native_teardown,
+    field,
+    value,
+):
+    provider, state = native_teardown
+    resource = ProvisionedOllamaResource(
+        OllamaResourceType.SERVERLESS_ENDPOINT,
+        "original-1",
+        "original",
+    )
+    cleanup_intent = _cleanup_intent(resource)
+
+    with pytest.raises(OllamaLeaseConflictError, match="resource is unbound"):
+        await provider.teardown(
+            replace(resource, **{field: value}),
+            cleanup_intent,
+        )
+
+    assert state["calls"] == []
 
 
 @pytest.mark.asyncio

@@ -435,7 +435,7 @@ class _ControlFailureFinalTelemetryProvider(FakeOllamaProvider):
 
     async def teardown(self, resource, cleanup_intent):
         if self.fail_teardown:
-            raise RunPodManagerError("provider delete remains retryable")
+            raise OllamaLeaseTeardownError("provider delete remains retryable")
         return await super().teardown(resource, cleanup_intent)
 
 
