@@ -1096,10 +1096,11 @@ class OllamaLeaseService:
             if not is_execution_control_error(exc):
                 raise
             telemetry_control_error = exc
-        lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
         if telemetry_control_error is None:
+            lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
             return await self._teardown_all_effects(lease, reason=reason)
         try:
+            lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
             await self._teardown_all_effects(lease, reason=reason)
         # Preserve both original native control evidence and every possible
         # cleanup terminal, including cancellation/control BaseExceptions.

@@ -30,6 +30,7 @@ from .models import (
     RunPodAPIError,
     RunPodManagerError,
     assess_endpoint_mounts,
+    assess_pod_mounts,
     environment_values_sha256,
     normalize_cuda_floor,
     validate_endpoint_mounts,
@@ -1441,17 +1442,25 @@ def _validate_pod_provisioning(
                 "Ollama Pod runtime configuration does not match intent",
             )
     if "mounts" in raw:
-        try:
-            response_mounts = _normalized_pod_response_mounts(raw["mounts"])
-            accepted_mounts = _normalized_pod_intent_mounts(expected.get("mounts"))
-        except OllamaProvisioningEvidenceError:
-            assessment.invalid("runtime", "mounts")
-        else:
-            if response_mounts != accepted_mounts:
-                assessment.mismatch(
-                    OllamaProvisioningMismatchReason.RUNTIME,
-                    "Ollama Pod runtime configuration does not match intent",
-                )
+        accepted_mounts = expected.get("mounts")
+        if accepted_mounts is not None and not isinstance(accepted_mounts, Mapping):
+            raise OllamaProvisioningEvidenceError(
+                "Stored Ollama Pod mounts are invalid"
+            )
+        mount_assessment = assess_pod_mounts(raw, accepted_mounts)
+        if mount_assessment.mismatched_kinds:
+            assessment.mismatch(
+                OllamaProvisioningMismatchReason.RUNTIME,
+                "Ollama Pod runtime configuration does not match intent",
+            )
+        for kind in mount_assessment.missing_kinds:
+            assessment.missing(
+                "runtime", "mounts" if kind == "mounts" else f"mounts.{kind}"
+            )
+        for kind in mount_assessment.invalid_kinds:
+            assessment.invalid(
+                "runtime", "mounts" if kind == "mounts" else f"mounts.{kind}"
+            )
     if "globalNetworking" in raw:
         try:
             networking_enabled = _pod_global_networking_enabled(raw["globalNetworking"])
@@ -1527,28 +1536,6 @@ def _typed_runtime_value(key: str, value: object, *, context: str) -> object:
             )
         return value
     raise ValueError(f"Unsupported Ollama runtime evidence field: {key}")
-
-
-def _normalized_pod_response_mounts(value: object) -> Mapping[str, Any] | None:
-    """Normalize the documented mountless Pod response to create intent."""
-
-    if value is None:
-        raise OllamaProvisioningEvidenceError("Ollama Pod omitted mount evidence")
-    if value == {}:
-        return None
-    if not isinstance(value, Mapping):
-        raise OllamaProvisioningEvidenceError(
-            "Ollama Pod returned invalid mount evidence"
-        )
-    return value
-
-
-def _normalized_pod_intent_mounts(value: object) -> Mapping[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise OllamaProvisioningEvidenceError("Stored Ollama Pod mounts are invalid")
-    return value
 
 
 def _pod_global_networking_enabled(value: object) -> bool:

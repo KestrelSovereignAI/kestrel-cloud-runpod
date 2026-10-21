@@ -83,6 +83,48 @@ def make_request(clock: MutableClock, **changes) -> OllamaLeaseRequest:
     return replace(request, **changes)
 
 
+def runtime_telemetry_payload(binding: str, timestamp: str) -> dict[str, object]:
+    """Build one exact authenticated runtime snapshot for native service tests."""
+
+    return {
+        "schema_version": 2,
+        "runtime_version": "test",
+        "ollama_version": "test",
+        "telemetry_binding_sha256": binding,
+        "runtime_instance_id": "runtime-instance-1",
+        "telemetry_revision": 1,
+        "provision_requested_at": timestamp,
+        "container_started_at": timestamp,
+        "ollama_process_started_at": timestamp,
+        "ollama_healthy_at": timestamp,
+        "model_pull_started_at": None,
+        "model_pull_completed_at": None,
+        "model_load_started_at": timestamp,
+        "model_ready_at": timestamp,
+        "ready_at": timestamp,
+        "placement_and_image_pull_wall_ms": 0,
+        "ollama_boot_ms": 0,
+        "model_pull_ms": None,
+        "model_load_ms": 0,
+        "container_to_ready_ms": 0,
+        "cache_hit": True,
+        "startup_strategy": "cache_hit",
+        "ready": True,
+        "ollama_process_running": True,
+        "terminal_error": None,
+        "inference_started": 0,
+        "inference_completed": 0,
+        "inference_failed": 0,
+        "inference_cancelled": 0,
+        "inference_in_flight": 0,
+        "first_inference_started_at": None,
+        "last_inference_started_at": None,
+        "last_inference_completed_at": None,
+        "inference_busy_ms": 0,
+        "inference_idle_ms": 0,
+    }
+
+
 def make_decision(
     product: ComputeProduct,
     *,
