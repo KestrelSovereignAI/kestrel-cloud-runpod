@@ -45,6 +45,7 @@ from .ollama_contracts import (
     PreparedOllamaProvisioning,
     ProvisionedOllamaResource,
     accrued_cost,
+    authorized_cost_deadline,
     normalize_new_ollama_request_money,
     over_authorized_cost,
     provision_attempt_id,
@@ -518,16 +519,51 @@ class OllamaLeaseService:
         """Run one pass suitable for an external timer or long-lived service."""
 
         results: list[OllamaLease] = []
+        now = self._now()
         for initial in self.repository.list_for_reconciliation(
-            now=self._now(), limit=self.reconciliation_batch_size
+            now=now, limit=self.reconciliation_batch_size
         ):
+            claimed = self.repository.claim_for_reconciliation(
+                initial,
+                now=now,
+                retry_at=self._next_reconcile_at(initial, now=now),
+            )
+            if claimed is None:
+                continue
             try:
-                lease = await self._reconcile_one(initial.lease_id)
+                lease = await self._reconcile_one(claimed.lease_id)
             except RunPodManagerError as exc:
-                lease = self._record_reconcile_error(initial.lease_id, exc)
+                lease = self._record_reconcile_error(claimed.lease_id, exc)
             if lease is not None:
                 results.append(lease)
         return tuple(results)
+
+    def _next_reconcile_at(self, lease: OllamaLease, *, now: datetime) -> datetime:
+        """Return the next durable visit without delaying an original cutoff."""
+
+        retry = now + timedelta(seconds=self.poll_interval_seconds)
+        if lease.state in {
+            OllamaLeaseState.REQUESTED,
+            OllamaLeaseState.PROVISIONING,
+            OllamaLeaseState.RECONCILE_REQUIRED,
+            OllamaLeaseState.WAITING_FOR_MODEL,
+        }:
+            for cutoff in (
+                lease.hard_deadline,
+                lease.readiness_deadline,
+                authorized_cost_deadline(lease),
+            ):
+                if now < cutoff < retry:
+                    retry = cutoff
+        elif lease.state is OllamaLeaseState.READY:
+            for cutoff in (
+                lease.hard_deadline,
+                lease.idle_deadline,
+                authorized_cost_deadline(lease),
+            ):
+                if now < cutoff < retry:
+                    retry = cutoff
+        return retry
 
     async def reconcile_lease(
         self, lease_id: str, *, owner_id: str, workload_id: str
@@ -552,6 +588,8 @@ class OllamaLeaseService:
         if lease is None:
             return lease
         if lease.state is OllamaLeaseState.TERMINATED:
+            if lease.additional_cleanup_targets:
+                return lease
             if lease.lifecycle_billing_state in {
                 OllamaLifecycleBillingState.PENDING,
                 OllamaLifecycleBillingState.SELECTED,
@@ -922,7 +960,17 @@ class OllamaLeaseService:
         if lease.state is OllamaLeaseState.TERMINATED:
             return lease
         now = self._now()
-        if lease.state is OllamaLeaseState.REQUESTED and not lease.provider_resource_id:
+        if (
+            lease.state in {OllamaLeaseState.REQUESTED, OllamaLeaseState.FAILED}
+            and lease.provisioning_evidence_state
+            is OllamaProvisioningEvidenceState.REQUIRED
+            and lease.provisioning_intent is None
+            and lease.provider_resource_id is None
+            and lease.ambiguous_create_candidate_id is None
+            and lease.provision_attempt_id is None
+            and lease.provision_attempts == 0
+            and lease.creation_uncertain is False
+        ):
             return self._transition(
                 lease,
                 OllamaLeaseState.TERMINATED,
@@ -1001,7 +1049,8 @@ class OllamaLeaseService:
         telemetry_control_error: BaseException | None = None
         try:
             if (
-                lease.provisioning_intent is not None
+                lease.cleanup_receipt is None
+                and lease.provisioning_intent is not None
                 and lease.provisioning_receipt is not None
                 and lease.provisioning_mismatch is None
             ):
@@ -1051,9 +1100,9 @@ class OllamaLeaseService:
             changes={"teardown_attempts": lease.teardown_attempts + 1},
         )
         if telemetry_control_error is None:
-            return await self._teardown_effect(lease, reason=reason)
+            return await self._teardown_all_effects(lease, reason=reason)
         try:
-            await self._teardown_effect(lease, reason=reason)
+            await self._teardown_all_effects(lease, reason=reason)
         # Preserve both original native control evidence and every possible
         # cleanup terminal, including cancellation/control BaseExceptions.
         except BaseException as cleanup_error:  # noqa: BLE001
@@ -1064,6 +1113,22 @@ class OllamaLeaseService:
         raise telemetry_control_error.with_traceback(
             telemetry_control_error.__traceback__
         )
+
+    async def _teardown_all_effects(
+        self, lease: OllamaLease, *, reason: str
+    ) -> OllamaLease:
+        """Join every exact resource proven for one admitted create lineage."""
+
+        if lease.cleanup_receipt is None:
+            lease = await self._teardown_effect(lease, reason=reason)
+        for target in lease.additional_cleanup_targets:
+            if target.cleanup_receipt is None:
+                lease = await self._teardown_additional_effect(
+                    lease,
+                    provider_resource_id=target.provider_resource_id,
+                    reason=reason,
+                )
+        return lease
 
     async def _teardown_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:
         """Join physical deletion, exact absence readback and receipt persistence."""
@@ -1084,6 +1149,7 @@ class OllamaLeaseService:
                 accrued_estimated_cost=accrued_cost(lease, self._now()),
                 termination_reason=reason,
                 provider_error=f"{reason}: {sanitize_provider_error(exc)}",
+                retry_at=self._now() + timedelta(seconds=self.poll_interval_seconds),
             )
             raise OllamaLeaseTeardownError(
                 f"Ollama lease '{lease.lease_id}' teardown remains retryable"
@@ -1096,6 +1162,60 @@ class OllamaLeaseService:
             termination_reason=reason,
             cleanup_receipt=cleanup_receipt,
             billing_next_check_at=self._now(),
+        )
+
+    async def _teardown_additional_effect(
+        self,
+        lease: OllamaLease,
+        *,
+        provider_resource_id: str,
+        reason: str,
+    ) -> OllamaLease:
+        """Join cleanup of one separately retained original POST ACK."""
+
+        lease = self.repository.record_additional_cleanup_intent(
+            lease,
+            provider_resource_id=provider_resource_id,
+            now=self._now(),
+            termination_reason=reason,
+        )
+        target = next(
+            item
+            for item in lease.additional_cleanup_targets
+            if item.provider_resource_id == provider_resource_id
+        )
+        cleanup_intent = target.cleanup_intent
+        if cleanup_intent is None:
+            raise OllamaLeaseTeardownError(
+                f"Ollama lease '{lease.lease_id}' additional cleanup intent disappeared"
+            )
+        resource = ProvisionedOllamaResource(
+            resource_type=target.resource_type,
+            provider_resource_id=target.provider_resource_id,
+            resource_name=target.resource_name,
+        )
+        try:
+            cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
+        except RunPodManagerError as exc:
+            self.repository.record_additional_cleanup_outcome(
+                lease,
+                provider_resource_id=provider_resource_id,
+                now=self._now(),
+                accrued_estimated_cost=accrued_cost(lease, self._now()),
+                termination_reason=reason,
+                provider_error=f"{reason}: {sanitize_provider_error(exc)}",
+                retry_at=self._now() + timedelta(seconds=self.poll_interval_seconds),
+            )
+            raise OllamaLeaseTeardownError(
+                f"Ollama lease '{lease.lease_id}' additional teardown remains retryable"
+            ) from exc
+        return self.repository.record_additional_cleanup_outcome(
+            lease,
+            provider_resource_id=provider_resource_id,
+            now=self._now(),
+            accrued_estimated_cost=accrued_cost(lease, self._now()),
+            termination_reason=reason,
+            cleanup_receipt=cleanup_receipt,
         )
 
     async def _resolve_uncertain_release(
@@ -1342,6 +1462,8 @@ class OllamaLeaseService:
             raise RunPodManagerError(
                 f"Invalid Ollama lease transition {lease.state.value} -> {target.value}"
             )
+        if target is OllamaLeaseState.RELEASING and lease.state is not target:
+            changes.setdefault("reconcile_after", self._now())
         return self.repository.compare_and_set(
             lease, changes={"state": target, **changes}
         )

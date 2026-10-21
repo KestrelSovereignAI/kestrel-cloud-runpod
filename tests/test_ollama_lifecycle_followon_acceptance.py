@@ -508,3 +508,50 @@ async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding():
     encoded = json.dumps(observed.to_dict(), sort_keys=True)
     assert bearer not in encoded
     assert request.model not in encoded
+
+
+@pytest.mark.asyncio
+async def test_python_accepts_go_nanosecond_timestamps_with_zero_millisecond_delta():
+    clock = MutableClock()
+    fake = FakeOllamaProvider(pod_plan())
+    request = make_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    prepared = fake.validate_runtime_request(
+        request, pod_plan(), provision_requested_at=clock()
+    )
+    resource = ProvisionedOllamaResource(
+        OllamaResourceType.POD,
+        "pod-go-nanosecond-telemetry",
+        prepared.intent.resource_name,
+    )
+    provisioning = await fake.observe_provisioning(prepared.intent, resource)
+    payload = _telemetry_payload(
+        prepared.runtime_telemetry_binding_sha256,
+        clock().isoformat(),
+    )
+    payload.update(
+        ollama_process_started_at="2026-08-01T12:00:00.000000900Z",
+        ollama_healthy_at="2026-08-01T12:00:00.001000100Z",
+        ollama_boot_ms=0,
+        model_load_started_at="2026-08-01T12:00:00.001000100Z",
+        model_ready_at="2026-08-01T12:00:00.001000100Z",
+        ready_at="2026-08-01T12:00:00.001000100Z",
+        model_load_ms=0,
+        container_to_ready_ms=1,
+    )
+    provider = _provider(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=payload)
+        )
+    )
+    provider._clock = clock
+
+    observed = await provider._runtime_telemetry(
+        "https://mock.invalid",
+        bearer_token="test-" + "s" * 32,
+        intent=prepared.intent,
+        provisioning=provisioning,
+    )
+
+    assert observed.snapshot.ollama_boot_ms == 0
+    assert observed.snapshot.model_load_ms == 0
+    assert observed.snapshot.container_to_ready_ms == 1

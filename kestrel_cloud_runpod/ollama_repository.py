@@ -19,6 +19,7 @@ from typing import Any
 from .billing import exact_decimal_integer_scale, exact_decimal_sum
 from .models import CloudType, RunPodManagerError
 from .ollama_contracts import (
+    OllamaAdditionalCleanupTarget,
     OllamaCleanupIntent,
     OllamaCleanupReceipt,
     OllamaLease,
@@ -48,16 +49,22 @@ from .ollama_contracts import (
 )
 from .sqlite_store import lease_database_connection
 
-_CURRENT_WRITER_CONTRACT_VERSION = 3
+_CURRENT_WRITER_CONTRACT_VERSION = 4
 _WRITER_TRIGGER_NAMES = (
+    "ollama_writer_insert_v4",
+    "ollama_writer_update_v4",
+    "ollama_writer_delete_v4",
+    "ollama_provisioning_evidence_insert_v4",
+    "ollama_provisioning_evidence_update_v4",
+    "ollama_lifecycle_evidence_update_v4",
+)
+_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v3",
     "ollama_writer_update_v3",
     "ollama_writer_delete_v3",
     "ollama_provisioning_evidence_insert_v3",
     "ollama_provisioning_evidence_update_v3",
     "ollama_lifecycle_evidence_update_v3",
-)
-_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v2",
     "ollama_writer_update_v2",
     "ollama_writer_delete_v2",
@@ -76,6 +83,7 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
     {
         "writer_contract_version",
         "writer_epoch",
+        "reconcile_after",
         "provisioning_evidence_state",
         "provisioning_intent_json",
         "provisioning_receipt_json",
@@ -87,8 +95,10 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
         "runtime_telemetry_binding_sha256",
         "cleanup_intent_json",
         "cleanup_receipt_json",
+        "additional_cleanup_targets_json",
         "runtime_telemetry_state",
         "runtime_telemetry_observations_json",
+        "runtime_telemetry_last_provider_error",
         "lifecycle_billing_state",
         "lifecycle_billing_observations_json",
         "lifecycle_billing_selection_json",
@@ -96,9 +106,16 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
         "billing_last_checked_at",
         "billing_next_check_at",
         "billing_last_provider_error",
+        "billing_retention_exhausted",
     }
 )
-_V2_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+_V3_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+    "reconcile_after",
+    "additional_cleanup_targets_json",
+    "runtime_telemetry_last_provider_error",
+    "billing_retention_exhausted",
+}
+_V2_WRITER_CONTRACT_COLUMNS = _V3_WRITER_CONTRACT_COLUMNS - {
     "runtime_telemetry_binding_sha256",
     "cleanup_intent_json",
     "cleanup_receipt_json",
@@ -214,8 +231,9 @@ _LEASE_COLUMNS = (
     _LeaseColumn("termination_reason", "TEXT"),
     _LeaseColumn("teardown_attempts", "INTEGER", not_null=True, default_sql="0"),
     _LeaseColumn("revision", "INTEGER", not_null=True, default_sql="0"),
-    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True, default_sql="3"),
+    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True, default_sql="4"),
     _LeaseColumn("writer_epoch", "INTEGER", not_null=True, default_sql="0"),
+    _LeaseColumn("reconcile_after", "TEXT"),
     _LeaseColumn(
         "provisioning_evidence_state",
         "TEXT",
@@ -230,6 +248,12 @@ _LEASE_COLUMNS = (
     _LeaseColumn("cleanup_intent_json", "TEXT"),
     _LeaseColumn("cleanup_receipt_json", "TEXT"),
     _LeaseColumn(
+        "additional_cleanup_targets_json",
+        "TEXT",
+        not_null=True,
+        default_sql="'[]'",
+    ),
+    _LeaseColumn(
         "runtime_telemetry_state", "TEXT", not_null=True, default_sql="'unknown'"
     ),
     _LeaseColumn(
@@ -238,6 +262,7 @@ _LEASE_COLUMNS = (
         not_null=True,
         default_sql="'[]'",
     ),
+    _LeaseColumn("runtime_telemetry_last_provider_error", "TEXT"),
     _LeaseColumn(
         "lifecycle_billing_state", "TEXT", not_null=True, default_sql="'unknown'"
     ),
@@ -257,6 +282,9 @@ _LEASE_COLUMNS = (
     _LeaseColumn("billing_last_checked_at", "TEXT"),
     _LeaseColumn("billing_next_check_at", "TEXT"),
     _LeaseColumn("billing_last_provider_error", "TEXT"),
+    _LeaseColumn(
+        "billing_retention_exhausted", "INTEGER", not_null=True, default_sql="0"
+    ),
 )
 _LEASE_COLUMN_BY_NAME = {column.name: column for column in _LEASE_COLUMNS}
 _CREATE_LEASE_TABLE_SQL = (
@@ -267,8 +295,8 @@ _CREATE_LEASE_TABLE_SQL = (
 _RECONCILE_INDEX_NAME = "idx_ollama_leases_reconcile"
 _RECONCILE_INDEX_SQL = (
     "CREATE INDEX idx_ollama_leases_reconcile "
-    "ON ollama_leases(state, lifecycle_billing_state, billing_next_check_at, "
-    "idle_deadline, hard_deadline)"
+    "ON ollama_leases(reconcile_after, state, provisioning_evidence_state, "
+    "lifecycle_billing_state, billing_next_check_at, idle_deadline, hard_deadline)"
 )
 
 
@@ -328,18 +356,19 @@ def _execute_sql_script_transactionally(
 
 def _writer_trigger_script() -> str:
     return """
-        CREATE TRIGGER ollama_writer_insert_v3
+        CREATE TRIGGER ollama_writer_insert_v4
         BEFORE INSERT ON ollama_leases
-        WHEN NEW.writer_contract_version IS NOT 3
+        WHEN NEW.writer_contract_version IS NOT 4
           OR NEW.writer_epoch IS NOT 1
           OR NEW.revision IS NOT 0
+          OR NEW.reconcile_after IS NULL
         BEGIN
             SELECT RAISE(ABORT, 'current Ollama writer contract required');
         END;
 
-        CREATE TRIGGER ollama_writer_update_v3
+        CREATE TRIGGER ollama_writer_update_v4
         BEFORE UPDATE ON ollama_leases
-        WHEN OLD.writer_contract_version IS NOT 3
+        WHEN OLD.writer_contract_version IS NOT 4
           OR NEW.writer_contract_version IS NOT OLD.writer_contract_version
           OR NEW.writer_epoch IS NOT OLD.writer_epoch + 1
           OR NEW.revision IS NOT OLD.revision + 1
@@ -347,13 +376,13 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'stale Ollama writer');
         END;
 
-        CREATE TRIGGER ollama_writer_delete_v3
+        CREATE TRIGGER ollama_writer_delete_v4
         BEFORE DELETE ON ollama_leases
         BEGIN
             SELECT RAISE(ABORT, 'Ollama lease deletion is unsupported');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_insert_v3
+        CREATE TRIGGER ollama_provisioning_evidence_insert_v4
         BEFORE INSERT ON ollama_leases
         WHEN NEW.state IS NOT 'requested'
           OR NEW.provisioning_evidence_state IS NOT 'required'
@@ -373,8 +402,10 @@ def _writer_trigger_script() -> str:
           OR NEW.runtime_telemetry_binding_sha256 IS NOT NULL
           OR NEW.cleanup_intent_json IS NOT NULL
           OR NEW.cleanup_receipt_json IS NOT NULL
+          OR NEW.additional_cleanup_targets_json IS NOT '[]'
           OR NEW.runtime_telemetry_state IS NOT 'unknown'
           OR NEW.runtime_telemetry_observations_json IS NOT '[]'
+          OR NEW.runtime_telemetry_last_provider_error IS NOT NULL
           OR NEW.lifecycle_billing_state IS NOT 'unknown'
           OR NEW.lifecycle_billing_observations_json IS NOT '[]'
           OR NEW.lifecycle_billing_selection_json IS NOT NULL
@@ -382,11 +413,12 @@ def _writer_trigger_script() -> str:
           OR NEW.billing_last_checked_at IS NOT NULL
           OR NEW.billing_next_check_at IS NOT NULL
           OR NEW.billing_last_provider_error IS NOT NULL
+          OR NEW.billing_retention_exhausted IS NOT 0
         BEGIN
             SELECT RAISE(ABORT, 'new Ollama lease must begin without provider evidence');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_update_v3
+        CREATE TRIGGER ollama_provisioning_evidence_update_v4
         BEFORE UPDATE ON ollama_leases
         WHEN
           (OLD.provisioning_evidence_state = 'required'
@@ -513,6 +545,7 @@ def _writer_trigger_script() -> str:
           OR NEW.original_requested_at IS NOT OLD.original_requested_at
           OR NEW.original_readiness_timeout_seconds
              IS NOT OLD.original_readiness_timeout_seconds
+          OR NEW.reconcile_after IS NULL
           OR NEW.owner_id IS NOT OLD.owner_id
           OR NEW.workload_id IS NOT OLD.workload_id
           OR NEW.request_fingerprint IS NOT OLD.request_fingerprint
@@ -534,7 +567,7 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'invalid Ollama provisioning evidence mutation');
         END;
 
-        CREATE TRIGGER ollama_lifecycle_evidence_update_v3
+        CREATE TRIGGER ollama_lifecycle_evidence_update_v4
         BEFORE UPDATE ON ollama_leases
         WHEN
           (NEW.cleanup_intent_json IS NOT NULL AND (
@@ -569,11 +602,102 @@ def _writer_trigger_script() -> str:
              OR json_extract(NEW.cleanup_receipt_json, '$.evidence_version') IS NOT 1
              OR json_extract(NEW.cleanup_receipt_json, '$.cleanup_intent_id')
                 IS NOT json_extract(NEW.cleanup_intent_json, '$.cleanup_intent_id')
-             OR NEW.state IS NOT 'terminated'
-             OR NEW.teardown_state IS NOT 'complete'
+             OR NOT (
+                  (NEW.state = 'terminated'
+                   AND NEW.teardown_state = 'complete')
+                  OR (NEW.state = 'releasing'
+                      AND NEW.teardown_state = 'pending'
+                      AND json_array_length(
+                            NEW.additional_cleanup_targets_json
+                          ) > 0)
+             )
           ))
           OR (OLD.cleanup_receipt_json IS NOT NULL
              AND NEW.cleanup_receipt_json IS NOT OLD.cleanup_receipt_json)
+          OR json_valid(NEW.additional_cleanup_targets_json) IS NOT 1
+          OR json_type(NEW.additional_cleanup_targets_json) IS NOT 'array'
+          OR json_array_length(NEW.additional_cleanup_targets_json) > 1
+          OR json_array_length(NEW.additional_cleanup_targets_json)
+             < json_array_length(OLD.additional_cleanup_targets_json)
+          OR EXISTS (
+               SELECT 1 FROM json_each(OLD.additional_cleanup_targets_json) old_item
+               LEFT JOIN json_each(NEW.additional_cleanup_targets_json) new_item
+                 ON new_item.key = old_item.key
+              WHERE new_item.value IS NULL
+                 OR json_extract(new_item.value, '$.evidence_version')
+                    IS NOT json_extract(old_item.value, '$.evidence_version')
+                 OR json_extract(new_item.value, '$.target_id')
+                    IS NOT json_extract(old_item.value, '$.target_id')
+                 OR json_extract(new_item.value, '$.intent_sha256')
+                    IS NOT json_extract(old_item.value, '$.intent_sha256')
+                 OR json_extract(new_item.value, '$.lease_id')
+                    IS NOT json_extract(old_item.value, '$.lease_id')
+                 OR json_extract(new_item.value, '$.provision_attempt_id')
+                    IS NOT json_extract(old_item.value, '$.provision_attempt_id')
+                 OR json_extract(new_item.value, '$.resource_type')
+                    IS NOT json_extract(old_item.value, '$.resource_type')
+                 OR json_extract(new_item.value, '$.resource_name')
+                    IS NOT json_extract(old_item.value, '$.resource_name')
+                 OR json_extract(new_item.value, '$.provider_resource_id')
+                    IS NOT json_extract(old_item.value, '$.provider_resource_id')
+                 OR json_extract(new_item.value, '$.source')
+                    IS NOT json_extract(old_item.value, '$.source')
+                 OR (json_extract(old_item.value, '$.provisioning_mismatch')
+                         IS NOT NULL
+                     AND json_extract(new_item.value, '$.provisioning_mismatch')
+                         IS NOT json_extract(old_item.value,
+                                             '$.provisioning_mismatch'))
+                 OR (json_extract(old_item.value, '$.cleanup_intent') IS NOT NULL
+                     AND json_extract(new_item.value, '$.cleanup_intent')
+                         IS NOT json_extract(old_item.value, '$.cleanup_intent'))
+                 OR (json_extract(old_item.value, '$.cleanup_receipt') IS NOT NULL
+                     AND json_extract(new_item.value, '$.cleanup_receipt')
+                         IS NOT json_extract(old_item.value, '$.cleanup_receipt'))
+          )
+          OR EXISTS (
+               SELECT 1
+                 FROM json_each(NEW.additional_cleanup_targets_json) item
+                WHERE json_type(item.value) IS NOT 'object'
+                   OR json_extract(item.value, '$.evidence_version') IS NOT 1
+                   OR json_extract(item.value, '$.intent_sha256')
+                      IS NOT json_extract(NEW.provisioning_receipt_json,
+                                          '$.intent_sha256')
+                   OR json_extract(item.value, '$.lease_id') IS NOT NEW.lease_id
+                   OR json_extract(item.value, '$.provision_attempt_id')
+                      IS NOT NEW.provision_attempt_id
+                   OR json_extract(item.value, '$.resource_type')
+                      IS NOT NEW.resource_type
+                   OR json_extract(item.value, '$.resource_name')
+                      IS NOT NEW.resource_name
+                   OR json_extract(item.value, '$.provider_resource_id') IS NULL
+                   OR json_extract(item.value, '$.provider_resource_id')
+                      IS NEW.provider_resource_id
+                   OR json_extract(item.value, '$.source')
+                      IS NOT 'original_post_ack'
+                   OR (json_extract(item.value, '$.provisioning_mismatch')
+                         IS NOT NULL
+                       AND json_extract(item.value,
+                             '$.provisioning_mismatch.provider_resource_id')
+                           IS NOT json_extract(item.value,
+                                               '$.provider_resource_id'))
+                   OR (json_extract(item.value, '$.cleanup_intent') IS NOT NULL
+                       AND json_extract(item.value,
+                                        '$.cleanup_intent.provider_resource_id')
+                           IS NOT json_extract(item.value,
+                                               '$.provider_resource_id'))
+                   OR (json_extract(item.value, '$.cleanup_receipt') IS NOT NULL
+                       AND (json_extract(item.value, '$.cleanup_intent') IS NULL
+                            OR json_extract(item.value,
+                                 '$.cleanup_receipt.cleanup_intent_id')
+                               IS NOT json_extract(item.value,
+                                 '$.cleanup_intent.cleanup_intent_id')))
+          )
+          OR (NEW.state = 'terminated'
+             AND EXISTS (
+                  SELECT 1
+                    FROM json_each(NEW.additional_cleanup_targets_json) item
+                   WHERE json_extract(item.value, '$.cleanup_receipt') IS NULL
+             ))
           OR json_valid(NEW.runtime_telemetry_observations_json) IS NOT 1
           OR json_type(NEW.runtime_telemetry_observations_json) IS NOT 'array'
           OR json_array_length(NEW.runtime_telemetry_observations_json)
@@ -649,7 +773,7 @@ def _writer_trigger_script() -> str:
              OR json_array_length(NEW.lifecycle_billing_corrections_json) != 0
           ))
           OR (NEW.lifecycle_billing_state = 'not_applicable' AND (
-                NEW.writer_contract_version IS NOT 3
+                NEW.writer_contract_version IS NOT 4
              OR NEW.provisioning_evidence_state IS NOT 'required'
              OR NEW.provisioning_intent_json IS NOT NULL
              OR NEW.provisioning_receipt_json IS NOT NULL
@@ -669,6 +793,7 @@ def _writer_trigger_script() -> str:
           ))
           OR (NEW.lifecycle_billing_state IN
                 ('pending', 'selected', 'correction_pending')
+             AND json_array_length(NEW.additional_cleanup_targets_json) = 0
              AND (NEW.state IS NOT 'terminated'
                   OR NEW.cleanup_receipt_json IS NULL
                   OR NEW.billing_next_check_at IS NULL))
@@ -754,8 +879,22 @@ def _writer_trigger_script() -> str:
              AND json_array_length(NEW.lifecycle_billing_corrections_json) != 0)
           OR (NEW.lifecycle_billing_state = 'correction_pending'
              AND json_array_length(NEW.lifecycle_billing_corrections_json) < 1
-             AND NEW.billing_last_provider_error IS NOT
-                 'billing evidence retention requires manual reconciliation')
+             AND NEW.billing_retention_exhausted IS NOT 1)
+          OR NEW.billing_retention_exhausted NOT IN (0, 1)
+          OR (OLD.billing_retention_exhausted = 1
+             AND NEW.billing_retention_exhausted IS NOT 1)
+          OR (NEW.billing_retention_exhausted = 1
+             AND NEW.lifecycle_billing_state NOT IN
+                 ('pending', 'correction_pending'))
+          OR (json_array_length(OLD.additional_cleanup_targets_json) > 0 AND (
+                NEW.lifecycle_billing_state IS NOT OLD.lifecycle_billing_state
+             OR NEW.lifecycle_billing_observations_json
+                IS NOT OLD.lifecycle_billing_observations_json
+             OR NEW.lifecycle_billing_selection_json
+                IS NOT OLD.lifecycle_billing_selection_json
+             OR NEW.lifecycle_billing_corrections_json
+                IS NOT OLD.lifecycle_billing_corrections_json
+          ))
         BEGIN
             SELECT RAISE(ABORT, 'invalid Ollama lifecycle evidence mutation');
         END;
@@ -883,6 +1022,7 @@ def _legacy_schema_is_supported(
             ("INTEGER", True, "0", False, 0),
             ("INTEGER", True, "1", False, 0),
             ("INTEGER", True, "2", False, 0),
+            ("INTEGER", True, "3", False, 0),
         )
 
     if not set(actual).issubset(expected) or any(
@@ -893,6 +1033,7 @@ def _legacy_schema_is_supported(
     writer_columns = names & _WRITER_CONTRACT_COLUMNS
     if writer_columns and writer_columns not in {
         _WRITER_CONTRACT_COLUMNS,
+        _V3_WRITER_CONTRACT_COLUMNS,
         _V2_WRITER_CONTRACT_COLUMNS,
         _V1_WRITER_CONTRACT_COLUMNS,
     }:
@@ -904,7 +1045,7 @@ def _legacy_schema_is_supported(
                 "SELECT DISTINCT writer_contract_version FROM ollama_leases"
             ).fetchall()
         }
-        if not versions.issubset({1, 2, _CURRENT_WRITER_CONTRACT_VERSION}):
+        if not versions.issubset({1, 2, 3, _CURRENT_WRITER_CONTRACT_VERSION}):
             return False
     required_legacy = set(expected) - _LEGACY_ADDITIVE_COLUMNS
     if not required_legacy.issubset(names):
@@ -959,6 +1100,20 @@ def _rebuild_current_lease_schema(
 
     source_table = "_ollama_leases_drained_source"
     source_names = {row["name"] for row in columns}
+    source_versions = (
+        {
+            row["writer_contract_version"]
+            for row in connection.execute(
+                "SELECT DISTINCT writer_contract_version FROM ollama_leases"
+            ).fetchall()
+        }
+        if "writer_contract_version" in source_names
+        else set()
+    )
+    upgrading_v3 = (
+        source_names & _WRITER_CONTRACT_COLUMNS == _V3_WRITER_CONTRACT_COLUMNS
+        and source_versions == {3}
+    )
     copied_names = [
         column.name
         for column in _LEASE_COLUMNS
@@ -978,8 +1133,9 @@ def _rebuild_current_lease_schema(
         connection.execute(
             """
             UPDATE ollama_leases
-            SET writer_contract_version = 3,
+            SET writer_contract_version = 4,
                 writer_epoch = 0,
+                reconcile_after = updated_at,
                 provisioning_evidence_state = 'historical_unknown',
                 provisioning_intent_json = NULL,
                 provisioning_receipt_json = NULL,
@@ -994,34 +1150,49 @@ def _rebuild_current_lease_schema(
                 runtime_telemetry_binding_sha256 = NULL,
                 cleanup_intent_json = NULL,
                 cleanup_receipt_json = NULL,
+                additional_cleanup_targets_json = '[]',
                 runtime_telemetry_state = 'unknown',
                 runtime_telemetry_observations_json = '[]',
+                runtime_telemetry_last_provider_error = NULL,
                 lifecycle_billing_state = 'unknown',
                 lifecycle_billing_observations_json = '[]',
                 lifecycle_billing_selection_json = NULL,
                 lifecycle_billing_corrections_json = '[]',
                 billing_last_checked_at = NULL,
                 billing_next_check_at = NULL,
-                billing_last_provider_error = NULL
+                billing_last_provider_error = NULL,
+                billing_retention_exhausted = 0
             """
         )
     else:
         if "ambiguous_candidate_mismatch_json" not in source_names:
             _translate_previous_candidate_mismatches(connection)
-        connection.execute(
-            """
-            UPDATE ollama_leases
-                SET writer_contract_version = 3,
-                    route_url = NULL,
-                    provider_health_url = NULL,
-                    runtime_telemetry_state = CASE
-                        WHEN provisioning_evidence_state = 'complete'
-                        THEN 'partial' ELSE 'unknown' END,
-                    lifecycle_billing_state = 'unknown',
-                    revision = revision + 1,
-                    writer_epoch = writer_epoch + 1
+        if upgrading_v3:
+            connection.execute(
                 """
-        )
+                UPDATE ollama_leases
+                   SET writer_contract_version = 4,
+                       reconcile_after = updated_at,
+                       revision = revision + 1,
+                       writer_epoch = writer_epoch + 1
+                """
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE ollama_leases
+                    SET writer_contract_version = 4,
+                        reconcile_after = updated_at,
+                        route_url = NULL,
+                        provider_health_url = NULL,
+                        runtime_telemetry_state = CASE
+                            WHEN provisioning_evidence_state = 'complete'
+                            THEN 'partial' ELSE 'unknown' END,
+                        lifecycle_billing_state = 'unknown',
+                        revision = revision + 1,
+                        writer_epoch = writer_epoch + 1
+                    """
+            )
         for migrated in connection.execute(
             "SELECT lease_id, provisioning_intent_json FROM ollama_leases "
             "WHERE provisioning_intent_json IS NOT NULL"
@@ -1036,8 +1207,9 @@ def _rebuild_current_lease_schema(
                 "SET runtime_telemetry_binding_sha256 = ? WHERE lease_id = ?",
                 (runtime_telemetry_binding_for_intent(intent), migrated["lease_id"]),
             )
-        connection.execute(
-            """
+        if not upgrading_v3:
+            connection.execute(
+                """
             UPDATE ollama_leases
                SET state = 'releasing',
                    teardown_state = 'pending',
@@ -1047,7 +1219,7 @@ def _rebuild_current_lease_schema(
              WHERE state IN ('waiting_for_model', 'ready')
                AND provider_resource_id IS NOT NULL
             """
-        )
+            )
         try:
             for row in connection.execute("SELECT * FROM ollama_leases"):
                 _lease_from_row(row)
@@ -1130,6 +1302,7 @@ class SQLiteOllamaLeaseRepository:
             "last_provider_error",
             "termination_reason",
             "teardown_attempts",
+            "reconcile_after",
             "provisioning_evidence_state",
             "provisioning_intent_json",
             "provisioning_receipt_json",
@@ -1138,8 +1311,10 @@ class SQLiteOllamaLeaseRepository:
             "runtime_telemetry_binding_sha256",
             "cleanup_intent_json",
             "cleanup_receipt_json",
+            "additional_cleanup_targets_json",
             "runtime_telemetry_state",
             "runtime_telemetry_observations_json",
+            "runtime_telemetry_last_provider_error",
             "lifecycle_billing_state",
             "lifecycle_billing_observations_json",
             "lifecycle_billing_selection_json",
@@ -1147,6 +1322,7 @@ class SQLiteOllamaLeaseRepository:
             "billing_last_checked_at",
             "billing_next_check_at",
             "billing_last_provider_error",
+            "billing_retention_exhausted",
         }
     )
 
@@ -1164,7 +1340,7 @@ class SQLiteOllamaLeaseRepository:
         *,
         attestation: OllamaWriterDrainAttestation,
     ) -> SQLiteOllamaLeaseRepository:
-        """Install the v3 writer fence after an operator-controlled drain."""
+        """Install the v4 writer fence after an operator-controlled drain."""
 
         resolved = Path(path)
         if not resolved.is_absolute():
@@ -1316,6 +1492,7 @@ class SQLiteOllamaLeaseRepository:
                     request.max_authorized_cost,
                     _CURRENT_WRITER_CONTRACT_VERSION,
                     1,
+                    iso_datetime(now),
                     OllamaProvisioningEvidenceState.REQUIRED.value,
                 )
                 connection.execute(
@@ -1330,8 +1507,9 @@ class SQLiteOllamaLeaseRepository:
                         expected_active_seconds, serverless_initialization_seconds,
                         serverless_idle_tail_seconds, idle_timeout_seconds,
                         max_authorized_cost, writer_contract_version, writer_epoch,
+                        reconcile_after,
                         provisioning_evidence_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     values,
                 )
@@ -1522,14 +1700,26 @@ class SQLiteOllamaLeaseRepository:
                             f"Lease '{lease.lease_id}' mismatch changed its create ID"
                         )
                     acknowledged_id = mismatch.provider_resource_id
+            additional_ack_target = (
+                current.provider_resource_id is not None
+                and acknowledged_id is not None
+                and current.provider_resource_id != acknowledged_id
+                and acknowledged_resource is not None
+            )
             if (
                 current.provider_resource_id is not None
                 and acknowledged_id is not None
                 and current.provider_resource_id != acknowledged_id
+                and not additional_ack_target
             ):
                 connection.rollback()
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' received a foreign create acknowledgment"
+                )
+            if additional_ack_target and receipt is not None:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' cannot bind one receipt to two resources"
                 )
             if current.state not in {
                 OllamaLeaseState.PROVISIONING,
@@ -1546,8 +1736,43 @@ class SQLiteOllamaLeaseRepository:
                     "in its current state"
                 )
             changes: dict[str, Any] = {}
-            if acknowledged_id is not None:
+            if acknowledged_id is not None and not additional_ack_target:
                 changes["provider_resource_id"] = acknowledged_id
+            if additional_ack_target:
+                target = OllamaAdditionalCleanupTarget(
+                    intent_sha256=intent.intent_sha256,
+                    lease_id=current.lease_id,
+                    provision_attempt_id=intent.provision_attempt_id,
+                    resource_type=intent.resource_type,
+                    resource_name=intent.resource_name,
+                    provider_resource_id=acknowledged_id,
+                    source="original_post_ack",
+                    provisioning_mismatch=(
+                        mismatch if not candidate_mismatch else None
+                    ),
+                )
+                existing_target = next(
+                    (
+                        item
+                        for item in current.additional_cleanup_targets
+                        if item.provider_resource_id == acknowledged_id
+                    ),
+                    None,
+                )
+                if existing_target is None:
+                    if current.additional_cleanup_targets:
+                        connection.rollback()
+                        raise OllamaLeaseConflictError(
+                            f"Lease '{lease.lease_id}' has conflicting cleanup targets"
+                        )
+                    changes["additional_cleanup_targets_json"] = (target,)
+                elif (
+                    mismatch is not None
+                    and existing_target.provisioning_mismatch is None
+                ):
+                    changes["additional_cleanup_targets_json"] = (
+                        replace(existing_target, provisioning_mismatch=mismatch),
+                    )
             if candidate_id is not None:
                 changes["ambiguous_create_candidate_id"] = candidate_id
             if candidate_mismatch:
@@ -1568,7 +1793,7 @@ class SQLiteOllamaLeaseRepository:
                         f"Lease '{lease.lease_id}' candidate mismatch is immutable"
                     )
                 changes["ambiguous_candidate_mismatch_json"] = mismatch
-            elif mismatch is not None:
+            elif mismatch is not None and not additional_ack_target:
                 if (
                     current.provisioning_mismatch is not None
                     and current.provisioning_mismatch != mismatch
@@ -1604,16 +1829,20 @@ class SQLiteOllamaLeaseRepository:
                     current.provisioning_receipt is not None
                     and current.provisioning_receipt != receipt
                 ):
-                    connection.rollback()
-                    raise OllamaLeaseConflictError(
-                        f"Lease '{lease.lease_id}' provisioning receipt is immutable"
-                    )
+                    if not _same_provisioning_receipt_authority(
+                        current.provisioning_receipt, receipt
+                    ):
+                        connection.rollback()
+                        raise OllamaLeaseConflictError(
+                            f"Lease '{lease.lease_id}' provisioning receipt is immutable"
+                        )
+                else:
+                    changes["provisioning_receipt_json"] = receipt
                 changes.update(
                     {
                         "provisioning_evidence_state": (
                             OllamaProvisioningEvidenceState.COMPLETE
                         ),
-                        "provisioning_receipt_json": receipt,
                         "creation_uncertain": False,
                         "last_provider_error": None,
                     }
@@ -1623,7 +1852,23 @@ class SQLiteOllamaLeaseRepository:
 
             new_state = current.state
             teardown_state = current.teardown_state
-            if (
+            if additional_ack_target:
+                new_state = OllamaLeaseState.RELEASING
+                teardown_state = OllamaTeardownState.PENDING
+                changes.update(
+                    {
+                        "creation_uncertain": False,
+                        "route_url": None,
+                        "provider_health_url": None,
+                        "billing_next_check_at": None,
+                        "billing_last_provider_error": (
+                            "multiple exact resources require manual billing "
+                            "reconciliation"
+                        ),
+                        "reconcile_after": now,
+                    }
+                )
+            elif (
                 acknowledged_id is not None
                 and current.provider_resource_id is None
                 and current.state
@@ -1748,6 +1993,174 @@ class SQLiteOllamaLeaseRepository:
                 "cleanup intent",
             )
 
+    def record_additional_cleanup_intent(
+        self,
+        lease: OllamaLease,
+        *,
+        provider_resource_id: str,
+        now: datetime,
+        termination_reason: str,
+    ) -> OllamaLease:
+        """Freeze teardown start for one separately proven original POST ACK."""
+
+        require_aware(now, "additional cleanup intent")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            intent = current.provisioning_intent
+            if intent is None or current.state is not OllamaLeaseState.RELEASING:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' lacks additional cleanup authority"
+                )
+            targets = list(current.additional_cleanup_targets)
+            index = next(
+                (
+                    offset
+                    for offset, item in enumerate(targets)
+                    if item.provider_resource_id == provider_resource_id
+                ),
+                None,
+            )
+            if index is None:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' has no matching cleanup target"
+                )
+            target = targets[index]
+            if target.cleanup_intent is not None:
+                connection.commit()
+                return current
+            cleanup = OllamaCleanupIntent(
+                intent_sha256=intent.intent_sha256,
+                provisioning_receipt_id=None,
+                lease_id=current.lease_id,
+                request_fingerprint=current.request_fingerprint,
+                provision_attempt_id=intent.provision_attempt_id,
+                resource_type=intent.resource_type,
+                provider_resource_id=target.provider_resource_id,
+                resource_name=intent.resource_name,
+                termination_reason=current.termination_reason or termination_reason,
+                delete_started_at=now,
+            )
+            cleanup.validate_provisioning(intent, None)
+            targets[index] = replace(target, cleanup_intent=cleanup)
+            return self._update_locked(
+                connection,
+                current,
+                {
+                    "additional_cleanup_targets_json": tuple(targets),
+                    "updated_at": now,
+                },
+                "additional cleanup intent",
+            )
+
+    def record_additional_cleanup_outcome(
+        self,
+        lease: OllamaLease,
+        *,
+        provider_resource_id: str,
+        now: datetime,
+        accrued_estimated_cost: float,
+        termination_reason: str,
+        cleanup_receipt: OllamaCleanupReceipt | None = None,
+        provider_error: str | None = None,
+        retry_at: datetime | None = None,
+    ) -> OllamaLease:
+        """Fold one exact additional-target teardown into the same aggregate."""
+
+        require_aware(now, "additional teardown outcome")
+        if (cleanup_receipt is None) == (provider_error is None):
+            raise ValueError("Additional cleanup requires one outcome")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            if (
+                current.request_fingerprint != lease.request_fingerprint
+                or current.provision_attempt_id != lease.provision_attempt_id
+                or current.state is not OllamaLeaseState.RELEASING
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed additional cleanup lineage"
+                )
+            targets = list(current.additional_cleanup_targets)
+            index = next(
+                (
+                    offset
+                    for offset, item in enumerate(targets)
+                    if item.provider_resource_id == provider_resource_id
+                ),
+                None,
+            )
+            if index is None:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' has no matching cleanup target"
+                )
+            target = targets[index]
+            if target.cleanup_receipt is not None:
+                connection.commit()
+                return current
+            if provider_error is not None:
+                if retry_at is None:
+                    connection.rollback()
+                    raise ValueError("Failed cleanup requires a retry schedule")
+                require_aware(retry_at, "additional cleanup retry")
+                if retry_at <= now:
+                    connection.rollback()
+                    raise ValueError("Additional cleanup retry must be in the future")
+                changes: dict[str, Any] = {
+                    "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
+                    "last_provider_error": provider_error,
+                    "reconcile_after": retry_at,
+                }
+            else:
+                if target.cleanup_intent is None or cleanup_receipt is None:
+                    connection.rollback()
+                    raise OllamaLeaseConflictError(
+                        f"Lease '{lease.lease_id}' additional cleanup lacks intent"
+                    )
+                try:
+                    cleanup_receipt.validate_intent(target.cleanup_intent)
+                except ValueError as exc:
+                    connection.rollback()
+                    raise OllamaLeaseConflictError(
+                        f"Lease '{lease.lease_id}' received unbound additional cleanup"
+                    ) from exc
+                targets[index] = replace(target, cleanup_receipt=cleanup_receipt)
+                all_cleanup_complete = current.cleanup_receipt is not None and all(
+                    item.cleanup_receipt is not None for item in targets
+                )
+                changes = {
+                    "additional_cleanup_targets_json": tuple(targets),
+                    "state": (
+                        OllamaLeaseState.TERMINATED
+                        if all_cleanup_complete
+                        else OllamaLeaseState.RELEASING
+                    ),
+                    "teardown_state": (
+                        OllamaTeardownState.COMPLETE
+                        if all_cleanup_complete
+                        else OllamaTeardownState.PENDING
+                    ),
+                    "last_provider_error": None,
+                    "termination_reason": (
+                        current.termination_reason or termination_reason
+                    ),
+                }
+            changes.update(
+                {
+                    "route_url": None,
+                    "provider_health_url": None,
+                    "accrued_estimated_cost": accrued_estimated_cost,
+                    "updated_at": now,
+                }
+            )
+            return self._update_locked(
+                connection, current, changes, "additional teardown outcome"
+            )
+
     def record_runtime_telemetry(
         self,
         lease: OllamaLease,
@@ -1777,12 +2190,18 @@ class SQLiteOllamaLeaseRepository:
                     f"Lease '{lease.lease_id}' changed telemetry lineage"
                 )
             if observation is None:
+                state = (
+                    OllamaRuntimeTelemetryState.COMPLETE
+                    if current.runtime_telemetry_state
+                    is OllamaRuntimeTelemetryState.COMPLETE
+                    else OllamaRuntimeTelemetryState.PARTIAL
+                )
                 return self._update_locked(
                     connection,
                     current,
                     {
-                        "runtime_telemetry_state": OllamaRuntimeTelemetryState.PARTIAL,
-                        "last_provider_error": provider_error,
+                        "runtime_telemetry_state": state,
+                        "runtime_telemetry_last_provider_error": provider_error,
                         "updated_at": now,
                     },
                     "runtime telemetry error",
@@ -1813,8 +2232,13 @@ class SQLiteOllamaLeaseRepository:
                     connection,
                     current,
                     {
-                        "runtime_telemetry_state": OllamaRuntimeTelemetryState.PARTIAL,
-                        "last_provider_error": (
+                        "runtime_telemetry_state": (
+                            OllamaRuntimeTelemetryState.COMPLETE
+                            if current.runtime_telemetry_state
+                            is OllamaRuntimeTelemetryState.COMPLETE
+                            else OllamaRuntimeTelemetryState.PARTIAL
+                        ),
+                        "runtime_telemetry_last_provider_error": (
                             "runtime telemetry retention requires manual reconciliation"
                         ),
                         "updated_at": now,
@@ -1834,15 +2258,17 @@ class SQLiteOllamaLeaseRepository:
                 OllamaLeaseState.TERMINATED,
             }
             state = (
-                OllamaRuntimeTelemetryState.PARTIAL
+                OllamaRuntimeTelemetryState.COMPLETE
+                if current.runtime_telemetry_state
+                is OllamaRuntimeTelemetryState.COMPLETE
+                else OllamaRuntimeTelemetryState.PARTIAL
                 if current.runtime_telemetry_state
                 is OllamaRuntimeTelemetryState.PARTIAL
                 or terminal_without_startup
                 or not lineage_complete
-                else OllamaRuntimeTelemetryState.COMPLETE
-                if current.state
+                or current.state
                 in {OllamaLeaseState.RELEASING, OllamaLeaseState.TERMINATED}
-                and observation.snapshot.inference_in_flight == 0
+                or not observation.is_complete_startup_for(intent)
                 else OllamaRuntimeTelemetryState.STARTUP_COMPLETE
             )
             return self._update_locked(
@@ -1851,6 +2277,7 @@ class SQLiteOllamaLeaseRepository:
                 {
                     "runtime_telemetry_observations_json": observations,
                     "runtime_telemetry_state": state,
+                    "runtime_telemetry_last_provider_error": None,
                     "updated_at": now,
                 },
                 "runtime telemetry",
@@ -1884,6 +2311,7 @@ class SQLiteOllamaLeaseRepository:
                 or current.cleanup_receipt is None
                 or current.provisioning_intent is None
                 or current.provisioning_receipt is None
+                or current.additional_cleanup_targets
             ):
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' lacks closed lifecycle billing authority"
@@ -1892,6 +2320,7 @@ class SQLiteOllamaLeaseRepository:
                 "billing_last_checked_at": now,
                 "billing_next_check_at": next_check_at,
                 "billing_last_provider_error": provider_error,
+                "reconcile_after": next_check_at,
                 "updated_at": now,
             }
             if observation is not None:
@@ -1934,7 +2363,7 @@ class SQLiteOllamaLeaseRepository:
                             actual_cost_delta_usd=exact_decimal_sum(
                                 (
                                     observation.provider_capacity_actual_cost_usd,
-                                    -selected.provider_capacity_actual_cost_usd,
+                                    selected.provider_capacity_actual_cost_usd.copy_negate(),
                                 )
                             ),
                             recorded_at=now,
@@ -1967,6 +2396,7 @@ class SQLiteOllamaLeaseRepository:
                                 "billing_last_provider_error": (
                                     "billing evidence retention requires manual reconciliation"
                                 ),
+                                "billing_retention_exhausted": True,
                             }
                         )
                     else:
@@ -1995,28 +2425,87 @@ class SQLiteOllamaLeaseRepository:
             raise ValueError("Ollama reconciliation limit must be positive")
         now = now or datetime.now(UTC)
         require_aware(now, "reconciliation clock")
+        now_text = iso_datetime(now)
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT * FROM ollama_leases
-                   WHERE state != ? OR provisioning_evidence_state = ?
-                      OR (state = ?
-                          AND lifecycle_billing_state IN
-                              ('pending', 'selected', 'correction_pending')
-                          AND (billing_next_check_at IS NULL
-                               OR billing_next_check_at <= ?))
-                   ORDER BY CASE WHEN billing_next_check_at IS NULL THEN 0 ELSE 1 END,
-                            billing_next_check_at, billing_last_checked_at,
-                            created_at, lease_id
+                   WHERE provisioning_evidence_state != ?
+                     AND reconcile_after <= ?
+                     AND (state != 'terminated'
+                          OR (json_array_length(additional_cleanup_targets_json) = 0
+                              AND lifecycle_billing_state IN
+                                ('pending', 'selected', 'correction_pending')
+                              AND (billing_next_check_at IS NULL
+                                   OR billing_next_check_at <= ?)))
+                   ORDER BY
+                     CASE
+                       WHEN state NOT IN ('releasing', 'terminated')
+                            AND hard_deadline <= ? THEN 0
+                       WHEN state IN ('provisioning', 'reconcile_required',
+                                      'waiting_for_model')
+                            AND readiness_deadline <= ? THEN 0
+                       WHEN state = 'ready' AND idle_deadline <= ? THEN 0
+                       ELSE 1
+                     END,
+                     reconcile_after, created_at, lease_id
                    LIMIT ?""",
                 (
-                    OllamaLeaseState.TERMINATED.value,
                     OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN.value,
-                    OllamaLeaseState.TERMINATED.value,
-                    iso_datetime(now),
+                    now_text,
+                    now_text,
+                    now_text,
+                    now_text,
+                    now_text,
                     limit,
                 ),
             ).fetchall()
         return tuple(_lease_from_row(row) for row in rows)
+
+    def claim_for_reconciliation(
+        self,
+        lease: OllamaLease,
+        *,
+        now: datetime,
+        retry_at: datetime,
+    ) -> OllamaLease | None:
+        """Durably rotate one due row before any provider await.
+
+        The claim is scheduling metadata only.  It neither creates provider
+        authority nor changes a lifecycle timestamp.  A competing process
+        wins through the same revision/epoch CAS used for every write.
+        """
+
+        require_aware(now, "reconciliation claim")
+        require_aware(retry_at, "reconciliation retry")
+        if retry_at <= now:
+            raise ValueError("Ollama reconciliation retry must be in the future")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """UPDATE ollama_leases
+                      SET reconcile_after = ?, revision = revision + 1,
+                          writer_epoch = writer_epoch + 1
+                    WHERE lease_id = ? AND revision = ?
+                      AND provisioning_evidence_state != ?
+                      AND reconcile_after <= ?""",
+                (
+                    iso_datetime(retry_at),
+                    lease.lease_id,
+                    lease.revision,
+                    OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN.value,
+                    iso_datetime(now),
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            row = connection.execute(
+                "SELECT * FROM ollama_leases WHERE lease_id = ?", (lease.lease_id,)
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            raise RunPodManagerError("Claimed Ollama lease disappeared")
+        return _lease_from_row(row)
 
     def _locked_lease(
         self, connection: sqlite3.Connection, lease_id: str
@@ -2068,6 +2557,7 @@ class SQLiteOllamaLeaseRepository:
         cleanup_receipt: OllamaCleanupReceipt | None = None,
         billing_next_check_at: datetime | None = None,
         provider_error: str | None = None,
+        retry_at: datetime | None = None,
     ) -> OllamaLease:
         """Fold an exact-ID teardown outcome into the latest lease revision."""
 
@@ -2122,9 +2612,21 @@ class SQLiteOllamaLeaseRepository:
                     connection.rollback()
                     raise ValueError("Successful cleanup requires a billing schedule")
                 require_aware(billing_next_check_at, "billing schedule")
+                all_cleanup_complete = all(
+                    target.cleanup_receipt is not None
+                    for target in current.additional_cleanup_targets
+                )
                 changes: dict[str, Any] = {
-                    "state": OllamaLeaseState.TERMINATED,
-                    "teardown_state": OllamaTeardownState.COMPLETE,
+                    "state": (
+                        OllamaLeaseState.TERMINATED
+                        if all_cleanup_complete
+                        else OllamaLeaseState.RELEASING
+                    ),
+                    "teardown_state": (
+                        OllamaTeardownState.COMPLETE
+                        if all_cleanup_complete
+                        else OllamaTeardownState.PENDING
+                    ),
                     "last_provider_error": (
                         current.last_provider_error
                         if current.provisioning_mismatch is not None
@@ -2135,20 +2637,32 @@ class SQLiteOllamaLeaseRepository:
                     ),
                     "cleanup_receipt_json": cleanup_receipt,
                     "lifecycle_billing_state": (
-                        OllamaLifecycleBillingState.PENDING
+                        current.lifecycle_billing_state
+                        if current.additional_cleanup_targets
+                        else OllamaLifecycleBillingState.PENDING
                         if current.provisioning_receipt is not None
                         else OllamaLifecycleBillingState.UNKNOWN
                     ),
                     "billing_next_check_at": (
-                        billing_next_check_at
+                        current.billing_next_check_at
+                        if current.additional_cleanup_targets
+                        else billing_next_check_at
                         if current.provisioning_receipt is not None
                         else None
                     ),
                 }
             else:
+                if retry_at is None:
+                    connection.rollback()
+                    raise ValueError("Failed cleanup requires a retry schedule")
+                require_aware(retry_at, "cleanup retry")
+                if retry_at <= now:
+                    connection.rollback()
+                    raise ValueError("Cleanup retry must be in the future")
                 changes = {
                     "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
                     "last_provider_error": provider_error,
+                    "reconcile_after": retry_at,
                 }
             changes.update(
                 {
@@ -2281,6 +2795,11 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
     )
     cleanup_intent = _stored_cleanup_intent(row["cleanup_intent_json"])
     cleanup_receipt = _stored_cleanup_receipt(row["cleanup_receipt_json"])
+    additional_cleanup_targets = _stored_json_array(
+        row["additional_cleanup_targets_json"],
+        "additional cleanup targets",
+        OllamaAdditionalCleanupTarget.from_dict,
+    )
     telemetry_observations = _stored_json_array(
         row["runtime_telemetry_observations_json"],
         "runtime telemetry observations",
@@ -2400,6 +2919,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         revision=row["revision"],
         writer_contract_version=row["writer_contract_version"],
         writer_epoch=row["writer_epoch"],
+        reconcile_after=_optional_datetime(row["reconcile_after"]),
         provisioning_evidence_state=OllamaProvisioningEvidenceState(
             row["provisioning_evidence_state"]
         ),
@@ -2410,10 +2930,14 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         runtime_telemetry_binding_sha256=row["runtime_telemetry_binding_sha256"],
         cleanup_intent=cleanup_intent,
         cleanup_receipt=cleanup_receipt,
+        additional_cleanup_targets=additional_cleanup_targets,
         runtime_telemetry_state=OllamaRuntimeTelemetryState(
             row["runtime_telemetry_state"]
         ),
         runtime_telemetry_observations=telemetry_observations,
+        runtime_telemetry_last_provider_error=(
+            row["runtime_telemetry_last_provider_error"]
+        ),
         lifecycle_billing_state=OllamaLifecycleBillingState(
             row["lifecycle_billing_state"]
         ),
@@ -2423,6 +2947,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         billing_last_checked_at=_optional_datetime(row["billing_last_checked_at"]),
         billing_next_check_at=_optional_datetime(row["billing_next_check_at"]),
         billing_last_provider_error=row["billing_last_provider_error"],
+        billing_retention_exhausted=bool(row["billing_retention_exhausted"]),
     )
     _validate_stored_provisioning_evidence(lease)
     _validate_stored_lifecycle_evidence(lease)
@@ -2436,6 +2961,7 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         lease.runtime_telemetry_binding_sha256 is not None
         or lease.cleanup_intent is not None
         or lease.cleanup_receipt is not None
+        or lease.additional_cleanup_targets
         or lease.runtime_telemetry_observations
         or lease.lifecycle_billing_observations
         or lease.lifecycle_billing_selection is not None
@@ -2465,11 +2991,31 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
             raise RunPodManagerError(
                 "Stored Ollama cleanup receipt is unbound"
             ) from exc
-        if (
+        primary_cleanup_is_partial = (
+            lease.state is OllamaLeaseState.RELEASING
+            and lease.teardown_state is OllamaTeardownState.PENDING
+            and bool(lease.additional_cleanup_targets)
+        )
+        if not primary_cleanup_is_partial and (
             lease.state is not OllamaLeaseState.TERMINATED
             or lease.teardown_state is not OllamaTeardownState.COMPLETE
         ):
             raise RunPodManagerError("Stored Ollama cleanup receipt is not terminal")
+    for target in lease.additional_cleanup_targets:
+        if intent is None:
+            raise RunPodManagerError(
+                "Stored Ollama additional cleanup has no original intent"
+            )
+        try:
+            target.validate_intent(intent)
+        except ValueError as exc:
+            raise RunPodManagerError(
+                "Stored Ollama additional cleanup target is unbound"
+            ) from exc
+    if lease.state is OllamaLeaseState.TERMINATED and any(
+        target.cleanup_receipt is None for target in lease.additional_cleanup_targets
+    ):
+        raise RunPodManagerError("Stored Ollama additional cleanup is incomplete")
     telemetry_ids: set[str] = set()
     for observation in lease.runtime_telemetry_observations:
         if (
@@ -2544,7 +3090,7 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         expected = exact_decimal_sum(
             (
                 revised.provider_capacity_actual_cost_usd,
-                -selected.provider_capacity_actual_cost_usd,
+                selected.provider_capacity_actual_cost_usd.copy_negate(),
             )
         )
         if correction.actual_cost_delta_usd != expected:
@@ -2586,19 +3132,28 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         selection is None
         or (
             not lease.lifecycle_billing_corrections
-            and lease.billing_last_provider_error
-            != "billing evidence retention requires manual reconciliation"
+            and not lease.billing_retention_exhausted
         )
     ):
         raise RunPodManagerError("Stored Ollama correction state is invalid")
-    if state in {
+    if lease.billing_retention_exhausted and state not in {
         OllamaLifecycleBillingState.PENDING,
-        OllamaLifecycleBillingState.SELECTED,
         OllamaLifecycleBillingState.CORRECTION_PENDING,
-    } and (
-        lease.state is not OllamaLeaseState.TERMINATED
-        or lease.cleanup_receipt is None
-        or lease.billing_next_check_at is None
+    }:
+        raise RunPodManagerError("Stored Ollama billing retention state is invalid")
+    if (
+        state
+        in {
+            OllamaLifecycleBillingState.PENDING,
+            OllamaLifecycleBillingState.SELECTED,
+            OllamaLifecycleBillingState.CORRECTION_PENDING,
+        }
+        and not lease.additional_cleanup_targets
+        and (
+            lease.state is not OllamaLeaseState.TERMINATED
+            or lease.cleanup_receipt is None
+            or lease.billing_next_check_at is None
+        )
     ):
         raise RunPodManagerError("Stored Ollama billing schedule is invalid")
 
@@ -2690,6 +3245,20 @@ def _telemetry_continues_lineage(
     )
 
 
+def _same_provisioning_receipt_authority(
+    first: OllamaProvisioningReceipt, second: OllamaProvisioningReceipt
+) -> bool:
+    """Compare immutable provider facts while ignoring poll-local metadata."""
+
+    first_value = first.to_dict()
+    second_value = second.to_dict()
+    for value in (first_value, second_value):
+        value.pop("receipt_id", None)
+        value.pop("readback_at", None)
+        value.pop("reconciled_after_ambiguous_create", None)
+    return first_value == second_value
+
+
 def _first_timestamp_is_monotonic(
     before: datetime | None, after: datetime | None
 ) -> bool:
@@ -2706,6 +3275,7 @@ def _validate_stored_provisioning_evidence(lease: OllamaLease) -> None:
     if (
         lease.writer_contract_version != _CURRENT_WRITER_CONTRACT_VERSION
         or lease.writer_epoch < 0
+        or lease.reconcile_after is None
     ):
         raise RunPodManagerError("Stored Ollama writer contract is invalid")
     if (
@@ -2907,6 +3477,7 @@ def _db_value(value: Any) -> Any:
             OllamaCleanupIntent,
             OllamaCleanupReceipt,
             OllamaLifecycleBillingSelection,
+            OllamaAdditionalCleanupTarget,
         ),
     ):
         return json.dumps(value.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -2917,6 +3488,7 @@ def _db_value(value: Any) -> Any:
                 OllamaRuntimeTelemetryObservation,
                 OllamaLifecycleBillingObservation,
                 OllamaLifecycleBillingCorrection,
+                OllamaAdditionalCleanupTarget,
             ),
         )
         for item in value

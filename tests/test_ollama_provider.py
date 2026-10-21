@@ -1434,6 +1434,15 @@ async def test_native_confirmed_pod_violation_wins_over_independent_missing_evid
         (
             OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
             {
+                "mounts": {
+                    "network": [{"volumeId": "confirmed-foreign"}, 17],
+                    "global": [],
+                },
+            },
+        ),
+        (
+            OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            {
                 "gpu": {
                     "pools": ["pool-24"],
                     "allowedCudaVersions": [],
@@ -2043,6 +2052,7 @@ async def test_native_ambiguous_name_collision_never_gains_cleanup_authority(
 
     state["inventory_visible"] = True
     state["replace_on_get"] = {"image": "wrong.invalid/runtime@sha256:" + "f" * 64}
+    clock.advance(1)
     final = (await service.reconcile())[0]
 
     assert final.state is OllamaLeaseState.RECONCILE_REQUIRED
@@ -2154,6 +2164,7 @@ async def test_native_ambiguous_create_persists_untrusted_locator_and_provenance
             (request.lease_id,),
         )
     state["drop_on_get"] = ()
+    clock.advance(1)
 
     restarted = OllamaLeaseService(
         repository=SQLiteOllamaLeaseRepository(repository.path),
