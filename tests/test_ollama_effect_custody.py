@@ -258,6 +258,190 @@ async def test_original_ack_folds_after_same_id_discovery_reaches_ready(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_different_valid_candidate_does_not_discard_original_post_custody(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    deleted: list[str] = []
+    original_provision = provider.provision
+    original_teardown = provider.teardown
+
+    async def blocked(prepared):
+        resource = await original_provision(prepared)
+        entered.set()
+        await finish.wait()
+        return resource
+
+    async def tracked_teardown(resource, cleanup_intent):
+        deleted.append(resource.provider_resource_id)
+        return await original_teardown(resource, cleanup_intent)
+
+    provider.provision = blocked
+    provider.teardown = tracked_teardown
+    owner = service(tmp_path, provider, clock)
+    request = make_request(clock)
+    original = asyncio.create_task(owner.acquire(request, wait_until_ready=False))
+    await entered.wait()
+    provider.find_result = replace(
+        provider.resource, provider_resource_id="different-complete-candidate"
+    )
+
+    discovered = await owner.reconcile_lease(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    assert discovered.state is OllamaLeaseState.READY
+    assert discovered.provider_resource_id == "different-complete-candidate"
+
+    finish.set()
+    completed = await original
+    assert completed.state in {
+        OllamaLeaseState.RELEASING,
+        OllamaLeaseState.TERMINATED,
+    }
+    released = await owner.release(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    assert released.state is OllamaLeaseState.TERMINATED
+    assert set(deleted) == {"different-complete-candidate", "provider-001"}
+    assert deleted.count("different-complete-candidate") == 1
+    assert deleted.count("provider-001") == 1
+
+
+@pytest.mark.asyncio
+async def test_original_post_ack_reopens_only_cleanup_after_candidate_is_terminal(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    deleted: list[str] = []
+    original_provision = provider.provision
+    original_teardown = provider.teardown
+
+    async def blocked(prepared):
+        resource = await original_provision(prepared)
+        entered.set()
+        await finish.wait()
+        return resource
+
+    async def tracked_teardown(resource, cleanup_intent):
+        deleted.append(resource.provider_resource_id)
+        return await original_teardown(resource, cleanup_intent)
+
+    provider.provision = blocked
+    provider.teardown = tracked_teardown
+    owner = service(tmp_path, provider, clock)
+    request = make_request(clock)
+    original = asyncio.create_task(owner.acquire(request, wait_until_ready=False))
+    await entered.wait()
+    provider.find_result = replace(
+        provider.resource, provider_resource_id="different-complete-candidate"
+    )
+    discovered = await owner.reconcile_lease(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    terminated_candidate = await owner.release(
+        discovered.lease_id,
+        owner_id=discovered.owner_id,
+        workload_id=discovered.workload_id,
+    )
+    assert terminated_candidate.state is OllamaLeaseState.TERMINATED
+    assert deleted == ["different-complete-candidate"]
+
+    finish.set()
+    completed = await original
+
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.public_route_url is None
+    assert set(deleted) == {"different-complete-candidate", "provider-001"}
+    assert completed.actual_cost_cap_status.value == "unknown"
+    assert len(completed.additional_cleanup_targets) == 1
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+    database = tmp_path / "leases.sqlite3"
+    mutations = (
+        "'[]'",
+        (
+            "json_set(additional_cleanup_targets_json, "
+            "'$[0].provider_resource_id', 'foreign-resource')"
+        ),
+        "json_remove(additional_cleanup_targets_json, '$[0].cleanup_receipt')",
+    )
+    for mutation in mutations:
+        with (
+            closing(sqlite3.connect(database)) as connection,
+            pytest.raises(
+                sqlite3.IntegrityError,
+                match="invalid Ollama lifecycle evidence mutation",
+            ),
+        ):
+            connection.execute(
+                "UPDATE ollama_leases "
+                f"SET additional_cleanup_targets_json = {mutation}, "
+                "revision = revision + 1, writer_epoch = writer_epoch + 1 "
+                "WHERE lease_id = ?",
+                (completed.lease_id,),
+            )
+
+    retained = owner.repository.get(completed.lease_id)
+    assert retained is not None
+    assert retained.additional_cleanup_targets == completed.additional_cleanup_targets
+
+
+@pytest.mark.asyncio
+async def test_same_id_concurrent_readback_keeps_first_committed_receipt(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    calls = 0
+    original_observe = provider.observe_provisioning
+
+    async def blocked_first_observation(intent, resource, **kwargs):
+        nonlocal calls
+        calls += 1
+        receipt = await original_observe(intent, resource, **kwargs)
+        receipt = replace(receipt, readback_at=clock())
+        if calls == 1:
+            entered.set()
+            await finish.wait()
+        return receipt
+
+    provider.observe_provisioning = blocked_first_observation
+    owner = service(tmp_path, provider, clock)
+    request = make_request(clock)
+    original = asyncio.create_task(owner.acquire(request, wait_until_ready=False))
+    await entered.wait()
+    clock.advance(1)
+
+    reconciled = await owner.reconcile_lease(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    assert reconciled.state is OllamaLeaseState.READY
+    assert reconciled.provisioning_receipt is not None
+
+    finish.set()
+    completed = await original
+
+    assert completed.state is OllamaLeaseState.READY
+    assert completed.provisioning_receipt == reconciled.provisioning_receipt
+    assert completed.provider_resource_id == reconciled.provider_resource_id
+    assert provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_late_mismatching_ack_preserves_prior_receipt_and_enters_cleanup(
     tmp_path,
 ):

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from fractions import Fraction
 from typing import Any, Protocol
 
 from .billing import (
@@ -126,6 +127,20 @@ _CLEANUP_RECEIPT_KEYS = {
     "cleanup_intent_id",
     "verified_absent_at",
     "basis",
+}
+_ADDITIONAL_CLEANUP_TARGET_KEYS = {
+    "evidence_version",
+    "target_id",
+    "intent_sha256",
+    "lease_id",
+    "provision_attempt_id",
+    "resource_type",
+    "resource_name",
+    "provider_resource_id",
+    "source",
+    "provisioning_mismatch",
+    "cleanup_intent",
+    "cleanup_receipt",
 }
 _TELEMETRY_SNAPSHOT_KEYS = {
     "schema_version",
@@ -1280,6 +1295,139 @@ class OllamaCleanupReceipt:
         return result
 
 
+@dataclass(frozen=True)
+class OllamaAdditionalCleanupTarget:
+    """A second exact resource proven to belong to one admitted create attempt."""
+
+    intent_sha256: str
+    lease_id: str
+    provision_attempt_id: str
+    resource_type: OllamaResourceType
+    resource_name: str
+    provider_resource_id: str
+    source: str
+    provisioning_mismatch: OllamaProvisioningMismatchEvidence | None = None
+    cleanup_intent: OllamaCleanupIntent | None = None
+    cleanup_receipt: OllamaCleanupReceipt | None = None
+    evidence_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.evidence_version != 1:
+            raise ValueError("Unsupported Ollama additional cleanup target version")
+        _sha256(self.intent_sha256, "additional cleanup intent")
+        for name, value in (
+            ("lease_id", self.lease_id),
+            ("provision_attempt_id", self.provision_attempt_id),
+            ("resource_name", self.resource_name),
+            ("provider_resource_id", self.provider_resource_id),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"Ollama additional cleanup {name} is invalid")
+        if self.source != "original_post_ack":
+            raise ValueError("Ollama additional cleanup source is invalid")
+        if (
+            self.provisioning_mismatch is not None
+            and self.provisioning_mismatch.provider_resource_id
+            != self.provider_resource_id
+        ):
+            raise ValueError("Ollama additional cleanup mismatch changed target")
+        if self.cleanup_receipt is not None:
+            if self.cleanup_intent is None:
+                raise ValueError("Ollama additional cleanup receipt lacks intent")
+            self.cleanup_receipt.validate_intent(self.cleanup_intent)
+
+    @property
+    def target_id(self) -> str:
+        return "runpod-ollama-additional-cleanup:" + _json_sha256(
+            {
+                "intent_sha256": self.intent_sha256,
+                "provider_resource_id": self.provider_resource_id,
+                "source": self.source,
+            }
+        )
+
+    def validate_intent(self, intent: OllamaProvisioningIntent) -> None:
+        if (
+            self.intent_sha256 != intent.intent_sha256
+            or self.lease_id != intent.lease_id
+            or self.provision_attempt_id != intent.provision_attempt_id
+            or self.resource_type is not intent.resource_type
+            or self.resource_name != intent.resource_name
+        ):
+            raise ValueError("Ollama additional cleanup target does not bind intent")
+        if self.provisioning_mismatch is not None:
+            self.provisioning_mismatch.validate_intent(intent)
+        if self.cleanup_intent is not None:
+            self.cleanup_intent.validate_provisioning(intent, None)
+            if self.cleanup_intent.provider_resource_id != self.provider_resource_id:
+                raise ValueError("Ollama additional cleanup intent changed target")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_version": self.evidence_version,
+            "target_id": self.target_id,
+            "intent_sha256": self.intent_sha256,
+            "lease_id": self.lease_id,
+            "provision_attempt_id": self.provision_attempt_id,
+            "resource_type": self.resource_type.value,
+            "resource_name": self.resource_name,
+            "provider_resource_id": self.provider_resource_id,
+            "source": self.source,
+            "provisioning_mismatch": (
+                self.provisioning_mismatch.to_dict()
+                if self.provisioning_mismatch
+                else None
+            ),
+            "cleanup_intent": (
+                self.cleanup_intent.to_dict() if self.cleanup_intent else None
+            ),
+            "cleanup_receipt": (
+                self.cleanup_receipt.to_dict() if self.cleanup_receipt else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> OllamaAdditionalCleanupTarget:
+        _exact_keys(value, _ADDITIONAL_CLEANUP_TARGET_KEYS, "additional cleanup target")
+        raw_intent = value.get("cleanup_intent")
+        raw_receipt = value.get("cleanup_receipt")
+        raw_mismatch = value.get("provisioning_mismatch")
+        result = cls(
+            evidence_version=_required_int(value, "evidence_version"),
+            intent_sha256=_required_string(value, "intent_sha256"),
+            lease_id=_required_string(value, "lease_id"),
+            provision_attempt_id=_required_string(value, "provision_attempt_id"),
+            resource_type=OllamaResourceType(_required_string(value, "resource_type")),
+            resource_name=_required_string(value, "resource_name"),
+            provider_resource_id=_required_string(value, "provider_resource_id"),
+            source=_required_string(value, "source"),
+            provisioning_mismatch=(
+                OllamaProvisioningMismatchEvidence.from_dict(raw_mismatch)
+                if isinstance(raw_mismatch, Mapping)
+                else None
+            ),
+            cleanup_intent=(
+                OllamaCleanupIntent.from_dict(raw_intent)
+                if isinstance(raw_intent, Mapping)
+                else None
+            ),
+            cleanup_receipt=(
+                OllamaCleanupReceipt.from_dict(raw_receipt)
+                if isinstance(raw_receipt, Mapping)
+                else None
+            ),
+        )
+        if value.get("target_id") != result.target_id:
+            raise ValueError("Ollama additional cleanup target identity is invalid")
+        if (
+            (raw_mismatch is not None and not isinstance(raw_mismatch, Mapping))
+            or (raw_intent is not None and not isinstance(raw_intent, Mapping))
+            or (raw_receipt is not None and not isinstance(raw_receipt, Mapping))
+        ):
+            raise ValueError("Ollama additional cleanup evidence is invalid")
+        return result
+
+
 def _validate_telemetry_phase(
     name: str,
     started_at: datetime | None,
@@ -1292,7 +1440,13 @@ def _validate_telemetry_phase(
         return
     if completed_at < started_at:
         raise ValueError(f"Ollama telemetry {name} order is invalid")
-    if duration_ms != (completed_at - started_at) // timedelta(milliseconds=1):
+    derived_ms = (completed_at - started_at) // timedelta(milliseconds=1)
+    # Go's RFC3339Nano wire preserves nanoseconds while Python ``datetime``
+    # retains only microseconds.  Truncating each endpoint independently can
+    # make Python's derived floor exactly one millisecond larger than Go's
+    # ``time.Duration.Milliseconds`` result.  Accept only that bounded
+    # quantization interval; larger discrepancies remain invalid.
+    if duration_ms not in {derived_ms, max(0, derived_ms - 1)}:
         raise ValueError(f"Ollama telemetry {name} duration is inconsistent")
 
 
@@ -1614,6 +1768,24 @@ class OllamaRuntimeTelemetryObservation:
             or self.fetch_started_at < receipt.readback_at
         ):
             raise ValueError("Ollama telemetry does not bind provisioning")
+
+    def is_complete_startup_for(self, intent: OllamaProvisioningIntent) -> bool:
+        """Return whether this snapshot proves the original runtime became ready.
+
+        Ordinary authenticated telemetry remains useful when startup is not
+        complete, but it must not authorize a route.  The runtime's original
+        birth timestamp is part of the immutable provisioning intent rather
+        than a value recoverable from a later observation.
+        """
+
+        snapshot = self.snapshot
+        return (
+            snapshot.provision_requested_at == intent.provision_requested_at
+            and snapshot.ready is True
+            and snapshot.ollama_process_running is True
+            and snapshot.ready_at is not None
+            and snapshot.terminal_error is None
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2003,8 +2175,9 @@ class OllamaLease:
     # silently meant something new would misread every existing row. Defaults
     # to a single GPU, which is what every pre-existing lease had.
     placement_gpu_count: int = 1
-    writer_contract_version: int = 3
+    writer_contract_version: int = 4
     writer_epoch: int = 1
+    reconcile_after: datetime | None = None
     provisioning_evidence_state: OllamaProvisioningEvidenceState = (
         OllamaProvisioningEvidenceState.REQUIRED
     )
@@ -2023,10 +2196,12 @@ class OllamaLease:
     runtime_telemetry_binding_sha256: str | None = None
     cleanup_intent: OllamaCleanupIntent | None = None
     cleanup_receipt: OllamaCleanupReceipt | None = None
+    additional_cleanup_targets: tuple[OllamaAdditionalCleanupTarget, ...] = ()
     runtime_telemetry_state: OllamaRuntimeTelemetryState = (
         OllamaRuntimeTelemetryState.UNKNOWN
     )
     runtime_telemetry_observations: tuple[OllamaRuntimeTelemetryObservation, ...] = ()
+    runtime_telemetry_last_provider_error: str | None = None
     lifecycle_billing_state: OllamaLifecycleBillingState = (
         OllamaLifecycleBillingState.UNKNOWN
     )
@@ -2036,6 +2211,7 @@ class OllamaLease:
     billing_last_checked_at: datetime | None = None
     billing_next_check_at: datetime | None = None
     billing_last_provider_error: str | None = None
+    billing_retention_exhausted: bool = False
 
     @property
     def public_route_url(self) -> str | None:
@@ -2045,6 +2221,8 @@ class OllamaLease:
 
     @property
     def actual_cost_cap_status(self) -> OllamaActualCostCapStatus:
+        if self.additional_cleanup_targets:
+            return OllamaActualCostCapStatus.UNKNOWN
         selection = self.lifecycle_billing_selection
         if selection is None:
             return OllamaActualCostCapStatus.UNKNOWN
@@ -2127,6 +2305,7 @@ class OllamaLease:
             "termination_reason": self.termination_reason,
             "writer_contract_version": self.writer_contract_version,
             "writer_epoch": self.writer_epoch,
+            "reconcile_after": optional_iso_datetime(self.reconcile_after),
             "provisioning_evidence_state": self.provisioning_evidence_state.value,
             "provisioning_intent": (
                 self.provisioning_intent.to_dict() if self.provisioning_intent else None
@@ -2153,9 +2332,15 @@ class OllamaLease:
             "cleanup_receipt": (
                 self.cleanup_receipt.to_dict() if self.cleanup_receipt else None
             ),
+            "additional_cleanup_target_ids": tuple(
+                item.target_id for item in self.additional_cleanup_targets
+            ),
             "runtime_telemetry_state": self.runtime_telemetry_state.value,
             "runtime_telemetry_observation_ids": tuple(
                 item.observation_id for item in self.runtime_telemetry_observations
+            ),
+            "runtime_telemetry_last_provider_error": (
+                self.runtime_telemetry_last_provider_error
             ),
             "lifecycle_billing_state": self.lifecycle_billing_state.value,
             "lifecycle_billing_selected_observation_id": (
@@ -2180,6 +2365,7 @@ class OllamaLease:
             ),
             "billing_next_check_at": optional_iso_datetime(self.billing_next_check_at),
             "billing_last_provider_error": self.billing_last_provider_error,
+            "billing_retention_exhausted": self.billing_retention_exhausted,
         }
 
 
@@ -2450,6 +2636,40 @@ def over_authorized_cost(lease: OllamaLease, now: datetime) -> bool:
     """
 
     return authorized_cost_exposure(lease, now) >= lease.max_authorized_cost
+
+
+def authorized_cost_deadline(lease: OllamaLease) -> datetime:
+    """Return the first exact microsecond at which the durable cap is spent."""
+
+    if (
+        lease.provisioning_started_at is None
+        or lease.offered_rate_per_hr is None
+        or lease.maximum_non_compute_cost is None
+        or lease.maximum_concurrent_workers is None
+        or lease.maximum_concurrent_workers < 1
+    ):
+        return lease.hard_deadline
+    remaining = Fraction(Decimal(str(lease.max_authorized_cost))) - Fraction(
+        Decimal(str(lease.maximum_non_compute_cost))
+    )
+    if remaining <= 0:
+        return lease.provisioning_started_at
+    hourly = (
+        Fraction(Decimal(str(lease.offered_rate_per_hr)))
+        * lease.maximum_concurrent_workers
+        * lease.placement_gpu_count
+    )
+    if hourly <= 0:
+        return lease.hard_deadline
+    exact_microseconds = remaining * 3_600_000_000 / hourly
+    microseconds = (
+        exact_microseconds.numerator + exact_microseconds.denominator - 1
+    ) // exact_microseconds.denominator
+    try:
+        crossing = lease.provisioning_started_at + timedelta(microseconds=microseconds)
+    except OverflowError:
+        return lease.hard_deadline
+    return min(crossing, lease.hard_deadline)
 
 
 def _rated_cost(hourly_rate: float, seconds: int, gpu_count: int = 1) -> float:

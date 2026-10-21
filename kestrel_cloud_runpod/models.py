@@ -154,19 +154,19 @@ def assess_endpoint_mounts(
         invalid.append("network")
     else:
         network_ids: list[str] = []
-        valid_network = True
+        invalid_network = False
         for mount in network:
             if not isinstance(mount, Mapping) or set(mount) != {"volumeId"}:
-                valid_network = False
-                break
+                invalid_network = True
+                continue
             volume_id = mount.get("volumeId")
             if not isinstance(volume_id, str) or not volume_id:
-                valid_network = False
-                break
+                invalid_network = True
+                continue
             network_ids.append(volume_id)
-        if not valid_network:
+        if invalid_network:
             invalid.append("network")
-        elif tuple(network_ids) != tuple(expected_network_volume_ids):
+        if tuple(network_ids) != tuple(expected_network_volume_ids):
             mismatched.append("network")
 
     global_mounts = mounts.get("global")

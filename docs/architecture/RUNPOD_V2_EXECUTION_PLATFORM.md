@@ -351,10 +351,11 @@ Confirmed fields are checked before reporting independent omissions so missing
 evidence cannot hide a known policy violation on an owned resource.
 
 The lease aggregate has one writer contract. Every insert starts at contract
-version 3/epoch 1, and every update must advance both the revision CAS and the
+version 4/epoch 1, and every update must advance both the revision CAS and the
 writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
-and deletes. Version 3 also prevents a retained version-1 or version-2 binary
-or migrator from reinstalling its weaker trigger set over a newer aggregate. Runtime
+and deletes. Version 4 also prevents a retained version-1, version-2, or
+version-3 binary or migrator from reinstalling its weaker trigger set over a
+newer aggregate. Runtime
 startup never upgrades a legacy database. Operators must
 first drain every old binary, admitted HTTP effect, and route holder, then call
 the explicit one-shot `migrate_legacy_database()` entry point with an attestation
@@ -392,6 +393,19 @@ original representation. SQLite
 triggers cannot retroactively fence an old process that already admitted an
 HTTP effect, which is why the deployment drain is mandatory.
 
+Version 4 also carries one durable `reconcile_after` visit time. A timer claims
+a due row by revision/epoch CAS and advances that time before provider I/O, so
+unchanged READY rows and retryable cleanup failures yield bounded batches to
+other due cleanup and billing work across process restart. Original hard,
+readiness, idle, and exact authorized-cost cutoffs remain urgent: scheduling is
+never authority and cannot move those timestamps or delay their first crossed
+visit. An original POST acknowledgement that arrives after a different,
+completely validated discovery candidate is retained as one additional exact
+cleanup target in the same lease aggregate. The route is closed and the same
+cleanup owner joins both exact-ID deletions and absence receipts. Neither an
+untrusted locator nor migration creates a target, and multi-resource lifecycle
+billing remains visibly unknown/manual rather than selecting a partial total.
+
 Original readiness and hard deadlines are sampled again after every awaited
 planning, provisioning, readback, and readiness boundary. A late plan never
 admits POST, and a late observation cannot backdate `ready_at` or publish a
@@ -420,10 +434,15 @@ The authenticated runtime exposes a content-free telemetry snapshot on the
 same bearer-protected route. Its original intent binding is committed before
 readiness. Process identity, monotonic revision, cumulative outcome counters,
 and union busy duration can advance; a restart, regression, retention limit,
-or missing final zero-in-flight observation makes the lineage permanently
-partial. Prompts, responses, tokens, model names, and credentials are not
-telemetry fields. Ordinary telemetry unavailability cannot abandon required
-cleanup, and it never becomes billing evidence.
+or final observation makes the current lineage partial. A zero-in-flight
+snapshot from one process does not prove that the load-balanced worker
+population and future admission are closed, so this contract reserves
+`complete` for a later whole-population quiescence proof and does not emit it
+for new leases. Prompts, responses, tokens, model names, and credentials are
+not telemetry fields. Ordinary telemetry unavailability cannot abandon
+required cleanup, and it never becomes billing evidence. A migrated historical
+`complete` assertion stays immutable, while a separate telemetry-error field
+can record a failed retry without blocking DELETE.
 
 After verified absence, reconciliation reuses the canonical exact Pod or
 Serverless billing reader over the original create-to-absence window. Only
