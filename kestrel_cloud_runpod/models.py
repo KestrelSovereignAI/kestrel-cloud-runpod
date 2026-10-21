@@ -166,7 +166,9 @@ def assess_endpoint_mounts(
             network_ids.append(volume_id)
         if invalid_network:
             invalid.append("network")
-        if tuple(network_ids) != tuple(expected_network_volume_ids):
+        if (not invalid_network or network_ids) and tuple(network_ids) != tuple(
+            expected_network_volume_ids
+        ):
             mismatched.append("network")
 
     global_mounts = mounts.get("global")
@@ -240,6 +242,27 @@ class RunPodAmbiguousResultError(RunPodAPIError):
     """A mutating request may have succeeded and must be reconciled first."""
 
     reconcile_required = True
+
+
+class RunPodAcknowledgedResourceError(RunPodAmbiguousResultError):
+    """A mutation returned an exact resource with invalid sibling evidence."""
+
+    def __init__(self, *, resource_id: str, resource_name: str) -> None:
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("Acknowledged resource ID must be nonempty")
+        if not isinstance(resource_name, str) or not resource_name:
+            raise ValueError("Acknowledged resource name must be nonempty")
+        self.resource_id = resource_id
+        self.resource_name = resource_name
+        super().__init__(
+            title="Runpod v2 create evidence is invalid",
+            detail=(
+                "The Pod create was acknowledged by exact ID, but its optional "
+                "response evidence was invalid"
+            ),
+            method="POST",
+            resource="/pods",
+        )
 
 
 class CloudType(str, Enum):

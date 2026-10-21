@@ -17,6 +17,7 @@ from .models import (
     ComputeProduct,
     GPUProfile,
     PlacementDecision,
+    RunPodAcknowledgedResourceError,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -69,15 +70,15 @@ class CreatedTrainingPod:
 
 
 class PodCapacityCreatedMismatchError(RunPodManagerError):
-    """A created Pod is known by ID but failed immutable validation."""
+    """A created Pod is known by ID but lacks accepted capacity evidence."""
 
     def __init__(self, provider_pod_id: str) -> None:
         if not provider_pod_id.strip():
             raise ValueError("Created Pod mismatch requires a provider Pod ID")
         self.provider_pod_id = provider_pod_id
         super().__init__(
-            "Runpod v2 created a Pod whose immutable placement did not match "
-            "the accepted capacity request"
+            "Runpod v2 acknowledged a Pod by exact ID, but the response did not "
+            "prove the accepted capacity request"
         )
 
 
@@ -254,9 +255,12 @@ class RunpodPodCapacityProvider:
         }
         if environment is not None:
             metadata["env_overrides"] = dict(environment)
-        result = await await_owned_effect(
-            asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
-        )
+        try:
+            result = await await_owned_effect(
+                asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
+            )
+        except RunPodAcknowledgedResourceError as exc:
+            raise PodCapacityCreatedMismatchError(exc.resource_id) from exc
         pod_id = result.get("id") or result.get("podId")
         if not isinstance(pod_id, str) or not pod_id:
             raise RunPodAmbiguousResultError(

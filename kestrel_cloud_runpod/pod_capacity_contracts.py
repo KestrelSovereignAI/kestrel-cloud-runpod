@@ -706,6 +706,13 @@ class PodBillingReceipt:
             "reconciled_at": iso_datetime(self.reconciled_at),
         }
 
+    def cost_identity(self) -> dict[str, Any]:
+        """Return immutable provider-cost facts without poll-local timing."""
+
+        value = self.to_dict()
+        value.pop("reconciled_at")
+        return value
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> PodBillingReceipt:
         return cls(

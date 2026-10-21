@@ -399,6 +399,72 @@ async def test_original_post_ack_reopens_only_cleanup_after_candidate_is_termina
 
 
 @pytest.mark.asyncio
+async def test_second_exact_resource_failure_retains_primary_receipt_and_retry_state(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    fail_original = True
+    original_provision = provider.provision
+    original_teardown = provider.teardown
+
+    async def blocked(prepared):
+        resource = await original_provision(prepared)
+        entered.set()
+        await finish.wait()
+        return resource
+
+    async def selective_teardown(resource, cleanup_intent):
+        if resource.provider_resource_id == "provider-001" and fail_original:
+            raise RunPodManagerError("original acknowledgment delete unavailable")
+        return await original_teardown(resource, cleanup_intent)
+
+    provider.provision = blocked
+    provider.teardown = selective_teardown
+    owner = service(tmp_path, provider, clock)
+    request = make_request(clock)
+    original = asyncio.create_task(owner.acquire(request, wait_until_ready=False))
+    await entered.wait()
+    provider.find_result = replace(
+        provider.resource, provider_resource_id="different-complete-candidate"
+    )
+    discovered = await owner.reconcile_lease(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    terminated_candidate = await owner.release(
+        discovered.lease_id,
+        owner_id=discovered.owner_id,
+        workload_id=discovered.workload_id,
+    )
+    assert terminated_candidate.cleanup_receipt is not None
+    finish.set()
+
+    with pytest.raises(OllamaLeaseTeardownError, match="additional teardown"):
+        await original
+
+    retained = owner.repository.get(request.lease_id)
+    assert retained is not None
+    assert retained.state is OllamaLeaseState.RELEASING
+    assert retained.teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+    assert retained.cleanup_receipt == terminated_candidate.cleanup_receipt
+    assert len(retained.additional_cleanup_targets) == 1
+    assert retained.additional_cleanup_targets[0].cleanup_receipt is None
+
+    fail_original = False
+    completed = await owner.release(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+
+
+@pytest.mark.asyncio
 async def test_same_id_concurrent_readback_keeps_first_committed_receipt(tmp_path):
     clock = MutableClock()
     provider = FakeOllamaProvider(serverless_plan())

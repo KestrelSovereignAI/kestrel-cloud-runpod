@@ -219,9 +219,11 @@ def _claim_reconciliation_process(database, gate, results, now, retry_at):
     results.put(None if claimed is None else claimed.revision)
 
 
-async def _selected_pod_billing_lease(tmp_path, *, actual=Decimal(1)):
+async def _selected_pod_billing_lease(
+    tmp_path, *, actual=Decimal(1), database_name="selected-billing.sqlite3"
+):
     clock = MutableClock()
-    database = tmp_path / "selected-billing.sqlite3"
+    database = tmp_path / database_name
     repository = SQLiteOllamaLeaseRepository(database)
     provider = FakeOllamaProvider(pod_plan())
     service = OllamaLeaseService(
@@ -498,6 +500,105 @@ def test_v3_requires_drain_then_migrates_to_v4_without_restamping_authority(
     assert retained.additional_cleanup_targets == ()
     assert retained.runtime_telemetry_last_provider_error is None
     assert retained.billing_retention_exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_v3_retention_sentinel_migrates_to_explicit_v4_retention_state(
+    tmp_path,
+) -> None:
+    """Translate the exact v3 bounded-retention sentinel, not arbitrary errors."""
+
+    repository, selected, observed_at = await _selected_pod_billing_lease(
+        tmp_path, actual=Decimal("0.1")
+    )
+    original = selected.lifecycle_billing_observations[0]
+    revised = replace(
+        original,
+        provider_capacity_actual_cost_usd=Decimal("0.2"),
+        first_observed_at=observed_at + timedelta(hours=1),
+        pod_billing_receipt=replace(
+            original.pod_billing_receipt,
+            provider_billing_id="pod-billing-v3-retention-revision",
+            actual_cost_usd=Decimal("0.2"),
+        ),
+    )
+    bounded = repository.record_billing_outcome(
+        selected,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        observation=revised,
+        maximum_observations=1,
+        maximum_bytes=100_000,
+    )
+    assert bounded.lifecycle_billing_state is (
+        OllamaLifecycleBillingState.CORRECTION_PENDING
+    )
+    assert bounded.lifecycle_billing_corrections == ()
+    assert bounded.billing_retention_exhausted is True
+
+    database = repository.path
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        _downgrade_to_v3_schema(connection)
+
+    migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        database, attestation=_drain_attestation(database)
+    )
+    retained = migrated.get(selected.lease_id)
+    assert retained is not None
+    assert retained.writer_contract_version == 4
+    assert retained.lifecycle_billing_state is (
+        OllamaLifecycleBillingState.CORRECTION_PENDING
+    )
+    assert retained.lifecycle_billing_selection == selected.lifecycle_billing_selection
+    assert retained.lifecycle_billing_corrections == ()
+    assert retained.billing_retention_exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_v3_arbitrary_billing_error_is_not_promoted_to_retention_proof(
+    tmp_path,
+) -> None:
+    repository, selected, observed_at = await _selected_pod_billing_lease(
+        tmp_path,
+        actual=Decimal("0.1"),
+        database_name="invalid-v3-retention.sqlite3",
+    )
+    original = selected.lifecycle_billing_observations[0]
+    bounded = repository.record_billing_outcome(
+        selected,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        observation=replace(
+            original,
+            provider_capacity_actual_cost_usd=Decimal("0.2"),
+            first_observed_at=observed_at + timedelta(hours=1),
+            pod_billing_receipt=replace(
+                original.pod_billing_receipt,
+                provider_billing_id="pod-billing-invalid-v3-sentinel",
+                actual_cost_usd=Decimal("0.2"),
+            ),
+        ),
+        maximum_observations=1,
+        maximum_bytes=100_000,
+    )
+    assert bounded.billing_retention_exhausted is True
+
+    database = repository.path
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        _downgrade_to_v3_schema(connection)
+        connection.execute(
+            "UPDATE ollama_leases SET billing_last_provider_error = ?",
+            ("another manual billing condition",),
+        )
+
+    with pytest.raises(RunPodManagerError, match="previous writer evidence"):
+        SQLiteOllamaLeaseRepository.migrate_legacy_database(
+            database, attestation=_drain_attestation(database)
+        )
 
 
 def test_v1_writer_contract_requires_real_v4_drain_and_cannot_regain_authority(
@@ -1757,6 +1858,37 @@ async def test_billing_retention_status_survives_a_later_duplicate_poll(tmp_path
     assert repeated.lifecycle_billing_observations == (
         selected.lifecycle_billing_observations
     )
+
+
+@pytest.mark.asyncio
+async def test_pod_billing_repoll_time_is_not_a_provider_cost_revision(tmp_path):
+    repository, selected, observed_at = await _selected_pod_billing_lease(
+        tmp_path, actual=Decimal("0.25")
+    )
+    original = selected.lifecycle_billing_observations[0]
+    assert original.pod_billing_receipt is not None
+    repolled = replace(
+        original,
+        first_observed_at=observed_at + timedelta(hours=1),
+        pod_billing_receipt=replace(
+            original.pod_billing_receipt,
+            reconciled_at=observed_at + timedelta(hours=1),
+        ),
+    )
+
+    assert repolled.observation_id == original.observation_id
+    repeated = repository.record_billing_outcome(
+        selected,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        observation=repolled,
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert repeated.lifecycle_billing_observations == (original,)
+    assert repeated.lifecycle_billing_corrections == ()
+    assert repeated.lifecycle_billing_state is OllamaLifecycleBillingState.SELECTED
 
 
 @pytest.mark.asyncio

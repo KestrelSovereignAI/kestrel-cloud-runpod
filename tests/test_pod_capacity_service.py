@@ -21,6 +21,10 @@ from pod_capacity_test_support import (
 )
 
 from kestrel_cloud_runpod.models import (
+    Availability,
+    CloudType,
+    GPUOffer,
+    PodResource,
     RunPodAmbiguousResultError,
     RunPodManagerError,
 )
@@ -38,8 +42,10 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
 )
 from kestrel_cloud_runpod.pod_capacity_provider import (
     PodCapacityCreatedMismatchError,
+    RunpodPodCapacityProvider,
 )
 from kestrel_cloud_runpod.pod_transport import CatalogPodTransportError
+from kestrel_cloud_runpod.providers import DirectRunPodProvider
 
 
 @pytest.mark.asyncio
@@ -978,6 +984,79 @@ async def test_definitive_pre_provider_rejection_is_authoritative_zero(
     assert lease.billing_receipt.actual_cost_usd == 0
     assert lease.billing_receipt.provider_pod_id is None
     assert store.revoked == [catalog_request.attempt_id]
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_invalid_create_retains_exact_pod_custody_and_cost_unknown(
+    tmp_path,
+) -> None:
+    """A malformed optional sibling cannot erase a successful POST identity."""
+
+    clock = MutableClock()
+
+    class AcknowledgingControlClient:
+        def __init__(self) -> None:
+            self.actions: list[tuple[str, str]] = []
+
+        def list_gpus(self, **_kwargs):
+            return (
+                GPUOffer(
+                    id="NVIDIA RTX PRO 4500",
+                    name="RTX PRO 4500",
+                    pool=None,
+                    manufacturer="NVIDIA",
+                    memory_gb=32,
+                    secure=True,
+                    community=False,
+                    secure_price_per_hr=0.4,
+                    community_price_per_hr=0.0,
+                    secure_max_count=8,
+                    community_max_count=0,
+                    availability=Availability.HIGH,
+                    data_centers=({"id": "US-TX-3", "availability": "HIGH"},),
+                    availability_min_cuda_version="12.8",
+                ),
+            )
+
+        def create_pod(self, create_request):
+            return PodResource.from_dict(
+                {
+                    "id": "pod-acknowledged-invalid-cost",
+                    "name": create_request.name,
+                    "status": "PROVISIONING",
+                    "gpu": {
+                        "id": create_request.gpu_id,
+                        "count": create_request.gpu_count,
+                    },
+                    "cost": True,
+                    "cloud": CloudType.SECURE.value,
+                    "dataCenterId": "US-TX-3",
+                    "image": create_request.image,
+                    "env": dict(create_request.env),
+                }
+            )
+
+        def pod_action(self, pod_id, action):
+            self.actions.append((pod_id, action))
+
+    client = AcknowledgingControlClient()
+    provider = RunpodPodCapacityProvider(
+        DirectRunPodProvider(api_key="", client=client), clock=clock
+    )
+    store = FakeCapabilityStore(clock)
+    runtime = service(tmp_path, clock, provider, store, FakeWorkloadTransport())
+    catalog_request = request(clock)
+
+    with pytest.raises(PodCapacityLifecycleError):
+        await runtime.acquire_catalog(catalog_request)
+
+    durable = runtime.repository.get(catalog_request.capacity_id)
+    assert durable is not None
+    assert durable.provider_pod_id == "pod-acknowledged-invalid-cost"
+    assert durable.creation_uncertain is False
+    assert durable.settlement_ready is False
+    assert durable.billing_receipt is None
+    assert client.actions == [("pod-acknowledged-invalid-cost", "terminate")]
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from .models import (
     GPUProfile,
     PlacementRequirements,
     PodCreateRequest,
+    RunPodAcknowledgedResourceError,
     RunPodManagerError,
 )
 from .placement import select_gpu
@@ -160,7 +161,13 @@ class DirectRunPodProvider(GPUProvider):
                 min_cuda_version=requirements.min_cuda_version,
             )
         )
-        pod.require_valid_fields(context="v2 Pod create")
+        try:
+            pod.require_valid_fields(context="v2 Pod create")
+        except RunPodManagerError as exc:
+            raise RunPodAcknowledgedResourceError(
+                resource_id=pod.id,
+                resource_name=pod.name,
+            ) from exc
         result = dict(pod.raw)
         result["_kestrel_placement"] = placement
         return result
