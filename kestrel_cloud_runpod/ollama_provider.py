@@ -1486,7 +1486,11 @@ def _validate_pod_provisioning(
                 iso_datetime(pod.created_at) if pod.created_at else None
             ),
             "provider_request": expected,
-            "realized_placement": placement.to_dict(),
+            "realized_placement": {
+                key: value
+                for key, value in placement.to_dict().items()
+                if key != "observed_at"
+            },
             "rate_precision": OllamaProviderRatePrecision.PARSED_JSON_NUMBER.value,
         },
         placement,

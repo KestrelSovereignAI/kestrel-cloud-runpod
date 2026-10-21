@@ -936,6 +936,25 @@ class OllamaProvisioningReceipt:
         }
         return "runpod-ollama-provisioning:" + _json_sha256(identity)
 
+    def same_provider_authority(self, other: OllamaProvisioningReceipt) -> bool:
+        """Compare immutable facts while ignoring exact-read poll metadata."""
+
+        def authority(receipt: OllamaProvisioningReceipt) -> dict[str, Any]:
+            value = receipt.to_dict()
+            for key in (
+                "receipt_id",
+                "readback_at",
+                "readback_sha256",
+                "reconciled_after_ambiguous_create",
+            ):
+                value.pop(key, None)
+            placement = value.get("pod_realized_placement")
+            if isinstance(placement, dict):
+                placement.pop("observed_at", None)
+            return value
+
+        return authority(self) == authority(other)
+
     def validate_intent(self, intent: OllamaProvisioningIntent) -> None:
         if (
             self.intent_sha256 != intent.intent_sha256
@@ -1898,7 +1917,7 @@ class OllamaLifecycleBillingObservation:
             "provider_capacity_actual_cost_usd": decimal_text(
                 self.provider_capacity_actual_cost_usd
             ),
-            "pod_billing_receipt": self.pod_billing_receipt.to_dict()
+            "pod_billing_receipt": self.pod_billing_receipt.cost_identity()
             if self.pod_billing_receipt
             else None,
             "serverless_endpoint_hour_costs": [

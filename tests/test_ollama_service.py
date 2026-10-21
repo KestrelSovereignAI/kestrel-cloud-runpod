@@ -439,6 +439,31 @@ class _ControlFailureFinalTelemetryProvider(FakeOllamaProvider):
         return await super().teardown(resource, cleanup_intent)
 
 
+class _ClaimingControlFailureFinalTelemetryProvider(FakeOllamaProvider):
+    """Move only scheduler metadata before surfacing native control evidence."""
+
+    def __init__(self, clock):
+        super().__init__(serverless_plan())
+        self.clock = clock
+        self.repository = None
+        self.fail_final_observation = False
+
+    async def observe(self, resource, intent, provisioning):
+        if not self.fail_final_observation:
+            return await super().observe(resource, intent, provisioning)
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+        current = self.repository.get(intent.lease_id)
+        assert current is not None
+        claimed = self.repository.claim_for_reconciliation(
+            current,
+            now=self.clock(),
+            retry_at=self.clock() + timedelta(seconds=1),
+        )
+        assert claimed is not None
+        raise ExecutionCommitOutcomeError("unknown")
+
+
 class _FinalTelemetryRetryProvider(FakeOllamaProvider):
     def __init__(self):
         super().__init__(serverless_plan())
@@ -536,6 +561,80 @@ async def test_concurrent_final_telemetry_failure_cannot_block_cleanup(tmp_path)
     assert released.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
     assert released.cleanup_receipt is not None
     assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_claim_during_native_final_telemetry_failure_preserves_cleanup(
+    tmp_path,
+):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    clock = MutableClock()
+    provider = _ClaimingControlFailureFinalTelemetryProvider(clock)
+    service = _service(tmp_path, clock, provider)
+    provider.repository = service.repository
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.cleanup_receipt is not None
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        lambda intent: {"ready": False, "ready_at": None},
+        lambda intent: {"ollama_process_running": False},
+        lambda intent: {"terminal_error": "runtime_initialization_failed"},
+        lambda intent: {
+            "provision_requested_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "container_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "ollama_process_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "ollama_healthy_at": intent.provision_requested_at + timedelta(seconds=1),
+            "model_load_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "model_ready_at": intent.provision_requested_at + timedelta(seconds=1),
+            "ready_at": intent.provision_requested_at + timedelta(seconds=1),
+        },
+    ],
+    ids=("not-ready", "process-stopped", "terminal-error", "changed-birth"),
+)
+async def test_ready_route_refresh_requires_original_bound_healthy_telemetry(
+    tmp_path, changes
+):
+    clock = MutableClock()
+    provider = _ChangedStartupTelemetryProvider(lambda _intent: {})
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock, idle_timeout_seconds=60))
+    original_deadline = ready.idle_deadline
+    provider.changes = changes
+    clock.advance(10)
+
+    with pytest.raises(OllamaLeaseReadinessError):
+        await service.touch(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.idle_deadline == original_deadline
+    assert durable.route_url is None
 
 
 @pytest.mark.asyncio

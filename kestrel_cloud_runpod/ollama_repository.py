@@ -606,7 +606,7 @@ def _writer_trigger_script() -> str:
                   (NEW.state = 'terminated'
                    AND NEW.teardown_state = 'complete')
                   OR (NEW.state = 'releasing'
-                      AND NEW.teardown_state = 'pending'
+                      AND NEW.teardown_state IN ('pending', 'retryable_failure')
                       AND json_array_length(
                             NEW.additional_cleanup_targets_json
                           ) > 0)
@@ -1173,6 +1173,13 @@ def _rebuild_current_lease_schema(
                 UPDATE ollama_leases
                    SET writer_contract_version = 4,
                        reconcile_after = updated_at,
+                       billing_retention_exhausted = CASE
+                           WHEN lifecycle_billing_state = 'correction_pending'
+                            AND lifecycle_billing_selection_json IS NOT NULL
+                            AND lifecycle_billing_corrections_json = '[]'
+                            AND billing_last_provider_error =
+                                'billing evidence retention requires manual reconciliation'
+                           THEN 1 ELSE billing_retention_exhausted END,
                        revision = revision + 1,
                        writer_epoch = writer_epoch + 1
                 """
@@ -1572,6 +1579,44 @@ class SQLiteOllamaLeaseRepository:
         if row is None:
             raise RunPodManagerError("Updated Ollama lease disappeared")
         return _lease_from_row(row)
+
+    def claim_cleanup_attempt(
+        self, lease: OllamaLease, *, now: datetime
+    ) -> OllamaLease:
+        """Claim cleanup against the latest row in one immutable effect lineage."""
+
+        require_aware(now, "cleanup attempt")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            if (
+                current.request_fingerprint != lease.request_fingerprint
+                or current.provision_attempt_id != lease.provision_attempt_id
+                or current.cleanup_intent != lease.cleanup_intent
+                or tuple(item.target_id for item in current.additional_cleanup_targets)
+                != tuple(item.target_id for item in lease.additional_cleanup_targets)
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed cleanup lineage"
+                )
+            if current.state is OllamaLeaseState.TERMINATED:
+                connection.commit()
+                return current
+            if current.state is not OllamaLeaseState.RELEASING:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' no longer permits cleanup"
+                )
+            return self._update_locked(
+                connection,
+                current,
+                {
+                    "teardown_attempts": current.teardown_attempts + 1,
+                    "updated_at": now,
+                },
+                "cleanup attempt",
+            )
 
     def attach_provider_acknowledgment(
         self,
@@ -2993,7 +3038,11 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
             ) from exc
         primary_cleanup_is_partial = (
             lease.state is OllamaLeaseState.RELEASING
-            and lease.teardown_state is OllamaTeardownState.PENDING
+            and lease.teardown_state
+            in {
+                OllamaTeardownState.PENDING,
+                OllamaTeardownState.RETRYABLE_FAILURE,
+            }
             and bool(lease.additional_cleanup_targets)
         )
         if not primary_cleanup_is_partial and (
@@ -3250,13 +3299,7 @@ def _same_provisioning_receipt_authority(
 ) -> bool:
     """Compare immutable provider facts while ignoring poll-local metadata."""
 
-    first_value = first.to_dict()
-    second_value = second.to_dict()
-    for value in (first_value, second_value):
-        value.pop("receipt_id", None)
-        value.pop("readback_at", None)
-        value.pop("reconciled_after_ambiguous_create", None)
-    return first_value == second_value
+    return first.same_provider_authority(second)
 
 
 def _first_timestamp_is_monotonic(

@@ -198,9 +198,9 @@ async def test_created_metadata_mismatch_preserves_known_pod_id() -> None:
 @pytest.mark.parametrize(
     ("override", "expected_message"),
     [
-        ({"dataCenterId": "EU-RO-1"}, "immutable placement"),
-        ({"cost": 0.41}, "immutable placement"),
-        ({"cloud": "COMMUNITY"}, "immutable placement"),
+        ({"dataCenterId": "EU-RO-1"}, "accepted capacity"),
+        ({"cost": 0.41}, "accepted capacity"),
+        ({"cloud": "COMMUNITY"}, "accepted capacity"),
     ],
 )
 async def test_create_rejects_realized_placement_outside_quote(

@@ -33,6 +33,7 @@ from kestrel_cloud_runpod.models import (
     PodResource,
     RunPodAPIError,
     RunPodManagerError,
+    assess_endpoint_mounts,
     environment_values_sha256,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
@@ -50,7 +51,10 @@ from kestrel_cloud_runpod.ollama_provider import (
     RunpodOllamaDeployment,
     _pod_base_url,
 )
-from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
+from kestrel_cloud_runpod.ollama_repository import (
+    SQLiteOllamaLeaseRepository,
+    _same_provisioning_receipt_authority,
+)
 from kestrel_cloud_runpod.ollama_runtime import OLLAMA_RUNTIME_IMAGE_REPOSITORY
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 from scripts.check_runpod_openapi import load_openapi
@@ -2255,6 +2259,83 @@ async def test_live_pod_zero_rate_is_exact_evidence_not_missing(monkeypatch):
     assert receipt.pod_realized_placement is not None
     assert receipt.pod_realized_placement.hourly_rate_usd == Decimal(0)
     assert receipt.provider_rate_precision.value == "parsed_json_number"
+
+
+@pytest.mark.asyncio
+async def test_compatible_pod_readbacks_ignore_poll_local_placement_time(
+    monkeypatch,
+    tmp_path,
+):
+    """Repeated exact-ID GETs retain one immutable provisioning authority."""
+
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    client = _ControlClient()
+    clock = MutableClock()
+    provider = _provider(client=client)
+    provider._clock = clock
+    request = make_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    plan = pod_plan(rate=0.5)
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "stable-readback.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    admitted = await service.acquire(request, plan=plan, wait_until_ready=False)
+    first = admitted.provisioning_receipt
+    intent = admitted.provisioning_intent
+    assert first is not None
+    assert intent is not None
+    resource = ProvisionedOllamaResource(
+        resource_type=intent.resource_type,
+        provider_resource_id=first.provider_resource_id,
+        resource_name=first.resource_name,
+    )
+    clock.advance(1)
+    second = await provider.observe_provisioning(intent, resource)
+
+    assert first.readback_at != second.readback_at
+    assert first.pod_realized_placement is not None
+    assert second.pod_realized_placement is not None
+    assert (
+        first.pod_realized_placement.observed_at
+        != second.pod_realized_placement.observed_at
+    )
+    assert first.readback_sha256 == second.readback_sha256
+    assert _same_provisioning_receipt_authority(first, second)
+    retained = repository.record_provisioning_outcome(
+        admitted, now=clock(), receipt=second
+    )
+    assert retained.provisioning_receipt == first
+
+
+def test_invalid_endpoint_mount_member_does_not_invent_expected_volume_absence():
+    assessment = assess_endpoint_mounts(
+        {"mounts": {"network": [17], "global": []}},
+        ("approved-volume",),
+    )
+
+    assert assessment.invalid_kinds == ("network",)
+    assert assessment.missing_kinds == ()
+    assert assessment.mismatched_kinds == ()
+
+
+def test_invalid_endpoint_mount_member_preserves_independent_foreign_volume():
+    assessment = assess_endpoint_mounts(
+        {
+            "mounts": {
+                "network": [17, {"volumeId": "foreign-volume"}],
+                "global": [],
+            }
+        },
+        ("approved-volume",),
+    )
+
+    assert assessment.invalid_kinds == ("network",)
+    assert assessment.missing_kinds == ()
+    assert assessment.mismatched_kinds == ("network",)
 
 
 @pytest.mark.asyncio

@@ -860,6 +860,7 @@ class OllamaLeaseService:
             or not observation.route_url
             or not observation.has_model(lease.model)
             or observation.runtime_telemetry is None
+            or not observation.runtime_telemetry.is_complete_startup_for(intent)
         ):
             self.repository.compare_and_set(
                 lease,
@@ -1095,10 +1096,7 @@ class OllamaLeaseService:
             if not is_execution_control_error(exc):
                 raise
             telemetry_control_error = exc
-        lease = self.repository.compare_and_set(
-            lease,
-            changes={"teardown_attempts": lease.teardown_attempts + 1},
-        )
+        lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
         if telemetry_control_error is None:
             return await self._teardown_all_effects(lease, reason=reason)
         try:
