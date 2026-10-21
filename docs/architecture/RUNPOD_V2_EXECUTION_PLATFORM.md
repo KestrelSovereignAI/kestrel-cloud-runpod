@@ -351,15 +351,19 @@ Confirmed fields are checked before reporting independent omissions so missing
 evidence cannot hide a known policy violation on an owned resource.
 
 The lease aggregate has one writer contract. Every insert starts at contract
-version 5/epoch 1, and every update must advance both the revision CAS and the
+version 6/epoch 1, and every update must advance both the revision CAS and the
 writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
-and deletes. Version 5 also prevents a retained version-1 through version-4
+and deletes. Version 6 also prevents a retained version-1 through version-5
 binary or migrator from reinstalling its weaker trigger set over a newer
-aggregate. Its explicit drained version-4 migration changes only writer
+aggregate. Its explicit drained version-4 or version-5 migration changes only writer
 metadata and revision; accepted intent, provisioning, cleanup, telemetry,
 billing, correction, retention, scheduling, route, and cost facts remain exact.
-Runtime
-startup never upgrades a legacy database. Operators must
+Because those predecessors retained a deduplicated billing fact set rather
+than receipt arrival order, existing facts migrate with an explicit
+`historical_unknown` latest-reference state. The first successful, exact,
+original-bound version-6 poll establishes the latest retained receipt without
+reordering facts, replacing the immutable selection, or erasing corrections.
+Runtime startup never upgrades a legacy database. Operators must
 first drain every old binary, admitted HTTP effect, and route holder, then call
 the explicit one-shot `migrate_legacy_database()` entry point with an attestation
 bound to that absolute database. The SDK requires that assertion but cannot
@@ -452,15 +456,21 @@ Serverless billing reader over the original create-to-absence window. Only
 closed, complete provider buckets can become an observation. The first complete
 observation is selected immutably; later provider revisions are append-only
 correction evidence and never replace it, debit an account, or claim provider
-invoice finality. Polling, batch size, observation count, and serialized
+invoice finality. A separate typed reference records the most recently
+received successful retained receipt and its receive time; it is distinct from
+the last poll time, which also advances on provider errors. Repeated receipt
+identities update only that reference and do not duplicate or reorder facts.
+Polling, batch size, observation count, and serialized
 evidence bytes are explicitly bounded. At a retention limit the existing
 selection is preserved and manual reconciliation remains visible rather than
 truncating history. Missing non-compute amounts keep all-in cost unknown; a raw
 provider-capacity amount above the original cap is reported separately as
-exceeded. Only a fresh version-3 request proven never to have reached provider
-admission may record no provider effect. Migrated rows and missing original
-facts remain unknown rather than gain invented rates, timestamps, termination,
-zero cost, or debit authority.
+exceeded even when a later receipt reverts to a lower retained identity; that
+warning does not choose a new debit or resolve the correction. Only a fresh
+current-writer request proven never to have reached provider admission may
+record no provider effect. Migrated rows and missing original facts remain
+unknown rather than gain invented rates, timestamps, termination, zero cost,
+or debit authority.
 
 Legacy `manage_gpu` commands are operator-only stop/status/log controls over an
 already retained session. Ownerless legacy create and stopped-Pod resume fail

@@ -28,6 +28,8 @@ from .ollama_contracts import (
     OllamaLeaseRequest,
     OllamaLeaseState,
     OllamaLifecycleBillingCorrection,
+    OllamaLifecycleBillingLatestReference,
+    OllamaLifecycleBillingLatestState,
     OllamaLifecycleBillingObservation,
     OllamaLifecycleBillingSelection,
     OllamaLifecycleBillingState,
@@ -49,19 +51,25 @@ from .ollama_contracts import (
 )
 from .sqlite_store import lease_database_connection
 
-_CURRENT_WRITER_CONTRACT_VERSION = 5
+_CURRENT_WRITER_CONTRACT_VERSION = 6
 _BILLING_RETENTION_MANUAL_ERROR = (
     "billing evidence retention requires manual reconciliation"
 )
 _WRITER_TRIGGER_NAMES = (
+    "ollama_writer_insert_v6",
+    "ollama_writer_update_v6",
+    "ollama_writer_delete_v6",
+    "ollama_provisioning_evidence_insert_v6",
+    "ollama_provisioning_evidence_update_v6",
+    "ollama_lifecycle_evidence_update_v6",
+)
+_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v5",
     "ollama_writer_update_v5",
     "ollama_writer_delete_v5",
     "ollama_provisioning_evidence_insert_v5",
     "ollama_provisioning_evidence_update_v5",
     "ollama_lifecycle_evidence_update_v5",
-)
-_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v4",
     "ollama_writer_update_v4",
     "ollama_writer_delete_v4",
@@ -112,13 +120,17 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
         "lifecycle_billing_observations_json",
         "lifecycle_billing_selection_json",
         "lifecycle_billing_corrections_json",
+        "lifecycle_billing_latest_reference_json",
         "billing_last_checked_at",
         "billing_next_check_at",
         "billing_last_provider_error",
         "billing_retention_exhausted",
     }
 )
-_V3_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+_V5_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+    "lifecycle_billing_latest_reference_json",
+}
+_V3_WRITER_CONTRACT_COLUMNS = _V5_WRITER_CONTRACT_COLUMNS - {
     "reconcile_after",
     "additional_cleanup_targets_json",
     "runtime_telemetry_last_provider_error",
@@ -240,7 +252,7 @@ _LEASE_COLUMNS = (
     _LeaseColumn("termination_reason", "TEXT"),
     _LeaseColumn("teardown_attempts", "INTEGER", not_null=True, default_sql="0"),
     _LeaseColumn("revision", "INTEGER", not_null=True, default_sql="0"),
-    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True, default_sql="5"),
+    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True, default_sql="6"),
     _LeaseColumn("writer_epoch", "INTEGER", not_null=True, default_sql="0"),
     _LeaseColumn("reconcile_after", "TEXT"),
     _LeaseColumn(
@@ -287,6 +299,14 @@ _LEASE_COLUMNS = (
         "TEXT",
         not_null=True,
         default_sql="'[]'",
+    ),
+    _LeaseColumn(
+        "lifecycle_billing_latest_reference_json",
+        "TEXT",
+        not_null=True,
+        default_sql=(
+            '\'{"observation_id":null,"received_at":null,"state":"not_observed"}\''
+        ),
     ),
     _LeaseColumn("billing_last_checked_at", "TEXT"),
     _LeaseColumn("billing_next_check_at", "TEXT"),
@@ -365,9 +385,9 @@ def _execute_sql_script_transactionally(
 
 def _writer_trigger_script() -> str:
     return """
-        CREATE TRIGGER ollama_writer_insert_v5
+        CREATE TRIGGER ollama_writer_insert_v6
         BEFORE INSERT ON ollama_leases
-        WHEN NEW.writer_contract_version IS NOT 5
+        WHEN NEW.writer_contract_version IS NOT 6
           OR NEW.writer_epoch IS NOT 1
           OR NEW.revision IS NOT 0
           OR NEW.reconcile_after IS NULL
@@ -375,9 +395,9 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'current Ollama writer contract required');
         END;
 
-        CREATE TRIGGER ollama_writer_update_v5
+        CREATE TRIGGER ollama_writer_update_v6
         BEFORE UPDATE ON ollama_leases
-        WHEN OLD.writer_contract_version IS NOT 5
+        WHEN OLD.writer_contract_version IS NOT 6
           OR NEW.writer_contract_version IS NOT OLD.writer_contract_version
           OR NEW.writer_epoch IS NOT OLD.writer_epoch + 1
           OR NEW.revision IS NOT OLD.revision + 1
@@ -385,13 +405,13 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'stale Ollama writer');
         END;
 
-        CREATE TRIGGER ollama_writer_delete_v5
+        CREATE TRIGGER ollama_writer_delete_v6
         BEFORE DELETE ON ollama_leases
         BEGIN
             SELECT RAISE(ABORT, 'Ollama lease deletion is unsupported');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_insert_v5
+        CREATE TRIGGER ollama_provisioning_evidence_insert_v6
         BEFORE INSERT ON ollama_leases
         WHEN NEW.state IS NOT 'requested'
           OR NEW.provisioning_evidence_state IS NOT 'required'
@@ -419,6 +439,8 @@ def _writer_trigger_script() -> str:
           OR NEW.lifecycle_billing_observations_json IS NOT '[]'
           OR NEW.lifecycle_billing_selection_json IS NOT NULL
           OR NEW.lifecycle_billing_corrections_json IS NOT '[]'
+          OR NEW.lifecycle_billing_latest_reference_json IS NOT
+             '{"observation_id":null,"received_at":null,"state":"not_observed"}'
           OR NEW.billing_last_checked_at IS NOT NULL
           OR NEW.billing_next_check_at IS NOT NULL
           OR NEW.billing_last_provider_error IS NOT NULL
@@ -427,7 +449,7 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'new Ollama lease must begin without provider evidence');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_update_v5
+        CREATE TRIGGER ollama_provisioning_evidence_update_v6
         BEFORE UPDATE ON ollama_leases
         WHEN
           (OLD.provisioning_evidence_state = 'required'
@@ -576,7 +598,7 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'invalid Ollama provisioning evidence mutation');
         END;
 
-        CREATE TRIGGER ollama_lifecycle_evidence_update_v5
+        CREATE TRIGGER ollama_lifecycle_evidence_update_v6
         BEFORE UPDATE ON ollama_leases
         WHEN
           (NEW.cleanup_intent_json IS NOT NULL AND (
@@ -779,9 +801,11 @@ def _writer_trigger_script() -> str:
                 json_array_length(NEW.lifecycle_billing_observations_json) != 0
              OR NEW.lifecycle_billing_selection_json IS NOT NULL
              OR json_array_length(NEW.lifecycle_billing_corrections_json) != 0
+             OR json_extract(NEW.lifecycle_billing_latest_reference_json,
+                             '$.state') IS NOT 'not_observed'
           ))
           OR (NEW.lifecycle_billing_state = 'not_applicable' AND (
-                NEW.writer_contract_version IS NOT 5
+                NEW.writer_contract_version IS NOT 6
              OR NEW.provisioning_evidence_state IS NOT 'required'
              OR NEW.provisioning_intent_json IS NOT NULL
              OR NEW.provisioning_receipt_json IS NOT NULL
@@ -798,6 +822,8 @@ def _writer_trigger_script() -> str:
              OR json_array_length(NEW.lifecycle_billing_observations_json) != 0
              OR NEW.lifecycle_billing_selection_json IS NOT NULL
              OR json_array_length(NEW.lifecycle_billing_corrections_json) != 0
+             OR json_extract(NEW.lifecycle_billing_latest_reference_json,
+                             '$.state') IS NOT 'not_observed'
           ))
           OR (NEW.lifecycle_billing_state IN
                 ('pending', 'selected', 'correction_pending')
@@ -877,11 +903,61 @@ def _writer_trigger_script() -> str:
                   AND json_extract(duplicate.value, '$.correction_id')
                       = json_extract(first.value, '$.correction_id')
           )
+          OR json_valid(NEW.lifecycle_billing_latest_reference_json) IS NOT 1
+          OR json_type(NEW.lifecycle_billing_latest_reference_json) IS NOT 'object'
+          OR (SELECT count(*)
+                FROM json_each(NEW.lifecycle_billing_latest_reference_json)) IS NOT 3
+          OR json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+             NOT IN ('not_observed', 'historical_unknown', 'known')
+          OR (json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+                 IN ('not_observed', 'historical_unknown')
+             AND (json_type(NEW.lifecycle_billing_latest_reference_json,
+                            '$.observation_id') IS NOT 'null'
+                  OR json_type(NEW.lifecycle_billing_latest_reference_json,
+                               '$.received_at') IS NOT 'null'))
+          OR (json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+                 = 'known'
+             AND (json_type(NEW.lifecycle_billing_latest_reference_json,
+                            '$.observation_id') IS NOT 'text'
+                  OR json_type(NEW.lifecycle_billing_latest_reference_json,
+                               '$.received_at') IS NOT 'text'
+                  OR NOT EXISTS (
+                       SELECT 1
+                         FROM json_each(NEW.lifecycle_billing_observations_json)
+                        WHERE json_extract(value, '$.observation_id') =
+                              json_extract(
+                                NEW.lifecycle_billing_latest_reference_json,
+                                '$.observation_id'
+                              )
+                  )))
+          OR (json_extract(OLD.lifecycle_billing_latest_reference_json, '$.state')
+                 = 'known'
+             AND json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+                 IS NOT 'known')
+          OR (json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+                 = 'historical_unknown'
+             AND json_extract(OLD.lifecycle_billing_latest_reference_json, '$.state')
+                 IS NOT 'historical_unknown')
+          OR (NEW.lifecycle_billing_latest_reference_json
+                 IS NOT OLD.lifecycle_billing_latest_reference_json
+             AND (json_extract(NEW.lifecycle_billing_latest_reference_json, '$.state')
+                    IS NOT 'known'
+                  OR NEW.billing_last_provider_error IS NOT NULL
+                  OR NEW.billing_last_checked_at IS OLD.billing_last_checked_at
+                  OR json_extract(NEW.lifecycle_billing_latest_reference_json,
+                                  '$.received_at')
+                     IS NOT NEW.billing_last_checked_at))
           OR (NEW.lifecycle_billing_state IN ('selected', 'correction_pending')
-             AND NEW.lifecycle_billing_selection_json IS NULL)
+             AND (NEW.lifecycle_billing_selection_json IS NULL
+                  OR json_extract(NEW.lifecycle_billing_latest_reference_json,
+                                  '$.state') NOT IN
+                     ('known', 'historical_unknown')))
           OR (NEW.lifecycle_billing_state = 'pending' AND (
-                NEW.lifecycle_billing_selection_json IS NOT NULL
+                json_array_length(NEW.lifecycle_billing_observations_json) != 0
+             OR NEW.lifecycle_billing_selection_json IS NOT NULL
              OR json_array_length(NEW.lifecycle_billing_corrections_json) != 0
+             OR json_extract(NEW.lifecycle_billing_latest_reference_json,
+                             '$.state') IS NOT 'not_observed'
           ))
           OR (NEW.lifecycle_billing_state = 'selected'
              AND json_array_length(NEW.lifecycle_billing_corrections_json) != 0)
@@ -890,7 +966,9 @@ def _writer_trigger_script() -> str:
              AND NEW.billing_retention_exhausted IS NOT 1)
           OR NEW.billing_retention_exhausted NOT IN (0, 1)
           OR (OLD.billing_retention_exhausted = 1
-             AND NEW.billing_retention_exhausted IS NOT 1)
+             AND (NEW.billing_retention_exhausted IS NOT 1
+                  OR NEW.lifecycle_billing_latest_reference_json
+                     IS NOT OLD.lifecycle_billing_latest_reference_json))
           OR (NEW.billing_retention_exhausted = 1
              AND NEW.lifecycle_billing_state NOT IN
                  ('pending', 'correction_pending'))
@@ -902,6 +980,8 @@ def _writer_trigger_script() -> str:
                 IS NOT OLD.lifecycle_billing_selection_json
              OR NEW.lifecycle_billing_corrections_json
                 IS NOT OLD.lifecycle_billing_corrections_json
+             OR NEW.lifecycle_billing_latest_reference_json
+                IS NOT OLD.lifecycle_billing_latest_reference_json
           ))
         BEGIN
             SELECT RAISE(ABORT, 'invalid Ollama lifecycle evidence mutation');
@@ -1032,6 +1112,7 @@ def _legacy_schema_is_supported(
             ("INTEGER", True, "2", False, 0),
             ("INTEGER", True, "3", False, 0),
             ("INTEGER", True, "4", False, 0),
+            ("INTEGER", True, "5", False, 0),
         )
 
     if not set(actual).issubset(expected) or any(
@@ -1042,6 +1123,7 @@ def _legacy_schema_is_supported(
     writer_columns = names & _WRITER_CONTRACT_COLUMNS
     if writer_columns and writer_columns not in {
         _WRITER_CONTRACT_COLUMNS,
+        _V5_WRITER_CONTRACT_COLUMNS,
         _V3_WRITER_CONTRACT_COLUMNS,
         _V2_WRITER_CONTRACT_COLUMNS,
         _V1_WRITER_CONTRACT_COLUMNS,
@@ -1054,7 +1136,27 @@ def _legacy_schema_is_supported(
                 "SELECT DISTINCT writer_contract_version FROM ollama_leases"
             ).fetchall()
         }
-        if not versions.issubset({1, 2, 3, 4, _CURRENT_WRITER_CONTRACT_VERSION}):
+        if not versions.issubset({1, 2, 3, 4, 5, _CURRENT_WRITER_CONTRACT_VERSION}):
+            return False
+        if len(versions) > 1:
+            return False
+        columns_for_version = {
+            1: _V1_WRITER_CONTRACT_COLUMNS,
+            2: _V2_WRITER_CONTRACT_COLUMNS,
+            3: _V3_WRITER_CONTRACT_COLUMNS,
+            4: _V5_WRITER_CONTRACT_COLUMNS,
+            5: _V5_WRITER_CONTRACT_COLUMNS,
+            _CURRENT_WRITER_CONTRACT_VERSION: _WRITER_CONTRACT_COLUMNS,
+        }
+        writer_default = actual["writer_contract_version"][2]
+        if writer_default is None or not writer_default.isdecimal():
+            return False
+        default_version = int(writer_default)
+        if (
+            default_version not in columns_for_version
+            or writer_columns != columns_for_version[default_version]
+            or (versions and versions != {default_version})
+        ):
             return False
     required_legacy = set(expected) - _LEGACY_ADDITIVE_COLUMNS
     if not required_legacy.issubset(names):
@@ -1127,8 +1229,16 @@ def _rebuild_current_lease_schema(
         source_names & _WRITER_CONTRACT_COLUMNS == _V3_WRITER_CONTRACT_COLUMNS
         and source_versions == {3}
     )
-    upgrading_v4 = (
+    repairing_v6 = (
         source_names & _WRITER_CONTRACT_COLUMNS == _WRITER_CONTRACT_COLUMNS
+        and source_versions == {_CURRENT_WRITER_CONTRACT_VERSION}
+    )
+    upgrading_v5 = (
+        source_names & _WRITER_CONTRACT_COLUMNS == _V5_WRITER_CONTRACT_COLUMNS
+        and source_versions == {5}
+    )
+    upgrading_v4 = (
+        source_names & _WRITER_CONTRACT_COLUMNS == _V5_WRITER_CONTRACT_COLUMNS
         and source_versions == {4}
     )
     copied_names = [
@@ -1150,7 +1260,7 @@ def _rebuild_current_lease_schema(
         connection.execute(
             """
             UPDATE ollama_leases
-            SET writer_contract_version = 5,
+            SET writer_contract_version = 6,
                 writer_epoch = 0,
                 reconcile_after = updated_at,
                 provisioning_evidence_state = 'historical_unknown',
@@ -1175,6 +1285,8 @@ def _rebuild_current_lease_schema(
                 lifecycle_billing_observations_json = '[]',
                 lifecycle_billing_selection_json = NULL,
                 lifecycle_billing_corrections_json = '[]',
+                lifecycle_billing_latest_reference_json =
+                    '{"observation_id":null,"received_at":null,"state":"not_observed"}',
                 billing_last_checked_at = NULL,
                 billing_next_check_at = NULL,
                 billing_last_provider_error = NULL,
@@ -1184,11 +1296,20 @@ def _rebuild_current_lease_schema(
     else:
         if "ambiguous_candidate_mismatch_json" not in source_names:
             _translate_previous_candidate_mismatches(connection)
-        if upgrading_v4:
+        if repairing_v6:
+            pass
+        elif upgrading_v4 or upgrading_v5:
             connection.execute(
                 """
                 UPDATE ollama_leases
-                   SET writer_contract_version = 5,
+                   SET writer_contract_version = 6,
+                       lifecycle_billing_latest_reference_json = CASE
+                           WHEN json_array_length(
+                                  lifecycle_billing_observations_json
+                                ) > 0
+                           THEN '{"observation_id":null,"received_at":null,"state":"historical_unknown"}'
+                           ELSE '{"observation_id":null,"received_at":null,"state":"not_observed"}'
+                       END,
                        revision = revision + 1,
                        writer_epoch = writer_epoch + 1
                 """
@@ -1197,8 +1318,15 @@ def _rebuild_current_lease_schema(
             connection.execute(
                 """
                 UPDATE ollama_leases
-                   SET writer_contract_version = 5,
+                   SET writer_contract_version = 6,
                        reconcile_after = updated_at,
+                       lifecycle_billing_latest_reference_json = CASE
+                           WHEN json_array_length(
+                                  lifecycle_billing_observations_json
+                                ) > 0
+                           THEN '{"observation_id":null,"received_at":null,"state":"historical_unknown"}'
+                           ELSE '{"observation_id":null,"received_at":null,"state":"not_observed"}'
+                       END,
                        billing_retention_exhausted = CASE
                            WHEN lifecycle_billing_state = 'correction_pending'
                             AND lifecycle_billing_selection_json IS NOT NULL
@@ -1214,7 +1342,9 @@ def _rebuild_current_lease_schema(
             connection.execute(
                 """
                 UPDATE ollama_leases
-                    SET writer_contract_version = 5,
+                    SET writer_contract_version = 6,
+                        lifecycle_billing_latest_reference_json =
+                            '{"observation_id":null,"received_at":null,"state":"not_observed"}',
                         reconcile_after = updated_at,
                         route_url = NULL,
                         provider_health_url = NULL,
@@ -1226,7 +1356,7 @@ def _rebuild_current_lease_schema(
                         writer_epoch = writer_epoch + 1
                     """
             )
-        if not upgrading_v4:
+        if not repairing_v6 and not upgrading_v4 and not upgrading_v5:
             for migrated in connection.execute(
                 "SELECT lease_id, provisioning_intent_json FROM ollama_leases "
                 "WHERE provisioning_intent_json IS NOT NULL"
@@ -1246,7 +1376,12 @@ def _rebuild_current_lease_schema(
                         migrated["lease_id"],
                     ),
                 )
-        if not upgrading_v3 and not upgrading_v4:
+        if (
+            not repairing_v6
+            and not upgrading_v3
+            and not upgrading_v4
+            and not upgrading_v5
+        ):
             connection.execute(
                 """
             UPDATE ollama_leases
@@ -1358,6 +1493,7 @@ class SQLiteOllamaLeaseRepository:
             "lifecycle_billing_observations_json",
             "lifecycle_billing_selection_json",
             "lifecycle_billing_corrections_json",
+            "lifecycle_billing_latest_reference_json",
             "billing_last_checked_at",
             "billing_next_check_at",
             "billing_last_provider_error",
@@ -1379,7 +1515,7 @@ class SQLiteOllamaLeaseRepository:
         *,
         attestation: OllamaWriterDrainAttestation,
     ) -> SQLiteOllamaLeaseRepository:
-        """Install the v5 writer fence after an operator-controlled drain."""
+        """Install the v6 writer fence after an operator-controlled drain."""
 
         resolved = Path(path)
         if not resolved.is_absolute():
@@ -1425,12 +1561,25 @@ class SQLiteOllamaLeaseRepository:
             contract_is_current = table_exists and _writer_contract_is_current(
                 connection, columns=columns
             )
-            migrating_v4 = (
+            source_writer_columns = {
+                row["name"] for row in columns
+            } & _WRITER_CONTRACT_COLUMNS
+            source_writer_versions = _source_writer_contract_versions(
+                connection, columns
+            )
+            migrating_complete_predecessor = (
                 table_exists
                 and not contract_is_current
-                and {row["name"] for row in columns} & _WRITER_CONTRACT_COLUMNS
-                == _WRITER_CONTRACT_COLUMNS
-                and _source_writer_contract_versions(connection, columns) == {4}
+                and (
+                    (
+                        source_writer_columns == _V5_WRITER_CONTRACT_COLUMNS
+                        and source_writer_versions in ({4}, {5})
+                    )
+                    or (
+                        source_writer_columns == _WRITER_CONTRACT_COLUMNS
+                        and source_writer_versions == {_CURRENT_WRITER_CONTRACT_VERSION}
+                    )
+                )
             )
             if table_exists and not contract_is_current:
                 if not allow_legacy_migration:
@@ -1470,7 +1619,7 @@ class SQLiteOllamaLeaseRepository:
             # Routes are re-observed from Runpod and exist only in the host
             # process.  Clear values written by releases before the SDK
             # inference boundary made addressable endpoints host-only.
-            if not migrating_v4:
+            if not migrating_complete_predecessor:
                 connection.execute(
                     """
                     UPDATE ollama_leases
@@ -2484,7 +2633,14 @@ class SQLiteOllamaLeaseRepository:
                     ),
                     None,
                 )
-                if existing is None:
+                if existing is not None:
+                    changes["lifecycle_billing_latest_reference_json"] = (
+                        OllamaLifecycleBillingLatestReference.known(
+                            existing.observation_id,
+                            received_at=now,
+                        )
+                    )
+                else:
                     observations = (
                         *current.lifecycle_billing_observations,
                         observation,
@@ -2518,12 +2674,17 @@ class SQLiteOllamaLeaseRepository:
                             *current.lifecycle_billing_corrections,
                             correction,
                         )
+                    latest_reference = OllamaLifecycleBillingLatestReference.known(
+                        observation.observation_id,
+                        received_at=now,
+                    )
                     serialized_bytes = sum(
                         len(_db_value(value))
                         for value in (
                             observations,
                             corrections,
                             candidate_selection,
+                            latest_reference,
                         )
                     )
                     exceeds_retention = (
@@ -2553,6 +2714,9 @@ class SQLiteOllamaLeaseRepository:
                                     candidate_selection
                                 ),
                                 "lifecycle_billing_corrections_json": corrections,
+                                "lifecycle_billing_latest_reference_json": (
+                                    latest_reference
+                                ),
                                 "lifecycle_billing_state": (
                                     OllamaLifecycleBillingState.SELECTED
                                     if selection is None
@@ -2964,6 +3128,9 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         "lifecycle billing corrections",
         OllamaLifecycleBillingCorrection.from_dict,
     )
+    billing_latest_reference = _stored_billing_latest_reference(
+        row["lifecycle_billing_latest_reference_json"]
+    )
     if receipt is not None:
         if intent is None:
             raise RunPodManagerError(
@@ -3090,6 +3257,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         lifecycle_billing_observations=billing_observations,
         lifecycle_billing_selection=billing_selection,
         lifecycle_billing_corrections=billing_corrections,
+        lifecycle_billing_latest_reference=billing_latest_reference,
         billing_last_checked_at=_optional_datetime(row["billing_last_checked_at"]),
         billing_next_check_at=_optional_datetime(row["billing_next_check_at"]),
         billing_last_provider_error=row["billing_last_provider_error"],
@@ -3112,6 +3280,8 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         or lease.lifecycle_billing_observations
         or lease.lifecycle_billing_selection is not None
         or lease.lifecycle_billing_corrections
+        or lease.lifecycle_billing_latest_reference.state
+        is not OllamaLifecycleBillingLatestState.NOT_OBSERVED
     ):
         raise RunPodManagerError(
             "Stored Ollama lifecycle evidence has no original intent"
@@ -3224,6 +3394,24 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
     selection = lease.lifecycle_billing_selection
     if selection is not None and selection.observation_id not in billing_by_id:
         raise RunPodManagerError("Stored Ollama billing selection is unbound")
+    latest = lease.lifecycle_billing_latest_reference
+    if latest.state is OllamaLifecycleBillingLatestState.KNOWN:
+        if (
+            latest.observation_id not in billing_by_id
+            or latest.received_at is None
+            or lease.billing_last_checked_at is None
+            or latest.received_at > lease.billing_last_checked_at
+        ):
+            raise RunPodManagerError(
+                "Stored Ollama billing latest reference is unbound"
+            )
+    elif latest.state is OllamaLifecycleBillingLatestState.HISTORICAL_UNKNOWN:
+        if not billing_by_id:
+            raise RunPodManagerError(
+                "Stored Ollama historical billing reference has no evidence"
+            )
+    elif billing_by_id:
+        raise RunPodManagerError("Stored Ollama billing evidence has no latest state")
     correction_ids: set[str] = set()
     for correction in lease.lifecycle_billing_corrections:
         selected = billing_by_id.get(correction.selected_observation_id)
@@ -3253,6 +3441,7 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         lease.lifecycle_billing_observations
         or selection is not None
         or lease.lifecycle_billing_corrections
+        or latest.state is not OllamaLifecycleBillingLatestState.NOT_OBSERVED
     ):
         raise RunPodManagerError("Stored Ollama unknown billing has evidence")
     if state is OllamaLifecycleBillingState.NOT_APPLICABLE and (
@@ -3268,18 +3457,33 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
         or lease.creation_uncertain
         or lease.state is not OllamaLeaseState.TERMINATED
         or lease.teardown_state is not OllamaTeardownState.COMPLETE
+        or latest.state is not OllamaLifecycleBillingLatestState.NOT_OBSERVED
     ):
         raise RunPodManagerError("Stored Ollama no-effect billing proof is invalid")
     if state is OllamaLifecycleBillingState.PENDING and (
-        selection is not None or lease.lifecycle_billing_corrections
+        lease.lifecycle_billing_observations
+        or selection is not None
+        or lease.lifecycle_billing_corrections
+        or latest.state is not OllamaLifecycleBillingLatestState.NOT_OBSERVED
     ):
         raise RunPodManagerError("Stored Ollama pending billing selected evidence")
     if state is OllamaLifecycleBillingState.SELECTED and (
-        selection is None or lease.lifecycle_billing_corrections
+        selection is None
+        or lease.lifecycle_billing_corrections
+        or latest.state
+        not in {
+            OllamaLifecycleBillingLatestState.KNOWN,
+            OllamaLifecycleBillingLatestState.HISTORICAL_UNKNOWN,
+        }
     ):
         raise RunPodManagerError("Stored Ollama selected billing state is invalid")
     if state is OllamaLifecycleBillingState.CORRECTION_PENDING and (
         selection is None
+        or latest.state
+        not in {
+            OllamaLifecycleBillingLatestState.KNOWN,
+            OllamaLifecycleBillingLatestState.HISTORICAL_UNKNOWN,
+        }
         or (
             not lease.lifecycle_billing_corrections
             and not lease.billing_retention_exhausted
@@ -3682,6 +3886,7 @@ def _db_value(value: Any) -> Any:
             OllamaCleanupIntent,
             OllamaCleanupReceipt,
             OllamaLifecycleBillingSelection,
+            OllamaLifecycleBillingLatestReference,
             OllamaAdditionalCleanupTarget,
         ),
     ):
@@ -3763,6 +3968,22 @@ def _stored_billing_selection(
     except (TypeError, ValueError) as exc:
         raise RunPodManagerError(
             "Stored Ollama lifecycle billing selection is corrupt"
+        ) from exc
+
+
+def _stored_billing_latest_reference(
+    value: str,
+) -> OllamaLifecycleBillingLatestReference:
+    decoded = _stored_json(value, "lifecycle billing latest reference")
+    if decoded is None:
+        raise RunPodManagerError(
+            "Stored Ollama lifecycle billing latest reference is missing"
+        )
+    try:
+        return OllamaLifecycleBillingLatestReference.from_dict(decoded)
+    except (TypeError, ValueError) as exc:
+        raise RunPodManagerError(
+            "Stored Ollama lifecycle billing latest reference is corrupt"
         ) from exc
 
 

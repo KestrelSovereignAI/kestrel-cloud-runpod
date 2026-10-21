@@ -378,6 +378,161 @@ async def test_terminated_lease_remains_due_for_exact_lifecycle_billing(
     )
 
 
+async def _three_poll_reverted_lifecycle_billing(tmp_path, billing_server, db_name):
+    """Persist exact A -> B -> A receipts through the canonical HTTP reader."""
+
+    state, exact_provider, billing_clock, _, _, activation = billing_server
+    state["gpu_amount"] = 0.04
+    clock = MutableClock()
+    provider = _LifecycleBillingProvider(
+        serverless_plan(),
+        control_client=exact_provider.control_client,
+        billing_clock=billing_clock,
+        endpoint_id=activation.endpoint_id,
+    )
+    repository = SQLiteOllamaLeaseRepository(tmp_path / db_name)
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=2.0,
+    )
+    ready = await service.acquire(request, plan=serverless_plan())
+    await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+    state["calls"].clear()
+    billing_clock.value = activation.readback_at + timedelta(hours=4)
+    restarted = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(repository.path),
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    first = (await restarted.reconcile())[0]
+    state["gpu_amount"] = 2.94
+    clock.advance(3601)
+    billing_clock.value += timedelta(hours=1)
+    second = (await restarted.reconcile())[0]
+    state["gpu_amount"] = 0.04
+    clock.advance(3601)
+    billing_clock.value += timedelta(hours=1)
+    third = (await restarted.reconcile())[0]
+    durable = SQLiteOllamaLeaseRepository(repository.path).get(request.lease_id)
+    assert durable is not None
+
+    assert provider.lifecycle_billing_calls == 3
+    assert [
+        observation.provider_capacity_actual_cost_usd
+        for observation in third.lifecycle_billing_observations
+    ] == [Decimal("0.10"), Decimal(3)]
+    assert first.lifecycle_billing_selection == second.lifecycle_billing_selection
+    assert second.lifecycle_billing_selection == third.lifecycle_billing_selection
+    assert len(third.lifecycle_billing_observations) == 2
+    assert len(third.lifecycle_billing_corrections) == 1
+    assert third.lifecycle_billing_state is (
+        OllamaLifecycleBillingState.CORRECTION_PENDING
+    )
+    assert third.billing_last_checked_at is not None
+    assert second.billing_last_checked_at is not None
+    assert third.billing_last_checked_at > second.billing_last_checked_at
+    return first, second, third, durable
+
+
+@pytest.mark.asyncio
+async def test_repeated_exact_receipt_becomes_durable_latest_without_duplicate_fact(
+    tmp_path, billing_server
+):
+    first, _second, third, durable = await _three_poll_reverted_lifecycle_billing(
+        tmp_path,
+        billing_server,
+        "reverted-latest.sqlite3",
+    )
+
+    first_observation = first.lifecycle_billing_observations[0]
+    metadata = _lease_metadata(durable)
+    assert metadata["lifecycle_billing_latest_observation_id"] == (
+        first_observation.observation_id
+    )
+    assert Decimal(metadata["provider_capacity_latest_actual_cost_usd"]) == Decimal(
+        "0.10"
+    )
+    assert durable.lifecycle_billing_observations == (
+        third.lifecycle_billing_observations
+    )
+    assert durable.lifecycle_billing_corrections == third.lifecycle_billing_corrections
+
+
+@pytest.mark.asyncio
+async def test_error_poll_preserves_successful_latest_freshness_across_restart(
+    tmp_path, billing_server
+):
+    _first, _second, _third, durable = await _three_poll_reverted_lifecycle_billing(
+        tmp_path,
+        billing_server,
+        "error-after-success-latest.sqlite3",
+    )
+    successful_reference = durable.lifecycle_billing_latest_reference
+    assert successful_reference.received_at is not None
+    assert durable.billing_last_checked_at is not None
+
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "error-after-success-latest.sqlite3"
+    )
+    error_checked_at = durable.billing_last_checked_at + timedelta(hours=1)
+    failed = repository.record_billing_outcome(
+        durable,
+        now=error_checked_at,
+        next_check_at=error_checked_at + timedelta(hours=1),
+        provider_error="provider billing evidence unavailable",
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+    restarted = SQLiteOllamaLeaseRepository(repository.path).get(durable.lease_id)
+    assert restarted is not None
+    assert failed.lifecycle_billing_latest_reference == successful_reference
+    assert restarted.lifecycle_billing_latest_reference == successful_reference
+    assert restarted.billing_last_checked_at == error_checked_at
+
+    expected_received_at = successful_reference.received_at.isoformat()
+    public = restarted.to_dict()
+    metadata = _lease_metadata(restarted)
+    assert public["lifecycle_billing_latest_reference_state"] == "known"
+    assert public["lifecycle_billing_latest_received_at"] == expected_received_at
+    assert metadata["lifecycle_billing_latest_reference_state"] == "known"
+    assert metadata["lifecycle_billing_latest_received_at"] == expected_received_at
+    assert metadata["lifecycle_billing_latest_observation_id"] == (
+        successful_reference.observation_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_over_cap_correction_stays_exceeded_after_exact_reversion(
+    tmp_path, billing_server
+):
+    _first, second, _third, durable = await _three_poll_reverted_lifecycle_billing(
+        tmp_path,
+        billing_server,
+        "reverted-over-cap.sqlite3",
+    )
+
+    assert second.lifecycle_billing_observations[
+        -1
+    ].provider_capacity_actual_cost_usd == (Decimal(3))
+    assert durable.actual_cost_cap_status is OllamaActualCostCapStatus.EXCEEDED
+    assert _lease_metadata(durable)["actual_cost_cap_status"] == "exceeded"
+
+
 @pytest.mark.asyncio
 async def test_ready_observation_reads_authenticated_bound_startup_telemetry(
     monkeypatch,

@@ -49,6 +49,7 @@ from .ollama_contracts import (
     OllamaResourceConstraints,
     OllamaResourceType,
     maximum_serverless_cold_starts,
+    optional_iso_datetime,
     require_aware,
 )
 from .ollama_provider import RunpodOllamaCapacityProvider
@@ -848,6 +849,7 @@ def _quote_metadata(plan: OllamaPlacementPlan) -> dict[str, Any]:
 
 
 def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
+    latest_billing_observation = lease.lifecycle_billing_latest_observation
     metadata = {
         "mode": lease.mode.value if lease.mode else None,
         "resource_type": lease.resource_type.value if lease.resource_type else None,
@@ -905,18 +907,20 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
             else None
         ),
         "lifecycle_billing_latest_observation_id": (
-            lease.lifecycle_billing_observations[-1].observation_id
-            if lease.lifecycle_billing_observations
+            latest_billing_observation.observation_id
+            if latest_billing_observation is not None
             else None
+        ),
+        "lifecycle_billing_latest_reference_state": (
+            lease.lifecycle_billing_latest_reference.state.value
+        ),
+        "lifecycle_billing_latest_received_at": optional_iso_datetime(
+            lease.lifecycle_billing_latest_reference.received_at
         ),
         "provider_capacity_selected_actual_cost_usd": None,
         "provider_capacity_latest_actual_cost_usd": (
-            str(
-                lease.lifecycle_billing_observations[
-                    -1
-                ].provider_capacity_actual_cost_usd
-            )
-            if lease.lifecycle_billing_observations
+            str(latest_billing_observation.provider_capacity_actual_cost_usd)
+            if latest_billing_observation is not None
             else None
         ),
         "provider_finality_confirmed": (

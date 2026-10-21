@@ -19,11 +19,14 @@ from ollama_test_support import (
     serverless_plan,
 )
 
+from kestrel_cloud_runpod.inference_provider import _lease_metadata
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseConflictError,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
+    OllamaLifecycleBillingLatestReference,
+    OllamaLifecycleBillingLatestState,
     OllamaLifecycleBillingObservation,
     OllamaLifecycleBillingSelection,
     OllamaLifecycleBillingState,
@@ -47,12 +50,12 @@ from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 from kestrel_cloud_runpod.pod_capacity_contracts import PodBillingReceipt
 
 _WRITER_TRIGGERS = (
-    "ollama_writer_insert_v5",
-    "ollama_writer_update_v5",
-    "ollama_writer_delete_v5",
-    "ollama_provisioning_evidence_insert_v5",
-    "ollama_provisioning_evidence_update_v5",
-    "ollama_lifecycle_evidence_update_v5",
+    "ollama_writer_insert_v6",
+    "ollama_writer_update_v6",
+    "ollama_writer_delete_v6",
+    "ollama_provisioning_evidence_insert_v6",
+    "ollama_provisioning_evidence_update_v6",
+    "ollama_lifecycle_evidence_update_v6",
 )
 _WRITER_COLUMNS = (
     "ambiguous_create_candidate_id",
@@ -74,6 +77,7 @@ _WRITER_COLUMNS = (
     "lifecycle_billing_observations_json",
     "lifecycle_billing_selection_json",
     "lifecycle_billing_corrections_json",
+    "lifecycle_billing_latest_reference_json",
     "billing_last_checked_at",
     "billing_next_check_at",
     "billing_last_provider_error",
@@ -82,8 +86,69 @@ _WRITER_COLUMNS = (
     "runtime_telemetry_last_provider_error",
     "billing_retention_exhausted",
 )
-_V4_ONLY_WRITER_COLUMNS = _WRITER_COLUMNS[-4:]
-_V3_ONLY_WRITER_COLUMNS = _WRITER_COLUMNS[-16:-4]
+_V5_ONLY_WRITER_COLUMNS = ("lifecycle_billing_latest_reference_json",)
+_V4_ONLY_WRITER_COLUMNS = (
+    "reconcile_after",
+    "additional_cleanup_targets_json",
+    "runtime_telemetry_last_provider_error",
+    "billing_retention_exhausted",
+)
+_V3_ONLY_WRITER_COLUMNS = (
+    "runtime_telemetry_binding_sha256",
+    "cleanup_intent_json",
+    "cleanup_receipt_json",
+    "runtime_telemetry_state",
+    "runtime_telemetry_observations_json",
+    "lifecycle_billing_state",
+    "lifecycle_billing_observations_json",
+    "lifecycle_billing_selection_json",
+    "lifecycle_billing_corrections_json",
+    "billing_last_checked_at",
+    "billing_next_check_at",
+    "billing_last_provider_error",
+)
+
+
+def _rewrite_writer_contract_default(connection, version):
+    """Give a synthetic predecessor its genuine versioned column default."""
+
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ollama_leases'"
+    ).fetchone()[0]
+    default_prefix = "writer_contract_version INTEGER NOT NULL DEFAULT "
+    default_start = table_sql.find(default_prefix)
+    if default_start < 0:
+        raise AssertionError("synthetic predecessor has an unexpected writer column")
+    value_start = default_start + len(default_prefix)
+    value_end = value_start
+    while value_end < len(table_sql) and table_sql[value_end].isdigit():
+        value_end += 1
+    if value_end == value_start:
+        raise AssertionError("synthetic predecessor has an invalid writer default")
+    index_sql = tuple(
+        row[0]
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND tbl_name = 'ollama_leases' "
+            "AND sql IS NOT NULL ORDER BY name"
+        )
+    )
+    for row in connection.execute("PRAGMA index_list(ollama_leases)").fetchall():
+        if row[3] == "c":
+            connection.execute(f"DROP INDEX {row[1]}")
+    columns = tuple(
+        row[1] for row in connection.execute("PRAGMA table_xinfo(ollama_leases)")
+    )
+    names_sql = ", ".join(columns)
+    connection.execute("ALTER TABLE ollama_leases RENAME TO _synthetic_predecessor")
+    connection.execute(table_sql[:value_start] + str(version) + table_sql[value_end:])
+    connection.execute(
+        f"INSERT INTO ollama_leases ({names_sql}) "
+        f"SELECT {names_sql} FROM _synthetic_predecessor"
+    )
+    connection.execute("DROP TABLE _synthetic_predecessor")
+    for statement in index_sql:
+        connection.execute(statement)
 
 
 def _legacy_database(database, *, state="requested", saved_route=False):
@@ -116,48 +181,66 @@ def _downgrade_to_v1_schema(connection):
     connection.execute(
         "ALTER TABLE ollama_leases DROP COLUMN ambiguous_candidate_mismatch_json"
     )
+    connection.execute("UPDATE ollama_leases SET writer_contract_version = 1")
+    _rewrite_writer_contract_default(connection, 1)
 
 
 def _downgrade_to_v2_schema(connection):
     connection.execute("DROP INDEX idx_ollama_leases_reconcile")
-    for column in (*_V4_ONLY_WRITER_COLUMNS, *_V3_ONLY_WRITER_COLUMNS):
+    for column in (
+        *_V5_ONLY_WRITER_COLUMNS,
+        *_V4_ONLY_WRITER_COLUMNS,
+        *_V3_ONLY_WRITER_COLUMNS,
+    ):
         connection.execute(f"ALTER TABLE ollama_leases DROP COLUMN {column}")
     connection.execute(
         "CREATE INDEX idx_ollama_leases_reconcile "
         "ON ollama_leases(state, idle_deadline, hard_deadline)"
     )
+    connection.execute("UPDATE ollama_leases SET writer_contract_version = 2")
+    _rewrite_writer_contract_default(connection, 2)
 
 
 def _downgrade_to_v3_schema(connection):
     connection.execute("DROP INDEX idx_ollama_leases_reconcile")
     connection.execute("UPDATE ollama_leases SET writer_contract_version = 3")
-    for column in _V4_ONLY_WRITER_COLUMNS:
+    for column in (*_V5_ONLY_WRITER_COLUMNS, *_V4_ONLY_WRITER_COLUMNS):
         connection.execute(f"ALTER TABLE ollama_leases DROP COLUMN {column}")
     connection.execute(
         "CREATE INDEX idx_ollama_leases_reconcile "
         "ON ollama_leases(state, lifecycle_billing_state, billing_next_check_at, "
         "idle_deadline, hard_deadline)"
     )
+    _rewrite_writer_contract_default(connection, 3)
 
 
 def _downgrade_to_v4_writer(connection):
-    """Install a synthetic prior-writer fence while retaining row facts."""
+    """Create a synthetic v4 schema while retaining row facts."""
 
-    trigger_sql = tuple(
-        row[0]
-        for row in connection.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'trigger' AND tbl_name = 'ollama_leases' "
-            "ORDER BY name"
-        )
-    )
     for trigger in _WRITER_TRIGGERS:
         connection.execute(f"DROP TRIGGER {trigger}")
     connection.execute("UPDATE ollama_leases SET writer_contract_version = 4")
-    for statement in trigger_sql:
-        connection.execute(
-            statement.replace("_v5", "_v4").replace("IS NOT 5", "IS NOT 4")
-        )
+    connection.execute(
+        "ALTER TABLE ollama_leases DROP COLUMN lifecycle_billing_latest_reference_json"
+    )
+    _rewrite_writer_contract_default(connection, 4)
+
+
+def _downgrade_to_v5_schema(connection):
+    """Create the exact v5 column/row shape for current-migrator unit tests.
+
+    Installed old-writer integration tests separately prove the genuine v5
+    triggers and runtime fence. This helper intentionally does not pretend to
+    reproduce those historical trigger bytes.
+    """
+
+    for trigger in _WRITER_TRIGGERS:
+        connection.execute(f"DROP TRIGGER {trigger}")
+    connection.execute("UPDATE ollama_leases SET writer_contract_version = 5")
+    connection.execute(
+        "ALTER TABLE ollama_leases DROP COLUMN lifecycle_billing_latest_reference_json"
+    )
+    _rewrite_writer_contract_default(connection, 5)
 
 
 def _drain_attestation(database):
@@ -181,7 +264,7 @@ def _replace_with_permissive_v1_contract_fixture(database):
     with closing(sqlite3.connect(database)) as connection, connection:
         for trigger in _WRITER_TRIGGERS:
             connection.execute(f"DROP TRIGGER {trigger}")
-        connection.execute("UPDATE ollama_leases SET writer_contract_version = 1")
+        _downgrade_to_v1_schema(connection)
         for trigger in old_triggers:
             event = (
                 "INSERT"
@@ -323,6 +406,15 @@ async def _selected_pod_billing_lease(
         maximum_observations=8,
         maximum_bytes=100_000,
     )
+    assert (
+        selected.lifecycle_billing_latest_reference.state
+        is OllamaLifecycleBillingLatestState.KNOWN
+    )
+    assert (
+        selected.lifecycle_billing_latest_reference.observation_id
+        == observation.observation_id
+    )
+    assert selected.lifecycle_billing_latest_reference.received_at == observed_at
     return repository, selected, observed_at
 
 
@@ -544,7 +636,7 @@ def test_attested_migration_repairs_supported_incomplete_current_schema(tmp_path
     repository.insert_request(make_request(clock), now=clock())
     current = SQLiteOllamaLeaseRepository(database).get("lease-001")
     assert current is not None
-    assert current.writer_contract_version == 5
+    assert current.writer_contract_version == 6
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("ALTER TABLE ollama_leases DROP COLUMN maximum_compute_cost")
 
@@ -554,7 +646,29 @@ def test_attested_migration_repairs_supported_incomplete_current_schema(tmp_path
 
     lease = migrated.get("lease-001")
     assert lease.provisioning_evidence_state is OllamaProvisioningEvidenceState.REQUIRED
-    assert lease.writer_contract_version == 5
+    assert lease.writer_contract_version == 6
+
+
+@pytest.mark.asyncio
+async def test_attested_v6_trigger_repair_preserves_every_current_fact(tmp_path):
+    repository, selected, _observed_at = await _selected_pod_billing_lease(tmp_path)
+    before = selected.to_dict()
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v6")
+
+    migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        repository.path,
+        attestation=_drain_attestation(repository.path),
+    )
+    retained = migrated.get(selected.lease_id)
+
+    assert retained is not None
+    assert retained.to_dict() == before
+    assert retained.revision == selected.revision
+    assert retained.writer_epoch == selected.writer_epoch
+    assert retained.lifecycle_billing_latest_reference == (
+        selected.lifecycle_billing_latest_reference
+    )
 
 
 def test_attested_migration_preserves_previous_writer_contract_authority(tmp_path):
@@ -576,11 +690,11 @@ def test_attested_migration_preserves_previous_writer_contract_authority(tmp_pat
     assert (
         retained.provisioning_evidence_state is OllamaProvisioningEvidenceState.REQUIRED
     )
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.ambiguous_candidate_mismatch is None
 
 
-def test_attested_v2_to_v5_migration_retains_authority_but_not_cost_proof(tmp_path):
+def test_attested_v2_to_v6_migration_retains_authority_but_not_cost_proof(tmp_path):
     database = tmp_path / "v2-writer.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     clock = MutableClock()
@@ -597,7 +711,7 @@ def test_attested_v2_to_v5_migration_retains_authority_but_not_cost_proof(tmp_pa
     retained = migrated.get(original.lease_id)
 
     assert retained.request_fingerprint == original.request_fingerprint
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.runtime_telemetry_state is OllamaRuntimeTelemetryState.UNKNOWN
     assert retained.runtime_telemetry_observations == ()
     assert retained.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
@@ -605,11 +719,17 @@ def test_attested_v2_to_v5_migration_retains_authority_but_not_cost_proof(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_v4_to_v5_migration_preserves_every_lifecycle_fact(tmp_path):
+@pytest.mark.parametrize(
+    ("writer_version", "downgrade"),
+    ((4, _downgrade_to_v4_writer), (5, _downgrade_to_v5_schema)),
+)
+async def test_v4_or_v5_to_v6_migration_preserves_every_lifecycle_fact(
+    tmp_path, writer_version, downgrade
+):
     repository, selected, observed_at = await _selected_pod_billing_lease(
         tmp_path,
         actual=Decimal("0.12345678901234567890123456789"),
-        database_name="v4-to-v5.sqlite3",
+        database_name=f"v{writer_version}-to-v6.sqlite3",
     )
     original = selected.lifecycle_billing_observations[0]
     assert original.pod_billing_receipt is not None
@@ -619,7 +739,7 @@ async def test_v4_to_v5_migration_preserves_every_lifecycle_fact(tmp_path):
         first_observed_at=observed_at + timedelta(hours=1),
         pod_billing_receipt=replace(
             original.pod_billing_receipt,
-            provider_billing_id="pod-billing-v4-correction",
+            provider_billing_id="pod-billing-v5-correction",
             actual_cost_usd=Decimal("0.2"),
             reconciled_at=observed_at + timedelta(hours=1),
         ),
@@ -638,7 +758,7 @@ async def test_v4_to_v5_migration_preserves_every_lifecycle_fact(tmp_path):
         first_observed_at=observed_at + timedelta(hours=2),
         pod_billing_receipt=replace(
             revised.pod_billing_receipt,
-            provider_billing_id="pod-billing-v4-retention-overflow",
+            provider_billing_id="pod-billing-v5-retention-overflow",
             actual_cost_usd=Decimal("0.3"),
             reconciled_at=observed_at + timedelta(hours=2),
         ),
@@ -658,7 +778,7 @@ async def test_v4_to_v5_migration_preserves_every_lifecycle_fact(tmp_path):
     before_revision = bounded.revision
     before_epoch = bounded.writer_epoch
     with closing(sqlite3.connect(repository.path)) as connection, connection:
-        _downgrade_to_v4_writer(connection)
+        downgrade(connection)
 
     with pytest.raises(RunPodManagerError, match="drained-writer migration"):
         SQLiteOllamaLeaseRepository(repository.path)
@@ -670,20 +790,44 @@ async def test_v4_to_v5_migration_preserves_every_lifecycle_fact(tmp_path):
     retained = migrated.get(bounded.lease_id)
     assert retained is not None
     after = retained.to_dict()
-    for field in ("writer_contract_version", "writer_epoch", "revision"):
+    for field in (
+        "writer_contract_version",
+        "writer_epoch",
+        "revision",
+        "lifecycle_billing_latest_observation_id",
+        "lifecycle_billing_latest_reference_state",
+        "lifecycle_billing_latest_received_at",
+    ):
         before.pop(field, None)
         after.pop(field, None)
     assert after == before
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.writer_epoch == before_epoch + 1
     assert retained.revision == before_revision + 1
     assert retained.lifecycle_billing_corrections == (
         bounded.lifecycle_billing_corrections
     )
+    assert (
+        retained.lifecycle_billing_latest_reference.state
+        is OllamaLifecycleBillingLatestState.HISTORICAL_UNKNOWN
+    )
+    assert retained.lifecycle_billing_latest_reference.observation_id is None
     assert retained.billing_retention_exhausted is True
+    retained_public = retained.to_dict()
+    retained_metadata = _lease_metadata(retained)
+    assert retained_public["lifecycle_billing_latest_reference_state"] == (
+        "historical_unknown"
+    )
+    assert retained_public["lifecycle_billing_latest_observation_id"] is None
+    assert retained_public["lifecycle_billing_latest_received_at"] is None
+    assert retained_metadata["lifecycle_billing_latest_reference_state"] == (
+        "historical_unknown"
+    )
+    assert retained_metadata["lifecycle_billing_latest_observation_id"] is None
+    assert retained_metadata["lifecycle_billing_latest_received_at"] is None
 
 
-def test_v3_requires_drain_then_migrates_to_v5_without_restamping_authority(
+def test_v3_requires_drain_then_migrates_to_v6_without_restamping_authority(
     tmp_path,
 ):
     database = tmp_path / "v3-writer.sqlite3"
@@ -706,7 +850,7 @@ def test_v3_requires_drain_then_migrates_to_v5_without_restamping_authority(
     retained = migrated.get(original.lease_id)
 
     assert retained is not None
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.provisioning_evidence_state is original.provisioning_evidence_state
     assert retained.reconcile_after == original.updated_at
     assert retained.additional_cleanup_targets == ()
@@ -715,7 +859,7 @@ def test_v3_requires_drain_then_migrates_to_v5_without_restamping_authority(
 
 
 @pytest.mark.asyncio
-async def test_v3_retention_sentinel_migrates_to_explicit_v5_retention_state(
+async def test_v3_retention_sentinel_migrates_to_explicit_v6_retention_state(
     tmp_path,
 ) -> None:
     """Translate the exact v3 bounded-retention sentinel, not arbitrary errors."""
@@ -759,7 +903,7 @@ async def test_v3_retention_sentinel_migrates_to_explicit_v5_retention_state(
     )
     retained = migrated.get(selected.lease_id)
     assert retained is not None
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.lifecycle_billing_state is (
         OllamaLifecycleBillingState.CORRECTION_PENDING
     )
@@ -813,7 +957,7 @@ async def test_v3_arbitrary_billing_error_is_not_promoted_to_retention_proof(
         )
 
 
-def test_v1_writer_contract_requires_real_v5_drain_and_cannot_regain_authority(
+def test_v1_writer_contract_requires_real_v6_drain_and_cannot_regain_authority(
     tmp_path,
 ):
     from test_ollama_service import _persist_uncertain_creation
@@ -853,7 +997,7 @@ def test_v1_writer_contract_requires_real_v5_drain_and_cannot_regain_authority(
         database, attestation=_drain_attestation(database)
     )
     retained = migrated.get(request.lease_id)
-    assert retained.writer_contract_version == 5
+    assert retained.writer_contract_version == 6
     assert retained.provisioning_mismatch == mismatch
     assert retained.provider_resource_id == "owned-mismatch"
     assert retained.state is OllamaLeaseState.RELEASING
@@ -890,7 +1034,7 @@ def test_v1_writer_contract_requires_real_v5_drain_and_cannot_regain_authority(
             )
 
 
-def test_v1_drain_attestation_cannot_target_the_v5_contract(tmp_path):
+def test_v1_drain_attestation_cannot_target_the_v6_contract(tmp_path):
     database = tmp_path / "wrong-target.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     repository.insert_request(make_request(MutableClock()), now=MutableClock()())
@@ -902,7 +1046,7 @@ def test_v1_drain_attestation_cannot_target_the_v5_contract(tmp_path):
     assert _database_files(database) == before
 
 
-def test_v5_runtime_rejects_unknown_future_writer_contract_without_repair(tmp_path):
+def test_v6_runtime_rejects_unknown_future_writer_contract_without_repair(tmp_path):
     database = tmp_path / "future-writer.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     clock = MutableClock()
@@ -930,6 +1074,60 @@ def test_v5_runtime_rejects_unknown_future_writer_contract_without_repair(tmp_pa
         SQLiteOllamaLeaseRepository.migrate_legacy_database(
             database, attestation=_drain_attestation(database)
         )
+    assert _database_files(database) == before
+
+
+def test_migration_rejects_writer_version_with_impossible_column_contract(tmp_path):
+    database = tmp_path / "impossible-v5-columns.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    clock = MutableClock()
+    repository.insert_request(make_request(clock), now=clock())
+    with closing(sqlite3.connect(database)) as connection, connection:
+        trigger_sql = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'ollama_leases' "
+                "ORDER BY name"
+            )
+        )
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("UPDATE ollama_leases SET writer_contract_version = 5")
+        for statement in trigger_sql:
+            connection.execute(statement)
+    before = _database_files(database)
+
+    with pytest.raises(RunPodManagerError, match="not a supported"):
+        SQLiteOllamaLeaseRepository.migrate_legacy_database(
+            database, attestation=_drain_attestation(database)
+        )
+
+    assert _database_files(database) == before
+
+
+def test_migration_rejects_mixed_previous_writer_versions(tmp_path):
+    database = tmp_path / "mixed-previous-writers.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    clock = MutableClock()
+    repository.insert_request(make_request(clock), now=clock())
+    repository.insert_request(
+        replace(make_request(clock), lease_id="lease-002", workload_id="workload-002"),
+        now=clock(),
+    )
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _downgrade_to_v5_schema(connection)
+        connection.execute(
+            "UPDATE ollama_leases SET writer_contract_version = 4 "
+            "WHERE lease_id = 'lease-002'"
+        )
+    before = _database_files(database)
+
+    with pytest.raises(RunPodManagerError, match="not a supported"):
+        SQLiteOllamaLeaseRepository.migrate_legacy_database(
+            database, attestation=_drain_attestation(database)
+        )
+
     assert _database_files(database) == before
 
 
@@ -1145,7 +1343,7 @@ def test_runtime_refuses_noncanonical_trigger_sql_before_any_ddl(tmp_path, mutat
     database = tmp_path / "noncanonical-trigger.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with closing(sqlite3.connect(database)) as connection, connection:
-        name = "ollama_provisioning_evidence_insert_v5"
+        name = "ollama_provisioning_evidence_insert_v6"
         sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
             (name,),
@@ -1207,8 +1405,8 @@ def test_wal_resident_incomplete_writer_columns_are_not_silently_repaired(tmp_pa
     database = tmp_path / "partial-wal.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with _live_wal_connection(database) as writer:
-        writer.execute("DROP TRIGGER ollama_provisioning_evidence_insert_v5")
-        writer.execute("DROP TRIGGER ollama_provisioning_evidence_update_v5")
+        writer.execute("DROP TRIGGER ollama_provisioning_evidence_insert_v6")
+        writer.execute("DROP TRIGGER ollama_provisioning_evidence_update_v6")
         writer.execute(
             "ALTER TABLE ollama_leases DROP COLUMN provisioning_mismatch_json"
         )
@@ -1224,9 +1422,9 @@ def test_wal_resident_incomplete_writer_triggers_are_not_silently_repaired(tmp_p
     database = tmp_path / "partial-trigger-wal.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with _live_wal_connection(database) as writer:
-        writer.execute("DROP TRIGGER ollama_writer_delete_v5")
+        writer.execute("DROP TRIGGER ollama_writer_delete_v6")
         writer.execute(
-            """CREATE TRIGGER ollama_writer_delete_v5
+            """CREATE TRIGGER ollama_writer_delete_v6
                BEFORE DELETE ON ollama_leases
                BEGIN SELECT 1; END"""
         )
@@ -1269,7 +1467,7 @@ def test_attested_legacy_migration_classifies_every_row_evidence_unknown(
     )
     lease = repository.get("lease-001")
 
-    assert lease.writer_contract_version == 5
+    assert lease.writer_contract_version == 6
     assert lease.writer_epoch == 0
     assert (
         lease.provisioning_evidence_state
@@ -1427,7 +1625,7 @@ def test_concurrent_attested_initializers_observe_only_complete_writer_fence(
     with ThreadPoolExecutor(max_workers=2) as executor:
         leases = tuple(executor.map(lambda _index: migrate(), range(2)))
 
-    assert all(lease.writer_contract_version == 5 for lease in leases)
+    assert all(lease.writer_contract_version == 6 for lease in leases)
     assert all(
         lease.provisioning_evidence_state
         is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
@@ -1470,8 +1668,8 @@ def test_concurrent_process_initializers_observe_only_complete_writer_fence(
     results.close()
     results.join_thread()
     assert observed == [
-        ("ok", 5, "historical_unknown"),
-        ("ok", 5, "historical_unknown"),
+        ("ok", 6, "historical_unknown"),
+        ("ok", 6, "historical_unknown"),
     ]
 
 
@@ -1769,8 +1967,8 @@ def test_recovery_preserves_an_already_accepted_integer_fingerprint(
     constraints = request.constraints.__dict__.copy()
     constraints["cloud"] = request.constraints.cloud.value
     with closing(sqlite3.connect(database)) as connection, connection:
-        connection.execute("DROP TRIGGER ollama_writer_update_v5")
-        connection.execute("DROP TRIGGER ollama_provisioning_evidence_update_v5")
+        connection.execute("DROP TRIGGER ollama_writer_update_v6")
+        connection.execute("DROP TRIGGER ollama_provisioning_evidence_update_v6")
         connection.execute(
             """UPDATE ollama_leases
                SET request_fingerprint = ?, constraints_json = ?,
@@ -1918,6 +2116,28 @@ def test_raw_sql_cannot_claim_no_provider_effect_after_admission(tmp_path):
         )
 
 
+def test_raw_sql_cannot_manufacture_historical_latest_billing_state(tmp_path):
+    database = tmp_path / "false-historical-latest.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    clock = MutableClock()
+    repository.insert_request(make_request(clock), now=clock())
+
+    with (
+        closing(sqlite3.connect(database)) as connection,
+        pytest.raises(
+            sqlite3.IntegrityError,
+            match="invalid Ollama lifecycle evidence mutation",
+        ),
+    ):
+        connection.execute(
+            """UPDATE ollama_leases
+                  SET lifecycle_billing_latest_reference_json =
+                        '{"observation_id":null,"received_at":null,"state":"historical_unknown"}',
+                      revision = revision + 1, writer_epoch = writer_epoch + 1
+                WHERE lease_id = 'lease-001'"""
+        )
+
+
 @pytest.mark.asyncio
 async def test_sql_fence_preserves_selected_lifecycle_evidence(tmp_path):
     repository, selected, _observed_at = await _selected_pod_billing_lease(tmp_path)
@@ -1926,11 +2146,35 @@ async def test_sql_fence_preserves_selected_lifecycle_evidence(tmp_path):
         "lifecycle_billing_observations_json = '[]'",
         "lifecycle_billing_selection_json = NULL",
         "lifecycle_billing_state = 'unknown'",
+        (
+            "lifecycle_billing_state = 'pending', "
+            "lifecycle_billing_selection_json = NULL, "
+            "lifecycle_billing_latest_reference_json = "
+            '\'{"observation_id":null,"received_at":null,'
+            '"state":"not_observed"}\''
+        ),
         "cleanup_receipt_json = NULL",
         (
             "lifecycle_billing_observations_json = "
             "json_insert(lifecycle_billing_observations_json, '$[#]', "
             "json_extract(lifecycle_billing_observations_json, '$[0]'))"
+        ),
+        (
+            "lifecycle_billing_latest_reference_json = "
+            '\'{"observation_id":null,"received_at":null,'
+            '"state":"not_observed"}\''
+        ),
+        (
+            "lifecycle_billing_latest_reference_json = "
+            '\'{"observation_id":"foreign",'
+            '"received_at":"2026-10-21T00:00:00.000000Z",'
+            '"state":"known"}\', '
+            "billing_last_checked_at = '2026-10-21T00:00:00.000000Z'"
+        ),
+        (
+            "lifecycle_billing_latest_reference_json = "
+            '\'{"observation_id":null,"received_at":null,'
+            '"state":"historical_unknown"}\''
         ),
     )
     for mutation in mutations:
@@ -2070,6 +2314,10 @@ async def test_billing_retention_status_survives_a_later_duplicate_poll(tmp_path
     assert repeated.lifecycle_billing_observations == (
         selected.lifecycle_billing_observations
     )
+    assert (
+        repeated.lifecycle_billing_latest_reference
+        == bounded.lifecycle_billing_latest_reference
+    )
 
 
 @pytest.mark.asyncio
@@ -2135,6 +2383,10 @@ async def test_billing_retention_before_first_selection_remains_manual(
     assert repeated.lifecycle_billing_selection is None
     assert repeated.lifecycle_billing_corrections == ()
     assert repeated.billing_retention_exhausted is True
+    assert (
+        repeated.lifecycle_billing_latest_reference.state
+        is OllamaLifecycleBillingLatestState.NOT_OBSERVED
+    )
     assert repeated.billing_last_checked_at == observed_at + timedelta(hours=1)
     assert repeated.billing_last_provider_error == (
         "billing evidence retention requires manual reconciliation"
@@ -2170,6 +2422,161 @@ async def test_pod_billing_repoll_time_is_not_a_provider_cost_revision(tmp_path)
     assert repeated.lifecycle_billing_observations == (original,)
     assert repeated.lifecycle_billing_corrections == ()
     assert repeated.lifecycle_billing_state is OllamaLifecycleBillingState.SELECTED
+    assert repeated.lifecycle_billing_latest_reference.observation_id == (
+        original.observation_id
+    )
+    assert repeated.lifecycle_billing_latest_reference.received_at == (
+        observed_at + timedelta(hours=1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_billing_error_advances_schedule_without_changing_latest_reference(
+    tmp_path,
+):
+    repository, selected, observed_at = await _selected_pod_billing_lease(
+        tmp_path, actual=Decimal("0.25")
+    )
+    original_reference = selected.lifecycle_billing_latest_reference
+
+    failed = repository.record_billing_outcome(
+        selected,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        provider_error="provider billing evidence unavailable",
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert failed.lifecycle_billing_latest_reference == original_reference
+    assert failed.billing_last_checked_at == observed_at + timedelta(hours=1)
+    assert failed.billing_last_provider_error == (
+        "provider billing evidence unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_poll_resolves_migrated_v5_latest_reference_without_new_fact(
+    tmp_path,
+):
+    repository, selected, observed_at = await _selected_pod_billing_lease(
+        tmp_path,
+        actual=Decimal("0.25"),
+        database_name="v5-latest-resolution.sqlite3",
+    )
+    original = selected.lifecycle_billing_observations[0]
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        _downgrade_to_v5_schema(connection)
+    migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        repository.path,
+        attestation=_drain_attestation(repository.path),
+    )
+    historical = migrated.get(selected.lease_id)
+    assert historical is not None
+    assert (
+        historical.lifecycle_billing_latest_reference.state
+        is OllamaLifecycleBillingLatestState.HISTORICAL_UNKNOWN
+    )
+
+    resolved = migrated.record_billing_outcome(
+        historical,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        observation=original,
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert resolved.lifecycle_billing_observations == (original,)
+    assert resolved.lifecycle_billing_corrections == ()
+    assert (
+        resolved.lifecycle_billing_latest_reference.state
+        is OllamaLifecycleBillingLatestState.KNOWN
+    )
+    assert resolved.lifecycle_billing_latest_reference.observation_id == (
+        original.observation_id
+    )
+    assert resolved.lifecycle_billing_latest_reference.received_at == (
+        observed_at + timedelta(hours=1)
+    )
+
+
+def test_billing_latest_reference_constructor_and_parser_are_strict() -> None:
+    received_at = datetime(2026, 10, 21, tzinfo=UTC)
+    reference = OllamaLifecycleBillingLatestReference.known(
+        "billing-observation", received_at=received_at
+    )
+
+    assert OllamaLifecycleBillingLatestReference.from_dict(reference.to_dict()) == (
+        reference
+    )
+    with pytest.raises(TypeError, match="supported enum"):
+        OllamaLifecycleBillingLatestReference(  # type: ignore[arg-type]
+            state="known",
+            observation_id="billing-observation",
+            received_at=received_at,
+        )
+    with pytest.raises(TypeError, match="supported enum"):
+        OllamaLifecycleBillingLatestReference(  # type: ignore[arg-type]
+            state=object()
+        )
+    with pytest.raises(ValueError, match="not a valid"):
+        OllamaLifecycleBillingLatestReference.from_dict(
+            {
+                "state": "future",
+                "observation_id": None,
+                "received_at": None,
+            }
+        )
+    with pytest.raises(ValueError, match="fields are invalid"):
+        OllamaLifecycleBillingLatestReference.from_dict(
+            {
+                "state": "not_observed",
+                "observation_id": None,
+                "received_at": None,
+                "future": None,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_orphaned_billing_latest_reference_fails_readback_and_projection(
+    tmp_path,
+) -> None:
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    orphaned = replace(
+        selected,
+        lifecycle_billing_latest_reference=(
+            OllamaLifecycleBillingLatestReference.known(
+                "orphaned-observation", received_at=observed_at
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="reference is unbound"):
+        orphaned.to_dict()
+
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v6")
+        connection.execute(
+            """
+            UPDATE ollama_leases
+               SET lifecycle_billing_latest_reference_json = ?,
+                   revision = revision + 1,
+                   writer_epoch = writer_epoch + 1
+             WHERE lease_id = ?
+            """,
+            (
+                json.dumps(
+                    orphaned.lifecycle_billing_latest_reference.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                selected.lease_id,
+            ),
+        )
+
+    with pytest.raises(RunPodManagerError, match="latest reference is unbound"):
+        repository.get(selected.lease_id)
 
 
 @pytest.mark.asyncio

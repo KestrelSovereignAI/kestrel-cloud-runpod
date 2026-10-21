@@ -280,6 +280,12 @@ class OllamaLifecycleBillingState(str, Enum):
     CORRECTION_PENDING = "correction_pending"
 
 
+class OllamaLifecycleBillingLatestState(str, Enum):
+    NOT_OBSERVED = "not_observed"
+    HISTORICAL_UNKNOWN = "historical_unknown"
+    KNOWN = "known"
+
+
 class OllamaActualCostCapStatus(str, Enum):
     UNKNOWN = "unknown"
     EXCEEDED = "exceeded"
@@ -2047,6 +2053,65 @@ class OllamaLifecycleBillingSelection:
 
 
 @dataclass(frozen=True)
+class OllamaLifecycleBillingLatestReference:
+    """Most recently received retained receipt, distinct from immutable facts."""
+
+    state: OllamaLifecycleBillingLatestState
+    observation_id: str | None = None
+    received_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, OllamaLifecycleBillingLatestState):
+            raise TypeError(
+                "Ollama billing latest state must be a supported enum value"
+            )
+        if self.state is OllamaLifecycleBillingLatestState.KNOWN:
+            if not self.observation_id or self.received_at is None:
+                raise ValueError("Known Ollama billing latest reference is incomplete")
+            require_aware(self.received_at, "billing latest received_at")
+        elif self.observation_id is not None or self.received_at is not None:
+            raise ValueError("Unknown Ollama billing latest reference has evidence")
+
+    @classmethod
+    def known(
+        cls, observation_id: str, *, received_at: datetime
+    ) -> OllamaLifecycleBillingLatestReference:
+        return cls(
+            state=OllamaLifecycleBillingLatestState.KNOWN,
+            observation_id=observation_id,
+            received_at=received_at,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "observation_id": self.observation_id,
+            "received_at": optional_iso_datetime(self.received_at),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, Any]
+    ) -> OllamaLifecycleBillingLatestReference:
+        _exact_keys(
+            value,
+            {"state", "observation_id", "received_at"},
+            "billing latest reference",
+        )
+        observation_id = value.get("observation_id")
+        received_at = value.get("received_at")
+        if observation_id is not None and not isinstance(observation_id, str):
+            raise TypeError("Ollama billing latest observation ID must be a string")
+        if received_at is not None and not isinstance(received_at, str):
+            raise TypeError("Ollama billing latest received_at must be a string")
+        return cls(
+            state=OllamaLifecycleBillingLatestState(_required_string(value, "state")),
+            observation_id=observation_id,
+            received_at=_datetime(received_at) if received_at is not None else None,
+        )
+
+
+@dataclass(frozen=True)
 class OllamaLifecycleBillingCorrection:
     selected_observation_id: str
     revised_observation_id: str
@@ -2194,7 +2259,7 @@ class OllamaLease:
     # silently meant something new would misread every existing row. Defaults
     # to a single GPU, which is what every pre-existing lease had.
     placement_gpu_count: int = 1
-    writer_contract_version: int = 5
+    writer_contract_version: int = 6
     writer_epoch: int = 1
     reconcile_after: datetime | None = None
     provisioning_evidence_state: OllamaProvisioningEvidenceState = (
@@ -2227,6 +2292,11 @@ class OllamaLease:
     lifecycle_billing_observations: tuple[OllamaLifecycleBillingObservation, ...] = ()
     lifecycle_billing_selection: OllamaLifecycleBillingSelection | None = None
     lifecycle_billing_corrections: tuple[OllamaLifecycleBillingCorrection, ...] = ()
+    lifecycle_billing_latest_reference: OllamaLifecycleBillingLatestReference = field(
+        default_factory=lambda: OllamaLifecycleBillingLatestReference(
+            state=OllamaLifecycleBillingLatestState.NOT_OBSERVED
+        )
+    )
     billing_last_checked_at: datetime | None = None
     billing_next_check_at: datetime | None = None
     billing_last_provider_error: str | None = None
@@ -2242,27 +2312,39 @@ class OllamaLease:
     def actual_cost_cap_status(self) -> OllamaActualCostCapStatus:
         if self.additional_cleanup_targets:
             return OllamaActualCostCapStatus.UNKNOWN
-        selection = self.lifecycle_billing_selection
-        if selection is None:
-            return OllamaActualCostCapStatus.UNKNOWN
-        selected = next(
-            (
-                item
-                for item in self.lifecycle_billing_observations
-                if item.observation_id == selection.observation_id
-            ),
-            None,
-        )
-        if selected is None:
+        if self.lifecycle_billing_selection is None:
             return OllamaActualCostCapStatus.UNKNOWN
         return (
             OllamaActualCostCapStatus.EXCEEDED
-            if selected.provider_capacity_actual_cost_usd
-            > Decimal(str(self.max_authorized_cost))
+            if any(
+                observation.provider_capacity_actual_cost_usd
+                > Decimal(str(self.max_authorized_cost))
+                for observation in self.lifecycle_billing_observations
+            )
             else OllamaActualCostCapStatus.UNKNOWN
         )
 
+    @property
+    def lifecycle_billing_latest_observation(
+        self,
+    ) -> OllamaLifecycleBillingObservation | None:
+        reference = self.lifecycle_billing_latest_reference
+        if reference.state is not OllamaLifecycleBillingLatestState.KNOWN:
+            return None
+        observation = next(
+            (
+                observation
+                for observation in self.lifecycle_billing_observations
+                if observation.observation_id == reference.observation_id
+            ),
+            None,
+        )
+        if observation is None:
+            raise ValueError("Ollama billing latest reference is unbound")
+        return observation
+
     def to_dict(self) -> dict[str, Any]:
+        latest_billing_observation = self.lifecycle_billing_latest_observation
         return {
             "lease_id": self.lease_id,
             "owner_id": self.owner_id,
@@ -2368,9 +2450,15 @@ class OllamaLease:
                 else None
             ),
             "lifecycle_billing_latest_observation_id": (
-                self.lifecycle_billing_observations[-1].observation_id
-                if self.lifecycle_billing_observations
+                latest_billing_observation.observation_id
+                if latest_billing_observation is not None
                 else None
+            ),
+            "lifecycle_billing_latest_reference_state": (
+                self.lifecycle_billing_latest_reference.state.value
+            ),
+            "lifecycle_billing_latest_received_at": optional_iso_datetime(
+                self.lifecycle_billing_latest_reference.received_at
             ),
             "lifecycle_billing_correction_count": len(
                 self.lifecycle_billing_corrections

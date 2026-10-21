@@ -2477,7 +2477,9 @@ def _all_nested_errors(error):
     return [error]
 
 
-def _fail_repository_stage_once(monkeypatch, repository, method_name, message):
+def _fail_repository_stage_once(
+    monkeypatch, repository, method_name, message, *, error=None
+):
     original = getattr(repository, method_name)
     failed = False
 
@@ -2485,7 +2487,7 @@ def _fail_repository_stage_once(monkeypatch, repository, method_name, message):
         nonlocal failed
         if not failed:
             failed = True
-            raise sqlite3.OperationalError(message)
+            raise error if error is not None else sqlite3.OperationalError(message)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(repository, method_name, fail_once)
@@ -2503,6 +2505,301 @@ def _conflict_repository_stage_once(monkeypatch, repository, method_name, messag
         return original(*args, **kwargs)
 
     monkeypatch.setattr(repository, method_name, fail_once)
+
+
+def _native_sqlite_operational_error(tmp_path, condition):
+    """Produce a real file-SQLite BUSY or shared-cache LOCKED failure."""
+
+    database = tmp_path / f"native-{condition}.sqlite3"
+    uri = f"file:{database}?cache=shared"
+    with (
+        closing(
+            sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+        ) as first,
+        closing(
+            sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
+        ) as second,
+    ):
+        first.execute("CREATE TABLE evidence (id INTEGER PRIMARY KEY, value TEXT)")
+        first.execute("INSERT INTO evidence VALUES (1, 'original')")
+        first.execute("BEGIN IMMEDIATE")
+        first.execute("UPDATE evidence SET value = 'held' WHERE id = 1")
+        try:
+            if condition == "busy":
+                with closing(
+                    sqlite3.connect(database, timeout=0, isolation_level=None)
+                ) as independent:
+                    independent.execute("BEGIN IMMEDIATE")
+            else:
+                second.execute("UPDATE evidence SET value = 'contended' WHERE id = 1")
+        except sqlite3.OperationalError as error:
+            return error
+        finally:
+            first.rollback()
+    raise AssertionError(f"SQLite did not produce the expected {condition} failure")
+
+
+def _native_sqlite_nonallowlisted_error(tmp_path):
+    """Produce SQLite's genuine generic SQL error, not an availability error."""
+
+    database = tmp_path / "native-nonallowlisted.sqlite3"
+    with closing(sqlite3.connect(database)) as connection:
+        try:
+            connection.execute("SELECT * FROM table_that_does_not_exist")
+        except sqlite3.OperationalError as error:
+            assert error.sqlite_errorcode == sqlite3.SQLITE_ERROR
+            return error
+    raise AssertionError("SQLite did not produce SQLITE_ERROR")
+
+
+def _native_sqlite_programming_error(tmp_path):
+    """Produce a genuine closed-connection programming failure."""
+
+    connection = sqlite3.connect(tmp_path / "native-programming.sqlite3")
+    connection.close()
+    try:
+        connection.execute("SELECT 1")
+    except sqlite3.ProgrammingError as error:
+        return error
+    raise AssertionError("SQLite did not produce ProgrammingError")
+
+
+def _cleanup_blocker(tmp_path, blocker_kind):
+    """Build exact blocker leaves/groups for cleanup classification tests."""
+
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    if blocker_kind == "integrity":
+        blocker = sqlite3.IntegrityError("injected cleanup integrity blocker")
+        return blocker, sqlite3.IntegrityError
+    if blocker_kind == "nested_control_and_integrity":
+        blocker = BaseExceptionGroup(
+            "outer mixed cleanup blocker",
+            [
+                ExecutionCommitOutcomeError("unknown"),
+                BaseExceptionGroup(
+                    "inner integrity blocker",
+                    [sqlite3.IntegrityError("injected nested integrity blocker")],
+                ),
+            ],
+        )
+        return blocker, sqlite3.IntegrityError
+    if blocker_kind == "control_and_conflict":
+        blocker = BaseExceptionGroup(
+            "outer mixed cleanup blocker",
+            [
+                ExecutionCommitOutcomeError("unknown"),
+                BaseExceptionGroup(
+                    "inner authority blocker",
+                    [OllamaLeaseConflictError("injected nested authority conflict")],
+                ),
+            ],
+        )
+        return blocker, OllamaLeaseConflictError
+    if blocker_kind == "control_and_unexpected":
+        blocker = BaseExceptionGroup(
+            "outer mixed cleanup blocker",
+            [
+                ExecutionCommitOutcomeError("unknown"),
+                BaseExceptionGroup(
+                    "inner unexpected blocker",
+                    [ValueError("injected nested unexpected failure")],
+                ),
+            ],
+        )
+        return blocker, ValueError
+    if blocker_kind == "programming":
+        return _native_sqlite_programming_error(tmp_path), sqlite3.ProgrammingError
+    if blocker_kind == "uncoded_operational":
+        blocker = sqlite3.OperationalError("synthetic uncoded operational failure")
+        assert not hasattr(blocker, "sqlite_errorcode")
+        return blocker, sqlite3.OperationalError
+    return _native_sqlite_nonallowlisted_error(tmp_path), sqlite3.OperationalError
+
+
+def _contains_exception_identity(error, expected):
+    if error is expected:
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(
+            _contains_exception_identity(child, expected) for child in error.exceptions
+        )
+    return False
+
+
+def _inject_cleanup_stage_once(
+    monkeypatch,
+    repository,
+    provider,
+    *,
+    stage,
+    error,
+):
+    """Inject one cleanup setup/refresh failure at the requested native stage."""
+
+    if stage == "claim":
+        original = repository.claim_cleanup_attempt
+
+        def fail_claim_once(*args, **kwargs):
+            monkeypatch.setattr(repository, "claim_cleanup_attempt", original)
+            raise error
+
+        monkeypatch.setattr(repository, "claim_cleanup_attempt", fail_claim_once)
+        return
+
+    original = repository.latest_cleanup_lineage
+    failed = False
+
+    def fail_lineage_once(*args, **kwargs):
+        nonlocal failed
+        should_fail = (
+            stage == "initial_refresh" and not provider.teardown_resource_ids
+        ) or (
+            stage == "post_first_refresh"
+            and provider.teardown_resource_ids == ["provider-001"]
+        )
+        if should_fail and not failed:
+            failed = True
+            raise error
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "latest_cleanup_lineage", fail_lineage_once)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage",
+    ["claim", "initial_refresh", "post_first_refresh"],
+)
+@pytest.mark.parametrize(
+    "blocker_kind",
+    [
+        "integrity",
+        "nested_control_and_integrity",
+        "control_and_conflict",
+        "control_and_unexpected",
+        "programming",
+        "uncoded_operational",
+        "native_nonallowlisted",
+    ],
+)
+async def test_native_cleanup_blocker_leaf_stops_later_provider_io(
+    tmp_path,
+    monkeypatch,
+    stage,
+    blocker_kind,
+):
+    """Any nested authority/integrity blocker must outrank control leaves."""
+
+    provider = _TwoTargetCleanupProvider()
+    blocker, expected_type = _cleanup_blocker(tmp_path, blocker_kind)
+
+    if stage == "claim":
+        _, service, lease = await _ready_two_target_cleanup(
+            tmp_path,
+            provider,
+            database_name=f"blocker-{stage}-{blocker_kind}.sqlite3",
+        )
+    else:
+        service, lease = await _claimed_two_target_cleanup(tmp_path, provider)
+    _inject_cleanup_stage_once(
+        monkeypatch,
+        service.repository,
+        provider,
+        stage=stage,
+        error=blocker,
+    )
+
+    try:
+        if stage == "claim":
+            await service.release(
+                lease.lease_id,
+                owner_id=lease.owner_id,
+                workload_id=lease.workload_id,
+            )
+        else:
+            await service._teardown_all_effects(lease, reason="test cleanup blocker")
+    except BaseException as error:  # noqa: BLE001 - exact leaf algebra is asserted
+        caught = error
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("cleanup blocker was not retained")
+
+    assert any(isinstance(error, expected_type) for error in failures)
+    assert _contains_exception_identity(caught, blocker)
+    assert provider.teardown_resource_ids == (
+        ["provider-001"] if stage == "post_first_refresh" else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage",
+    ["claim", "initial_refresh", "post_first_refresh"],
+)
+@pytest.mark.parametrize("sqlite_condition", ["busy", "locked"])
+async def test_native_cleanup_recoverable_leaf_group_joins_known_targets(
+    tmp_path,
+    monkeypatch,
+    stage,
+    sqlite_condition,
+):
+    """Coded transient SQLite plus native control retains all proven cleanup."""
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    provider = _TwoTargetCleanupProvider()
+    if stage == "claim":
+        _, service, lease = await _ready_two_target_cleanup(
+            tmp_path,
+            provider,
+            database_name=f"recoverable-{stage}.sqlite3",
+        )
+    else:
+        service, lease = await _claimed_two_target_cleanup(tmp_path, provider)
+    recoverable = BaseExceptionGroup(
+        "recoverable cleanup setup",
+        [
+            ExecutionCommitOutcomeError("unknown"),
+            _native_sqlite_operational_error(tmp_path, sqlite_condition),
+        ],
+    )
+    _inject_cleanup_stage_once(
+        monkeypatch,
+        service.repository,
+        provider,
+        stage=stage,
+        error=recoverable,
+    )
+
+    try:
+        if stage == "claim":
+            await service.release(
+                lease.lease_id,
+                owner_id=lease.owner_id,
+                workload_id=lease.workload_id,
+            )
+        else:
+            await service._teardown_all_effects(lease, reason="test recoverable setup")
+    except BaseException as error:  # noqa: BLE001 - exact leaf algebra is asserted
+        caught = error
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("recoverable setup failures were not retained")
+
+    assert any(is_execution_control_error(error) for error in failures)
+    sqlite_failures = [
+        error for error in failures if isinstance(error, sqlite3.OperationalError)
+    ]
+    assert len(sqlite_failures) == 1
+    assert sqlite_failures[0].sqlite_errorcode & 0xFF == (
+        sqlite3.SQLITE_BUSY if sqlite_condition == "busy" else sqlite3.SQLITE_LOCKED
+    )
+    assert _contains_exception_identity(caught, recoverable)
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
 
 
 @pytest.mark.asyncio
@@ -2528,6 +2825,7 @@ async def test_native_file_sqlite_setup_failure_cannot_starve_proven_cleanup_tar
         service.repository,
         method_name,
         f"injected {stage}",
+        error=_native_sqlite_operational_error(tmp_path, "busy"),
     )
 
     try:
@@ -2542,7 +2840,8 @@ async def test_native_file_sqlite_setup_failure_cannot_starve_proven_cleanup_tar
         pytest.fail(f"{stage} failure was not retained")
 
     assert any(
-        isinstance(error, sqlite3.OperationalError) and stage in str(error)
+        isinstance(error, sqlite3.OperationalError)
+        and error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
         for error in failures
     )
     assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
@@ -2580,6 +2879,7 @@ async def test_native_control_and_cleanup_claim_failure_do_not_starve_known_targ
         service.repository,
         "claim_cleanup_attempt",
         "injected cleanup claim",
+        error=_native_sqlite_operational_error(tmp_path, "busy"),
     )
 
     try:
@@ -2595,7 +2895,8 @@ async def test_native_control_and_cleanup_claim_failure_do_not_starve_known_targ
 
     assert any(is_execution_control_error(error) for error in failures)
     assert any(
-        isinstance(error, sqlite3.OperationalError) and "cleanup claim" in str(error)
+        isinstance(error, sqlite3.OperationalError)
+        and error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
         for error in failures
     )
     assert any("teardown remains retryable" in str(error) for error in failures)
@@ -2782,10 +3083,13 @@ async def test_failed_reload_never_authorizes_an_unseen_cleanup_target(
         repository,
         "latest_cleanup_lineage",
         "injected unreadable newer suffix",
+        error=_native_sqlite_operational_error(tmp_path, "busy"),
     )
 
-    with pytest.raises(sqlite3.OperationalError, match="newer suffix"):
+    with pytest.raises(sqlite3.OperationalError) as caught:
         await service._teardown_all_effects(stale, reason="test unseen target")
+
+    assert caught.value.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
 
     assert provider.teardown_resource_ids == ["provider-001"]
     durable = repository.get(stale.lease_id)
