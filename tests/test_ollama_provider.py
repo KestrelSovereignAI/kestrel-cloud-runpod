@@ -2413,9 +2413,9 @@ class _TwoTargetCleanupProvider(FakeOllamaProvider):
         return await super().teardown(resource, cleanup_intent)
 
 
-async def _claimed_two_target_cleanup(tmp_path, provider):
+async def _ready_two_target_cleanup(tmp_path, provider, *, database_name):
     clock = MutableClock()
-    repository = SQLiteOllamaLeaseRepository(tmp_path / "two-target-cleanup.sqlite3")
+    repository = SQLiteOllamaLeaseRepository(tmp_path / database_name)
     service = OllamaLeaseService(
         repository=repository,
         provider=provider,
@@ -2437,6 +2437,21 @@ async def _claimed_two_target_cleanup(tmp_path, provider):
         ),
         now=clock(),
     )
+    assert with_late_ack.provider_resource_id == "provider-001"
+    assert [
+        target.provider_resource_id
+        for target in with_late_ack.additional_cleanup_targets
+    ] == ["late-original-ack"]
+    return clock, service, with_late_ack
+
+
+async def _claimed_two_target_cleanup(tmp_path, provider):
+    clock, service, with_late_ack = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name="two-target-cleanup.sqlite3",
+    )
+    repository = service.repository
     releasing = repository.compare_and_set(
         with_late_ack,
         changes={
@@ -2454,6 +2469,386 @@ async def _claimed_two_target_cleanup(tmp_path, provider):
     return service, repository.claim_cleanup_attempt(admitted, now=clock())
 
 
+def _all_nested_errors(error):
+    if isinstance(error, BaseExceptionGroup):
+        return [
+            nested for child in error.exceptions for nested in _all_nested_errors(child)
+        ]
+    return [error]
+
+
+def _fail_repository_stage_once(monkeypatch, repository, method_name, message):
+    original = getattr(repository, method_name)
+    failed = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise sqlite3.OperationalError(message)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, method_name, fail_once)
+
+
+def _conflict_repository_stage_once(monkeypatch, repository, method_name, message):
+    original = getattr(repository, method_name)
+    failed = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OllamaLeaseConflictError(message)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, method_name, fail_once)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "method_name"),
+    [
+        ("final telemetry persistence", "record_runtime_telemetry"),
+        ("cleanup claim", "claim_cleanup_attempt"),
+        ("initial lineage reload", "latest_cleanup_lineage"),
+    ],
+)
+async def test_native_file_sqlite_setup_failure_cannot_starve_proven_cleanup_targets(
+    tmp_path, monkeypatch, stage, method_name
+):
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name=f"setup-failure-{method_name}.sqlite3",
+    )
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        method_name,
+        f"injected {stage}",
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - native control groups are evidence
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail(f"{stage} failure was not retained")
+
+    assert any(
+        isinstance(error, sqlite3.OperationalError) and stage in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.cleanup_intent is not None
+    assert durable.cleanup_receipt is not None
+    assert len(durable.additional_cleanup_targets) == 1
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+
+
+@pytest.mark.asyncio
+async def test_native_control_and_cleanup_claim_failure_do_not_starve_known_targets(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name="control-and-claim-failure.sqlite3",
+    )
+
+    async def final_telemetry_control_failure(*_args, **_kwargs):
+        raise ExecutionCommitOutcomeError("unknown")
+
+    monkeypatch.setattr(provider, "observe", final_telemetry_control_failure)
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        "claim_cleanup_attempt",
+        "injected cleanup claim",
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - exact failure algebra is asserted
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("native control and cleanup failures were not retained")
+
+    assert any(is_execution_control_error(error) for error in failures)
+    assert any(
+        isinstance(error, sqlite3.OperationalError) and "cleanup claim" in str(error)
+        for error in failures
+    )
+    assert any("teardown remains retryable" in str(error) for error in failures)
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "method_name"),
+    [
+        ("cleanup claim", "claim_cleanup_attempt"),
+        ("stored authority validation", "validate_stored_cleanup_authority"),
+        ("initial lineage refresh", "latest_cleanup_lineage"),
+    ],
+)
+async def test_native_control_and_authority_conflict_retain_both_without_io(
+    tmp_path, monkeypatch, stage, method_name
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name=f"control-conflict-{method_name}.sqlite3",
+    )
+
+    async def final_telemetry_control_failure(*_args, **_kwargs):
+        raise ExecutionCommitOutcomeError("unknown")
+
+    monkeypatch.setattr(provider, "observe", final_telemetry_control_failure)
+    _conflict_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        method_name,
+        f"injected {stage}",
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - exact failure algebra is asserted
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("native control and authority conflict were not retained")
+
+    assert any(is_execution_control_error(error) for error in failures)
+    assert any(
+        isinstance(error, OllamaLeaseConflictError) and stage in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_native_control_and_unclassified_claim_failure_retain_both_without_io(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name="control-unclassified-claim.sqlite3",
+    )
+
+    async def final_telemetry_control_failure(*_args, **_kwargs):
+        raise ExecutionCommitOutcomeError("unknown")
+
+    def unexpected_claim_failure(*_args, **_kwargs):
+        raise ValueError("unexpected cleanup claim failure")
+
+    monkeypatch.setattr(provider, "observe", final_telemetry_control_failure)
+    monkeypatch.setattr(
+        service.repository,
+        "claim_cleanup_attempt",
+        unexpected_claim_failure,
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - exact failure algebra is asserted
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("native control and unexpected failure were not retained")
+
+    assert any(is_execution_control_error(error) for error in failures)
+    assert any(
+        isinstance(error, ValueError) and "unexpected cleanup claim" in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_native_provider_and_outcome_persistence_failures_keep_other_cleanup(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        "record_teardown_outcome",
+        "injected primary outcome persistence",
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+
+    failures = _all_nested_errors(caught.value)
+    assert any("teardown remains retryable" in str(error) for error in failures)
+    assert any(
+        isinstance(error, sqlite3.OperationalError)
+        and "outcome persistence" in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_never_authorizes_an_unseen_cleanup_target(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider()
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "unseen-target.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock), plan=serverless_plan())
+    releasing = repository.compare_and_set(
+        ready,
+        changes={
+            "state": OllamaLeaseState.RELEASING,
+            "teardown_state": OllamaTeardownState.PENDING,
+            "route_url": None,
+            "termination_reason": "test unseen target",
+        },
+    )
+    stale = repository.record_cleanup_intent(
+        releasing,
+        now=clock(),
+        termination_reason="test unseen target",
+    )
+    assert stale.provisioning_intent is not None
+    current = repository.attach_provider_acknowledgment(
+        stale,
+        ProvisionedOllamaResource(
+            resource_type=stale.provisioning_intent.resource_type,
+            provider_resource_id="unseen-late-ack",
+            resource_name=stale.provisioning_intent.resource_name,
+        ),
+        now=clock(),
+    )
+    assert len(current.additional_cleanup_targets) == 1
+    _fail_repository_stage_once(
+        monkeypatch,
+        repository,
+        "latest_cleanup_lineage",
+        "injected unreadable newer suffix",
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="newer suffix"):
+        await service._teardown_all_effects(stale, reason="test unseen target")
+
+    assert provider.teardown_resource_ids == ["provider-001"]
+    durable = repository.get(stale.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is not None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+async def test_changed_or_missing_cleanup_authority_never_reaches_provider(
+    tmp_path,
+):
+    provider = _TwoTargetCleanupProvider()
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    assert claimed.cleanup_intent is not None
+    invalid = (
+        replace(claimed, provider_resource_id="foreign-resource"),
+        replace(claimed, cleanup_intent=None),
+        replace(
+            claimed,
+            cleanup_intent=replace(
+                claimed.cleanup_intent,
+                provider_resource_id="foreign-resource",
+            ),
+        ),
+        replace(claimed, writer_contract_version=99),
+        replace(claimed, writer_epoch=claimed.writer_epoch + 1),
+    )
+
+    for lease in invalid:
+        with pytest.raises(OllamaLeaseConflictError, match="cleanup lineage"):
+            await service._teardown_all_effects(lease, reason="invalid authority")
+
+    assert provider.teardown_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_intent_persistence_failure_admits_no_provider_io(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name="cleanup-intent-admission.sqlite3",
+    )
+    _fail_repository_stage_once(
+        monkeypatch,
+        service.repository,
+        "record_cleanup_intent",
+        "injected cleanup intent admission",
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="cleanup intent admission"):
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert provider.teardown_resource_ids == []
+
+
 def _group_messages(error):
     if isinstance(error, BaseExceptionGroup):
         return [
@@ -2465,7 +2860,7 @@ def _group_messages(error):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_reload_failure_preserves_prior_failure_and_known_target(
+async def test_cleanup_lineage_conflict_preserves_prior_failure_and_stops_other_target(
     tmp_path, monkeypatch
 ):
     provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
@@ -2489,10 +2884,103 @@ async def test_cleanup_reload_failure_preserves_prior_failure_and_known_target(
     with pytest.raises(BaseExceptionGroup) as caught:
         await service._teardown_all_effects(claimed, reason="test cleanup")
 
-    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    assert provider.teardown_resource_ids == ["provider-001"]
     messages = _group_messages(caught.value)
     assert any("teardown remains retryable" in message for message in messages)
     assert any("cleanup lineage reload failed" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_unclassified_post_attempt_refresh_retains_prior_failure_and_stops(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    original_latest = service.repository.latest_cleanup_lineage
+    failed_reload = False
+
+    def fail_once_after_first_provider_attempt(lease):
+        nonlocal failed_reload
+        if provider.teardown_resource_ids and not failed_reload:
+            failed_reload = True
+            raise ValueError("unexpected post-attempt lineage failure")
+        return original_latest(lease)
+
+    monkeypatch.setattr(
+        service.repository,
+        "latest_cleanup_lineage",
+        fail_once_after_first_provider_attempt,
+    )
+
+    try:
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+    except BaseException as error:  # noqa: BLE001 - exact failure algebra is asserted
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("provider and post-attempt refresh failures were not retained")
+
+    assert any("teardown remains retryable" in str(error) for error in failures)
+    assert any(
+        isinstance(error, ValueError) and "post-attempt lineage" in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == ["provider-001"]
+
+
+@pytest.mark.asyncio
+async def test_unclassified_final_empty_refresh_retains_prior_control_failure(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    provider = _TwoTargetCleanupProvider()
+    _, service, ready = await _ready_two_target_cleanup(
+        tmp_path,
+        provider,
+        database_name="final-empty-refresh.sqlite3",
+    )
+
+    async def final_telemetry_control_failure(*_args, **_kwargs):
+        raise ExecutionCommitOutcomeError("unknown")
+
+    original_latest = service.repository.latest_cleanup_lineage
+    all_targets_attempted_refreshes = 0
+
+    def fail_final_empty_refresh(lease):
+        nonlocal all_targets_attempted_refreshes
+        if provider.teardown_resource_ids == ["provider-001", "late-original-ack"]:
+            all_targets_attempted_refreshes += 1
+            if all_targets_attempted_refreshes == 2:
+                raise ValueError("unexpected final-empty lineage failure")
+        return original_latest(lease)
+
+    monkeypatch.setattr(provider, "observe", final_telemetry_control_failure)
+    monkeypatch.setattr(
+        service.repository,
+        "latest_cleanup_lineage",
+        fail_final_empty_refresh,
+    )
+
+    try:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    except BaseException as error:  # noqa: BLE001 - exact failure algebra is asserted
+        failures = _all_nested_errors(error)
+    else:
+        pytest.fail("control and final-empty refresh failures were not retained")
+
+    assert any(is_execution_control_error(error) for error in failures)
+    assert any(
+        isinstance(error, ValueError) and "final-empty lineage" in str(error)
+        for error in failures
+    )
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
 
 
 @pytest.mark.asyncio

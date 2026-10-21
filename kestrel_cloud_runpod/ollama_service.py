@@ -6,11 +6,12 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Never
 
 from kestrel_sovereign.execution_custody import is_execution_control_error
 
@@ -57,6 +58,23 @@ from .ollama_contracts import (
 from .ollama_repository import SQLiteOllamaLeaseRepository, request_from_lease
 
 logger = logging.getLogger(__name__)
+
+
+def _is_cleanup_setup_failure(error: BaseException) -> bool:
+    """Identify retained setup/control failures that do not revoke authority."""
+
+    return isinstance(error, sqlite3.Error) or is_execution_control_error(error)
+
+
+def _raise_cleanup_failures(
+    message: str, failures: tuple[BaseException, ...] | list[BaseException]
+) -> Never:
+    """Raise every retained cleanup failure without losing native control."""
+
+    if len(failures) == 1:
+        failure = failures[0]
+        raise failure.with_traceback(failure.__traceback__)
+    raise BaseExceptionGroup(message, list(failures)) from None
 
 
 def _validate_provisioning_receipt(
@@ -1047,7 +1065,7 @@ class OllamaLeaseService:
             now=self._now(),
             termination_reason=reason,
         )
-        telemetry_control_error: BaseException | None = None
+        setup_failures: list[BaseException] = []
         try:
             if (
                 lease.cleanup_receipt is None
@@ -1093,28 +1111,34 @@ class OllamaLeaseService:
                             ),
                         )
         except BaseException as exc:
-            if not is_execution_control_error(exc):
+            if not _is_cleanup_setup_failure(exc):
                 raise
-            telemetry_control_error = exc
-        if telemetry_control_error is None:
-            lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
-            return await self._teardown_all_effects(lease, reason=reason)
+            setup_failures.append(exc)
         try:
             lease = self.repository.claim_cleanup_attempt(lease, now=self._now())
-            await self._teardown_all_effects(lease, reason=reason)
-        # Preserve both original native control evidence and every possible
-        # cleanup terminal, including cancellation/control BaseExceptions.
-        except BaseException as cleanup_error:  # noqa: BLE001
-            raise BaseExceptionGroup(
-                "Ollama final telemetry control and cleanup both failed",
-                [telemetry_control_error, cleanup_error],
-            ) from None
-        raise telemetry_control_error.with_traceback(
-            telemetry_control_error.__traceback__
+        except BaseException as exc:
+            if isinstance(
+                exc, OllamaLeaseConflictError
+            ) or not _is_cleanup_setup_failure(exc):
+                if setup_failures:
+                    _raise_cleanup_failures(
+                        "Ollama cleanup setup and claim both failed",
+                        [*setup_failures, exc],
+                    )
+                raise
+            setup_failures.append(exc)
+        return await self._teardown_all_effects(
+            lease,
+            reason=reason,
+            prior_failures=tuple(setup_failures),
         )
 
     async def _teardown_all_effects(
-        self, lease: OllamaLease, *, reason: str
+        self,
+        lease: OllamaLease,
+        *,
+        reason: str,
+        prior_failures: tuple[BaseException, ...] = (),
     ) -> OllamaLease:
         """Join every exact resource proven for one admitted create lineage.
 
@@ -1124,11 +1148,40 @@ class OllamaLeaseService:
         without broadening authority beyond the original attempt.
         """
 
-        lineage = lease
+        try:
+            lineage = self.repository.validate_stored_cleanup_authority(lease)
+        except BaseException as exc:
+            if prior_failures:
+                _raise_cleanup_failures(
+                    "Ollama cleanup setup and authority validation both failed",
+                    [*prior_failures, exc],
+                )
+            raise
+        if lineage.state is OllamaLeaseState.TERMINATED:
+            if prior_failures:
+                _raise_cleanup_failures(
+                    "Multiple Ollama cleanup effects failed", prior_failures
+                )
+            return lineage
         attempted: set[tuple[str, str]] = set()
-        failures: list[BaseException] = []
-        current = self.repository.latest_cleanup_lineage(lineage)
+        failures = list(prior_failures)
+        current = lineage
         can_refresh = True
+
+        try:
+            current = self.repository.latest_cleanup_lineage(lineage)
+        except BaseException as exc:
+            if isinstance(
+                exc, OllamaLeaseConflictError
+            ) or not _is_cleanup_setup_failure(exc):
+                if failures:
+                    _raise_cleanup_failures(
+                        "Ollama cleanup setup and lineage refresh both failed",
+                        [*failures, exc],
+                    )
+                raise
+            failures.append(exc)
+            can_refresh = False
 
         def cleanup_obligations(value: OllamaLease) -> list[tuple[str, str]]:
             obligations: list[tuple[str, str]] = []
@@ -1141,8 +1194,15 @@ class OllamaLeaseService:
             )
             return obligations
 
+        authorized = set(cleanup_obligations(lineage))
+        if can_refresh:
+            authorized.update(cleanup_obligations(current))
+        stop_cleanup = False
+
         while True:
-            obligations = cleanup_obligations(current)
+            obligations = [
+                item for item in cleanup_obligations(current) if item in authorized
+            ]
             pending = [item for item in obligations if item not in attempted]
             if not pending:
                 lease = current
@@ -1150,10 +1210,17 @@ class OllamaLeaseService:
                     break
                 try:
                     refreshed = self.repository.latest_cleanup_lineage(lineage)
-                except BaseException as exc:  # noqa: BLE001
+                except BaseException as exc:  # noqa: BLE001 - retain native control
+                    if isinstance(
+                        exc, OllamaLeaseConflictError
+                    ) or not _is_cleanup_setup_failure(exc):
+                        failures.append(exc)
+                        stop_cleanup = True
+                        break
                     failures.append(exc)
                     break
                 current = refreshed
+                authorized.update(cleanup_obligations(current))
                 if set(cleanup_obligations(current)).issubset(attempted):
                     lease = current
                     break
@@ -1192,17 +1259,24 @@ class OllamaLeaseService:
                 if can_refresh:
                     try:
                         current = self.repository.latest_cleanup_lineage(lineage)
-                    except BaseException as exc:  # noqa: BLE001
-                        failures.append(exc)
-                        can_refresh = False
+                    except BaseException as exc:  # noqa: BLE001 - retain native control
+                        if isinstance(
+                            exc, OllamaLeaseConflictError
+                        ) or not _is_cleanup_setup_failure(exc):
+                            failures.append(exc)
+                            stop_cleanup = True
+                        else:
+                            failures.append(exc)
+                            can_refresh = False
+                    else:
+                        authorized.update(cleanup_obligations(current))
                 lease = current
-        if len(failures) == 1:
-            failure = failures[0]
-            raise failure.with_traceback(failure.__traceback__)
+                if stop_cleanup:
+                    break
+            if stop_cleanup:
+                break
         if failures:
-            raise BaseExceptionGroup(
-                "Multiple Ollama cleanup effects failed", failures
-            ) from None
+            _raise_cleanup_failures("Multiple Ollama cleanup effects failed", failures)
         return lease
 
     async def _teardown_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:

@@ -161,8 +161,8 @@ func main() {
 }
 
 func run() error {
-	startedAt := time.Now().UTC()
-	config, err := loadConfig(os.Getenv, startedAt)
+	startedAt := time.Now()
+	config, err := loadConfig(os.Getenv, startedAt.UTC())
 	if err != nil {
 		return err
 	}
@@ -170,8 +170,7 @@ func run() error {
 		return err
 	}
 	scrubSensitiveProcessEnvironment()
-	state := &startupState{strategy: "initializing"}
-	state.initializeRuntime(startedAt)
+	state := newStartupState("initializing", startedAt)
 	handler := newRuntimeProxy(config, state, time.Now)
 	server := &http.Server{
 		Addr:              config.ListenAddress,
@@ -676,7 +675,7 @@ func ollamaJSON(ctx context.Context, client *http.Client, upstream *url.URL, pat
 }
 
 func newRuntimeProxy(config runtimeConfig, state *startupState, now func() time.Time) http.Handler {
-	state.initializeRuntime(config.ContainerStartedAt)
+	state.requireRuntimeInitialized()
 	reverse := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(config.Upstream)
@@ -980,7 +979,7 @@ func (state *startupState) markReady() {
 func (state *startupState) snapshot(config runtimeConfig) telemetry {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.ensureRuntimeInitialized(config.ContainerStartedAt)
+	state.requireRuntimeInitialized()
 	state.telemetryRevision++
 	terminalError := (*string)(nil)
 	if state.terminalError != "" {
@@ -1028,24 +1027,25 @@ func (state *startupState) snapshot(config runtimeConfig) telemetry {
 	return result
 }
 
-func (state *startupState) initializeRuntime(containerStartedAt time.Time) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.ensureRuntimeInitialized(containerStartedAt)
+func newStartupState(strategy string, containerStartedAt time.Time) *startupState {
+	if containerStartedAt.IsZero() {
+		panic("runtime startup origin is unavailable")
+	}
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic("runtime entropy unavailable")
+	}
+	return &startupState{
+		strategy:             strategy,
+		runtimeInstanceID:    hex.EncodeToString(value),
+		containerStartedMono: containerStartedAt,
+	}
 }
 
-func (state *startupState) ensureRuntimeInitialized(containerStartedAt time.Time) {
-	if state.runtimeInstanceID == "" {
-		value := make([]byte, 16)
-		if _, err := rand.Read(value); err != nil {
-			panic("runtime entropy unavailable")
-		}
-		state.runtimeInstanceID = hex.EncodeToString(value)
+func (state *startupState) requireRuntimeInitialized() {
+	if state.runtimeInstanceID == "" || state.containerStartedMono.IsZero() {
+		panic("runtime state was not initialized")
 	}
-	if state.containerStartedMono.IsZero() {
-		state.containerStartedMono = time.Now()
-	}
-	_ = containerStartedAt
 }
 
 func (state *startupState) beginInference(observedAt time.Time) time.Time {

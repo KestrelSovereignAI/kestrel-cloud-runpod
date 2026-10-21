@@ -5,7 +5,7 @@ regenerate via `python scripts/generate_repo_map.py` (refreshed nightly by
 `.github/workflows/repo-map.yml`). No timestamp on purpose: the nightly job
 commits only when the tree actually changes; `git log REPO_MAP.md` has the date.
 
-**Scope:** 123 tracked files (94 `.py`, 8 `.md`, 21 other). Excludes caches, lockfiles, and build artifacts.
+**Scope:** 125 tracked files (96 `.py`, 8 `.md`, 21 other). Excludes caches, lockfiles, and build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -42,6 +42,8 @@ Repo entry points and standard project files.
 ## `kestrel_cloud_runpod/`
 
 - **kestrel_cloud_runpod/__init__.py** — RunPod GPU management for Kestrel.
+- **kestrel_cloud_runpod/_one_shot_reconciler.py** — Shared, content-free argument boundary for one-shot reconcilers.
+  - `def run_one_shot_reconciler(argv)`
 - **kestrel_cloud_runpod/billing.py** — Shared UTC coverage and exact monetary arithmetic for provider observations.
   - `def billing_hour_bounds(started_at, coverage_until)`; `def exact_decimal_sum(values)`; `def exact_timedelta_microseconds(value)`; `def ceil_timedelta_seconds(value)`; `def floor_timedelta_seconds(value)`; `def exact_decimal_integer_scale(value, multiplier)`; `def conservative_decimal_ratio_float(value, divisor)`; `def billing_exposure_ratio_float(value)`; `…`
 - **kestrel_cloud_runpod/clients.py** — Runpod v2 HTTP clients with one authenticated transport boundary.
@@ -185,6 +187,8 @@ Repo entry points and standard project files.
   - `def test_runtime_image_must_use_reviewed_repository_and_digest()`; `def test_runtime_environment_is_owned_and_lease_bounded()`; `def test_runtime_environment_rejects_unapproved_model_and_overrides()`; `def test_runtime_environment_rejects_weak_or_expired_capability()`; `def test_runtime_environment_restricts_mode_specific_storage_roots()`; `def test_runpod_template_covers_pod_and_native_load_balancer()`; `def test_container_contract_is_pinned_nonroot_and_secret_free()`; `def test_tracked_configs_share_the_runtime_policy_surface()`; `…`
 - **tests/test_ollama_service.py** — Lifecycle, crash recovery, readiness, cost, and teardown tests.
   - `async def test_acquire_pulls_missing_model_and_only_returns_ready_route(tmp_path)`; `async def test_duplicate_acquire_does_not_create_second_resource(tmp_path)`; `async def test_integer_and_float_money_spellings_share_first_acceptance(tmp_path)`; `async def test_unrepresentable_public_integer_cost_fails_before_admission(tmp_path, field_name)`; `async def test_requested_restart_recovers_exact_original_fingerprint_inputs(tmp_path)`; `async def test_touch_renews_only_after_reobserving_the_exact_ready_route(tmp_path)`; `async def test_touch_route_failure_does_not_renew_or_replace_capacity(tmp_path)`; `async def test_reconciler_recovers_crash_after_requested_insert(tmp_path)`; `…`
+- **tests/test_one_shot_reconciler.py** — Shared argument boundary for installed one-shot reconcilers.
+  - `def test_help_exits_before_coroutine_factory_or_event_loop(capsys)`; `def test_invalid_argument_is_generic_and_never_constructs_operation()`; `def test_empty_arguments_run_exactly_one_operation()`
 - **tests/test_pod_capacity_architecture.py** — One-source-of-truth and public/private package-boundary tests.
   - `def test_training_names_are_aliases_not_a_second_writable_lifecycle()`; `def test_public_cloud_package_has_no_private_catalog_dependency()`
 - **tests/test_pod_capacity_contracts.py** — Generic quote, identity, cost, environment, and persistence contracts.
