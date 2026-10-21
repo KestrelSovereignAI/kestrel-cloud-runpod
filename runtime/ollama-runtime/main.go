@@ -144,6 +144,12 @@ type runtimeProxy struct {
 	now    func() time.Time
 }
 
+type exposedRoutePolicy struct {
+	readOnly            bool
+	requiresModelPolicy bool
+	countsInference     bool
+}
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
@@ -710,11 +716,12 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 		writeJSON(writer, http.StatusForbidden, map[string]string{"error": "model mutation is disabled"})
 		return
 	}
-	if !allowedRoute(path, request.Method) {
+	policy, allowed := policyForRoute(path, request.Method)
+	if !allowed {
 		writeJSON(writer, http.StatusNotFound, map[string]string{"error": "route is not exposed"})
 		return
 	}
-	if requiresModelPolicy(path, request.Method) {
+	if policy.requiresModelPolicy {
 		model, status, err := inspectModelRequest(writer, request)
 		if err != nil {
 			writeJSON(writer, status, map[string]string{"error": err.Error()})
@@ -722,6 +729,10 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 		}
 		if _, allowed := runtime.config.AllowedModels[model]; !allowed {
 			writeJSON(writer, http.StatusForbidden, map[string]string{"error": "model is not allowlisted"})
+			return
+		}
+		if !policy.countsInference {
+			runtime.proxy.ServeHTTP(writer, request)
 			return
 		}
 		started := runtime.state.beginInference(runtime.now())
@@ -834,27 +845,30 @@ func isForbiddenManagementPath(path string) bool {
 	return path == "/api/create" || path == "/api/copy" || path == "/api/delete" || path == "/api/pull" || path == "/api/push" || strings.HasPrefix(path, "/api/blobs")
 }
 
-func allowedRoute(path, method string) bool {
-	readOnly := map[string]bool{"/": true, "/api/tags": true, "/api/ps": true, "/api/version": true, "/v1/models": true}
-	if readOnly[path] {
-		return method == http.MethodGet || method == http.MethodHead
+func policyForRoute(path, method string) (exposedRoutePolicy, bool) {
+	var policy exposedRoutePolicy
+	switch path {
+	case "/", "/api/tags", "/api/ps", "/api/version", "/v1/models":
+		policy = exposedRoutePolicy{readOnly: true}
+	case "/api/generate", "/api/chat", "/api/embed", "/api/embeddings",
+		"/v1/chat/completions", "/v1/completions", "/v1/embeddings":
+		policy = exposedRoutePolicy{requiresModelPolicy: true, countsInference: true}
+	case "/api/show":
+		policy = exposedRoutePolicy{requiresModelPolicy: true}
+	default:
+		if strings.HasPrefix(path, "/v1/models/") {
+			policy = exposedRoutePolicy{readOnly: true}
+		} else {
+			return exposedRoutePolicy{}, false
+		}
 	}
-	if strings.HasPrefix(path, "/v1/models/") {
-		return method == http.MethodGet || method == http.MethodHead
+	if policy == (exposedRoutePolicy{}) {
+		return exposedRoutePolicy{}, false
 	}
-	post := map[string]bool{
-		"/api/generate": true, "/api/chat": true, "/api/embed": true, "/api/embeddings": true,
-		"/api/show": true, "/v1/chat/completions": true,
-		"/v1/completions": true, "/v1/embeddings": true,
+	if policy.readOnly {
+		return policy, method == http.MethodGet || method == http.MethodHead
 	}
-	return post[path] && method == http.MethodPost
-}
-
-func requiresModelPolicy(path, method string) bool {
-	if method != http.MethodPost {
-		return false
-	}
-	return path != "/api/ps" && path != "/api/version"
+	return policy, method == http.MethodPost
 }
 
 func inspectModelRequest(writer http.ResponseWriter, request *http.Request) (string, int, error) {

@@ -26,6 +26,7 @@ from kestrel_sdk.config.constants import (
 from .models import (
     GPUProfile,
     RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
 )
@@ -502,9 +503,7 @@ class RunPodTrainingMixin:
 
     async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
         """
-        Start a pod for LoRA-based image generation.
-
-        Reuses an eligible stopped Pod before creating a new one.
+        Refuse the legacy ownerless LoRA inference admission path.
 
         Args:
             companion_id: Companion for tracking
@@ -513,16 +512,8 @@ class RunPodTrainingMixin:
             RunPodSession if started successfully, None otherwise
         """
         try:
-            profile = self._select_profile("image")
             ttl_seconds = 600  # 10 min for inference
 
-            # Try to resume a stopped inference pod first (much faster)
-            stopped_pod = await self.find_stopped_pod("lora_inference", "image")
-            if stopped_pod:
-                logger.info("Starting existing stopped inference Pod through Runpod v2")
-                return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
-
-            # No stopped pod found, create new one
             await self.start_session(
                 task_profile="image",
                 model_name="flux-with-lora",
@@ -537,7 +528,7 @@ class RunPodTrainingMixin:
             async with self._lock:
                 return self._session
 
-        except RunPodAmbiguousResultError:
+        except (RunPodAmbiguousResultError, RunPodLegacyAdmissionRetiredError):
             raise
         except RunPodManagerError as e:
             logger.error(f"Failed to start inference pod for {companion_id}: {e}")

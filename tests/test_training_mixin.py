@@ -1,14 +1,17 @@
 """Manager integration for durable training capacity and workload recovery."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from training_test_support import FakeTrainingProvider, MutableClock, training_service
 
 from kestrel_cloud_runpod.manager import RunPodManager
-from kestrel_cloud_runpod.models import RunPodManagerError
+from kestrel_cloud_runpod.models import (
+    RunPodLegacyAdmissionRetiredError,
+    RunPodManagerError,
+)
 from kestrel_cloud_runpod.providers import DirectRunPodProvider
 from kestrel_cloud_runpod.training_contracts import (
     TrainingPodCleanupError,
@@ -81,6 +84,46 @@ def _manager(tmp_path: Path, provider: FakeTrainingProvider) -> RunPodManager:
     clock = MutableClock()
     manager.set_training_pod_lease_service(training_service(tmp_path, clock, provider))
     return manager
+
+
+@pytest.mark.asyncio
+async def test_legacy_lora_inference_admission_fails_before_provider_post(
+    tmp_path: Path,
+) -> None:
+    provider = FakeTrainingProvider()
+    manager = _manager(tmp_path, provider)
+    manager.profiles["image"] = manager.profiles["training"]
+    manager.find_stopped_pod = AsyncMock(return_value=None)
+
+    with pytest.raises(RunPodLegacyAdmissionRetiredError, match="durable"):
+        await manager.start_inference_pod("companion-1")
+
+    manager.provider.start_pod.assert_not_called()
+    manager.find_stopped_pod.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_lora_inference_does_not_resume_name_matched_foreign_pod(
+    tmp_path: Path,
+) -> None:
+    provider = FakeTrainingProvider()
+    manager = _manager(tmp_path, provider)
+    manager.profiles["image"] = manager.profiles["training"]
+    manager.find_stopped_pod = AsyncMock(
+        return_value={
+            "id": "foreign-pod-1",
+            "name": "kestrel-selfie-foreign",
+            "status": "EXITED",
+        }
+    )
+    manager.resume_stopped_pod = AsyncMock()
+
+    with pytest.raises(RunPodLegacyAdmissionRetiredError, match="durable"):
+        await manager.start_inference_pod("companion-1")
+
+    manager.find_stopped_pod.assert_not_awaited()
+    manager.resume_stopped_pod.assert_not_awaited()
+    manager.provider.resume_pod.assert_not_called()
 
 
 @pytest.mark.asyncio

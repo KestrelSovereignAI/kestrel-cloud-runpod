@@ -157,6 +157,50 @@ async def test_runpod_provider_uses_exact_generic_serverless_billing_binding(
 
 
 @pytest.mark.asyncio
+async def test_receiptless_cleanup_only_accepts_receipt_for_exact_resource():
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    prepared = provider.validate_runtime_request(
+        request, serverless_plan(), provision_requested_at=clock()
+    )
+    resource_a = ProvisionedOllamaResource(
+        OllamaResourceType.SERVERLESS_ENDPOINT,
+        "endpoint-a",
+        prepared.intent.resource_name,
+    )
+    resource_b = replace(resource_a, provider_resource_id="endpoint-b")
+    receipt_a = await provider.observe_provisioning(prepared.intent, resource_a)
+    receipt_b = await provider.observe_provisioning(prepared.intent, resource_b)
+    cleanup = OllamaCleanupIntent(
+        intent_sha256=prepared.intent.intent_sha256,
+        provisioning_receipt_id=None,
+        lease_id=prepared.intent.lease_id,
+        request_fingerprint=prepared.intent.request_fingerprint,
+        provision_attempt_id=prepared.intent.provision_attempt_id,
+        resource_type=prepared.intent.resource_type,
+        provider_resource_id=resource_a.provider_resource_id,
+        resource_name=prepared.intent.resource_name,
+        termination_reason="test cleanup",
+        delete_started_at=clock(),
+    )
+
+    cleanup.validate_provisioning(prepared.intent, None)
+    cleanup.validate_provisioning(prepared.intent, receipt_a)
+    with pytest.raises(ValueError, match="does not bind its receipt"):
+        cleanup.validate_provisioning(prepared.intent, receipt_b)
+
+    bound = replace(cleanup, provisioning_receipt_id=receipt_a.receipt_id)
+    bound.validate_provisioning(prepared.intent, receipt_a)
+    with pytest.raises(ValueError, match="does not bind its receipt"):
+        bound.validate_provisioning(prepared.intent, receipt_b)
+
+
+@pytest.mark.asyncio
 async def test_runpod_provider_uses_exact_generic_pod_billing_binding(
     native_billing,
 ):

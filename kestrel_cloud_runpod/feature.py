@@ -4,12 +4,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import requests
-
 from kestrel_sdk.features.base import Feature, tool
-from kestrel_cloud_runpod.manager import RunPodManager
-from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_cloud_runpod.manager import RunPodManager
+from kestrel_cloud_runpod.models import (
+    RunPodLegacyAdmissionRetiredError,
+    RunPodManagerError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +23,8 @@ class RunPodFeature(Feature):
     @property
     def tool_description(self) -> str:
         return (
-            "Operator controls for RunPod GPU sessions: start or stop a pod, "
-            "inspect status, and view logs"
+            "Inspect, stop, or view logs for an existing RunPod GPU session. "
+            "New capacity requires the durable inference-lease or catalog service."
         )
 
     async def initialize(self):
@@ -48,7 +51,10 @@ class RunPodFeature(Feature):
 
     @tool(
         name="manage_gpu",
-        description="Start, stop, or inspect RunPod GPU sessions (usage: !gpu <action> [...]).",
+        description=(
+            "Inspect, stop, or view logs for existing RunPod GPU sessions. "
+            "Legacy start is retired (usage: !gpu <action> [...])."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!gpu",
     )
@@ -216,6 +222,8 @@ class RunPodFeature(Feature):
                     model_name=model_name,
                     ttl_seconds=ttl,
                 )
+            except RunPodLegacyAdmissionRetiredError as exc:
+                return self._legacy_admission_failure("generate_image", exc)
             except Exception as e:
                 # Only attempt teardown if there was nothing active
                 # before we tried — anything we created in the failed
@@ -432,6 +440,8 @@ class RunPodFeature(Feature):
                     pod_type=pod_type or None,
                     metadata=metadata,
                 )
+            except RunPodLegacyAdmissionRetiredError as exc:
+                return self._legacy_admission_failure("start", exc)
             except Exception as e:
                 # Best-effort teardown only when there was nothing
                 # active before — any session state we leave behind is
@@ -468,6 +478,23 @@ class RunPodFeature(Feature):
             data={
                 "action": "start",
                 "session": status,
+            },
+        )
+
+    @staticmethod
+    def _legacy_admission_failure(
+        action: str, error: RunPodLegacyAdmissionRetiredError
+    ) -> ToolResult:
+        """Expose the canonical retirement without implying a provider mutation."""
+
+        return ToolResult.failed(
+            str(error),
+            data={
+                "action": action,
+                "error_type": type(error).__name__,
+                "migration_required": (
+                    "inference_lease_or_durable_pod_capacity_service"
+                ),
             },
         )
 

@@ -61,6 +61,14 @@ cannot observe those provider phases separately. The live gate correlates it
 with Runpod worker/Pod timestamps to isolate image-pull time. Runpod LB also
 measures the `/ping` `204` to `200` cold-start interval.
 
+`KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256` is mandatory workload input. The
+Python capacity provider derives it once from the accepted immutable
+provisioning intent with the canonical `runtime_telemetry_binding_for_intent`
+contract and includes it in the exact create payload. Operators must not
+derive it from current configuration, substitute an arbitrary digest, or
+default it when the original binding is unavailable. Runtime telemetry that
+does not reproduce that original binding is not authoritative for the lease.
+
 ## Build and local validation
 
 The runtime is independently versioned as `1.1.1`; it does not change the

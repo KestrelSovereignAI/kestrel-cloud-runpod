@@ -1116,17 +1116,93 @@ class OllamaLeaseService:
     async def _teardown_all_effects(
         self, lease: OllamaLease, *, reason: str
     ) -> OllamaLease:
-        """Join every exact resource proven for one admitted create lineage."""
+        """Join every exact resource proven for one admitted create lineage.
 
-        if lease.cleanup_receipt is None:
-            lease = await self._teardown_effect(lease, reason=reason)
-        for target in lease.additional_cleanup_targets:
-            if target.cleanup_receipt is None:
-                lease = await self._teardown_additional_effect(
-                    lease,
-                    provider_resource_id=target.provider_resource_id,
-                    reason=reason,
-                )
+        A provider failure for one independently owned resource cannot prevent
+        cleanup of another. Each awaited effect is followed by a durable
+        lineage reload so a concurrently recorded original POST ACK is joined
+        without broadening authority beyond the original attempt.
+        """
+
+        lineage = lease
+        attempted: set[tuple[str, str]] = set()
+        failures: list[BaseException] = []
+        current = self.repository.latest_cleanup_lineage(lineage)
+        can_refresh = True
+
+        def cleanup_obligations(value: OllamaLease) -> list[tuple[str, str]]:
+            obligations: list[tuple[str, str]] = []
+            if value.cleanup_receipt is None and value.provider_resource_id:
+                obligations.append(("primary", value.provider_resource_id))
+            obligations.extend(
+                ("additional", target.provider_resource_id)
+                for target in value.additional_cleanup_targets
+                if target.cleanup_receipt is None
+            )
+            return obligations
+
+        while True:
+            obligations = cleanup_obligations(current)
+            pending = [item for item in obligations if item not in attempted]
+            if not pending:
+                lease = current
+                if not can_refresh:
+                    break
+                try:
+                    refreshed = self.repository.latest_cleanup_lineage(lineage)
+                except BaseException as exc:  # noqa: BLE001
+                    failures.append(exc)
+                    break
+                current = refreshed
+                if set(cleanup_obligations(current)).issubset(attempted):
+                    lease = current
+                    break
+                continue
+            for kind, provider_resource_id in pending:
+                attempted.add((kind, provider_resource_id))
+                try:
+                    if kind == "primary":
+                        if current.cleanup_receipt is None:
+                            current = await self._teardown_effect(
+                                current, reason=reason
+                            )
+                    else:
+                        target = next(
+                            (
+                                item
+                                for item in current.additional_cleanup_targets
+                                if item.provider_resource_id == provider_resource_id
+                            ),
+                            None,
+                        )
+                        if target is None:
+                            raise OllamaLeaseConflictError(
+                                f"Lease '{lease.lease_id}' lost cleanup authority"
+                            )
+                        if target.cleanup_receipt is None:
+                            current = await self._teardown_additional_effect(
+                                current,
+                                provider_resource_id=provider_resource_id,
+                                reason=reason,
+                            )
+                except BaseException as exc:  # noqa: BLE001
+                    # Preserve cancellation/control evidence until every joined
+                    # resource has had its independently owned cleanup attempt.
+                    failures.append(exc)
+                if can_refresh:
+                    try:
+                        current = self.repository.latest_cleanup_lineage(lineage)
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append(exc)
+                        can_refresh = False
+                lease = current
+        if len(failures) == 1:
+            failure = failures[0]
+            raise failure.with_traceback(failure.__traceback__)
+        if failures:
+            raise BaseExceptionGroup(
+                "Multiple Ollama cleanup effects failed", failures
+            ) from None
         return lease
 
     async def _teardown_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:
@@ -1141,18 +1217,27 @@ class OllamaLeaseService:
                 )
             cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
         except RunPodManagerError as exc:
-            self.repository.record_teardown_outcome(
-                lease,
-                provider_resource_id=resource.provider_resource_id,
-                now=self._now(),
-                accrued_estimated_cost=accrued_cost(lease, self._now()),
-                termination_reason=reason,
-                provider_error=f"{reason}: {sanitize_provider_error(exc)}",
-                retry_at=self._now() + timedelta(seconds=self.poll_interval_seconds),
-            )
-            raise OllamaLeaseTeardownError(
+            provider_failure = OllamaLeaseTeardownError(
                 f"Ollama lease '{lease.lease_id}' teardown remains retryable"
-            ) from exc
+            )
+            provider_failure.__cause__ = exc
+            try:
+                self.repository.record_teardown_outcome(
+                    lease,
+                    provider_resource_id=resource.provider_resource_id,
+                    now=self._now(),
+                    accrued_estimated_cost=accrued_cost(lease, self._now()),
+                    termination_reason=reason,
+                    provider_error=f"{reason}: {sanitize_provider_error(exc)}",
+                    retry_at=self._now()
+                    + timedelta(seconds=self.poll_interval_seconds),
+                )
+            except BaseException as persistence_error:  # noqa: BLE001
+                raise BaseExceptionGroup(
+                    "Ollama teardown and outcome persistence both failed",
+                    [provider_failure, persistence_error],
+                ) from None
+            raise provider_failure from exc
         return self.repository.record_teardown_outcome(
             lease,
             provider_resource_id=resource.provider_resource_id,
@@ -1196,18 +1281,27 @@ class OllamaLeaseService:
         try:
             cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
         except RunPodManagerError as exc:
-            self.repository.record_additional_cleanup_outcome(
-                lease,
-                provider_resource_id=provider_resource_id,
-                now=self._now(),
-                accrued_estimated_cost=accrued_cost(lease, self._now()),
-                termination_reason=reason,
-                provider_error=f"{reason}: {sanitize_provider_error(exc)}",
-                retry_at=self._now() + timedelta(seconds=self.poll_interval_seconds),
-            )
-            raise OllamaLeaseTeardownError(
+            provider_failure = OllamaLeaseTeardownError(
                 f"Ollama lease '{lease.lease_id}' additional teardown remains retryable"
-            ) from exc
+            )
+            provider_failure.__cause__ = exc
+            try:
+                self.repository.record_additional_cleanup_outcome(
+                    lease,
+                    provider_resource_id=provider_resource_id,
+                    now=self._now(),
+                    accrued_estimated_cost=accrued_cost(lease, self._now()),
+                    termination_reason=reason,
+                    provider_error=f"{reason}: {sanitize_provider_error(exc)}",
+                    retry_at=self._now()
+                    + timedelta(seconds=self.poll_interval_seconds),
+                )
+            except BaseException as persistence_error:  # noqa: BLE001
+                raise BaseExceptionGroup(
+                    "Ollama additional teardown and outcome persistence both failed",
+                    [provider_failure, persistence_error],
+                ) from None
+            raise provider_failure from exc
         return self.repository.record_additional_cleanup_outcome(
             lease,
             provider_resource_id=provider_resource_id,

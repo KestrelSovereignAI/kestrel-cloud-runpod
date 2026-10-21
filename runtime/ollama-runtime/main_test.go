@@ -372,6 +372,33 @@ func TestApprovedInferenceStripsWorkloadBearer(t *testing.T) {
 	}
 }
 
+func TestModelMetadataIsAuthorizedWithoutCountingInference(t *testing.T) {
+	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/show" {
+			t.Fatalf("unexpected upstream path %s", request.URL.Path)
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"model": "metadata"})
+	})
+	config := testConfig(upstream)
+	state := &startupState{}
+	handler := newRuntimeProxy(config, state, time.Now)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authorizedRequest(
+		t,
+		http.MethodPost,
+		"/api/show",
+		`{"model":"registry.example/team/model:v1"}`,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("/api/show returned %d", response.Code)
+	}
+	observed := state.snapshot(config)
+	if observed.InferenceStarted != 0 || observed.InferenceCompleted != 0 ||
+		observed.InferenceInFlight != 0 || observed.InferenceBusyMilliseconds != 0 {
+		t.Fatalf("metadata request changed inference telemetry: %#v", observed)
+	}
+}
+
 func TestOpenAIStreamingToolsAndToolCallsPassThroughUnchanged(t *testing.T) {
 	requestBody := `{"model":"registry.example/team/model:v1","messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"stream":true}`
 	responseBody := "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\",\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Chicago\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"

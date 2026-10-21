@@ -15,6 +15,7 @@ import httpx
 import pytest
 from jsonschema import Draft202012Validator
 from ollama_test_support import (
+    FakeOllamaProvider,
     MutableClock,
     make_request,
     non_compute_cost_policy,
@@ -40,6 +41,7 @@ from kestrel_cloud_runpod.models import (
 )
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaCleanupIntent,
+    OllamaLeaseConflictError,
     OllamaLeaseMode,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
@@ -958,6 +960,74 @@ async def test_native_provisioning_persists_safe_exact_readback_before_waiting(
     )
     assert _SERVERLESS_TOKEN not in lease.provisioning_intent.provider_request_json
     assert _SERVERLESS_TOKEN.encode() not in repository.path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_native_late_valid_receipt_survives_receiptless_completed_cleanup(
+    native_provisioning, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    clock = MutableClock()
+    original_observe = provider.observe_provisioning
+    first_readback_entered = asyncio.Event()
+    first_readback_finished = asyncio.Event()
+    readbacks = 0
+
+    async def delayed_first_readback(*args, **kwargs):
+        nonlocal readbacks
+        readbacks += 1
+        if readbacks == 1:
+            receipt = await original_observe(*args, **kwargs)
+            first_readback_entered.set()
+            await first_readback_finished.wait()
+            return receipt
+        state["read_status"] = 503
+        try:
+            return await original_observe(*args, **kwargs)
+        finally:
+            state["read_status"] = None
+
+    provider.observe_provisioning = delayed_first_readback
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "late-valid-receipt.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    acquire = asyncio.create_task(
+        service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    )
+    try:
+        await first_readback_entered.wait()
+        closed = await service.release(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+        assert closed.state is OllamaLeaseState.TERMINATED
+        assert closed.cleanup_intent is not None
+        assert closed.cleanup_intent.provisioning_receipt_id is None
+        assert closed.cleanup_receipt is not None
+    finally:
+        first_readback_finished.set()
+
+    completed = await acquire
+    durable = repository.get(request.lease_id)
+    assert durable is not None
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert durable.provisioning_receipt is not None
+    assert durable.cleanup_intent == closed.cleanup_intent
+    assert durable.cleanup_receipt == closed.cleanup_receipt
+    assert durable.route_url is None
+    assert state["calls"].count(("DELETE", "/v2/serverless/endpoint-evidence-1")) == 1
 
 
 @pytest.mark.asyncio
@@ -2047,9 +2117,12 @@ async def test_native_original_ack_survives_different_candidate_mismatch(
     assert client.actions == [("original-endpoint", "delete")]
 
 
-@pytest.mark.asyncio
-async def test_native_late_original_ack_joins_final_control_failure_cleanup(
-    tmp_path, monkeypatch
+async def _run_native_late_original_ack_with_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+    *,
+    fail_primary_cleanup: bool,
+    fail_additional_cleanup: bool = False,
 ):
     from kestrel_sovereign.execution_custody import (
         ExecutionCommitOutcomeError,
@@ -2115,7 +2188,14 @@ async def test_native_late_original_ack_joins_final_control_failure_cleanup(
                 return httpx.Response(404, json={"title": "absent"})
             return httpx.Response(200, json=resource)
         if request.method == "DELETE":
-            state["resources"].pop(path.rsplit("/", 1)[-1], None)
+            resource_id = path.rsplit("/", 1)[-1]
+            if fail_primary_cleanup and resource_id == "candidate-valid":
+                return httpx.Response(503, json={"title": "primary delete unavailable"})
+            if fail_additional_cleanup and resource_id == "original-post-ack":
+                return httpx.Response(
+                    503, json={"title": "additional delete unavailable"}
+                )
+            state["resources"].pop(resource_id, None)
             return httpx.Response(204)
         raise AssertionError((request.method, path))
 
@@ -2212,17 +2292,282 @@ async def test_native_late_original_ack_joins_final_control_failure_cleanup(
             for method, path in state["calls"]
             if method == "DELETE"
         ]
-        assert sorted(delete_ids) == ["candidate-valid", "original-post-ack"]
         completed = repository.get(request.lease_id)
         assert completed is not None
-        assert completed.state is OllamaLeaseState.TERMINATED
-        assert completed.cleanup_receipt is not None
-        assert len(completed.additional_cleanup_targets) == 1
-        assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+        return state, result_evidence, delete_ids, completed
     finally:
         post_finished.set()
         final_telemetry_finished.set()
         client.close()
+
+
+@pytest.mark.asyncio
+async def test_native_late_original_ack_joins_final_control_failure_cleanup(
+    tmp_path, monkeypatch
+):
+    (
+        state,
+        result_evidence,
+        delete_ids,
+        completed,
+    ) = await _run_native_late_original_ack_with_cleanup_failure(
+        tmp_path, monkeypatch, fail_primary_cleanup=False
+    )
+
+    assert state["resources"] == {}
+    assert all(item[2] for item in result_evidence), result_evidence
+    assert sorted(delete_ids) == ["candidate-valid", "original-post-ack"]
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.cleanup_receipt is not None
+    assert len(completed.additional_cleanup_targets) == 1
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+
+
+@pytest.mark.asyncio
+async def test_native_additional_cleanup_failure_retains_primary_receipt(
+    tmp_path, monkeypatch
+):
+    (
+        state,
+        result_evidence,
+        delete_ids,
+        completed,
+    ) = await _run_native_late_original_ack_with_cleanup_failure(
+        tmp_path,
+        monkeypatch,
+        fail_primary_cleanup=False,
+        fail_additional_cleanup=True,
+    )
+
+    assert all(item[2] for item in result_evidence), result_evidence
+    assert sorted(delete_ids) == ["candidate-valid", "original-post-ack"]
+    assert "candidate-valid" not in state["resources"]
+    assert "original-post-ack" in state["resources"]
+    assert completed.state is OllamaLeaseState.RELEASING
+    assert completed.cleanup_receipt is not None
+    assert len(completed.additional_cleanup_targets) == 1
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+async def test_native_every_cleanup_failure_is_retained_after_join(
+    tmp_path, monkeypatch
+):
+    (
+        state,
+        result_evidence,
+        delete_ids,
+        completed,
+    ) = await _run_native_late_original_ack_with_cleanup_failure(
+        tmp_path,
+        monkeypatch,
+        fail_primary_cleanup=True,
+        fail_additional_cleanup=True,
+    )
+
+    assert all(item[2] for item in result_evidence), result_evidence
+    assert sorted(delete_ids) == ["candidate-valid", "original-post-ack"]
+    assert set(state["resources"]) == {"candidate-valid", "original-post-ack"}
+    assert completed.state is OllamaLeaseState.RELEASING
+    assert completed.cleanup_receipt is None
+    assert len(completed.additional_cleanup_targets) == 1
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+async def test_native_primary_cleanup_failure_does_not_starve_original_ack(
+    tmp_path, monkeypatch
+):
+    (
+        state,
+        result_evidence,
+        delete_ids,
+        completed,
+    ) = await _run_native_late_original_ack_with_cleanup_failure(
+        tmp_path, monkeypatch, fail_primary_cleanup=True
+    )
+
+    assert all(item[2] for item in result_evidence), result_evidence
+    assert "candidate-valid" in delete_ids
+    assert "original-post-ack" in delete_ids
+    assert "candidate-valid" in state["resources"]
+    assert "original-post-ack" not in state["resources"]
+    assert completed.state is OllamaLeaseState.RELEASING
+    assert completed.cleanup_receipt is None
+    assert len(completed.additional_cleanup_targets) == 1
+    assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+
+
+class _TwoTargetCleanupProvider(FakeOllamaProvider):
+    def __init__(self, *, failed_resource_ids=()):
+        super().__init__(serverless_plan())
+        self.failed_resource_ids = set(failed_resource_ids)
+        self.teardown_resource_ids = []
+
+    async def teardown(self, resource, cleanup_intent):
+        self.teardown_resource_ids.append(resource.provider_resource_id)
+        if resource.provider_resource_id in self.failed_resource_ids:
+            raise RunPodManagerError(
+                f"teardown failed for {resource.provider_resource_id}"
+            )
+        return await super().teardown(resource, cleanup_intent)
+
+
+async def _claimed_two_target_cleanup(tmp_path, provider):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "two-target-cleanup.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(
+        make_request(clock, mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER),
+        plan=serverless_plan(),
+    )
+    assert ready.provisioning_intent is not None
+    with_late_ack = repository.attach_provider_acknowledgment(
+        ready,
+        ProvisionedOllamaResource(
+            resource_type=ready.provisioning_intent.resource_type,
+            provider_resource_id="late-original-ack",
+            resource_name=ready.provisioning_intent.resource_name,
+        ),
+        now=clock(),
+    )
+    releasing = repository.compare_and_set(
+        with_late_ack,
+        changes={
+            "state": OllamaLeaseState.RELEASING,
+            "teardown_state": OllamaTeardownState.PENDING,
+            "route_url": None,
+            "termination_reason": "test two-target cleanup",
+        },
+    )
+    admitted = repository.record_cleanup_intent(
+        releasing,
+        now=clock(),
+        termination_reason="test two-target cleanup",
+    )
+    return service, repository.claim_cleanup_attempt(admitted, now=clock())
+
+
+def _group_messages(error):
+    if isinstance(error, BaseExceptionGroup):
+        return [
+            message
+            for nested in error.exceptions
+            for message in _group_messages(nested)
+        ]
+    return [str(error)]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reload_failure_preserves_prior_failure_and_known_target(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+    original_latest = service.repository.latest_cleanup_lineage
+    failed_reload = False
+
+    def fail_once_after_first_provider_attempt(lease):
+        nonlocal failed_reload
+        if provider.teardown_resource_ids and not failed_reload:
+            failed_reload = True
+            raise OllamaLeaseConflictError("cleanup lineage reload failed")
+        return original_latest(lease)
+
+    monkeypatch.setattr(
+        service.repository,
+        "latest_cleanup_lineage",
+        fail_once_after_first_provider_attempt,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    messages = _group_messages(caught.value)
+    assert any("teardown remains retryable" in message for message in messages)
+    assert any("cleanup lineage reload failed" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_initial_reload_failure_sends_no_unverified_delete(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider()
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+
+    def fail_lineage_reload(_lease):
+        raise OllamaLeaseConflictError("cleanup authority is unreadable")
+
+    monkeypatch.setattr(
+        service.repository, "latest_cleanup_lineage", fail_lineage_reload
+    )
+
+    with pytest.raises(OllamaLeaseConflictError, match="authority is unreadable"):
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+
+    assert provider.teardown_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_claim_failure_composes_with_prior_provider_failure(
+    tmp_path, monkeypatch
+):
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={"provider-001"})
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+
+    def fail_additional_claim(*_args, **_kwargs):
+        raise OllamaLeaseConflictError("additional cleanup claim failed")
+
+    monkeypatch.setattr(
+        service.repository,
+        "record_additional_cleanup_intent",
+        fail_additional_claim,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+
+    assert provider.teardown_resource_ids == ["provider-001"]
+    messages = _group_messages(caught.value)
+    assert any("teardown remains retryable" in message for message in messages)
+    assert any("additional cleanup claim failed" in message for message in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_resource_id", "record_method"),
+    [
+        ("provider-001", "record_teardown_outcome"),
+        ("late-original-ack", "record_additional_cleanup_outcome"),
+    ],
+)
+async def test_cleanup_provider_and_outcome_cas_failures_are_both_retained(
+    tmp_path, monkeypatch, failed_resource_id, record_method
+):
+    provider = _TwoTargetCleanupProvider(failed_resource_ids={failed_resource_id})
+    service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
+
+    def fail_outcome_cas(*_args, **_kwargs):
+        raise OllamaLeaseConflictError(
+            f"cleanup outcome CAS failed for {failed_resource_id}"
+        )
+
+    monkeypatch.setattr(service.repository, record_method, fail_outcome_cas)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await service._teardown_all_effects(claimed, reason="test cleanup")
+
+    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    messages = _group_messages(caught.value)
+    assert any("teardown remains retryable" in message for message in messages)
+    assert any("outcome CAS failed" in message for message in messages)
 
 
 class _BlockingDeleteClient(_ControlClient):

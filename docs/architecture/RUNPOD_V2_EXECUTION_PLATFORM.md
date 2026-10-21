@@ -351,11 +351,14 @@ Confirmed fields are checked before reporting independent omissions so missing
 evidence cannot hide a known policy violation on an owned resource.
 
 The lease aggregate has one writer contract. Every insert starts at contract
-version 4/epoch 1, and every update must advance both the revision CAS and the
+version 5/epoch 1, and every update must advance both the revision CAS and the
 writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
-and deletes. Version 4 also prevents a retained version-1, version-2, or
-version-3 binary or migrator from reinstalling its weaker trigger set over a
-newer aggregate. Runtime
+and deletes. Version 5 also prevents a retained version-1 through version-4
+binary or migrator from reinstalling its weaker trigger set over a newer
+aggregate. Its explicit drained version-4 migration changes only writer
+metadata and revision; accepted intent, provisioning, cleanup, telemetry,
+billing, correction, retention, scheduling, route, and cost facts remain exact.
+Runtime
 startup never upgrades a legacy database. Operators must
 first drain every old binary, admitted HTTP effect, and route holder, then call
 the explicit one-shot `migrate_legacy_database()` entry point with an attestation
@@ -459,9 +462,13 @@ admission may record no provider effect. Migrated rows and missing original
 facts remain unknown rather than gain invented rates, timestamps, termination,
 zero cost, or debit authority.
 
-Legacy `manage_gpu` commands are operator-only Pod controls. They do not mutate
-or report LLM routing; the provider-neutral coordinator owns the sole active
-route and drains it before provider release.
+Legacy `manage_gpu` commands are operator-only stop/status/log controls over an
+already retained session. Ownerless legacy create and stopped-Pod resume fail
+before a provider action because they have no durable original-effect
+authority. New inference uses the provider-neutral lease coordinator, while
+catalog and training capacity use their existing durable Pod-capacity owners.
+The legacy command does not mutate or report LLM routing; the coordinator owns
+the sole active route and drains it before provider release.
 
 For bursty interactive sessions, the default candidate is load-balanced Serverless because Ollama's native HTTP and streaming contract requires direct routing. The endpoint must report healthy and `/api/tags` must show the requested model before Kestrel switches `LLMService` to the route. The caller handles load-balancer no-worker/initialization responses with bounded retry and never treats them as queued work. Runpod provides separate examples for [Ollama on Serverless](https://docs.runpod.io/tutorials/serverless/run-ollama-inference) and [Ollama on a Pod](https://docs.runpod.io/tutorials/pods/run-ollama).
 
