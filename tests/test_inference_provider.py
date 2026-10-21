@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
-from datetime import timedelta
-from decimal import Decimal
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, localcontext
 from importlib import metadata as importlib_metadata
 
 import pytest
@@ -19,20 +21,30 @@ from kestrel_sdk.llm import (
     InferenceLeaseRequest,
     InferenceLeaseState,
     InferencePrivacy,
+    InferenceRoute,
 )
+from kestrel_sovereign.llm.inference_leases import InferenceLeaseCoordinator
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
     serverless_plan,
 )
+from pydantic import SecretStr
 
+from kestrel_cloud_runpod.billing import exact_decimal_integer_scale
 from kestrel_cloud_runpod.inference_provider import RunpodInferenceLeaseProvider
 from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaLeaseMode,
     OllamaLeaseState,
+    OllamaProvisioningEvidenceState,
     OllamaResourceType,
 )
-from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
+from kestrel_cloud_runpod.ollama_repository import (
+    _WRITER_CONTRACT_COLUMNS,
+    OllamaWriterDrainAttestation,
+    SQLiteOllamaLeaseRepository,
+)
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 
 _DIGEST = "a" * 64
@@ -165,6 +177,30 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
     assert lease.route is None
     assert capacity.provision_calls == 1
     assert service.repository.get(lease.lease_id).route_url is None
+
+
+@pytest.mark.asyncio
+async def test_directed_component_total_quote_validates_on_acquire(tmp_path):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(
+            rate=0.47,
+            estimated_cost=0.05091666666666667,
+            maximum_compute_cost=0.05483333333333334,
+            estimated_non_compute_cost=0.2,
+            maximum_non_compute_cost=0.2,
+        )
+    )
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock)
+
+    quote = await adapter.quote(request)
+    lease = await adapter.acquire(request, quote)
+
+    assert quote.metadata["estimated_all_in_cost_usd"] == "0.2509166666666667"
+    assert quote.metadata["all_in_cost_ceiling_usd"] == "0.25483333333333336"
+    assert lease.state is InferenceLeaseState.PENDING
+    assert capacity.provision_calls == 1
 
 
 @pytest.mark.asyncio
@@ -566,8 +602,8 @@ async def test_transient_ready_route_loss_fails_closed_without_cold_restart(tmp_
 
 
 class _FailingProvisionProvider(FakeOllamaProvider):
-    async def provision(self, **kwargs):
-        del kwargs
+    async def provision(self, prepared):
+        del prepared
         self.provision_calls += 1
         raise RunPodManagerError("provider URL=https://secret.invalid token=hidden")
 
@@ -695,6 +731,52 @@ async def test_sdk_quote_rejects_a_multi_gpu_placement_over_the_hourly_cap(
         quote.validate_for(_request(clock, max_hourly_cost_usd=Decimal("1.00")))
 
 
+@pytest.mark.asyncio
+async def test_sdk_multi_gpu_cap_cannot_be_rounded_open_by_decimal_context(tmp_path):
+    """Every SDK cost boundary must use the same exact whole-placement rate."""
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.47, estimated_cost=0.1, gpu_count=3)
+    )
+    adapter, _service, _capacity = _adapter(
+        tmp_path, clock, capacity=capacity, gpu_count=3
+    )
+    request = _request(clock, max_hourly_cost_usd=Decimal("1.40"))
+
+    with localcontext() as context:
+        context.prec = 2
+        with pytest.raises(InferenceLeaseProviderUnavailableError):
+            await adapter.quote(request)
+
+    assert capacity.provision_calls == 0
+
+
+def test_internal_caps_are_conservative_for_high_precision_callers(tmp_path):
+    clock = MutableClock()
+    adapter, _service, _capacity = _adapter(tmp_path, clock, gpu_count=3)
+    runtime = adapter._get_runtime()
+    hourly_cap = Decimal("1.4099999999999999")
+    total_cap = Decimal("1.9999999999999999")
+
+    internal = adapter._internal_request(
+        _request(clock),
+        policy=runtime.policy,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        provider_region="US-TX-3",
+        max_hourly_cost=hourly_cap,
+        max_total_cost=total_cap,
+    )
+
+    assert (
+        exact_decimal_integer_scale(
+            Decimal.from_float(internal.constraints.max_hourly_rate), 3
+        )
+        <= hourly_cap
+    )
+    assert Decimal.from_float(internal.max_authorized_cost) <= total_cap
+
+
 @pytest.mark.parametrize(
     "price, gpu_count",
     [(0.99, 3), (0.39, 3), (0.70, 3), (1.99, 5), (0.49, 7), (3.99, 7)],
@@ -755,6 +837,228 @@ async def test_durable_lease_hourly_cost_covers_every_gpu(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_durable_multi_gpu_cost_is_independent_of_decimal_context(tmp_path):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(
+        serverless_plan(rate=0.47, estimated_cost=0.1, gpu_count=3)
+    )
+    adapter, _service, _capacity = _adapter(
+        tmp_path, clock, capacity=capacity, gpu_count=3
+    )
+    request = _request(clock, max_hourly_cost_usd=Decimal("1.41"))
+    quote = await adapter.quote(request)
+    lease = await adapter.acquire(request, quote)
+
+    with localcontext() as context:
+        context.prec = 2
+        reloaded = await adapter.status(request.owner_id, lease.lease_id)
+
+    assert reloaded.hourly_cost_usd == Decimal("1.41")
+
+
+@pytest.mark.asyncio
+async def test_total_cost_planning_never_rounds_below_exact_multi_gpu_exposure(
+    tmp_path,
+):
+    clock = MutableClock()
+    request = _request(
+        clock,
+        expected_session_seconds=3600,
+        max_hourly_cost_usd=Decimal("1.41"),
+        max_total_cost_usd=Decimal("1.40"),
+    )
+
+    with localcontext() as context:
+        context.prec = 2
+        # This fixture uses the production rate/sum formula, so constructing it
+        # inside the hostile context reproduces the provider's understated plan.
+        capacity = FakeOllamaProvider(
+            serverless_plan(
+                rate=0.47,
+                estimated_cost=1.41,
+                maximum_compute_cost=1.41,
+                gpu_count=3,
+            )
+        )
+        adapter, _service, capacity = _adapter(
+            tmp_path, clock, capacity=capacity, gpu_count=3
+        )
+        with pytest.raises(InferenceLeaseProviderUnavailableError):
+            await adapter.quote(request)
+
+    assert capacity.provision_calls == 0
+
+
+@pytest.mark.parametrize(
+    "internal_state", [OllamaLeaseState.READY, OllamaLeaseState.TERMINATED]
+)
+def test_sdk_projection_exposes_historical_unknown_manual_debt(
+    tmp_path, internal_state
+):
+    clock = MutableClock()
+    adapter, service, _capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    internal_request = adapter._internal_request(
+        request,
+        policy=adapter._get_runtime().policy,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        provider_region="US-TX-3",
+        max_hourly_cost=request.max_hourly_cost_usd,
+        max_total_cost=request.max_total_cost_usd,
+    )
+    lease, _ = service.repository.insert_request(internal_request, now=clock())
+    historical = replace(
+        lease,
+        state=internal_state,
+        provisioning_evidence_state=(
+            OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+        ),
+        route_url=None,
+    )
+
+    projected = adapter._to_sdk_lease(historical, runtime=adapter._get_runtime())
+
+    assert projected.state is InferenceLeaseState.RELEASING
+    assert projected.route is None
+    assert projected.failure is None
+    assert projected.metadata["provisioning_evidence_state"] == "historical_unknown"
+    assert projected.metadata["manual_reconciliation_required"] is True
+    assert projected.hourly_cost_usd == request.max_hourly_cost_usd
+    assert projected.estimated_total_cost_usd == request.max_total_cost_usd
+
+
+@pytest.mark.asyncio
+async def test_core_coordinator_retains_historical_unknown_as_manual_debt(tmp_path):
+    """Exercise the installed Core coordinator, not only the adapter DTO."""
+
+    class _LLMService:
+        def __init__(self):
+            self.activated = 0
+            self.deactivated = 0
+
+        async def activate_inference_lease(self, *_args, **_kwargs):
+            self.activated += 1
+
+        async def deactivate_inference_lease(self, *_args, **_kwargs):
+            self.deactivated += 1
+
+    clock = MutableClock()
+    clock.value = datetime.now(UTC)
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    admitted = await adapter.acquire(request, quote)
+    assert capacity.provision_calls == 1
+    database = service.repository.path
+    with closing(sqlite3.connect(database)) as connection, connection:
+        triggers = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'ollama_leases'"
+        ).fetchall()
+        for (trigger,) in triggers:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("DROP INDEX idx_ollama_leases_reconcile")
+        for column in sorted(_WRITER_CONTRACT_COLUMNS):
+            connection.execute(f"ALTER TABLE ollama_leases DROP COLUMN {column}")
+        connection.execute(
+            "CREATE INDEX idx_ollama_leases_reconcile "
+            "ON ollama_leases(state, idle_deadline, hard_deadline)"
+        )
+    service.repository = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        database,
+        attestation=OllamaWriterDrainAttestation(
+            database_path=database,
+            drained_at=clock(),
+            drain_reference_sha256="a" * 64,
+        ),
+    )
+    migrated = service.repository.get(admitted.lease_id)
+    assert migrated is not None
+    assert migrated.lifecycle_billing_state.value == "unknown"
+    assert migrated.lifecycle_billing_observations == ()
+
+    persisted = []
+
+    async def persist(value):
+        persisted.append(value)
+
+    llm = _LLMService()
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=llm,
+        owner_id=request.owner_id,
+        providers={"runpod": adapter},
+        persist_state=persist,
+    )
+    acquired = await coordinator.acquire(request)
+    assert acquired.state is InferenceLeaseState.RELEASING
+    assert acquired.metadata["manual_reconciliation_required"] is True
+    assert llm.activated == 0
+    assert capacity.provision_calls == 1
+    with pytest.raises(InferenceLeaseProvisioningError, match="release"):
+        await coordinator.acquire(request)
+    status = await coordinator.status(acquired.lease_id)
+    assert status.state is InferenceLeaseState.RELEASING
+
+    restarted = InferenceLeaseCoordinator(
+        llm_service=llm,
+        owner_id=request.owner_id,
+        providers={"runpod": adapter},
+        persist_state=persist,
+    )
+    restored = await restarted.restore(persisted[-1])
+    assert restored is not None
+    assert restored.state is InferenceLeaseState.RELEASING
+    clock.advance(1)
+    released = await restarted.release(restored.lease_id)
+    assert released.state is InferenceLeaseState.RELEASING
+    assert restarted.current_record is not None
+    assert restarted.current_record.lease is not None
+    assert restarted.current_record.lease.state is InferenceLeaseState.RELEASING
+    assert (
+        restarted.current_record.lease.metadata["manual_reconciliation_required"]
+        is True
+    )
+    assert llm.deactivated == 5
+
+
+def test_installed_core_accepts_manual_debt_from_every_live_predecessor(tmp_path):
+    """Pin the real Core transition contract used by the UNKNOWN projection."""
+
+    clock = MutableClock()
+    adapter, service, _capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    internal_request = adapter._internal_request(
+        request,
+        policy=adapter._get_runtime().policy,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        provider_region="US-TX-3",
+        max_hourly_cost=request.max_hourly_cost_usd,
+        max_total_cost=request.max_total_cost_usd,
+    )
+    internal, _ = service.repository.insert_request(internal_request, now=clock())
+    historical = replace(
+        internal,
+        provisioning_evidence_state=(
+            OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+        ),
+    )
+    current = adapter._to_sdk_lease(historical, runtime=adapter._get_runtime())
+    assert current.state is InferenceLeaseState.RELEASING
+
+    pending = replace(current, state=InferenceLeaseState.PENDING)
+    ready = replace(
+        current,
+        state=InferenceLeaseState.READY,
+        route=InferenceRoute(
+            endpoint=SecretStr("https://owned.invalid/v1"),
+            model=current.model,
+        ),
+    )
+    for previous in (pending, ready, current):
+        InferenceLeaseCoordinator._validate_transition(previous, current)
+
+
+@pytest.mark.asyncio
 async def test_profile_gpu_count_converts_the_caller_cap_to_a_per_gpu_budget(
     tmp_path,
 ):
@@ -800,13 +1104,21 @@ async def test_unprovisioned_lease_reports_the_whole_lease_hourly_cost(tmp_path)
     adapter, service, _c = _adapter(tmp_path, clock, capacity=capacity, gpu_count=2)
     request = _request(clock, max_hourly_cost_usd=D("1.00"))
     quote = await adapter.quote(request)
-    lease = await adapter.acquire(request, quote)
+    runtime = adapter._get_runtime()
+    internal_request = adapter._internal_request(
+        request,
+        policy=runtime.policy,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        provider_region=runtime.policy.regions[quote.region],
+        max_hourly_cost=quote.hourly_cost_usd,
+        max_total_cost=request.max_total_cost_usd,
+    )
+    stored, inserted = service.repository.insert_request(internal_request, now=clock())
+    assert inserted is True
 
-    # Simulate the crash window: the row exists with no realized rate yet.
-    stored = service.repository.get(lease.lease_id)
-    service.repository.compare_and_set(stored, changes={"offered_rate_per_hr": None})
-
-    reloaded = await adapter.status(request.owner_id, lease.lease_id)
+    # Exercise the genuine pre-provision crash window: the durable REQUESTED
+    # row has no catalog observation yet, so cost reporting uses its bound.
+    reloaded = adapter._to_sdk_lease(stored, runtime=runtime)
     assert reloaded.hourly_cost_usd == D("1.00")
 
 

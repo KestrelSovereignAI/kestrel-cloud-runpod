@@ -514,16 +514,27 @@ class RunpodControlPlaneClient:
             raise RunPodManagerError(
                 "Legacy endpoint authority must upgrade before new spend"
             )
-        payload = _required_payload(
-            self.transport.request_json(
-                "POST",
-                "/serverless",
-                json_body=request.to_payload(),
-                expected_statuses=(201,),
-                ambiguous_on_failure=True,
-            )
+        payload = self.transport.request_json(
+            "POST",
+            "/serverless",
+            json_body=request.to_payload(),
+            expected_statuses=(201,),
+            ambiguous_on_failure=True,
         )
-        return EndpointResource.from_dict(payload)
+        try:
+            return EndpointResource.from_dict(_required_payload(payload))
+        except (RunPodManagerError, RecursionError):
+            raise RunPodAmbiguousResultError(
+                title="Unverified Endpoint creation response",
+                detail=(
+                    "The successful create response omitted a usable identity; "
+                    "reconcile before retrying"
+                ),
+                status_code=201,
+                method="POST",
+                resource="/serverless",
+                rate_limit=self.transport.last_rate_limit,
+            ) from None
 
     def get_endpoint(self, endpoint_id: str) -> EndpointResource:
         payload = _required_payload(

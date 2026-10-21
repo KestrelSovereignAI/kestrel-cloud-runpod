@@ -1,7 +1,8 @@
 """Cost selection and public-route contracts for Ollama leases."""
 
-from datetime import timedelta
 from dataclasses import replace
+from datetime import timedelta
+from decimal import Clamped, Inexact, Rounded, Subnormal, Underflow, localcontext
 
 import pytest
 from ollama_test_support import (
@@ -17,12 +18,11 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLease,
     OllamaLeaseMode,
     OllamaLeaseState,
+    OllamaPlacementPlan,
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
     authorized_cost_exposure,
-    OllamaPlacementPlan,
-    OllamaResourceType,
     canonical_model_name,
     maximum_serverless_cold_starts,
     sanitize_provider_error,
@@ -292,6 +292,49 @@ def test_all_in_ceiling_exact_boundary_and_tiny_overage(extra_overhead, affordab
             select_ollama_plan(**arguments)
 
 
+def test_tiny_component_sum_never_rounds_away_under_hostile_decimal_context():
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.DEDICATED_POD,
+        expected_session_seconds=1,
+        expected_active_seconds=1,
+        hard_deadline=clock() + timedelta(seconds=1),
+        max_authorized_cost=0.00001,
+    )
+    policies = non_compute_cost_policies(estimated=0.00001, maximum=0.00001)
+    arguments = {
+        "request": request,
+        "decisions": {
+            ComputeProduct.POD: make_decision(
+                ComputeProduct.POD,
+                rate=0.036,
+                gpu_id="pod",
+                pool=None,
+            )
+        },
+        "non_compute_cost_policies": policies,
+        "planned_at": clock(),
+        "serverless_max_workers": 1,
+    }
+
+    with localcontext() as context:
+        context.prec = 2
+        context.Emin = -1
+        for signal in (Underflow, Subnormal, Inexact, Rounded, Clamped):
+            context.traps[signal] = False
+        with pytest.raises(RunPodManagerError, match="authorized cost"):
+            select_ollama_plan(**arguments)
+        plan = select_ollama_plan(
+            **{
+                **arguments,
+                "request": replace(request, max_authorized_cost=0.00002),
+            }
+        )
+
+    assert plan.cost_ceiling == 0.00002
+
+
 @pytest.mark.parametrize(
     "mode, product",
     [
@@ -494,13 +537,13 @@ def test_accrued_cost_bills_every_gpu_in_the_placement():
     """
     clock = MutableClock()
     started = clock()
-    base = dict(
-        offered_rate_per_hr=1.0,
-        provisioning_started_at=started,
-        hard_deadline=started + timedelta(hours=4),
-        maximum_concurrent_workers=1,
-        accrued_estimated_cost=0.0,
-    )
+    base = {
+        "offered_rate_per_hr": 1.0,
+        "provisioning_started_at": started,
+        "hard_deadline": started + timedelta(hours=4),
+        "maximum_concurrent_workers": 1,
+        "accrued_estimated_cost": 0.0,
+    }
     single = replace(_accrual_lease(), **base, placement_gpu_count=1)
     quad = replace(_accrual_lease(), **base, placement_gpu_count=4)
     now = started + timedelta(hours=1)
@@ -604,13 +647,13 @@ def test_accrued_cost_bills_every_serverless_worker():
     """
     clock = MutableClock()
     started = clock()
-    base = dict(
-        offered_rate_per_hr=1.0,
-        provisioning_started_at=started,
-        hard_deadline=started + timedelta(hours=4),
-        accrued_estimated_cost=0.0,
-        placement_gpu_count=1,
-    )
+    base = {
+        "offered_rate_per_hr": 1.0,
+        "provisioning_started_at": started,
+        "hard_deadline": started + timedelta(hours=4),
+        "accrued_estimated_cost": 0.0,
+        "placement_gpu_count": 1,
+    }
     one = replace(_accrual_lease(), **base, maximum_concurrent_workers=1)
     five = replace(_accrual_lease(), **base, maximum_concurrent_workers=5)
     now = started + timedelta(hours=1)

@@ -18,6 +18,12 @@ orphan_timeout_seconds = 90
 [ollama_leases]
 database_path = "${KESTREL_HOME}/state/runpod-ollama-leases.sqlite3"
 poll_interval_seconds = 5
+billing_poll_interval_seconds = 3600
+billing_batch_hours = 24
+reconciliation_batch_size = 100
+maximum_telemetry_observations = 256
+maximum_billing_observations = 128
+maximum_evidence_bytes = 1048576
 serverless_workers_max = 1
 serverless_request_count = 1
 serverless_execution_timeout_ms = 300000

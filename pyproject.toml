@@ -35,7 +35,7 @@ dependencies = [
     "kestrel-sovereign-sdk>=0.35.0,<1",
     # Canonical joined-operation and native terminal-evidence composition.
     # Do not duplicate Core's ownership algorithm in the cloud adapter.
-    "kestrel-sovereign>=0.53.35,<1",
+    "kestrel-sovereign>=0.53.37,<1",
     # Direct runtime dep of signed_invocations (Ed25519 receipt signing and
     # verification).  Declared explicitly rather than leaned on transitively:
     # kestrel-sovereign-sdk already puts cryptography behind a `crypto` extra,

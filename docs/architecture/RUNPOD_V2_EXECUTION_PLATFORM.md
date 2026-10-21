@@ -196,7 +196,7 @@ See Runpod's [Serverless pricing](https://docs.runpod.io/serverless/pricing) and
 | Load-balanced Serverless | Interactive Ollama/native HTTP streaming | Direct request routing, no durable queue and no automatic backlog handling; callers retry readiness/no-worker responses safely | Scale to zero for bursty sessions, with an intentional warm idle window |
 | Dedicated Pod | Sustained Ollama sessions, LoRA training when benchmark evidence favors it, and development canaries | Kestrel owns durable capacity, readiness, a hard deadline, and external stop/termination reconciliation | Prefer only when expected utilization or model-cache reuse beats measured Serverless initialization and idle tail |
 
-Runpod documents the behavior and tradeoffs of [queue and load-balancing endpoints](https://docs.runpod.io/serverless/load-balancing/overview). A catalog request never creates a Pod: it submits to a provisioned endpoint and lets Runpod scale workers. Endpoint definitions are managed declaratively through the v2 control plane and reused across jobs.
+Runpod documents the behavior and tradeoffs of [queue and load-balancing endpoints](https://docs.runpod.io/serverless/load-balancing/overview). Catalog execution is transport-specific: selfie and avatar inference submit to an operation-bound queue-based endpoint after its durable activation, while explicit LoRA training creates one disposable, attempt-scoped v2 Pod. Frinz persists each original endpoint or Pod identity and its cleanup authority; an owned inference endpoint and disposable training capacity are physically retired and verified absent before lifecycle settlement. Neither path treats an unowned shared endpoint as reusable job authority.
 
 Endpoint policy is measured per workload. Initial safe defaults are minimum workers zero, a bounded maximum worker count, FlashBoot enabled, and explicit queue/idle/execution timeouts. Production values are outputs of the benchmark gate, not constants in this record.
 
@@ -297,6 +297,110 @@ only after an authenticated exact-ID GET reports 404, not merely because the
 delete/action request was acknowledged. A present resource, authentication
 failure or unavailable read keeps teardown pending for reconciliation.
 
+One service clock instant and one recursively immutable prepared create object
+define each admitted attempt. The request owns a deep-frozen copy of every
+environment, scaling, and mount value before admission, so the digest check and
+threaded HTTP serialization consume the same snapshot. Before POST, SQLite
+stores a content-safe canonical intent containing the exact payload digest,
+environment-key set and environment-value digest; the raw environment values
+remain only in that in-memory prepared request.
+The aggregate also stores the original nullable `requested_at` value and exact
+readiness-timeout integer used by the request fingerprint. A REQUESTED restart
+reuses those inputs byte-for-byte; it never derives replacement authority from
+`created_at`, a deadline, or the restart clock. Accepted per-GPU catalog rates
+are scaled to whole-resource rates with context-independent Decimal/integer
+arithmetic, so ambient Decimal precision cannot alter durable authority.
+After POST, the provider ID is acknowledged before an exact-ID GET is used to
+construct an immutable provisioning receipt. Endpoint image and environment
+are optional in the v2 response schema, as are Endpoint type, disk, ports, and
+an explicitly accepted registry; their omission is unavailable evidence rather
+than a confirmed mismatch and can never produce `READY`. Pod mounts are
+required response evidence: explicit `{}` proves mountless policy, while
+omission or `null` does not. Dedicated-Pod
+placement and whole-Pod rate likewise come only from a live `PROVISIONING`,
+`STARTING`, or `RUNNING` readback. A live numeric zero is valid while an absent
+rate is not; the receipt labels its precision as a parsed JSON number because
+the transport does not retain the provider's original numeric lexeme.
+
+The low-level v2 resource decoder therefore separates identity from sibling
+evidence. A non-empty provider ID and name may be returned with immutable,
+sanitized `missing`/`invalid` field evidence so the caller retains the exact
+POST acknowledgment; malformed identity remains an ambiguous create result.
+This partial object is not compatibility or readiness proof. The compatibility
+Pod manager and generic Serverless lifecycle require valid evidence before
+using raw configuration, and the Ollama provider folds every field into its one
+complete provisioning assessment. Invalid status, rate, placement, policy,
+environment, or request-URL data can consequently retain cleanup custody but
+cannot publish a route, invoke a model, or manufacture a provisioning receipt.
+
+A confirmed incompatible known resource is different from an incomplete
+readback. Wrong identity, image, environment, placement, runtime policy, or a
+live Pod rate above the accepted ceiling creates sanitized mismatch evidence
+and immediately enters the same fenced exact-ID teardown path. It never waits
+at a readiness deadline while known-wrong capacity accrues cost, publishes a
+route, or fabricates a successful receipt. Missing fields and transient reads
+remain `RECONCILE_REQUIRED` with the POST-acknowledged ID. Name-based inventory
+can locate an ambiguous-create candidate only. That candidate is persisted in
+a separate immutable aggregate field and survives restart, but is neither
+provider ownership nor deletion authority. Only a complete exact-ID readback
+that binds the original intent may atomically promote it to the owned provider
+ID; incomplete or mismatching candidate evidence never authorizes DELETE.
+Direct POST acknowledgement does authorize cleanup of that exact ID even when
+optional readback evidence remains unavailable, but never authorizes readiness.
+Confirmed fields are checked before reporting independent omissions so missing
+evidence cannot hide a known policy violation on an owned resource.
+
+The lease aggregate has one writer contract. Every insert starts at contract
+version 3/epoch 1, and every update must advance both the revision CAS and the
+writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
+and deletes. Version 3 also prevents a retained version-1 or version-2 binary
+or migrator from reinstalling its weaker trigger set over a newer aggregate. Runtime
+startup never upgrades a legacy database. Operators must
+first drain every old binary, admitted HTTP effect, and route holder, then call
+the explicit one-shot `migrate_legacy_database()` entry point with an attestation
+bound to that absolute database. The SDK requires that assertion but cannot
+observe the process drain. Startup reads the live database and any outstanding
+WAL inside one exclusive transaction before it performs schema or index DDL;
+missing columns, wrong column definitions, non-canonical indexes, or
+non-canonical triggers fail closed rather than being repaired implicitly.
+The validator creates an isolated reference schema from the same table, index,
+and trigger DDL builders, then compares the full table metadata, literal SQL,
+implicit and explicit index origins/columns, and trigger text before touching
+the target. It does not case-fold or whitespace-normalize executable SQL.
+Schema addition, historical classification, route scrub, and
+trigger installation occur in that same transaction, so a failed or concurrent
+initializer cannot expose a partly fenced store. Existing
+non-requested rows are classified `HISTORICAL_UNKNOWN` and remain cleanup-only;
+saved routes are cleared in the same pre-trigger classification write, and no
+migration backfills missing original fingerprint inputs or derives original
+evidence from current configuration. A legacy provider ID is retained only as
+an untrusted reconciliation locator, never as deletion authority. Legacy
+terminal flags, a false create-uncertainty flag, or a locator 404 do not prove
+original acknowledgement, physical absence, termination, or zero cost. These
+rows remain route-less and visible as unknown debt. The SDK projects them as
+`RELEASING`, Core's nonterminal state accepted from each live predecessor, with
+original request/quote cost bounds and explicit manual-reconciliation metadata.
+Provider cleanup still refuses because the retained locator is not ownership;
+repeated Core status/release calls therefore cannot delete possibly foreign
+capacity or describe the debt as released. Core 0.53.37 refreshes provider
+evidence before returning cached terminal records and invalidates stale terminal
+evidence to the provider-neutral `RELEASING` state. This keeps historical debt
+visible and prevents replacement without teaching Core provider-specific
+metadata. New public integer and float cost spellings are normalized once
+before first acceptance, while already accepted fingerprints replay their exact
+original representation. SQLite
+triggers cannot retroactively fence an old process that already admitted an
+HTTP effect, which is why the deployment drain is mandatory.
+
+Original readiness and hard deadlines are sampled again after every awaited
+planning, provisioning, readback, and readiness boundary. A late plan never
+admits POST, and a late observation cannot backdate `ready_at` or publish a
+route; a known owned resource instead joins the existing teardown path. An
+original POST acknowledgement is attached transactionally to the latest
+matching intent/attempt lineage. A concurrent release or terminalization stays
+route-less and resumes only cleanup; a different name-discovery locator remains
+immutable and untrusted, and cannot displace the acknowledged exact ID.
+
 Every `OllamaCapacityProvider` implements the pure, no-I/O
 `validate_runtime_request()` contract. Both quoting and the canonical lease
 service call it for a concrete selected mode; the service does so before
@@ -305,12 +409,36 @@ Invalid immutable-image/model/credential configuration therefore fails with
 zero provisioning attempts and no uncertain-create debt. All errors after
 admission still retain uncertain-create custody rather than infer no resource.
 
-These physical lifecycle safeguards are not observed financial evidence.
-Catalog offer prices and cold-start estimates remain estimates. Durable
-original realized-rate/readback provenance, immutable verified-absence receipts
-and resumable closed-hour billing are required before reporting actual Ollama
-lifecycle cost; historical rows must remain unknown rather than gain invented
-rates, timestamps or debit authority.
+Before teardown I/O, the same lease aggregate freezes one cleanup intent with
+the original provider ID and action-start time. Retries reuse that intent. A
+cleanup receipt records the later exact-ID absence observation as an upper
+bound; it does not invent the provider's exact termination instant. Provider
+reads remain outside SQLite, while service-owned tasks join DELETE, absence
+readback, and the receipt write under the existing effect-custody boundary.
+
+The authenticated runtime exposes a content-free telemetry snapshot on the
+same bearer-protected route. Its original intent binding is committed before
+readiness. Process identity, monotonic revision, cumulative outcome counters,
+and union busy duration can advance; a restart, regression, retention limit,
+or missing final zero-in-flight observation makes the lineage permanently
+partial. Prompts, responses, tokens, model names, and credentials are not
+telemetry fields. Ordinary telemetry unavailability cannot abandon required
+cleanup, and it never becomes billing evidence.
+
+After verified absence, reconciliation reuses the canonical exact Pod or
+Serverless billing reader over the original create-to-absence window. Only
+closed, complete provider buckets can become an observation. The first complete
+observation is selected immutably; later provider revisions are append-only
+correction evidence and never replace it, debit an account, or claim provider
+invoice finality. Polling, batch size, observation count, and serialized
+evidence bytes are explicitly bounded. At a retention limit the existing
+selection is preserved and manual reconciliation remains visible rather than
+truncating history. Missing non-compute amounts keep all-in cost unknown; a raw
+provider-capacity amount above the original cap is reported separately as
+exceeded. Only a fresh version-3 request proven never to have reached provider
+admission may record no provider effect. Migrated rows and missing original
+facts remain unknown rather than gain invented rates, timestamps, termination,
+zero cost, or debit authority.
 
 Legacy `manage_gpu` commands are operator-only Pod controls. They do not mutate
 or report LLM routing; the provider-neutral coordinator owns the sole active
@@ -403,7 +531,7 @@ flowchart TD
     LeaseAPI --> Cleanup
 ```
 
-The local Mac executor stays available as an explicit configured backend throughout the catalog migration. Canarying and rollback select that backend deliberately; a Runpod failure does not silently reroute private work.
+The local Mac executor remains an explicit backend choice only when a live schema-3 worker capability adapter proves its readiness. Static configuration does not make it available: catalog startup currently fails closed until the local contract in [frinz-catalog#77](https://github.com/KestrelSovereignAI/frinz-catalog/issues/77) and [Frinz#827](https://github.com/KestrelSovereignAI/frinz/issues/827) is complete. Canarying or rollback may select that backend deliberately after readiness is proven; a Runpod failure never silently reroutes private work.
 
 ## Launch gates
 

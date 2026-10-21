@@ -13,6 +13,7 @@ from kestrel_cloud_runpod.models import (
     CpuPodCreateRequest,
     PodCreateRequest,
     PodResource,
+    ResourceFieldState,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -132,6 +133,7 @@ def test_cpu_flavor_is_required(cpu_id):
         {"mounts": {"unknown": []}},
         {"mounts": []},
         {"mounts": {"network": None}},
+        {"mounts": {"network": ()}},
         {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
         {"mounts": {"network": [{"volumeId": "v"}]}},
         {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
@@ -143,22 +145,31 @@ def test_cpu_rejects_unsupported_networking_and_storage(fields):
         cpu_request(**fields)
 
 
-def test_mutated_mount_mapping_is_refused_before_sending():
+def test_cpu_request_deeply_owns_environment_and_mount_payload():
     mounts = {"network": [{"volumeId": "v", "path": "/workspace"}]}
-    request = cpu_request(mounts=mounts)
+    environment = {"PRIVATE": "original"}
+    request = cpu_request(mounts=mounts, env=environment)
     mounts["persistent"] = {"size": 1, "path": "/other"}
+    mounts["network"][0]["volumeId"] = "foreign"
+    environment["PRIVATE"] = "mutated"
     calls = []
-    with (
-        closing(
-            RunpodControlPlaneClient(
-                api_key="unit-test",
-                http_transport=httpx.MockTransport(lambda req: calls.append(req)),
-            )
-        ) as client,
-        pytest.raises(ValueError, match="CPU Pod"),
-    ):
+
+    def handler(raw_request):
+        calls.append(raw_request)
+        payload = json.loads(raw_request.content)
+        assert payload["env"] == {"PRIVATE": "original"}
+        assert payload["mounts"] == {
+            "network": [{"volumeId": "v", "path": "/workspace"}]
+        }
+        return httpx.Response(201, json=pod())
+
+    with closing(
+        RunpodControlPlaneClient(
+            api_key="unit-test", http_transport=httpx.MockTransport(handler)
+        )
+    ) as client:
         client.create_pod(request)
-    assert calls == []
+    assert len(calls) == 1
 
 
 def test_cpu_create_inspect_and_delete_use_existing_v2_transport():
@@ -213,7 +224,7 @@ def test_lost_cpu_create_response_remains_unknown_without_replay():
     assert len(calls) == 1
 
 
-def test_invalid_success_receipt_keeps_creation_uncertain():
+def test_known_create_id_retains_invalid_optional_success_evidence():
     calls = []
 
     def handler(request):
@@ -224,18 +235,21 @@ def test_invalid_success_receipt_keeps_creation_uncertain():
             headers={"Retry-After": "3"},
         )
 
-    with (
-        closing(
-            RunpodControlPlaneClient(
-                api_key="unit-test", http_transport=httpx.MockTransport(handler)
-            )
-        ) as client,
-        pytest.raises(RunPodAmbiguousResultError) as result,
-    ):
-        client.create_pod(cpu_request())
-    assert len(calls) == 1 and result.value.reconcile_required
+    with closing(
+        RunpodControlPlaneClient(
+            api_key="unit-test", http_transport=httpx.MockTransport(handler)
+        )
+    ) as client:
+        created = client.create_pod(cpu_request())
+        assert client.transport.last_rate_limit.retry_after_seconds == 3
+    assert len(calls) == 1
+    assert created.id == "cpu-pod"
+    assert created.cost_per_hr is None
+    assert created.field_evidence.state("cost") is ResourceFieldState.INVALID
+    assert created.raw["env"] == {"PRIVATE": "[REDACTED]"}
+    with pytest.raises(RunPodManagerError, match="cost") as result:
+        created.require_valid_fields(context="v2 Pod create")
     assert "must-not-leak" not in str(result.value)
-    assert result.value.rate_limit.retry_after_seconds == 3
 
 
 @pytest.mark.parametrize("body", [b"", b"[]", b"not json", b"{}"])
@@ -300,8 +314,11 @@ def test_missing_rate_remains_unknown_for_every_pod(gpu):
 
 @pytest.mark.parametrize("rate", [-1, float("inf"), float("nan"), 10**400, True, "0.2"])
 def test_invalid_pod_rate_is_not_a_usable_price(rate):
-    with pytest.raises(RunPodManagerError, match="Pod.cost"):
-        PodResource.from_dict(pod(cost=rate))
+    resource = PodResource.from_dict(pod(cost=rate))
+    assert resource.cost_per_hr is None
+    assert resource.field_evidence.state("cost") is ResourceFieldState.INVALID
+    with pytest.raises(RunPodManagerError, match="cost"):
+        resource.require_valid_fields(context="v2 Pod readback")
 
 
 def test_explicit_zero_rate_remains_zero():
