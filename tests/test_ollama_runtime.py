@@ -139,6 +139,10 @@ def test_runpod_template_covers_pod_and_native_load_balancer() -> None:
         "/runpod-volume/ollama"
     )
     assert contract["models"]["arbitrary_pull"] is False
+    assert (
+        "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"
+        in (contract["environment"]["required"])
+    )
 
 
 def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
@@ -169,9 +173,10 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
     assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.9\n")
     assert "USER 0:0" in dockerfile
-    assert "prepareRuntimeFilesystem(config.ModelStoragePath)" in (
-        RUNTIME / "main.go"
-    ).read_text()
+    assert (
+        "prepareRuntimeFilesystem(config.ModelStoragePath)"
+        in (RUNTIME / "main.go").read_text()
+    )
     assert 'VOLUME ["/models"]' in dockerfile
     assert "EXPOSE 11434" in dockerfile
     assert "RUNPOD_API_KEY=" not in dockerfile

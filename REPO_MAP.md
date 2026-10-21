@@ -61,7 +61,7 @@ Repo entry points and standard project files.
 - **kestrel_cloud_runpod/manager.py** — RunPod Manager - Combined Class.
   - `class RunPodManager`
 - **kestrel_cloud_runpod/models.py** — Typed contracts for the Runpod v2 control and data planes.
-  - `class RunPodManagerError`; `class RunPodMountPolicyMismatchError`; `class ResourceFieldState`; `class ResourceFieldEvidence`; `def environment_values_sha256(environment)`; `def normalize_cuda_floor(value)`; `class EndpointMountAssessment`; `def assess_endpoint_mounts(raw, expected_network_volume_ids)`; `…`
+  - `class RunPodManagerError`; `class RunPodLegacyAdmissionRetiredError`; `class RunPodMountPolicyMismatchError`; `class ResourceFieldState`; `class ResourceFieldEvidence`; `def environment_values_sha256(environment)`; `def normalize_cuda_floor(value)`; `class EndpointMountAssessment`; `…`
 - **kestrel_cloud_runpod/ollama.py** — Runpod private-Ollama lease integration for :class:`RunPodManager`.
   - `class RunPodOllamaMixin`
 - **kestrel_cloud_runpod/ollama_contracts.py** — Typed contracts and cost policy for durable private-Ollama leases.
@@ -69,7 +69,7 @@ Repo entry points and standard project files.
 - **kestrel_cloud_runpod/ollama_provider.py** — Runpod v2 capacity, readiness, and teardown adapter for Ollama leases.
   - `class RunpodOllamaDeployment`; `class RunpodOllamaCapacityProvider`
 - **kestrel_cloud_runpod/ollama_reconciler.py** — One-shot entry point for externally scheduled Ollama lease reconciliation.
-  - `async def reconcile_once(manager_factory)`; `def main()`
+  - `async def reconcile_once(manager_factory)`; `def run_cli(argv)`; `def main()`
 - **kestrel_cloud_runpod/ollama_repository.py** — Transactional SQLite persistence for private-Ollama leases.
   - `class OllamaWriterDrainAttestation`; `class SQLiteOllamaLeaseRepository`; `def lease_database_path(config)`; `def request_from_lease(lease)`
 - **kestrel_cloud_runpod/ollama_runtime.py** — Canonical configuration contract for the authenticated Ollama workload.
@@ -109,7 +109,7 @@ Repo entry points and standard project files.
 - **kestrel_cloud_runpod/training_contracts.py** — Compatibility names for the canonical Pod capacity contracts.
 - **kestrel_cloud_runpod/training_provider.py** — Compatibility names for the canonical Pod capacity provider.
 - **kestrel_cloud_runpod/training_reconciler.py** — One-shot entry point for externally scheduled training Pod reconciliation.
-  - `class TrainingReconcileManager`; `async def reconcile_once(manager_factory)`; `def main()`
+  - `class TrainingReconcileManager`; `async def reconcile_once(manager_factory)`; `def run_cli(argv)`; `def main()`
 - **kestrel_cloud_runpod/training_repository.py** — Compatibility import for the canonical Pod capacity repository.
 - **kestrel_cloud_runpod/training_service.py** — Compatibility import for the canonical Pod capacity lease service.
 
@@ -172,13 +172,13 @@ Repo entry points and standard project files.
 - **tests/test_ollama_effect_custody.py** — Original Ollama effects must physically finish before cancellation escapes.
   - `class ThreadedProvider`; `def service(tmp_path, provider, clock)`; `async def test_cancellation_joins_original_thread_and_durable_receipt(tmp_path, effect)`; `async def test_release_during_post_cannot_discard_late_exact_acknowledgment(tmp_path)`; `async def test_late_exact_ack_does_not_replace_a_different_untrusted_locator(tmp_path)`; `async def test_original_ack_folds_after_same_id_discovery_reaches_ready(tmp_path)`; `async def test_different_valid_candidate_does_not_discard_original_post_custody(tmp_path)`; `async def test_original_post_ack_reopens_only_cleanup_after_candidate_is_terminal(tmp_path)`; `…`
 - **tests/test_ollama_lifecycle_followon_acceptance.py** — Native acceptance for Ollama lifecycle billing and telemetry custody.
-  - `async def test_runpod_provider_uses_exact_generic_serverless_billing_binding(billing_server)`; `async def test_runpod_provider_uses_exact_generic_pod_billing_binding(native_billing)`; `async def test_terminated_lease_remains_due_for_exact_lifecycle_billing(tmp_path, billing_server)`; `async def test_ready_observation_reads_authenticated_bound_startup_telemetry(monkeypatch)`; `async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding()`; `async def test_python_accepts_go_nanosecond_timestamps_with_zero_millisecond_delta()`
+  - `async def test_runpod_provider_uses_exact_generic_serverless_billing_binding(billing_server)`; `async def test_receiptless_cleanup_only_accepts_receipt_for_exact_resource()`; `async def test_runpod_provider_uses_exact_generic_pod_billing_binding(native_billing)`; `async def test_terminated_lease_remains_due_for_exact_lifecycle_billing(tmp_path, billing_server)`; `async def test_ready_observation_reads_authenticated_bound_startup_telemetry(monkeypatch)`; `async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding()`; `async def test_python_accepts_go_nanosecond_timestamps_with_zero_millisecond_delta()`
 - **tests/test_ollama_mixin.py** — Manager integration tests for the durable Ollama lease surface.
   - `async def test_mixin_delegates_only_to_injected_durable_service()`; `def test_mixin_has_no_in_memory_or_managed_provider_fallback()`; `def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch)`
 - **tests/test_ollama_provider.py** — Runpod v2 adapter tests with in-memory HTTP/control-plane doubles.
   - `def test_workload_credentials_must_not_reuse_control_or_cross_product_keys()`; `async def test_network_volume_cache_rejects_concurrent_serverless_writers(monkeypatch)`; `async def test_private_ollama_rejects_shared_serverless_gpu_pool(monkeypatch)`; `async def test_plan_uses_product_specific_live_catalog_prices(monkeypatch)`; `async def test_poolless_serverless_availability_fails_clearly_without_create(monkeypatch)`; `async def test_pooled_serverless_offer_survives_unrelated_poolless_offer(monkeypatch)`; `async def test_serverless_provision_is_load_balanced_and_configuration_owned(monkeypatch)`; `async def test_prepared_request_is_single_use_safe_and_mutation_detected(monkeypatch)`; `…`
 - **tests/test_ollama_reconciler.py** — External one-shot reconciler entry point tests.
-  - `async def test_reconcile_once_constructs_manager_and_runs_single_pass()`
+  - `async def test_reconcile_once_constructs_manager_and_runs_single_pass()`; `def test_cli_empty_arguments_preserve_one_shot_manager_contract()`
 - **tests/test_ollama_repository.py** — Persistence, idempotency, and restart tests for Ollama leases.
   - `def test_insert_is_idempotent_and_survives_repository_restart(tmp_path)`; `async def test_cleanup_claim_folds_latest_same_lineage_owned_target(tmp_path)`; `async def test_cleanup_claim_rejects_every_changed_lineage(tmp_path)`; `def test_two_repositories_cannot_claim_one_reconciliation_visit(tmp_path)`; `def test_two_processes_cannot_claim_one_reconciliation_visit(tmp_path)`; `def test_runtime_refuses_incomplete_current_schema_before_any_ddl(tmp_path)`; `def test_attested_migration_repairs_supported_incomplete_current_schema(tmp_path)`; `def test_attested_migration_preserves_previous_writer_contract_authority(tmp_path)`; `…`
 - **tests/test_ollama_runtime.py** — Authenticated Ollama runtime and Runpod template contract tests.
@@ -208,11 +208,11 @@ Repo entry points and standard project files.
 - **tests/test_runpod_clients.py** — HTTP and request-shape contracts for both Runpod v2 services.
   - `def test_control_client_auth_user_agent_catalog_query_and_timeouts()`; `def test_inventory_walks_all_pages_including_an_empty_intermediate_page(method, key, path, factory)`; `def test_inventory_rejects_missing_or_ambiguous_pagination(metadata)`; `def test_inventory_rejects_cursor_cycles_instead_of_hanging()`; `def test_inventory_bounds_a_provider_that_keeps_issuing_unique_cursors()`; `def test_inventory_page_bound_is_strictly_positive_and_integral(limit)`; `def test_inventory_rejects_duplicate_resources_across_pages()`; `def test_inventory_does_not_return_partial_success_after_a_later_page_fails()`; `…`
 - **tests/test_runpod_feature.py** — —
-  - `class FakeRunPodManager`; `class DummyLLMService`; `async def runpod_feature(monkeypatch)`; `async def test_manage_gpu_start_and_stop(runpod_feature)`; `async def test_image_generation_tears_down_session(runpod_feature)`; `async def test_manage_gpu_unknown_action_returns_failed(runpod_feature)`; `async def test_start_unknown_profile_returns_failed(runpod_feature)`; `async def test_start_invalid_ttl_returns_failed(runpod_feature)`; `…`
+  - `async def test_legacy_feature_refuses_direct_admission_before_acknowledged_post()`; `class FakeRunPodManager`; `class DummyLLMService`; `async def runpod_feature(monkeypatch)`; `async def test_manage_gpu_start_and_stop(runpod_feature)`; `async def test_image_generation_tears_down_session(runpod_feature)`; `async def test_manage_gpu_unknown_action_returns_failed(runpod_feature)`; `async def test_start_unknown_profile_returns_failed(runpod_feature)`; `…`
 - **tests/test_runpod_ga_authority.py** — GA creation and storage readback must enforce accepted workload constraints.
   - `def test_cuda_floor_is_sent_in_both_create_requests(floor, expected)`; `def test_invalid_cuda_constraints_fail_before_creation(floor)`; `def test_endpoint_create_explicitly_binds_both_storage_representations()`; `def test_partial_allowed_endpoint_mount_evidence_is_unavailable_not_foreign()`; `def test_historical_spec_round_trips_without_rewriting_its_authority()`; `def test_legacy_wire_shape_is_readable_but_the_transport_cannot_create_from_it()`; `def test_unknown_or_noncanonical_resource_version_cannot_be_deserialized(version)`; `def test_removing_a_ga_version_marker_cannot_downgrade_its_saved_authority()`; `…`
 - **tests/test_runpod_model_contracts.py** — Contracts for RunPod profile-owned model defaults.
-  - `def test_cuda_floor_requires_ascii_wire_numbers(floor)`; `def test_resource_authority_version_is_exported_with_public_contracts()`; `async def test_resume_stopped_pod_requires_profile_default_model()`
+  - `def test_cuda_floor_requires_ascii_wire_numbers(floor)`; `def test_resource_authority_version_is_exported_with_public_contracts()`; `async def test_resume_stopped_pod_refuses_ownerless_admission_before_provider_action()`
 - **tests/test_runpod_openapi_contract.py** — Parity tests between Kestrel's typed calls and the pinned v2 schema.
   - `def test_pin_checksum_and_validator_script()`; `def test_all_consumed_control_plane_operations_match_pin()`; `def test_consumed_request_and_response_shapes_match_pin()`; `def test_typed_create_and_update_payloads_validate_against_pin()`; `def test_runtime_base_url_matches_the_ga_schema_server()`; `def test_semantic_diff_reports_breaking_and_additive_changes()`; `def test_production_package_contains_no_v1_graphql_or_legacy_sdk_calls()`
 - **tests/test_runpod_placement.py** — Live-catalog placement policy tests.
@@ -232,11 +232,11 @@ Repo entry points and standard project files.
 - **tests/test_training_contracts.py** — Public durable training ownership contracts.
   - `def test_request_requires_ordered_aware_deadlines()`; `def test_create_request_does_not_accept_a_provider_id()`; `def test_lifecycle_error_exposes_cleanup_authority_without_provider_detail()`; `def test_request_fingerprint_changes_with_deadline()`; `def test_child_request_fingerprint_is_bound_to_its_cleanup_family()`; `def test_request_defaults_root_for_pre_family_callers()`
 - **tests/test_training_mixin.py** — Manager integration for durable training capacity and workload recovery.
-  - `class FakeWorkloadClient`; `async def test_manager_session_tracks_job_result_and_confirmed_stop(tmp_path, monkeypatch)`; `async def test_submission_failure_stops_capacity_and_preserves_record(tmp_path, monkeypatch)`; `async def test_status_failure_keeps_job_and_cleanup_authority(tmp_path, monkeypatch)`; `async def test_cancel_stops_pod_and_stop_failure_is_retryable(tmp_path, monkeypatch)`
+  - `class FakeWorkloadClient`; `async def test_legacy_lora_inference_admission_fails_before_provider_post(tmp_path)`; `async def test_legacy_lora_inference_does_not_resume_name_matched_foreign_pod(tmp_path)`; `async def test_manager_session_tracks_job_result_and_confirmed_stop(tmp_path, monkeypatch)`; `async def test_submission_failure_stops_capacity_and_preserves_record(tmp_path, monkeypatch)`; `async def test_status_failure_keeps_job_and_cleanup_authority(tmp_path, monkeypatch)`; `async def test_cancel_stops_pod_and_stop_failure_is_retryable(tmp_path, monkeypatch)`
 - **tests/test_training_provider.py** — Runpod REST v2 training capacity adapter contracts.
   - `async def test_observe_resolves_exact_http_proxy_route()`; `async def test_create_uses_provider_v2_boundary_and_validates_id()`; `async def test_successful_create_with_unusable_identity_remains_reconcilable(response)`; `async def test_find_by_name_rejects_duplicate_provider_resources()`; `async def test_stop_requires_v2_confirmation()`; `async def test_cancelled_start_waits_for_inflight_v2_mutation_to_resolve()`
 - **tests/test_training_reconciler.py** — External one-shot training reconciliation entry point.
-  - `async def test_reconcile_once_constructs_manager_and_runs_one_pass()`
+  - `async def test_reconcile_once_constructs_manager_and_runs_one_pass()`; `def test_cli_empty_arguments_preserve_one_shot_manager_contract()`
 - **tests/test_training_repository.py** — Persistence, CAS, restart, and cross-process exclusion tests.
   - `def test_reservation_survives_repository_restart(tmp_path)`; `def test_revision_cas_rejects_stale_writer(tmp_path)`; `def test_second_active_token_cannot_claim_same_pod(tmp_path)`; `def test_database_path_is_explicit_absolute_and_expands_environment(tmp_path, monkeypatch)`; `def test_pre_family_database_migrates_with_legacy_attempt_self_rooted(tmp_path)`; `def test_family_release_gate_blocks_a_late_fallback_reservation(tmp_path)`; `def test_versioned_table_migration_preserves_every_lifecycle_shape(tmp_path)`
 - **tests/test_training_service.py** — Billing-safe training acquisition, cancellation, and reconciliation tests.

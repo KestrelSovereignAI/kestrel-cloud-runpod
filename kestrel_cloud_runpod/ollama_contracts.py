@@ -1208,12 +1208,12 @@ class OllamaCleanupIntent:
             or self.delete_started_at < intent.provision_requested_at
         ):
             raise ValueError("Ollama cleanup intent does not bind provisioning")
-        if receipt is None:
-            if self.provisioning_receipt_id is not None:
-                raise ValueError("Ollama cleanup intent claims an absent receipt")
-        elif (
-            self.provisioning_receipt_id != receipt.receipt_id
-            or self.provider_resource_id != receipt.provider_resource_id
+        if receipt is not None:
+            receipt.validate_intent(intent)
+            if self.provider_resource_id != receipt.provider_resource_id:
+                raise ValueError("Ollama cleanup intent does not bind its receipt")
+        if self.provisioning_receipt_id is not None and (
+            receipt is None or self.provisioning_receipt_id != receipt.receipt_id
         ):
             raise ValueError("Ollama cleanup intent does not bind its receipt")
 
@@ -2194,7 +2194,7 @@ class OllamaLease:
     # silently meant something new would misread every existing row. Defaults
     # to a single GPU, which is what every pre-existing lease had.
     placement_gpu_count: int = 1
-    writer_contract_version: int = 4
+    writer_contract_version: int = 5
     writer_epoch: int = 1
     reconcile_after: datetime | None = None
     provisioning_evidence_state: OllamaProvisioningEvidenceState = (

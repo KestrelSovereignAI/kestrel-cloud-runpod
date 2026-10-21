@@ -25,6 +25,16 @@ class RunPodManagerError(Exception):
     """Base exception for Runpod manager and provider failures."""
 
 
+class RunPodLegacyAdmissionRetiredError(RunPodManagerError):
+    """Legacy session admission has no durable original-effect owner."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Legacy Runpod session admission is retired; use the inference-lease "
+            "provider or durable Pod-capacity service"
+        )
+
+
 class RunPodMountPolicyMismatchError(RunPodManagerError):
     """A complete endpoint readback confirms storage outside policy."""
 

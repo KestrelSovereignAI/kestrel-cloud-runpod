@@ -1,11 +1,15 @@
 """Contracts for RunPod profile-owned model defaults."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from kestrel_cloud_runpod.core import RunPodManagerCore
-from kestrel_cloud_runpod.models import RunPodManagerError, normalize_cuda_floor
+from kestrel_cloud_runpod.models import (
+    RunPodLegacyAdmissionRetiredError,
+    normalize_cuda_floor,
+)
 
 
 @pytest.mark.parametrize("floor", ["１２.８", "١٢", "12.８"])
@@ -22,9 +26,10 @@ def test_resource_authority_version_is_exported_with_public_contracts():
 
 class _ResumeHarness:
     resume_stopped_pod = RunPodManagerCore.resume_stopped_pod
+    _refuse_legacy_admission = staticmethod(RunPodManagerCore._refuse_legacy_admission)
 
     def __init__(self, profile):
-        self.provider = SimpleNamespace(resume_pod=lambda pod_id, gpu_count: None)
+        self.provider = SimpleNamespace(resume_pod=MagicMock())
         self._lock = None
         self._session = None
         self.wait_called = False
@@ -43,7 +48,7 @@ class _AsyncNullLock:
 
 
 @pytest.mark.asyncio
-async def test_resume_stopped_pod_requires_profile_default_model():
+async def test_resume_stopped_pod_refuses_ownerless_admission_before_provider_action():
     profile = SimpleNamespace(
         id="training",
         task_type="training",
@@ -53,7 +58,11 @@ async def test_resume_stopped_pod_requires_profile_default_model():
     harness = _ResumeHarness(profile)
     harness._lock = _AsyncNullLock()
 
-    with pytest.raises(RunPodManagerError, match="has no default_model configured"):
+    with pytest.raises(RunPodLegacyAdmissionRetiredError, match="durable"):
         await harness.resume_stopped_pod(
             {"id": "pod-123", "gpuCount": 1}, profile, 3600
         )
+
+    harness.provider.resume_pod.assert_not_called()
+    assert harness._session is None
+    assert harness.wait_called is False

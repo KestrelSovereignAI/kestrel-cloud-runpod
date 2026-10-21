@@ -20,6 +20,7 @@ from kestrel_cloud_runpod.models import (
     PodStatus,
     RunPodAcknowledgedResourceError,
     RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
 )
@@ -510,23 +511,15 @@ def test_manager_maps_every_v2_pod_status(runpod_status, expected):
 
 
 @pytest.mark.asyncio
-async def test_manager_preserves_ambiguous_create_for_reconciliation():
-    ambiguous = RunPodAmbiguousResultError(
-        title="Runpod transport failed",
-        detail="ReadTimeout",
-        method="POST",
-        resource="/pods",
-    )
+async def test_manager_refuses_legacy_admission_before_provider_post():
     mock_provider = MagicMock(spec=DirectRunPodProvider)
-    mock_provider.start_pod.side_effect = ambiguous
     with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
         manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
 
-    with pytest.raises(RunPodAmbiguousResultError) as raised:
+    with pytest.raises(RunPodLegacyAdmissionRetiredError, match="durable"):
         await manager.start_session("llm", model_name="qwen")
 
-    assert raised.value is ambiguous
-    assert raised.value.reconcile_required is True
+    mock_provider.start_pod.assert_not_called()
     assert manager._session is None
 
 

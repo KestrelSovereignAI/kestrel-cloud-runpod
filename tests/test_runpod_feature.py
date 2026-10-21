@@ -1,11 +1,107 @@
 from types import SimpleNamespace
 
 import pytest
+from kestrel_sdk.llm import BackendType
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_cloud_runpod.feature import RunPodFeature
 from kestrel_cloud_runpod.models import RunPodManagerError
-from kestrel_sdk.llm import BackendType
-from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+
+@pytest.mark.asyncio
+async def test_legacy_feature_refuses_direct_admission_before_acknowledged_post():
+    """Legacy admission has no durable place to retain an exact POST ACK."""
+
+    import asyncio
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
+    from kestrel_cloud_runpod.manager import RunPodManager
+    from kestrel_cloud_runpod.providers import DirectRunPodProvider
+
+    calls: list[tuple[str, str]] = []
+    created: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/v2/catalog/gpus":
+            return httpx.Response(
+                200,
+                json={
+                    "gpus": [
+                        {
+                            "id": "live-gpu",
+                            "name": "Live GPU",
+                            "pool": None,
+                            "manufacturer": "NVIDIA",
+                            "memory": 24,
+                            "secure": True,
+                            "community": False,
+                            "price": {"secure": 0.5, "community": 0.0},
+                            "maxCount": {"secure": 1, "community": 0},
+                            "availability": "HIGH",
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v2/pods":
+            body = json.loads(request.content)
+            resource_id = f"known-pod-{len(created) + 1}"
+            created.append(resource_id)
+            return httpx.Response(
+                201,
+                json={
+                    "id": resource_id,
+                    "name": body["name"],
+                    "status": "PROVISIONING",
+                    "gpu": body["gpu"],
+                    "cost": True,
+                },
+            )
+        raise AssertionError((request.method, request.url.path))
+
+    client = RunpodControlPlaneClient(
+        api_key="synthetic-control-only",
+        http_transport=httpx.MockTransport(handler),
+        max_safe_retries=0,
+    )
+    provider = DirectRunPodProvider(api_key="", client=client)
+    config = {
+        "manager": {"cloud_type": "SECURE"},
+        "profiles": {
+            "llm": {
+                "name": "Test",
+                "image_name": "synthetic/image:sha",
+                "min_vram_gb": 24,
+                "max_cost_per_hr": 1.0,
+                "default_model": "model",
+            }
+        },
+    }
+    try:
+        with patch.object(RunPodManager, "_build_provider", return_value=provider):
+            manager = RunPodManager(config=config)
+        feature = RunPodFeature.__new__(RunPodFeature)
+        feature.manager = manager
+        feature._start_lock = asyncio.Lock()
+
+        first = await feature._start(
+            model_name="", task_profile="llm", ttl_seconds="", pod_type=""
+        )
+        second = await feature._start(
+            model_name="", task_profile="llm", ttl_seconds="", pod_type=""
+        )
+
+        assert first.status is ToolResultStatus.ERROR
+        assert second.status is ToolResultStatus.ERROR
+        assert created == [], "legacy admission performed a Pod POST without custody"
+        assert all(method != "POST" for method, _path in calls)
+        assert manager._session is None
+    finally:
+        client.close()
 
 
 class FakeRunPodManager:
