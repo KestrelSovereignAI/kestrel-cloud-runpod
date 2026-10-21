@@ -38,6 +38,7 @@ func testConfig(upstream *url.URL) runtimeConfig {
 		PollInterval:       time.Millisecond,
 		PreloadModel:       true,
 		ContainerStartedAt: now,
+		TelemetryBinding:   strings.Repeat("b", 64),
 	}
 }
 
@@ -70,12 +71,13 @@ func toolModel(name, digest string) map[string]any {
 func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 	started := time.Now().UTC()
 	valid := map[string]string{
-		"KESTREL_OLLAMA_BEARER_TOKEN":            testToken,
-		"KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT": started.Add(time.Hour).Format(time.RFC3339),
-		"KESTREL_OLLAMA_ALLOWED_MODELS":          "registry.example/team/model:v1@sha256:" + strings.Repeat("a", 64),
-		"KESTREL_OLLAMA_REQUIRED_MODEL":          "registry.example/team/model:v1",
-		"KESTREL_OLLAMA_MODE":                    "dedicated_pod",
-		"KESTREL_OLLAMA_MODEL_STORAGE_PATH":      "/models",
+		"KESTREL_OLLAMA_BEARER_TOKEN":             testToken,
+		"KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT":  started.Add(time.Hour).Format(time.RFC3339),
+		"KESTREL_OLLAMA_ALLOWED_MODELS":           "registry.example/team/model:v1@sha256:" + strings.Repeat("a", 64),
+		"KESTREL_OLLAMA_REQUIRED_MODEL":           "registry.example/team/model:v1",
+		"KESTREL_OLLAMA_MODE":                     "dedicated_pod",
+		"KESTREL_OLLAMA_MODEL_STORAGE_PATH":       "/models",
+		"KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256": strings.Repeat("b", 64),
 	}
 	getenv := func(name string) string { return valid[name] }
 	config, err := loadConfig(getenv, started)
@@ -449,9 +451,13 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 		<-request.Context().Done()
 		close(cancelled)
 	})
-	server := httptest.NewServer(newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now))
+	config := testConfig(upstream)
+	state := &startupState{}
+	server := httptest.NewServer(newRuntimeProxy(config, state, time.Now))
 	t.Cleanup(server.Close)
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/generate", strings.NewReader(`{"model":"registry.example/team/model:v1","prompt":"private","stream":true}`))
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+	request, _ := http.NewRequestWithContext(requestContext, http.MethodPost, server.URL+"/api/generate", strings.NewReader(`{"model":"registry.example/team/model:v1","prompt":"private","stream":true}`))
 	request.Header.Set("Authorization", "Bearer "+testToken)
 	response, err := server.Client().Do(request)
 	if err != nil {
@@ -461,11 +467,23 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 	if err != nil || line != "{\"chunk\":1}\n" {
 		t.Fatalf("streamed line %q, error %v", line, err)
 	}
+	cancelRequest()
 	_ = response.Body.Close()
 	select {
 	case <-cancelled:
 	case <-time.After(time.Second):
 		t.Fatal("upstream request context was not cancelled")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		snapshot := state.snapshot(config)
+		if snapshot.InferenceStarted == 1 && snapshot.InferenceCancelled == 1 && snapshot.InferenceInFlight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled inference counters = started %d, cancelled %d, active %d", snapshot.InferenceStarted, snapshot.InferenceCancelled, snapshot.InferenceInFlight)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -549,6 +567,7 @@ func TestTelemetryIsAuthenticatedAndContainsNoCredentialOrModelName(t *testing.T
 	config.ProvisionRequested = &provision
 	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit", cacheHit: true}
 	state.markReady()
+	state.setTerminalFailure()
 	handler := newRuntimeProxy(config, state, time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodGet, "/kestrel/telemetry", ""))
@@ -561,8 +580,11 @@ func TestTelemetryIsAuthenticatedAndContainsNoCredentialOrModelName(t *testing.T
 			t.Fatalf("telemetry leaked %q: %s", forbidden, body)
 		}
 	}
-	if !strings.Contains(body, `"placement_and_image_pull_ms":2000`) {
+	if !strings.Contains(body, `"placement_and_image_pull_wall_ms":2000`) {
 		t.Fatalf("telemetry omitted phase duration: %s", body)
+	}
+	if !strings.Contains(body, `"terminal_error":"runtime_initialization_failed"`) {
+		t.Fatalf("telemetry omitted typed terminal failure: %s", body)
 	}
 }
 

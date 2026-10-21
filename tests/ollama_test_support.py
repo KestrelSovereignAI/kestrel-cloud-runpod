@@ -2,28 +2,52 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from fractions import Fraction
 
+from kestrel_cloud_runpod.billing import (
+    billing_exposure_ratio_float,
+    exact_decimal_integer_scale,
+    exact_decimal_sum,
+)
 from kestrel_cloud_runpod.models import (
     Availability,
     CloudType,
     ComputeProduct,
+    EndpointCreateRequest,
     PlacementDecision,
-    RunPodManagerError,
+    PodCreateRequest,
+    environment_values_sha256,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaCleanupBasis,
+    OllamaCleanupIntent,
+    OllamaCleanupReceipt,
     OllamaLeaseMode,
     OllamaLeaseRequest,
     OllamaNonComputeCostComponent,
     OllamaNonComputeCostPolicy,
     OllamaPlacementPlan,
+    OllamaProviderRatePrecision,
+    OllamaProvisioningIntent,
+    OllamaProvisioningReceipt,
     OllamaReadinessObservation,
     OllamaResourceConstraints,
     OllamaResourceType,
+    OllamaRuntimeTelemetryObservation,
+    OllamaRuntimeTelemetrySnapshot,
+    PreparedOllamaProvisioning,
     ProvisionedOllamaResource,
+    ollama_runtime_telemetry_binding_sha256,
+    provision_attempt_id,
+    resource_name,
+    runtime_telemetry_binding_for_intent,
 )
+from kestrel_cloud_runpod.pod_capacity_contracts import PodRealizedPlacement
 
 
 class MutableClock:
@@ -150,9 +174,86 @@ class FakeOllamaProvider:
         )
         self.find_result: ProvisionedOllamaResource | None = None
 
-    def validate_runtime_request(self, request: OllamaLeaseRequest) -> None:
-        if request.mode is OllamaLeaseMode.AUTO:
-            raise RunPodManagerError("Runtime preflight requires a concrete mode")
+    def validate_runtime_request(
+        self,
+        request: OllamaLeaseRequest,
+        plan: OllamaPlacementPlan,
+        *,
+        provision_requested_at: datetime,
+    ) -> PreparedOllamaProvisioning:
+        name = resource_name(request.lease_id)
+        image = "example.invalid/ollama@sha256:" + "a" * 64
+        attempt_id = provision_attempt_id(request)
+        binding = ollama_runtime_telemetry_binding_sha256(
+            lease_id=request.lease_id,
+            request_fingerprint=request.fingerprint,
+            provision_attempt_id=attempt_id,
+            mode=plan.mode,
+            resource_type=plan.resource_type,
+            resource_name=name,
+            provision_requested_at=provision_requested_at,
+            immutable_image=image,
+        )
+        environment = {
+            "KESTREL_OLLAMA_BEARER_TOKEN": "test-" + "s" * 32,
+            "KESTREL_OLLAMA_PROVISION_REQUESTED_AT": (
+                provision_requested_at.isoformat()
+            ),
+            "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256": binding,
+        }
+        if plan.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            provider_request = EndpointCreateRequest(
+                name=name,
+                image=image,
+                gpu_pools=(plan.placement.gpu_pool or "test-pool",),
+                endpoint_type="LOAD_BALANCER",
+                scaling={"type": "REQUEST_COUNT", "requestCount": 1},
+                gpu_count=plan.placement.gpu_count,
+                env=environment,
+                data_center_ids=request.constraints.allowed_data_center_ids,
+            )
+        else:
+            provider_request = PodCreateRequest(
+                name=name,
+                image=image,
+                gpu_id=plan.placement.gpu_id,
+                gpu_count=plan.placement.gpu_count,
+                cloud=plan.placement.cloud,
+                env=environment,
+                data_center_ids=request.constraints.allowed_data_center_ids,
+            )
+        safe = provider_request.to_payload()
+        safe["env"] = {
+            "keys": sorted(environment),
+            "sha256": environment_values_sha256(environment),
+        }
+        canonical = json.dumps(safe, sort_keys=True, separators=(",", ":"))
+        intent = OllamaProvisioningIntent(
+            lease_id=request.lease_id,
+            request_fingerprint=request.fingerprint,
+            provision_attempt_id=attempt_id,
+            mode=plan.mode,
+            resource_type=plan.resource_type,
+            resource_name=resource_name(request.lease_id),
+            provision_requested_at=provision_requested_at,
+            environment_sha256=environment_values_sha256(environment),
+            environment_keys=tuple(sorted(environment)),
+            provider_request_json=canonical,
+            provider_request_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+            selected_gpu_id=plan.placement.gpu_id,
+            selected_gpu_pool=plan.placement.gpu_pool,
+            selected_gpu_name=plan.placement.gpu_name,
+            selected_gpu_count=plan.placement.gpu_count,
+            selected_cloud=plan.placement.cloud,
+            allowed_data_center_ids=request.constraints.allowed_data_center_ids,
+            accepted_whole_hourly_rate_usd=(
+                exact_decimal_integer_scale(
+                    Decimal(str(plan.placement.offered_cost_per_hr)),
+                    plan.placement.gpu_count,
+                )
+            ),
+        )
+        return PreparedOllamaProvisioning(intent, provider_request, binding)
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
         del request
@@ -172,32 +273,127 @@ class FakeOllamaProvider:
         return self.selected_plan
 
     async def provision(
-        self,
-        *,
-        request: OllamaLeaseRequest,
-        plan: OllamaPlacementPlan,
-        resource_name: str,
+        self, prepared: PreparedOllamaProvisioning
     ) -> ProvisionedOllamaResource:
-        del request, plan
         self.provision_calls += 1
-        self.resource = replace(self.resource, resource_name=resource_name)
+        self.resource = replace(
+            self.resource,
+            resource_type=prepared.intent.resource_type,
+            resource_name=prepared.intent.resource_name,
+        )
         return self.resource
 
-    async def find_resource(
-        self, *, resource_type: OllamaResourceType, resource_name: str
+    async def observe_provisioning(
+        self,
+        intent: OllamaProvisioningIntent,
+        resource: ProvisionedOllamaResource,
+        *,
+        reconciled_after_ambiguous_create: bool = False,
+    ) -> OllamaProvisioningReceipt:
+        placement = None
+        precision = None
+        if intent.resource_type is OllamaResourceType.POD:
+            placement = PodRealizedPlacement(
+                provider_pod_id=resource.provider_resource_id,
+                gpu_type_id=intent.selected_gpu_id,
+                gpu_display_name=intent.selected_gpu_name,
+                gpu_count=intent.selected_gpu_count,
+                cloud=intent.selected_cloud,
+                data_center_id=(intent.allowed_data_center_ids or ("US-TX-1",))[0],
+                hourly_rate_usd=intent.accepted_whole_hourly_rate_usd,
+                observed_at=intent.provision_requested_at,
+            )
+            precision = OllamaProviderRatePrecision.PARSED_JSON_NUMBER
+        return OllamaProvisioningReceipt(
+            intent_sha256=intent.intent_sha256,
+            lease_id=intent.lease_id,
+            request_fingerprint=intent.request_fingerprint,
+            provision_attempt_id=intent.provision_attempt_id,
+            resource_type=intent.resource_type,
+            provider_resource_id=resource.provider_resource_id,
+            resource_name=intent.resource_name,
+            provider_created_at=intent.provision_requested_at,
+            readback_at=intent.provision_requested_at,
+            readback_sha256="b" * 64,
+            environment_sha256=intent.environment_sha256,
+            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
+            pod_realized_placement=placement,
+            provider_rate_precision=precision,
+        )
+
+    async def discover_provisioning_resource(
+        self, intent: OllamaProvisioningIntent
     ) -> ProvisionedOllamaResource | None:
-        del resource_type, resource_name
+        del intent
+        if self.find_result is None:
+            return None
         return self.find_result
 
     async def observe(
-        self, resource: ProvisionedOllamaResource
+        self,
+        resource: ProvisionedOllamaResource,
+        intent: OllamaProvisioningIntent,
+        provisioning: OllamaProvisioningReceipt,
     ) -> OllamaReadinessObservation:
-        del resource
+        binding = runtime_telemetry_binding_for_intent(intent)
+        snapshot = OllamaRuntimeTelemetrySnapshot(
+            runtime_version="test",
+            ollama_version="test",
+            telemetry_binding_sha256=binding,
+            runtime_instance_id="runtime-test-1",
+            telemetry_revision=1,
+            provision_requested_at=intent.provision_requested_at,
+            container_started_at=intent.provision_requested_at,
+            ollama_process_started_at=intent.provision_requested_at,
+            ollama_healthy_at=intent.provision_requested_at,
+            model_pull_started_at=None,
+            model_pull_completed_at=None,
+            model_load_started_at=intent.provision_requested_at,
+            model_ready_at=intent.provision_requested_at,
+            ready_at=intent.provision_requested_at,
+            placement_and_image_pull_wall_ms=0,
+            ollama_boot_ms=0,
+            model_pull_ms=None,
+            model_load_ms=0,
+            container_to_ready_ms=0,
+            cache_hit=True,
+            startup_strategy="cache_hit",
+            ready=True,
+            ollama_process_running=True,
+            terminal_error=None,
+            inference_started=0,
+            inference_completed=0,
+            inference_failed=0,
+            inference_cancelled=0,
+            inference_in_flight=0,
+            first_inference_started_at=None,
+            last_inference_started_at=None,
+            last_inference_completed_at=None,
+            inference_busy_ms=0,
+            inference_idle_ms=0,
+        )
+        observation = OllamaRuntimeTelemetryObservation(
+            intent_sha256=intent.intent_sha256,
+            provisioning_receipt_id=provisioning.receipt_id,
+            lease_id=intent.lease_id,
+            provision_attempt_id=intent.provision_attempt_id,
+            resource_type=intent.resource_type,
+            provider_resource_id=resource.provider_resource_id,
+            snapshot=snapshot,
+            snapshot_sha256=hashlib.sha256(
+                json.dumps(
+                    snapshot.to_dict(), sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest(),
+            fetch_started_at=provisioning.readback_at,
+            observed_at=provisioning.readback_at,
+        )
         return OllamaReadinessObservation(
             provider_ready=self.provider_ready,
             route_url=self.route_url,
             provider_health_url=self.health_url,
             model_names=self.models,
+            runtime_telemetry=observation,
         )
 
     async def pull_model(
@@ -207,7 +403,11 @@ class FakeOllamaProvider:
         self.pull_calls += 1
         self.models = (model,)
 
-    async def teardown(self, resource: ProvisionedOllamaResource) -> None:
+    async def teardown(
+        self,
+        resource: ProvisionedOllamaResource,
+        cleanup_intent: OllamaCleanupIntent,
+    ) -> OllamaCleanupReceipt:
         del resource
         self.teardown_calls += 1
         if self.teardown_failures:
@@ -215,6 +415,17 @@ class FakeOllamaProvider:
             from kestrel_cloud_runpod.models import RunPodManagerError
 
             raise RunPodManagerError("temporary teardown failure")
+        return OllamaCleanupReceipt(
+            cleanup_intent_id=cleanup_intent.cleanup_intent_id,
+            verified_absent_at=max(
+                cleanup_intent.delete_started_at,
+                cleanup_intent.delete_started_at + timedelta(microseconds=1),
+            ),
+            basis=OllamaCleanupBasis.DELETE_ACKNOWLEDGED,
+        )
+
+    async def observe_lifecycle_billing(self, intent, provisioning, cleanup):
+        del intent, provisioning, cleanup
 
 
 def serverless_plan(
@@ -238,29 +449,33 @@ def serverless_plan(
     )
     # Costs are rated as rate x seconds x gpu_count / 3600, so the seconds that
     # produce a given cost shrink as GPUs are added.
-    unit_rate = Decimal(str(rate)) * Decimal(gpu_count)
+    unit_rate = Fraction(Decimal(str(rate))) * gpu_count
     estimated_billable_seconds = round(
-        Decimal(str(estimated_cost)) * Decimal(3600) / unit_rate
+        Fraction(Decimal(str(estimated_cost))) * 3600 / unit_rate
     )
     maximum_billable_seconds = round(
-        Decimal(str(compute_ceiling)) * Decimal(3600) / unit_rate
+        Fraction(Decimal(str(compute_ceiling))) * 3600 / unit_rate
     )
 
     # Re-derive the costs FROM the rounded seconds, in the same direction and
     # with the same formula the plan's own consistency check uses, so a rate
     # that does not divide evenly cannot make the fixture self-inconsistent.
     def _rate(seconds: int) -> float:
-        return float(
-            Decimal(str(rate)) * Decimal(seconds) * Decimal(gpu_count) / Decimal(3600)
+        return billing_exposure_ratio_float(
+            Decimal(str(rate)), multiplier=seconds * gpu_count, divisor=3600
         )
 
     estimated_cost = _rate(estimated_billable_seconds)
     compute_ceiling = _rate(maximum_billable_seconds)
-    estimated_total = float(
-        Decimal(str(estimated_cost)) + Decimal(str(estimated_non_compute_cost))
+    estimated_total = billing_exposure_ratio_float(
+        exact_decimal_sum(
+            (Decimal(str(estimated_cost)), Decimal(str(estimated_non_compute_cost)))
+        )
     )
-    total_ceiling = float(
-        Decimal(str(compute_ceiling)) + Decimal(str(maximum_non_compute_cost))
+    total_ceiling = billing_exposure_ratio_float(
+        exact_decimal_sum(
+            (Decimal(str(compute_ceiling)), Decimal(str(maximum_non_compute_cost)))
+        )
     )
     return OllamaPlacementPlan(
         mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
@@ -277,4 +492,36 @@ def serverless_plan(
         maximum_concurrent_workers=1,
         non_compute_components=_BASE_COST_COMPONENTS,
         maximum_serverless_cold_starts=1,
+    )
+
+
+def pod_plan(
+    rate: float = 0.9,
+    *,
+    estimated_cost: float = 0.1,
+    maximum_compute_cost: float | None = None,
+    estimated_non_compute_cost: float = 0.0,
+    maximum_non_compute_cost: float = 0.0,
+    gpu_count: int = 1,
+) -> OllamaPlacementPlan:
+    serverless = serverless_plan(
+        rate,
+        estimated_cost=estimated_cost,
+        maximum_compute_cost=maximum_compute_cost,
+        estimated_non_compute_cost=estimated_non_compute_cost,
+        maximum_non_compute_cost=maximum_non_compute_cost,
+        gpu_count=gpu_count,
+    )
+    return replace(
+        serverless,
+        mode=OllamaLeaseMode.DEDICATED_POD,
+        resource_type=OllamaResourceType.POD,
+        placement=make_decision(
+            ComputeProduct.POD,
+            rate=rate,
+            gpu_id="gpu-pod",
+            pool=None,
+            gpu_count=gpu_count,
+        ),
+        maximum_serverless_cold_starts=0,
     )

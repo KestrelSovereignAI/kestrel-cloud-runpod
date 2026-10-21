@@ -22,6 +22,7 @@ from .models import (
     PlacementDecision,
     PlacementRequirements,
     RunPodManagerError,
+    environment_values_sha256,
 )
 
 TRAINING_PROFILE_IDS = ("training", "training-h100", "training-flex")
@@ -1993,7 +1994,7 @@ def attempt_environment_sha256(environment: Mapping[str, str]) -> str:
     """Bind secret environment values without persisting or exposing them."""
 
     _validate_attempt_environment(environment)
-    return _json_sha256(dict(sorted(environment.items())))
+    return environment_values_sha256(environment)
 
 
 def _json_sha256(value: Mapping[str, Any]) -> str:

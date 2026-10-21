@@ -28,6 +28,12 @@ from kestrel_sdk.llm import (
 )
 from pydantic import SecretStr
 
+from .billing import (
+    billing_exposure_sum_float,
+    conservative_decimal_ratio_float,
+    exact_decimal_integer_scale,
+    floor_timedelta_seconds,
+)
 from .models import GPUProfile, RunPodManagerError
 from .ollama import _required_int
 from .ollama_contracts import (
@@ -37,7 +43,9 @@ from .ollama_contracts import (
     OllamaLeaseMode,
     OllamaLeaseRequest,
     OllamaLeaseState,
+    OllamaLifecycleBillingState,
     OllamaPlacementPlan,
+    OllamaProvisioningEvidenceState,
     OllamaResourceConstraints,
     OllamaResourceType,
     maximum_serverless_cold_starts,
@@ -149,9 +157,13 @@ class RunpodInferenceLeaseProvider:
                 max_total_cost=request.max_total_cost_usd,
             )
             try:
-                runtime.service.provider.validate_runtime_request(internal_request)
                 plan = await runtime.service.provider.plan(internal_request)
                 runtime.service.validate_plan(internal_request, plan)
+                runtime.service.provider.validate_runtime_request(
+                    internal_request,
+                    plan,
+                    provision_requested_at=now,
+                )
             except RunPodManagerError:
                 continue
             ready_seconds = runtime.policy.ready_seconds(mode)
@@ -179,8 +191,9 @@ class RunpodInferenceLeaseProvider:
         # Multiply in Decimal, not float: 0.99 * 3 is 2.9699999999999998 in
         # binary, and dividing that back on acquire yields a per-GPU budget
         # just under the catalog price, making a valid quote unacquirable.
-        hourly = _money(plan.placement.offered_cost_per_hr) * Decimal(
-            plan.placement.gpu_count
+        hourly = exact_decimal_integer_scale(
+            _money(plan.placement.offered_cost_per_hr),
+            plan.placement.gpu_count,
         )
         total = _money(plan.estimated_cost)
         readiness_deadline = request.requested_at + timedelta(
@@ -257,7 +270,6 @@ class RunpodInferenceLeaseProvider:
                 now=now,
             )
             try:
-                runtime.service.provider.validate_runtime_request(internal_request)
                 plan = await runtime.service.provider.plan(internal_request)
                 runtime.service.validate_plan(internal_request, plan)
             except RunPodManagerError as exc:
@@ -519,7 +531,13 @@ class RunpodInferenceLeaseProvider:
         # deterministically unacquirable. Rounding down keeps the conversion
         # conservative - it can never authorize more than the caller allowed.
         gpu_count = max(1, int(policy.profile.gpu_count))
-        hourly_limit = float(max_hourly_cost / Decimal(gpu_count))
+        try:
+            hourly_limit = conservative_decimal_ratio_float(max_hourly_cost, gpu_count)
+            total_limit = conservative_decimal_ratio_float(max_total_cost, 1)
+        except ValueError as exc:
+            raise InferenceLeaseConstraintError(
+                "Runpod cost authorization cannot be represented safely"
+            ) from exc
         if policy.profile.max_cost_per_hr is not None:
             hourly_limit = min(hourly_limit, policy.profile.max_cost_per_hr)
         return OllamaLeaseRequest(
@@ -551,7 +569,7 @@ class RunpodInferenceLeaseProvider:
                     )
                 )
             ),
-            max_authorized_cost=float(max_total_cost),
+            max_authorized_cost=total_limit,
             mode=mode,
             requested_at=request.requested_at,
         )
@@ -563,7 +581,7 @@ class RunpodInferenceLeaseProvider:
         deadline = request.requested_at + timedelta(
             seconds=request.ready_deadline_seconds
         )
-        return max(0, math.floor((deadline - now).total_seconds()))
+        return max(0, floor_timedelta_seconds(deadline - now))
 
     def _validate_cold_start_window(
         self,
@@ -605,8 +623,10 @@ class RunpodInferenceLeaseProvider:
         # $1.80/hr. It happened to be caught downstream by the estimated-cost
         # check, which is monotonic in rate, but that is not this guard's job.
         if (
-            _money(plan.placement.offered_cost_per_hr)
-            * Decimal(plan.placement.gpu_count)
+            exact_decimal_integer_scale(
+                _money(plan.placement.offered_cost_per_hr),
+                plan.placement.gpu_count,
+            )
             > quote.hourly_cost_usd
         ):
             raise InferenceLeaseConstraintError(
@@ -658,6 +678,15 @@ class RunpodInferenceLeaseProvider:
         now = self._now()
         state = _sdk_state(lease, now)
         updated_at = max(lease.created_at, min(lease.updated_at, now))
+        if (
+            lease.provisioning_evidence_state
+            is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+        ):
+            # This is the adapter's current observation of the still-open
+            # manual debt, not a provider finality timestamp. Keeping the
+            # response monotonic lets Core persist/replay RELEASING without
+            # altering any unknown provider fact in the durable aggregate.
+            updated_at = max(updated_at, now)
         expires_at = lease.hard_deadline
         if state is InferenceLeaseState.EXPIRED:
             expires_at = max(
@@ -819,7 +848,7 @@ def _quote_metadata(plan: OllamaPlacementPlan) -> dict[str, Any]:
 
 
 def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
-    return {
+    metadata = {
         "mode": lease.mode.value if lease.mode else None,
         "resource_type": lease.resource_type.value if lease.resource_type else None,
         "gpu_id": lease.selected_gpu_id,
@@ -853,7 +882,74 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
             item.value for item in lease.cost_policy_components
         ),
         "cost_kind": "conservative_authorization_not_observed_billing",
+        "runtime_telemetry_state": lease.runtime_telemetry_state.value,
+        "runtime_telemetry_first_observation_id": (
+            lease.runtime_telemetry_observations[0].observation_id
+            if lease.runtime_telemetry_observations
+            else None
+        ),
+        "runtime_telemetry_latest_observation_id": (
+            lease.runtime_telemetry_observations[-1].observation_id
+            if lease.runtime_telemetry_observations
+            else None
+        ),
+        "runtime_telemetry_latest_snapshot_sha256": (
+            lease.runtime_telemetry_observations[-1].snapshot_sha256
+            if lease.runtime_telemetry_observations
+            else None
+        ),
+        "lifecycle_billing_state": lease.lifecycle_billing_state.value,
+        "lifecycle_billing_selected_observation_id": (
+            lease.lifecycle_billing_selection.observation_id
+            if lease.lifecycle_billing_selection
+            else None
+        ),
+        "lifecycle_billing_latest_observation_id": (
+            lease.lifecycle_billing_observations[-1].observation_id
+            if lease.lifecycle_billing_observations
+            else None
+        ),
+        "provider_capacity_selected_actual_cost_usd": None,
+        "provider_capacity_latest_actual_cost_usd": (
+            str(
+                lease.lifecycle_billing_observations[
+                    -1
+                ].provider_capacity_actual_cost_usd
+            )
+            if lease.lifecycle_billing_observations
+            else None
+        ),
+        "provider_finality_confirmed": (
+            False if lease.lifecycle_billing_selection else None
+        ),
+        "lifecycle_billing_correction_pending": (
+            lease.lifecycle_billing_state
+            is OllamaLifecycleBillingState.CORRECTION_PENDING
+        ),
+        "lifecycle_billing_correction_count": len(lease.lifecycle_billing_corrections),
+        "actual_cost_cap_status": lease.actual_cost_cap_status.value,
     }
+    if lease.lifecycle_billing_selection is not None:
+        selected = next(
+            observation
+            for observation in lease.lifecycle_billing_observations
+            if observation.observation_id
+            == lease.lifecycle_billing_selection.observation_id
+        )
+        metadata["provider_capacity_selected_actual_cost_usd"] = str(
+            selected.provider_capacity_actual_cost_usd
+        )
+    if (
+        lease.provisioning_evidence_state
+        is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+    ):
+        metadata.update(
+            {
+                "provisioning_evidence_state": "historical_unknown",
+                "manual_reconciliation_required": True,
+            }
+        )
+    return metadata
 
 
 def _quoted_maximum_serverless_cold_starts(
@@ -884,7 +980,9 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
     hourly = (
         None
         if lease.offered_rate_per_hr is None
-        else _money(lease.offered_rate_per_hr) * Decimal(lease.placement_gpu_count)
+        else exact_decimal_integer_scale(
+            _money(lease.offered_rate_per_hr), lease.placement_gpu_count
+        )
     )
     if hourly is None:
         raw_hourly = constraints.get("max_hourly_rate")
@@ -897,8 +995,9 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
         # above does. A row that never reached PROVISIONING - a crash or a
         # plan failure in that window, both of which this module exists to
         # survive - otherwise reports an hourly cost short by gpu_count.
-        hourly = _money(raw_hourly) * Decimal(
-            max(1, int(constraints.get("gpu_count", 1) or 1))
+        hourly = exact_decimal_integer_scale(
+            _money(raw_hourly),
+            max(1, int(constraints.get("gpu_count", 1) or 1)),
         )
     total = lease.estimated_cost
     if total is None:
@@ -932,6 +1031,15 @@ def _lease_region(lease: OllamaLease) -> str:
 
 def _sdk_state(lease: OllamaLease, now: datetime) -> InferenceLeaseState:
     del now
+    if (
+        lease.provisioning_evidence_state
+        is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+    ):
+        # UNKNOWN is neither provider absence nor financial closure. RELEASING
+        # is Core's only route-less, nonterminal state accepted from each live
+        # predecessor (PENDING, READY, and RELEASING). It retains and rechecks
+        # the manual debt without claiming that provider deletion was admitted.
+        return InferenceLeaseState.RELEASING
     if lease.state is OllamaLeaseState.READY:
         return InferenceLeaseState.READY
     if lease.state is OllamaLeaseState.FAILED:
@@ -1006,8 +1114,12 @@ def _validate_quote_cost_breakdown(quote: InferenceLeaseQuote) -> None:
     if (
         maximum_compute < estimated_compute
         or maximum_overhead < estimated_overhead
-        or estimated_total != estimated_compute + estimated_overhead
-        or ceiling != maximum_compute + maximum_overhead
+        or estimated_total
+        != Decimal(
+            str(billing_exposure_sum_float((estimated_compute, estimated_overhead)))
+        )
+        or ceiling
+        != Decimal(str(billing_exposure_sum_float((maximum_compute, maximum_overhead))))
         or ceiling < estimated_total
         or estimated_total != quote.estimated_total_cost_usd
     ):

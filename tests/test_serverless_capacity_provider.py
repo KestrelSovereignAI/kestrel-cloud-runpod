@@ -261,6 +261,32 @@ async def test_created_endpoint_with_unaccepted_cuda_or_storage_keeps_cleanup_id
     assert len(control.create_requests) == 1
 
 
+@pytest.mark.asyncio
+async def test_create_ack_retains_exact_id_but_invalid_optional_evidence_never_activates():
+    control = _PlannedControl()
+    control.created = planned_endpoint_resource(env={"PRIVATE": 17})
+    control.readback = control.created
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+
+    with pytest.raises(
+        ServerlessEndpointActivationError, match="invalid policy evidence"
+    ) as raised:
+        await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+
+    assert raised.value.observed_endpoint_ids == (control.created.id,)
+    assert control.get_calls == []
+    assert control.delete_calls == []
+
+
 def _ambiguous_create_error() -> RunPodAmbiguousResultError:
     return RunPodAmbiguousResultError(
         title="Ambiguous create",

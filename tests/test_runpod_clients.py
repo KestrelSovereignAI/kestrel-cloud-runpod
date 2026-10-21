@@ -18,6 +18,7 @@ from kestrel_cloud_runpod.models import (
     EndpointCreateRequest,
     EndpointUpdateRequest,
     PodCreateRequest,
+    ResourceFieldState,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -73,6 +74,18 @@ def _endpoint(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def _endpoint_request() -> EndpointCreateRequest:
+    return EndpointCreateRequest(
+        name="catalog",
+        image="registry/catalog:sha",
+        gpu_pools=("BLACKWELL_48",),
+        endpoint_type="QUEUE",
+        scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
+        workers_min=0,
+        workers_max=2,
+    )
 
 
 def _network_volume(**overrides):
@@ -312,15 +325,7 @@ def test_rfc9457_problem_is_typed_and_does_not_expose_body():
         api_key="secret", http_transport=httpx.MockTransport(handler)
     )
     with pytest.raises(RunPodAPIError) as raised:
-        client.create_endpoint(
-            EndpointCreateRequest(
-                name="test",
-                image="example/image:sha",
-                gpu_pools=("bad",),
-                endpoint_type="QUEUE",
-                scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
-            )
-        )
+        client.create_endpoint(_endpoint_request())
 
     error = raised.value
     assert error.status_code == 422
@@ -436,6 +441,45 @@ def test_create_timeout_is_ambiguous_and_not_retried():
 
     assert calls == 1
     assert raised.value.detail == "ReadTimeout"
+
+
+@pytest.mark.parametrize("body", [{}, {"id": "endpoint-ack", "name": None}])
+def test_endpoint_create_without_a_usable_identity_remains_ambiguous(body):
+    calls = []
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(201, json=body)
+        ),
+    )
+
+    with pytest.raises(RunPodAmbiguousResultError, match="usable identity"):
+        client.create_endpoint(_endpoint_request())
+
+    assert len(calls) == 1
+
+
+def test_endpoint_create_retains_identity_and_invalid_optional_evidence():
+    payload = _endpoint(
+        requestUrls=17,
+        env={"PRIVATE": "must-not-leak"},
+    )
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(201, json=payload)
+        ),
+    )
+
+    resource = client.create_endpoint(_endpoint_request())
+
+    assert resource.id == "ep-123"
+    assert resource.request_urls == {}
+    assert resource.field_evidence.state("requestUrls") is ResourceFieldState.INVALID
+    assert resource.raw["env"] == {"PRIVATE": "[REDACTED]"}
+    with pytest.raises(RunPodManagerError, match="requestUrls") as raised:
+        resource.require_valid_fields(context="v2 Endpoint create")
+    assert "must-not-leak" not in str(raised.value)
 
 
 def test_pod_action_timeout_is_ambiguous_and_not_retried():
@@ -610,15 +654,7 @@ def test_endpoint_worker_and_billing_request_shapes():
     client = RunpodControlPlaneClient(
         api_key="secret", http_transport=httpx.MockTransport(handler)
     )
-    request = EndpointCreateRequest(
-        name="catalog",
-        image="registry/catalog:sha",
-        gpu_pools=("BLACKWELL_48",),
-        endpoint_type="QUEUE",
-        scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
-        workers_min=0,
-        workers_max=2,
-    )
+    request = _endpoint_request()
     assert client.create_endpoint(request).id == "ep-123"
     assert client.get_endpoint("ep-123").id == "ep-123"
     assert len(client.list_endpoints()) == 1

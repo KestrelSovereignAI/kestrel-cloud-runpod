@@ -142,6 +142,32 @@ def test_direct_provider_selects_from_live_catalog_and_records_placement():
     assert result["gpu"]["id"] == "live-gpu-id"
 
 
+def test_direct_provider_never_exposes_invalid_partial_create_evidence():
+    client = _FakeControlClient()
+
+    def invalid_create(request):
+        client.create_request = request
+        return PodResource.from_dict(
+            {
+                "id": "pod-invalid-cost",
+                "name": request.name,
+                "status": "PROVISIONING",
+                "gpu": {"id": request.gpu_id, "count": request.gpu_count},
+                "cost": True,
+                "env": {"PRIVATE": "must-not-leak"},
+            }
+        )
+
+    client.create_pod = invalid_create
+    provider = DirectRunPodProvider(api_key="", client=client)
+
+    with pytest.raises(RunPodManagerError, match="cost") as raised:
+        provider.start_pod(_profile(), {"name": "kestrel-image"})
+
+    assert client.create_request is not None
+    assert "must-not-leak" not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("environment_cloud", "manager_cloud", "profile_cloud", "metadata_cloud", "expected"),
     [

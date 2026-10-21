@@ -14,7 +14,7 @@ from kestrel_cloud_runpod import await_owned_effect
 
 def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     dependencies = [Requirement(value) for value in requires("kestrel-cloud-runpod")]
-    core, = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    (core,) = [value for value in dependencies if value.name == "kestrel-sovereign"]
     assert "0.53.34" not in core.specifier
     # SDK0.43's trust-bundle profile first resolves with published Core0.54.4.
     assert "0.53.35" not in core.specifier

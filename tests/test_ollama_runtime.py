@@ -38,6 +38,7 @@ def _environment(**changes: object) -> dict[str, str]:
         "mode": OllamaLeaseMode.DEDICATED_POD,
         "model_storage_path": "/models",
         "provision_requested_at": requested_at,
+        "telemetry_binding_sha256": "b" * 64,
     }
     values.update(changes)
     return build_ollama_runtime_environment(**values)  # type: ignore[arg-type]
