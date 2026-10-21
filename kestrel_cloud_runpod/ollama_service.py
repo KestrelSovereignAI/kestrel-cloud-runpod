@@ -60,10 +60,28 @@ from .ollama_repository import SQLiteOllamaLeaseRepository, request_from_lease
 logger = logging.getLogger(__name__)
 
 
-def _is_cleanup_setup_failure(error: BaseException) -> bool:
-    """Identify retained setup/control failures that do not revoke authority."""
+def _is_recoverable_cleanup_setup_failure(error: BaseException) -> bool:
+    """Return whether every leaf permits already-proven cleanup to continue.
 
-    return isinstance(error, sqlite3.Error) or is_execution_control_error(error)
+    A mixed exception group is recoverable only when every leaf is either a
+    native execution-control outcome or one of SQLite's two transient locking
+    conditions.  Structural, authority, and unclassified failures must take
+    precedence over recoverable siblings; they stop further provider I/O while
+    the original exception object is retained for final composition.
+    """
+
+    if isinstance(error, BaseExceptionGroup):
+        return all(
+            _is_recoverable_cleanup_setup_failure(child) for child in error.exceptions
+        )
+    if is_execution_control_error(error):
+        return True
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if not isinstance(error_code, int) or isinstance(error_code, bool):
+        return False
+    return error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
 
 
 def _raise_cleanup_failures(
@@ -1111,7 +1129,7 @@ class OllamaLeaseService:
                             ),
                         )
         except BaseException as exc:
-            if not _is_cleanup_setup_failure(exc):
+            if not _is_recoverable_cleanup_setup_failure(exc):
                 raise
             setup_failures.append(exc)
         try:
@@ -1119,7 +1137,7 @@ class OllamaLeaseService:
         except BaseException as exc:
             if isinstance(
                 exc, OllamaLeaseConflictError
-            ) or not _is_cleanup_setup_failure(exc):
+            ) or not _is_recoverable_cleanup_setup_failure(exc):
                 if setup_failures:
                     _raise_cleanup_failures(
                         "Ollama cleanup setup and claim both failed",
@@ -1173,7 +1191,7 @@ class OllamaLeaseService:
         except BaseException as exc:
             if isinstance(
                 exc, OllamaLeaseConflictError
-            ) or not _is_cleanup_setup_failure(exc):
+            ) or not _is_recoverable_cleanup_setup_failure(exc):
                 if failures:
                     _raise_cleanup_failures(
                         "Ollama cleanup setup and lineage refresh both failed",
@@ -1213,7 +1231,7 @@ class OllamaLeaseService:
                 except BaseException as exc:  # noqa: BLE001 - retain native control
                     if isinstance(
                         exc, OllamaLeaseConflictError
-                    ) or not _is_cleanup_setup_failure(exc):
+                    ) or not _is_recoverable_cleanup_setup_failure(exc):
                         failures.append(exc)
                         stop_cleanup = True
                         break
@@ -1262,7 +1280,7 @@ class OllamaLeaseService:
                     except BaseException as exc:  # noqa: BLE001 - retain native control
                         if isinstance(
                             exc, OllamaLeaseConflictError
-                        ) or not _is_cleanup_setup_failure(exc):
+                        ) or not _is_recoverable_cleanup_setup_failure(exc):
                             failures.append(exc)
                             stop_cleanup = True
                         else:
