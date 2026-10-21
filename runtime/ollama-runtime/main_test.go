@@ -113,6 +113,40 @@ func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 	}
 }
 
+func TestRuntimeInitializationPreservesSuppliedNativeStartupOrigin(t *testing.T) {
+	// This is a deterministic native-clock contract check, not a simulated
+	// cache/GPU benchmark. Add preserves time.Now's monotonic component without
+	// sleeping; UTC is used only for the separately reported wall timestamp.
+	origin := time.Now().Add(-3 * time.Second)
+	state := newStartupState("cache_hit", origin)
+	state.ollamaProcessRunning = true
+	state.markReady()
+	config := testConfig(nil)
+	config.ContainerStartedAt = origin.UTC()
+	snapshot := state.snapshot(config)
+
+	if !state.containerStartedMono.Equal(origin) {
+		t.Fatalf(
+			"runtime replaced supplied native startup origin: got %v want %v",
+			state.containerStartedMono,
+			origin,
+		)
+	}
+	if snapshot.ContainerToReadyMilliseconds == nil || *snapshot.ContainerToReadyMilliseconds < 2_900 {
+		t.Fatalf(
+			"container-to-ready omitted pre-initialization work: %v",
+			snapshot.ContainerToReadyMilliseconds,
+		)
+	}
+	if !snapshot.ContainerStartedAt.Equal(origin.UTC()) {
+		t.Fatalf(
+			"reported wall start changed: got %v want %v",
+			snapshot.ContainerStartedAt,
+			origin.UTC(),
+		)
+	}
+}
+
 func TestModelStoragePathIsBoundToRunpodMode(t *testing.T) {
 	tests := []struct {
 		mode, path string
@@ -148,7 +182,7 @@ func TestAnonymousAndWrongBearerAreDeniedOnEveryNonHealthSurface(t *testing.T) {
 	_, upstream := testUpstream(t, func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	tests := []struct {
 		method string
 		path   string
@@ -182,7 +216,7 @@ func TestExpiredBearerIsDenied(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	handler := newRuntimeProxy(config, &startupState{}, func() time.Time {
+	handler := newRuntimeProxy(config, newStartupState("test", time.Now()), func() time.Time {
 		return config.BearerTokenExpires.Add(time.Nanosecond)
 	})
 	response := httptest.NewRecorder()
@@ -204,7 +238,8 @@ func TestHealthIsPublicButFailClosedUntilExactModelReady(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	handler := newRuntimeProxy(config, state, time.Now)
 
 	for _, path := range []string{"/ping", "/health/ready"} {
@@ -253,7 +288,8 @@ func TestReadinessRevalidatesExactModelAndCapabilityExpiry(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 	state.markReady()
 
 	missing := httptest.NewRecorder()
@@ -287,7 +323,8 @@ func TestExactPinnedModelWithoutToolCapabilityNeverBecomesReady(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 
 	err := bootstrap(context.Background(), config, state, http.DefaultClient)
 	if err == nil || !strings.Contains(err.Error(), `capability "tools"`) {
@@ -327,7 +364,7 @@ func TestModelManagementAndArbitraryModelsFailClosed(t *testing.T) {
 		upstreamCalls.Add(1)
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	tests := []struct {
 		path string
 		body string
@@ -360,7 +397,7 @@ func TestApprovedInferenceStripsWorkloadBearer(t *testing.T) {
 		requests <- request.Clone(context.Background())
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodPost, "/api/chat", `{"model":"registry.example/team/model:v1","messages":[]}`))
 	if response.Code != http.StatusOK {
@@ -380,7 +417,7 @@ func TestModelMetadataIsAuthorizedWithoutCountingInference(t *testing.T) {
 		writeJSON(writer, http.StatusOK, map[string]any{"model": "metadata"})
 	})
 	config := testConfig(upstream)
-	state := &startupState{}
+	state := newStartupState("test", time.Now())
 	handler := newRuntimeProxy(config, state, time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(
@@ -413,7 +450,7 @@ func TestOpenAIStreamingToolsAndToolCallsPassThroughUnchanged(t *testing.T) {
 		writer.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(writer, responseBody)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(
 		t, http.MethodPost, "/v1/chat/completions", requestBody,
@@ -436,7 +473,7 @@ func TestModelPolicyMatchesOllamaCaseInsensitiveLastKeyWinsParsing(t *testing.T)
 		upstreamCalls.Add(1)
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(
@@ -479,7 +516,7 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 		close(cancelled)
 	})
 	config := testConfig(upstream)
-	state := &startupState{}
+	state := newStartupState("test", time.Now())
 	server := httptest.NewServer(newRuntimeProxy(config, state, time.Now))
 	t.Cleanup(server.Close)
 	requestContext, cancelRequest := context.WithCancel(context.Background())
@@ -533,7 +570,8 @@ func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 		}
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	if err := bootstrap(context.Background(), config, state, http.DefaultClient); err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +610,8 @@ func TestBootstrapPullsOnlyRequiredPinAndRejectsDigestMismatch(t *testing.T) {
 	})
 	config := testConfig(upstream)
 	config.PreloadModel = false
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	err := bootstrap(context.Background(), config, state, http.DefaultClient)
 	if err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("expected digest mismatch, got %v", err)
@@ -592,7 +631,9 @@ func TestTelemetryIsAuthenticatedAndContainsNoCredentialOrModelName(t *testing.T
 	config := testConfig(upstream)
 	provision := config.ContainerStartedAt.Add(-2 * time.Second)
 	config.ProvisionRequested = &provision
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit", cacheHit: true}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
+	state.cacheHit = true
 	state.markReady()
 	state.setTerminalFailure()
 	handler := newRuntimeProxy(config, state, time.Now)
@@ -621,7 +662,7 @@ func TestRequestSizeLimitIsEnforcedBeforeUpstream(t *testing.T) {
 		calls.Add(1)
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	body := fmt.Sprintf(`{"model":"registry.example/team/model:v1","prompt":"%s"}`, strings.Repeat("x", maxRequestBytes))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodPost, "/api/generate", body))

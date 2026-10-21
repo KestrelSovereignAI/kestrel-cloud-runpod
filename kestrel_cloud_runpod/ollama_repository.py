@@ -1666,6 +1666,42 @@ class SQLiteOllamaLeaseRepository:
             connection.commit()
         return current
 
+    def validate_stored_cleanup_authority(self, lease: OllamaLease) -> OllamaLease:
+        """Validate one supplied cleanup snapshot without discovering new targets.
+
+        Cleanup can continue from an already-durable snapshot when an optional
+        later refresh fails, but only after the snapshot is proven to be a
+        prefix of the current stored authority.  Returning the supplied value
+        deliberately prevents this admission check from turning an unseen
+        concurrent suffix into provider-delete authority.
+        """
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            if not _cleanup_lineage_is_compatible(lease, current):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed cleanup lineage"
+                )
+            if current.state is OllamaLeaseState.TERMINATED:
+                connection.commit()
+                return current
+            if (
+                lease.state is not OllamaLeaseState.RELEASING
+                or current.state is not OllamaLeaseState.RELEASING
+                or lease.cleanup_intent is None
+                or lease.provider_resource_id is None
+                or lease.cleanup_intent.provider_resource_id
+                != lease.provider_resource_id
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' lacks stored cleanup authority"
+                )
+            connection.commit()
+        return lease
+
     def attach_provider_acknowledgment(
         self,
         lease: OllamaLease,
@@ -3398,6 +3434,10 @@ def _cleanup_lineage_is_compatible(stale: OllamaLease, current: OllamaLease) -> 
 
     return (
         current.lease_id == stale.lease_id
+        and stale.writer_contract_version == _CURRENT_WRITER_CONTRACT_VERSION
+        and current.writer_contract_version == stale.writer_contract_version
+        and 0 <= stale.writer_epoch <= current.writer_epoch
+        and 0 <= stale.revision <= current.revision
         and current.request_fingerprint == stale.request_fingerprint
         and current.provision_attempt_id == stale.provision_attempt_id
         and current.provisioning_intent == stale.provisioning_intent
@@ -3405,6 +3445,10 @@ def _cleanup_lineage_is_compatible(stale: OllamaLease, current: OllamaLease) -> 
         and current.resource_name == stale.resource_name
         and current.provider_resource_id == stale.provider_resource_id
         and current.cleanup_intent == stale.cleanup_intent
+        and (
+            stale.cleanup_receipt is None
+            or current.cleanup_receipt == stale.cleanup_receipt
+        )
         and _additional_cleanup_targets_are_evidence_prefix(
             stale.additional_cleanup_targets,
             current.additional_cleanup_targets,

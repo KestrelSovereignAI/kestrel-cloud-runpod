@@ -31,7 +31,8 @@ func TestStartupTelemetryCarriesOriginalBindingAndMonotonicIdentity(t *testing.T
 		writer.WriteHeader(http.StatusOK)
 	})
 	config.Upstream = upstream
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 	state.markReady()
 	handler := newRuntimeProxy(config, state, func() time.Time { return started })
 	response := httptest.NewRecorder()
@@ -66,7 +67,8 @@ func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) 
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 	state.markReady()
 	handler := newRuntimeProxy(config, state, time.Now)
 	privateBodies := []string{
