@@ -202,3 +202,20 @@ def test_runtime_workflow_scans_and_publishes_one_exact_image() -> None:
     assert workflow.count("subject-digest: ${{ steps.publish.outputs.digest }}") == 2
     assert "sbom-path: ollama-runtime.spdx.json" in workflow
     assert "KESTREL_OLLAMA_BEARER_TOKEN" in workflow
+
+
+def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
+    contract = json.loads((RUNTIME / "runpod-template.json").read_text())
+    workflow = (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    smoke = workflow.split(
+        "- name: Verify fresh-volume initialization drops all runtime privilege",
+        maxsplit=1,
+    )[1].split("- name: Generate SPDX SBOM", maxsplit=1)[0]
+
+    invalid_counts = {
+        name: smoke.count(f'--env "{name}=')
+        for name in contract["environment"]["required"]
+        if smoke.count(f'--env "{name}=') != 1
+    }
+
+    assert invalid_counts == {}

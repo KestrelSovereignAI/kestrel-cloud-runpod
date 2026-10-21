@@ -29,6 +29,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaCleanupReceipt,
     OllamaLeaseMode,
     OllamaLeaseRequest,
+    OllamaLeaseTeardownError,
     OllamaNonComputeCostComponent,
     OllamaNonComputeCostPolicy,
     OllamaPlacementPlan,
@@ -454,9 +455,7 @@ class FakeOllamaProvider:
         self.teardown_calls += 1
         if self.teardown_failures:
             self.teardown_failures -= 1
-            from kestrel_cloud_runpod.models import RunPodManagerError
-
-            raise RunPodManagerError("temporary teardown failure")
+            raise OllamaLeaseTeardownError("temporary teardown remains retryable")
         return OllamaCleanupReceipt(
             cleanup_intent_id=cleanup_intent.cleanup_intent_id,
             verified_absent_at=max(

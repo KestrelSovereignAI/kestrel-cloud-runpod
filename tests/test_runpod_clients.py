@@ -11,6 +11,7 @@ from kestrel_cloud_runpod.clients import (
     DEFAULT_USER_AGENT,
     RunpodControlPlaneClient,
     RunpodServerlessClient,
+    is_retryable_runpod_api_error,
 )
 from kestrel_cloud_runpod.models import (
     CloudType,
@@ -334,6 +335,84 @@ def test_rfc9457_problem_is_typed_and_does_not_expose_body():
     assert error.rate_limit.raw == "limit=100, remaining=99, reset=30"
     assert error.rate_limit.policy == "100;w=60"
     assert "must-not-leak" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (429, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (None, False),
+        (200, False),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (500, False),
+    ],
+)
+def test_api_error_retry_disposition_uses_the_transport_policy(status_code, expected):
+    error = RunPodAPIError(
+        title="Runpod error",
+        detail="bounded test",
+        status_code=status_code,
+    )
+    assert is_retryable_runpod_api_error(error) is expected
+
+
+def test_statusless_api_error_requires_the_original_httpx_failure_cause():
+    request = httpx.Request("GET", "https://api.runpod.io/v2/pods/test")
+    transport = httpx.ConnectError("connection failed", request=request)
+    try:
+        raise RunPodAPIError(
+            title="Runpod transport failed",
+            detail="ConnectError",
+        ) from transport
+    except RunPodAPIError as error:
+        retained = error
+
+    assert is_retryable_runpod_api_error(retained)
+
+    malformed = RunPodAPIError(
+        title="Invalid Runpod response",
+        detail="Expected JSON",
+    )
+    malformed.__cause__ = ValueError("invalid JSON")
+    assert not is_retryable_runpod_api_error(malformed)
+
+    ambiguous = RunPodAmbiguousResultError(
+        title="Ambiguous mutation",
+        detail="provider outcome is unknown",
+        status_code=503,
+    )
+    assert is_retryable_runpod_api_error(ambiguous)
+
+    ambiguous_without_transport = RunPodAmbiguousResultError(
+        title="Ambiguous mutation",
+        detail="provider outcome is unknown",
+    )
+    assert not is_retryable_runpod_api_error(ambiguous_without_transport)
+
+    try:
+        raise RunPodAmbiguousResultError(
+            title="Ambiguous mutation",
+            detail="provider transport failed",
+        ) from transport
+    except RunPodAmbiguousResultError as ambiguous_transport:
+        retained_ambiguous = ambiguous_transport
+    assert is_retryable_runpod_api_error(retained_ambiguous)
+
+    class UnknownAPIError(RunPodAPIError):
+        pass
+
+    unknown = UnknownAPIError(
+        title="Unknown subclass",
+        detail="provider outcome is unknown",
+        status_code=503,
+    )
+    assert not is_retryable_runpod_api_error(unknown)
 
 
 def test_safe_get_retries_using_retry_after_and_records_rate_limit():

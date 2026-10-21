@@ -2125,6 +2125,31 @@ class SQLiteOllamaLeaseRepository:
                         "last_provider_error": None,
                     }
                 )
+                if (
+                    current.provisioning_receipt is None
+                    and current.state is OllamaLeaseState.TERMINATED
+                    and current.teardown_state is OllamaTeardownState.COMPLETE
+                    and current.cleanup_intent is not None
+                    and current.cleanup_receipt is not None
+                    and not current.additional_cleanup_targets
+                    and current.provisioning_mismatch is None
+                    and current.lifecycle_billing_state
+                    is OllamaLifecycleBillingState.UNKNOWN
+                    and not current.lifecycle_billing_observations
+                    and current.lifecycle_billing_selection is None
+                    and not current.lifecycle_billing_corrections
+                    and current.lifecycle_billing_latest_reference.state
+                    is OllamaLifecycleBillingLatestState.NOT_OBSERVED
+                    and not current.billing_retention_exhausted
+                ):
+                    changes.update(
+                        {
+                            "lifecycle_billing_state": (
+                                OllamaLifecycleBillingState.PENDING
+                            ),
+                            "billing_next_check_at": now,
+                        }
+                    )
             elif provider_error is not None:
                 changes["last_provider_error"] = provider_error
 

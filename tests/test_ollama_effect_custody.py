@@ -418,7 +418,9 @@ async def test_second_exact_resource_failure_retains_primary_receipt_and_retry_s
 
     async def selective_teardown(resource, cleanup_intent):
         if resource.provider_resource_id == "provider-001" and fail_original:
-            raise RunPodManagerError("original acknowledgment delete unavailable")
+            raise OllamaLeaseTeardownError(
+                "additional teardown remains retryable for original acknowledgment"
+            )
         return await original_teardown(resource, cleanup_intent)
 
     provider.provision = blocked
