@@ -25,17 +25,21 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseState,
     OllamaLeaseTeardownError,
     OllamaLifecycleBillingObservation,
+    OllamaLifecycleBillingSelection,
     OllamaLifecycleBillingState,
     OllamaProvisioningEvidenceState,
     OllamaProvisioningMismatchEvidence,
     OllamaProvisioningMismatchReason,
     OllamaRuntimeTelemetryObservation,
     OllamaRuntimeTelemetryState,
+    OllamaTeardownState,
+    ProvisionedOllamaResource,
     normalize_new_ollama_request_money,
 )
 from kestrel_cloud_runpod.ollama_repository import (
     OllamaWriterDrainAttestation,
     SQLiteOllamaLeaseRepository,
+    _db_value,
     lease_database_path,
     request_from_lease,
 )
@@ -219,7 +223,7 @@ def _claim_reconciliation_process(database, gate, results, now, retry_at):
     results.put(None if claimed is None else claimed.revision)
 
 
-async def _selected_pod_billing_lease(
+async def _terminated_pod_billing_evidence(
     tmp_path, *, actual=Decimal(1), database_name="selected-billing.sqlite3"
 ):
     clock = MutableClock()
@@ -277,6 +281,20 @@ async def _selected_pod_billing_lease(
         first_observed_at=observed_at,
         pod_billing_receipt=receipt,
     )
+    return repository, terminated, observed_at, observation
+
+
+async def _selected_pod_billing_lease(
+    tmp_path, *, actual=Decimal(1), database_name="selected-billing.sqlite3"
+):
+    (
+        repository,
+        terminated,
+        observed_at,
+        observation,
+    ) = await _terminated_pod_billing_evidence(
+        tmp_path, actual=actual, database_name=database_name
+    )
     selected = repository.record_billing_outcome(
         terminated,
         now=observed_at,
@@ -328,6 +346,89 @@ def test_insert_is_idempotent_and_survives_repository_restart(tmp_path):
     assert duplicate == first
     assert duplicate.state is OllamaLeaseState.REQUESTED
     assert request_from_lease(duplicate) == make_request(clock)
+
+
+async def _cleanup_claim_with_late_target(tmp_path, *, database_name):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / database_name)
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock), plan=serverless_plan())
+    releasing = repository.compare_and_set(
+        ready,
+        changes={
+            "state": OllamaLeaseState.RELEASING,
+            "teardown_state": OllamaTeardownState.PENDING,
+            "route_url": None,
+            "termination_reason": "test cleanup claim",
+        },
+    )
+    stale = repository.record_cleanup_intent(
+        releasing,
+        now=clock(),
+        termination_reason="test cleanup claim",
+    )
+    assert stale.provisioning_intent is not None
+    current = repository.attach_provider_acknowledgment(
+        stale,
+        ProvisionedOllamaResource(
+            resource_type=stale.provisioning_intent.resource_type,
+            provider_resource_id="late-original-ack",
+            resource_name=stale.provisioning_intent.resource_name,
+        ),
+        now=clock(),
+    )
+    assert len(current.additional_cleanup_targets) == 1
+    return clock, repository, stale, current
+
+
+@pytest.mark.asyncio
+async def test_cleanup_claim_folds_latest_same_lineage_owned_target(tmp_path):
+    clock, repository, stale, current = await _cleanup_claim_with_late_target(
+        tmp_path, database_name="cleanup-claim-fold.sqlite3"
+    )
+    claimed = repository.claim_cleanup_attempt(stale, now=clock())
+    assert claimed.additional_cleanup_targets == current.additional_cleanup_targets
+
+
+@pytest.mark.asyncio
+async def test_cleanup_claim_rejects_every_changed_lineage(tmp_path):
+    clock, repository, stale, current = await _cleanup_claim_with_late_target(
+        tmp_path, database_name="cleanup-claim-changed.sqlite3"
+    )
+    target = current.additional_cleanup_targets[0]
+    changed_lineages = (
+        replace(stale, request_fingerprint="f" * 64),
+        replace(stale, provision_attempt_id="changed-attempt"),
+        replace(
+            stale,
+            cleanup_intent=replace(
+                stale.cleanup_intent,
+                termination_reason="changed cleanup lineage",
+            ),
+        ),
+        replace(
+            stale,
+            additional_cleanup_targets=(
+                replace(target, provider_resource_id="foreign-resource"),
+            ),
+        ),
+        replace(
+            stale,
+            additional_cleanup_targets=(
+                replace(target, resource_name="changed-resource-name"),
+            ),
+        ),
+    )
+    for changed in changed_lineages:
+        with pytest.raises(OllamaLeaseConflictError, match="cleanup lineage"):
+            repository.claim_cleanup_attempt(changed, now=clock())
 
 
 def test_two_repositories_cannot_claim_one_reconciliation_visit(tmp_path):
@@ -1857,6 +1958,75 @@ async def test_billing_retention_status_survives_a_later_duplicate_poll(tmp_path
     )
     assert repeated.lifecycle_billing_observations == (
         selected.lifecycle_billing_observations
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_capacity_bytes", [0, 100_000])
+async def test_billing_retention_before_first_selection_remains_manual(
+    tmp_path, later_capacity_bytes
+):
+    (
+        repository,
+        terminated,
+        observed_at,
+        oversized,
+    ) = await _terminated_pod_billing_evidence(
+        tmp_path,
+        actual=Decimal("0.12345678901234567"),
+        database_name=f"first-selection-retention-{later_capacity_bytes}.sqlite3",
+    )
+    assert oversized.pod_billing_receipt is not None
+    shorter = replace(
+        oversized,
+        provider_capacity_actual_cost_usd=Decimal("0.1"),
+        first_observed_at=observed_at + timedelta(hours=1),
+        pod_billing_receipt=replace(
+            oversized.pod_billing_receipt,
+            provider_billing_id="pod-billing-shorter-revision",
+            actual_cost_usd=Decimal("0.1"),
+            reconciled_at=observed_at + timedelta(hours=1),
+        ),
+    )
+    shorter_selection = OllamaLifecycleBillingSelection(
+        observation_id=shorter.observation_id,
+        selected_at=observed_at + timedelta(hours=1),
+    )
+    retention_limit = sum(
+        len(_db_value(value)) for value in ((shorter,), (), shorter_selection)
+    )
+    assert len(_db_value((oversized,))) > len(_db_value((shorter,)))
+
+    bounded = repository.record_billing_outcome(
+        terminated,
+        now=observed_at,
+        next_check_at=observed_at + timedelta(hours=1),
+        observation=oversized,
+        maximum_observations=8,
+        maximum_bytes=retention_limit,
+    )
+    assert bounded.lifecycle_billing_state is OllamaLifecycleBillingState.PENDING
+    assert bounded.lifecycle_billing_observations == ()
+    assert bounded.lifecycle_billing_selection is None
+    assert bounded.billing_retention_exhausted is True
+
+    repeated = repository.record_billing_outcome(
+        bounded,
+        now=observed_at + timedelta(hours=1),
+        next_check_at=observed_at + timedelta(hours=2),
+        observation=shorter,
+        maximum_observations=8,
+        maximum_bytes=retention_limit + later_capacity_bytes,
+    )
+
+    assert repeated.lifecycle_billing_state is OllamaLifecycleBillingState.PENDING
+    assert repeated.lifecycle_billing_observations == ()
+    assert repeated.lifecycle_billing_selection is None
+    assert repeated.lifecycle_billing_corrections == ()
+    assert repeated.billing_retention_exhausted is True
+    assert repeated.billing_last_checked_at == observed_at + timedelta(hours=1)
+    assert repeated.billing_last_provider_error == (
+        "billing evidence retention requires manual reconciliation"
     )
 
 

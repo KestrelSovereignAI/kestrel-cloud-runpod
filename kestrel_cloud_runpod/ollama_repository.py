@@ -50,6 +50,9 @@ from .ollama_contracts import (
 from .sqlite_store import lease_database_connection
 
 _CURRENT_WRITER_CONTRACT_VERSION = 4
+_BILLING_RETENTION_MANUAL_ERROR = (
+    "billing evidence retention requires manual reconciliation"
+)
 _WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v4",
     "ollama_writer_update_v4",
@@ -1593,8 +1596,10 @@ class SQLiteOllamaLeaseRepository:
                 current.request_fingerprint != lease.request_fingerprint
                 or current.provision_attempt_id != lease.provision_attempt_id
                 or current.cleanup_intent != lease.cleanup_intent
-                or tuple(item.target_id for item in current.additional_cleanup_targets)
-                != tuple(item.target_id for item in lease.additional_cleanup_targets)
+                or not _additional_cleanup_targets_are_evidence_prefix(
+                    lease.additional_cleanup_targets,
+                    current.additional_cleanup_targets,
+                )
             ):
                 connection.rollback()
                 raise OllamaLeaseConflictError(
@@ -2375,6 +2380,23 @@ class SQLiteOllamaLeaseRepository:
                     current.cleanup_intent,
                     current.cleanup_receipt,
                 )
+            if current.billing_retention_exhausted:
+                changes.update(
+                    {
+                        "lifecycle_billing_state": (
+                            OllamaLifecycleBillingState.CORRECTION_PENDING
+                            if current.lifecycle_billing_selection is not None
+                            else OllamaLifecycleBillingState.PENDING
+                        ),
+                        "billing_last_provider_error": (
+                            _BILLING_RETENTION_MANUAL_ERROR
+                        ),
+                    }
+                )
+                return self._update_locked(
+                    connection, current, changes, "lifecycle billing"
+                )
+            if observation is not None:
                 existing = next(
                     (
                         item
@@ -2439,7 +2461,7 @@ class SQLiteOllamaLeaseRepository:
                                     else OllamaLifecycleBillingState.PENDING
                                 ),
                                 "billing_last_provider_error": (
-                                    "billing evidence retention requires manual reconciliation"
+                                    _BILLING_RETENTION_MANUAL_ERROR
                                 ),
                                 "billing_retention_exhausted": True,
                             }
@@ -3292,6 +3314,40 @@ def _telemetry_continues_lineage(
             before.last_inference_completed_at, after.last_inference_completed_at
         )
     )
+
+
+def _additional_cleanup_targets_are_evidence_prefix(
+    stale: tuple[OllamaAdditionalCleanupTarget, ...],
+    current: tuple[OllamaAdditionalCleanupTarget, ...],
+) -> bool:
+    """Accept only monotonic evidence added to the same owned target lineage."""
+
+    if len(stale) > len(current):
+        return False
+    for before, after in zip(stale, current):
+        if (
+            before.intent_sha256 != after.intent_sha256
+            or before.lease_id != after.lease_id
+            or before.provision_attempt_id != after.provision_attempt_id
+            or before.resource_type is not after.resource_type
+            or before.resource_name != after.resource_name
+            or before.provider_resource_id != after.provider_resource_id
+            or before.source != after.source
+            or (
+                before.provisioning_mismatch is not None
+                and before.provisioning_mismatch != after.provisioning_mismatch
+            )
+            or (
+                before.cleanup_intent is not None
+                and before.cleanup_intent != after.cleanup_intent
+            )
+            or (
+                before.cleanup_receipt is not None
+                and before.cleanup_receipt != after.cleanup_receipt
+            )
+        ):
+            return False
+    return True
 
 
 def _same_provisioning_receipt_authority(

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -124,11 +125,111 @@ def normalize_cuda_floor(value: Optional[str]) -> Optional[str]:
 
 @dataclass(frozen=True)
 class EndpointMountAssessment:
-    """Complete endpoint mount evidence, before outcome precedence is chosen."""
+    """Complete resource mount evidence, before outcome precedence is chosen."""
 
     missing_kinds: tuple[str, ...]
     invalid_kinds: tuple[str, ...]
     mismatched_kinds: tuple[str, ...]
+
+
+def _mount_sequence(
+    value: object, *, required_keys: frozenset[str]
+) -> tuple[tuple[tuple[object, ...], ...], bool, bool]:
+    """Return typed members, invalid evidence and whether evidence is complete."""
+
+    if not isinstance(value, list):
+        return (), True, False
+    valid: list[tuple[object, ...]] = []
+    invalid = False
+    for mount in value:
+        if not isinstance(mount, Mapping) or set(mount) != required_keys:
+            invalid = True
+            continue
+        fields: list[object] = []
+        for key in sorted(required_keys):
+            field = mount.get(key)
+            if not isinstance(field, str) or not field:
+                invalid = True
+                break
+            fields.append(field)
+        else:
+            valid.append(tuple(fields))
+    return tuple(valid), invalid, not invalid
+
+
+def _persistent_mount(
+    value: object,
+) -> tuple[tuple[object, ...] | None, bool, bool]:
+    if not isinstance(value, Mapping) or set(value) != {"path", "size"}:
+        return None, True, False
+    path = value.get("path")
+    size = value.get("size")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+    ):
+        return None, True, False
+    return (path, size), False, True
+
+
+def _has_confirmed_foreign_mount_member(actual: object, accepted: object) -> bool:
+    """Return whether partial sequence evidence proves an unaccepted member."""
+
+    if not isinstance(actual, tuple) or not isinstance(accepted, tuple):
+        return False
+    remaining = list(accepted)
+    for member in actual:
+        try:
+            remaining.remove(member)
+        except ValueError:
+            return True
+    return False
+
+
+def _assess_mounts(
+    raw: Mapping[str, Any],
+    *,
+    expected: Mapping[str, object],
+    parsers: Mapping[str, Callable[[object], tuple[object, bool, bool]]],
+    required_kinds: frozenset[str],
+) -> EndpointMountAssessment:
+    """Assess every mount kind without inferring absence from malformed siblings."""
+
+    if "mounts" not in raw or raw.get("mounts") is None:
+        return EndpointMountAssessment(tuple(sorted(required_kinds)), (), ())
+    mounts = raw.get("mounts")
+    if not isinstance(mounts, Mapping):
+        return EndpointMountAssessment((), tuple(sorted(parsers)), ())
+    missing: list[str] = []
+    invalid: list[str] = []
+    mismatched: list[str] = []
+    if set(mounts).difference(parsers):
+        mismatched.append("unsupported")
+    for kind, parser in parsers.items():
+        if kind not in mounts:
+            if kind in required_kinds:
+                missing.append(kind)
+            elif kind in expected:
+                mismatched.append(kind)
+            continue
+        actual, actual_invalid, complete = parser(mounts[kind])
+        if actual_invalid:
+            invalid.append(kind)
+        if kind not in expected:
+            if complete or _has_confirmed_foreign_mount_member(actual, ()):
+                mismatched.append(kind)
+            continue
+        accepted, accepted_invalid, accepted_complete = parser(expected[kind])
+        if accepted_invalid or not accepted_complete:
+            raise ValueError("Accepted mount policy is invalid")
+        if (complete and actual != accepted) or (
+            actual_invalid and _has_confirmed_foreign_mount_member(actual, accepted)
+        ):
+            mismatched.append(kind)
+    return EndpointMountAssessment(tuple(missing), tuple(invalid), tuple(mismatched))
 
 
 def assess_endpoint_mounts(
@@ -136,49 +237,46 @@ def assess_endpoint_mounts(
 ) -> EndpointMountAssessment:
     """Assess network and global policy independently without short-circuiting."""
 
+    return _assess_mounts(
+        raw,
+        expected={
+            "network": [
+                {"volumeId": volume_id} for volume_id in expected_network_volume_ids
+            ],
+            "global": [],
+        },
+        parsers={
+            "network": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"volumeId"})
+            ),
+            "global": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"volumeId"})
+            ),
+        },
+        required_kinds=frozenset({"network", "global"}),
+    )
+
+
+def assess_pod_mounts(
+    raw: Mapping[str, Any], expected_mounts: Mapping[str, Any] | None
+) -> EndpointMountAssessment:
+    """Assess Pod network and persistent mounts as independent typed evidence."""
+
     if "mounts" not in raw or raw.get("mounts") is None:
-        return EndpointMountAssessment(("global", "network"), (), ())
-    mounts = raw.get("mounts")
-    if not isinstance(mounts, Mapping):
-        return EndpointMountAssessment((), ("global", "network"), ())
-    missing: list[str] = []
-    invalid: list[str] = []
-    mismatched: list[str] = []
-    if set(mounts).difference({"network", "global"}):
-        mismatched.append("unsupported")
-
-    network = mounts.get("network")
-    if "network" not in mounts:
-        missing.append("network")
-    elif not isinstance(network, list):
-        invalid.append("network")
-    else:
-        network_ids: list[str] = []
-        invalid_network = False
-        for mount in network:
-            if not isinstance(mount, Mapping) or set(mount) != {"volumeId"}:
-                invalid_network = True
-                continue
-            volume_id = mount.get("volumeId")
-            if not isinstance(volume_id, str) or not volume_id:
-                invalid_network = True
-                continue
-            network_ids.append(volume_id)
-        if invalid_network:
-            invalid.append("network")
-        if (not invalid_network or network_ids) and tuple(network_ids) != tuple(
-            expected_network_volume_ids
-        ):
-            mismatched.append("network")
-
-    global_mounts = mounts.get("global")
-    if "global" not in mounts:
-        missing.append("global")
-    elif not isinstance(global_mounts, list):
-        invalid.append("global")
-    elif global_mounts:
-        mismatched.append("global")
-    return EndpointMountAssessment(tuple(missing), tuple(invalid), tuple(mismatched))
+        return EndpointMountAssessment(("mounts",), (), ())
+    if not isinstance(raw.get("mounts"), Mapping):
+        return EndpointMountAssessment((), ("mounts",), ())
+    return _assess_mounts(
+        raw,
+        expected=expected_mounts or {},
+        parsers={
+            "network": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"path", "volumeId"})
+            ),
+            "persistent": _persistent_mount,
+        },
+        required_kinds=frozenset(),
+    )
 
 
 def validate_endpoint_mounts(

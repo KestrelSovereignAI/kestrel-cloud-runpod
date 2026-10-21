@@ -19,6 +19,7 @@ from ollama_test_support import (
     make_request,
     non_compute_cost_policy,
     pod_plan,
+    runtime_telemetry_payload,
     serverless_plan,
 )
 
@@ -34,6 +35,7 @@ from kestrel_cloud_runpod.models import (
     RunPodAPIError,
     RunPodManagerError,
     assess_endpoint_mounts,
+    assess_pod_mounts,
     environment_values_sha256,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
@@ -1415,6 +1417,89 @@ async def test_native_confirmed_pod_violation_wins_over_independent_missing_evid
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("mounts", "confirmed_mismatch"),
+    [
+        ({"network": [17]}, False),
+        (
+            {"network": [{"volumeId": "foreign-volume", "path": "/workspace"}]},
+            True,
+        ),
+        (
+            {
+                "network": [
+                    17,
+                    {"volumeId": "foreign-volume", "path": "/workspace"},
+                ]
+            },
+            True,
+        ),
+    ],
+)
+async def test_native_pod_mounts_separate_invalid_from_confirmed_foreign_storage(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+    mounts,
+    confirmed_mismatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    state["replace_on_get"] = {"mounts": mounts}
+    deployment = replace(
+        fixture_provider.deployment,
+        profile=replace(
+            fixture_provider.deployment.profile,
+            network_volume_id="approved-volume",
+        ),
+        serverless_non_compute_cost=non_compute_cost_policy(
+            include_network_volume=True
+        ),
+        pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+    )
+    provider = _provider(client=fixture_provider.client, deployment=deployment)
+    clock = MutableClock()
+    provider._clock = clock
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"pod-mount-{confirmed_mismatch}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    plan = replace(
+        pod_plan(rate=0.5),
+        non_compute_components=(deployment.pod_non_compute_cost.covered_components),
+    )
+
+    expected_error = (
+        OllamaProvisioningMismatchError if confirmed_mismatch else RunPodManagerError
+    )
+    with pytest.raises(expected_error):
+        await service.acquire(request, plan=plan, wait_until_ready=False)
+
+    durable = repository.get(request.lease_id)
+    assert durable is not None
+    if confirmed_mismatch:
+        assert durable.state is OllamaLeaseState.TERMINATED
+        assert durable.provisioning_mismatch is not None
+        assert durable.provisioning_mismatch.reason.value == "runtime"
+        assert state["calls"][-2:] == [
+            ("POST", "/v2/pods/pod-evidence-1/action"),
+            ("GET", "/v2/pods/pod-evidence-1"),
+        ]
+    else:
+        assert durable.state is OllamaLeaseState.RECONCILE_REQUIRED
+        assert durable.provisioning_mismatch is None
+        assert durable.cleanup_receipt is None
+        assert not any(path.endswith("/action") for _method, path in state["calls"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "mode,replace_on_get",
     [
         (
@@ -1962,6 +2047,184 @@ async def test_native_original_ack_survives_different_candidate_mismatch(
     assert client.actions == [("original-endpoint", "delete")]
 
 
+@pytest.mark.asyncio
+async def test_native_late_original_ack_joins_final_control_failure_cleanup(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    clock = MutableClock()
+    post_entered = threading.Event()
+    post_finished = threading.Event()
+    final_telemetry_entered = asyncio.Event()
+    final_telemetry_finished = asyncio.Event()
+    state = {
+        "resources": {},
+        "calls": [],
+        "request_body": None,
+        "final_telemetry": False,
+    }
+
+    def control_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        state["calls"].append((request.method, path))
+        if request.method == "POST" and path == "/v2/serverless":
+            body = json.loads(request.content)
+            state["request_body"] = body
+            gpu = dict(body["gpu"])
+            gpu.update(
+                allowedCudaVersions=[],
+                excludedTypes=[],
+                minCudaVersion=gpu.get("minCudaVersion"),
+            )
+            base = {
+                **body,
+                "gpu": gpu,
+                "args": body.get("args", ""),
+                "createdAt": clock().isoformat(),
+                "requestUrls": {
+                    "base": "https://runtime.invalid",
+                    "health": "https://runtime.invalid/ping",
+                },
+            }
+            candidate = {**base, "id": "candidate-valid"}
+            original = {**base, "id": "original-post-ack"}
+            state["resources"] = {
+                "candidate-valid": candidate,
+                "original-post-ack": original,
+            }
+            post_entered.set()
+            assert post_finished.wait(5), "test did not release original POST"
+            return httpx.Response(201, json=original)
+        if request.method == "GET" and path == "/v2/serverless":
+            return httpx.Response(
+                200,
+                json={
+                    "endpoints": [state["resources"]["candidate-valid"]],
+                    "pagination": {"hasNextPage": False, "nextCursor": None},
+                },
+            )
+        if request.method == "GET":
+            resource_id = path.rsplit("/", 1)[-1]
+            resource = state["resources"].get(resource_id)
+            if resource is None:
+                return httpx.Response(404, json={"title": "absent"})
+            return httpx.Response(200, json=resource)
+        if request.method == "DELETE":
+            state["resources"].pop(path.rsplit("/", 1)[-1], None)
+            return httpx.Response(204)
+        raise AssertionError((request.method, path))
+
+    async def runtime_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/ping":
+            return httpx.Response(200)
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+        if request.url.path == "/kestrel/telemetry":
+            if state["final_telemetry"]:
+                final_telemetry_entered.set()
+                await final_telemetry_finished.wait()
+                raise ExecutionCommitOutcomeError("unknown")
+            body = state["request_body"]
+            assert isinstance(body, dict)
+            environment = body["env"]
+            return httpx.Response(
+                200,
+                json=runtime_telemetry_payload(
+                    environment["KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"],
+                    environment["KESTREL_OLLAMA_PROVISION_REQUESTED_AT"],
+                ),
+            )
+        return httpx.Response(404)
+
+    client = RunpodControlPlaneClient(
+        api_key="synthetic-control-only",
+        http_transport=httpx.MockTransport(control_handler),
+        max_safe_retries=0,
+    )
+    try:
+        deployment = replace(
+            _deployment(), profile=replace(_profile(), image_name=_TEST_IMAGE)
+        )
+        provider = _provider(
+            client=client,
+            deployment=deployment,
+            transport=httpx.MockTransport(runtime_handler),
+        )
+        provider._clock = clock
+        repository = SQLiteOllamaLeaseRepository(tmp_path / "late-ack-control.sqlite3")
+        service = OllamaLeaseService(
+            repository=repository,
+            provider=provider,
+            poll_interval_seconds=1,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+        request = make_request(
+            clock,
+            mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            max_authorized_cost=5.0,
+        )
+        acquire = asyncio.create_task(
+            service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+        )
+        assert await asyncio.to_thread(post_entered.wait, 5)
+        adopted = await service.reconcile_lease(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+        assert adopted.state is OllamaLeaseState.READY
+        assert adopted.provider_resource_id == "candidate-valid"
+
+        state["final_telemetry"] = True
+        release = asyncio.create_task(
+            service.release(
+                request.lease_id,
+                owner_id=request.owner_id,
+                workload_id=request.workload_id,
+            )
+        )
+        await asyncio.wait_for(final_telemetry_entered.wait(), timeout=5)
+        post_finished.set()
+        for _ in range(1_000):
+            await asyncio.sleep(0)
+            durable = repository.get(request.lease_id)
+            assert durable is not None
+            if durable.additional_cleanup_targets:
+                break
+        else:
+            pytest.fail("late original acknowledgment was not durably retained")
+        final_telemetry_finished.set()
+
+        results = await asyncio.gather(acquire, release, return_exceptions=True)
+        result_evidence = [
+            (type(result).__name__, str(result), is_execution_control_error(result))
+            for result in results
+        ]
+        assert all(item[2] for item in result_evidence), result_evidence
+        delete_ids = [
+            path.rsplit("/", 1)[-1]
+            for method, path in state["calls"]
+            if method == "DELETE"
+        ]
+        assert sorted(delete_ids) == ["candidate-valid", "original-post-ack"]
+        completed = repository.get(request.lease_id)
+        assert completed is not None
+        assert completed.state is OllamaLeaseState.TERMINATED
+        assert completed.cleanup_receipt is not None
+        assert len(completed.additional_cleanup_targets) == 1
+        assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+    finally:
+        post_finished.set()
+        final_telemetry_finished.set()
+        client.close()
+
+
 class _BlockingDeleteClient(_ControlClient):
     def __init__(self):
         super().__init__()
@@ -2336,6 +2599,146 @@ def test_invalid_endpoint_mount_member_preserves_independent_foreign_volume():
     assert assessment.invalid_kinds == ("network",)
     assert assessment.missing_kinds == ()
     assert assessment.mismatched_kinds == ("network",)
+
+
+@pytest.mark.parametrize(
+    ("assessment", "expected_invalid", "expected_mismatch"),
+    [
+        (
+            lambda: assess_endpoint_mounts(
+                {
+                    "mounts": {
+                        "network": [{"volumeId": "accepted-a"}, 17],
+                        "global": [],
+                    }
+                },
+                ("accepted-a", "accepted-b"),
+            ),
+            ("network",),
+            (),
+        ),
+        (
+            lambda: assess_pod_mounts(
+                {
+                    "mounts": {
+                        "network": [
+                            {"volumeId": "accepted-a", "path": "/a"},
+                            17,
+                        ]
+                    }
+                },
+                {
+                    "network": [
+                        {"volumeId": "accepted-a", "path": "/a"},
+                        {"volumeId": "accepted-b", "path": "/b"},
+                    ]
+                },
+            ),
+            ("network",),
+            (),
+        ),
+        (
+            lambda: assess_endpoint_mounts(
+                {
+                    "mounts": {
+                        "network": [],
+                        "global": [17],
+                    }
+                },
+                (),
+            ),
+            ("global",),
+            (),
+        ),
+    ],
+)
+def test_partially_typed_allowed_mounts_do_not_invent_missing_accepted_members(
+    assessment, expected_invalid, expected_mismatch
+):
+    result = assessment()
+
+    assert result.invalid_kinds == expected_invalid
+    assert result.mismatched_kinds == expected_mismatch
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    [
+        lambda: assess_endpoint_mounts(
+            {
+                "mounts": {
+                    "network": [
+                        {"volumeId": "accepted-a"},
+                        {"volumeId": "accepted-b"},
+                    ],
+                    "global": [],
+                }
+            },
+            ("accepted-a", "accepted-b"),
+        ),
+        lambda: assess_pod_mounts(
+            {
+                "mounts": {
+                    "network": [
+                        {"volumeId": "accepted-a", "path": "/a"},
+                        {"volumeId": "accepted-b", "path": "/b"},
+                    ]
+                }
+            },
+            {
+                "network": [
+                    {"volumeId": "accepted-a", "path": "/a"},
+                    {"volumeId": "accepted-b", "path": "/b"},
+                ]
+            },
+        ),
+    ],
+)
+def test_fully_typed_allowed_mounts_remain_comparable(assessment):
+    result = assessment()
+
+    assert result.invalid_kinds == ()
+    assert result.mismatched_kinds == ()
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    [
+        lambda: assess_endpoint_mounts(
+            {
+                "mounts": {
+                    "network": [
+                        {"volumeId": "accepted-a"},
+                        {"volumeId": "confirmed-foreign"},
+                    ],
+                    "global": [],
+                }
+            },
+            ("accepted-a", "accepted-b"),
+        ),
+        lambda: assess_pod_mounts(
+            {
+                "mounts": {
+                    "network": [
+                        {"volumeId": "accepted-a", "path": "/a"},
+                        {"volumeId": "confirmed-foreign", "path": "/foreign"},
+                    ]
+                }
+            },
+            {
+                "network": [
+                    {"volumeId": "accepted-a", "path": "/a"},
+                    {"volumeId": "accepted-b", "path": "/b"},
+                ]
+            },
+        ),
+    ],
+)
+def test_fully_typed_foreign_mounts_remain_confirmed_mismatches(assessment):
+    result = assessment()
+
+    assert result.invalid_kinds == ()
+    assert result.mismatched_kinds == ("network",)
 
 
 @pytest.mark.asyncio

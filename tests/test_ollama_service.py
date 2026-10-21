@@ -694,6 +694,40 @@ async def test_final_telemetry_control_and_cleanup_failure_are_both_retained(tmp
 
 
 @pytest.mark.asyncio
+async def test_final_telemetry_control_and_cleanup_claim_failure_are_both_retained(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    clock = MutableClock()
+    provider = _ControlFailureFinalTelemetryProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    def changed_cleanup_lineage(_lease, *, now):
+        del now
+        raise OllamaLeaseConflictError("changed cleanup lineage")
+
+    monkeypatch.setattr(
+        service.repository, "claim_cleanup_attempt", changed_cleanup_lineage
+    )
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert any(is_execution_control_error(error) for error in raised.value.exceptions)
+    assert any(
+        isinstance(error, OllamaLeaseConflictError)
+        and "changed cleanup lineage" in str(error)
+        for error in raised.value.exceptions
+    )
+
+
+@pytest.mark.asyncio
 async def test_accrued_multi_gpu_cost_is_independent_of_decimal_context(tmp_path):
     clock = MutableClock()
     provider = FakeOllamaProvider(

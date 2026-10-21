@@ -16,6 +16,7 @@ from ollama_test_support import (
     MutableClock,
     make_request,
     pod_plan,
+    runtime_telemetry_payload,
     serverless_plan,
 )
 from test_ollama_provider import _ControlClient, _provider
@@ -42,46 +43,6 @@ from kestrel_cloud_runpod.serverless_capacity_contracts import (
 )
 
 pytest_plugins = ("test_retired_endpoint_billing", "test_exact_pod_billing")
-
-
-def _telemetry_payload(binding: str, timestamp: str) -> dict[str, object]:
-    return {
-        "schema_version": 2,
-        "runtime_version": "test",
-        "ollama_version": "test",
-        "telemetry_binding_sha256": binding,
-        "runtime_instance_id": "runtime-instance-1",
-        "telemetry_revision": 1,
-        "provision_requested_at": timestamp,
-        "container_started_at": timestamp,
-        "ollama_process_started_at": timestamp,
-        "ollama_healthy_at": timestamp,
-        "model_pull_started_at": None,
-        "model_pull_completed_at": None,
-        "model_load_started_at": timestamp,
-        "model_ready_at": timestamp,
-        "ready_at": timestamp,
-        "placement_and_image_pull_wall_ms": 0,
-        "ollama_boot_ms": 0,
-        "model_pull_ms": None,
-        "model_load_ms": 0,
-        "container_to_ready_ms": 0,
-        "cache_hit": True,
-        "startup_strategy": "cache_hit",
-        "ready": True,
-        "ollama_process_running": True,
-        "terminal_error": None,
-        "inference_started": 0,
-        "inference_completed": 0,
-        "inference_failed": 0,
-        "inference_cancelled": 0,
-        "inference_in_flight": 0,
-        "first_inference_started_at": None,
-        "last_inference_started_at": None,
-        "last_inference_completed_at": None,
-        "inference_busy_ms": 0,
-        "inference_idle_ms": 0,
-    }
 
 
 class _LifecycleBillingProvider(FakeOllamaProvider):
@@ -412,7 +373,7 @@ async def test_ready_observation_reads_authenticated_bound_startup_telemetry(
     )
     timestamp = clock().isoformat()
     telemetry_payload.update(
-        _telemetry_payload(prepared.runtime_telemetry_binding_sha256, timestamp)
+        runtime_telemetry_payload(prepared.runtime_telemetry_binding_sha256, timestamp)
     )
     resource = await provider.provision(prepared)
     control_client.pod = replace(
@@ -448,7 +409,7 @@ async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding():
         prepared.intent.resource_name,
     )
     provisioning = await fake.observe_provisioning(prepared.intent, resource)
-    payload = _telemetry_payload(
+    payload = runtime_telemetry_payload(
         prepared.runtime_telemetry_binding_sha256,
         clock().isoformat(),
     )
@@ -524,7 +485,7 @@ async def test_python_accepts_go_nanosecond_timestamps_with_zero_millisecond_del
         prepared.intent.resource_name,
     )
     provisioning = await fake.observe_provisioning(prepared.intent, resource)
-    payload = _telemetry_payload(
+    payload = runtime_telemetry_payload(
         prepared.runtime_telemetry_binding_sha256,
         clock().isoformat(),
     )
