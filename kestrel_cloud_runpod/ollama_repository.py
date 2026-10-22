@@ -2014,6 +2014,7 @@ class SQLiteOllamaLeaseRepository:
                     "in its current state"
                 )
             changes: dict[str, Any] = {}
+            new_additional_ack_target = False
             if acknowledged_id is not None and not additional_ack_target:
                 changes["provider_resource_id"] = acknowledged_id
             if additional_ack_target:
@@ -2044,12 +2045,21 @@ class SQLiteOllamaLeaseRepository:
                             f"Lease '{lease.lease_id}' has conflicting cleanup targets"
                         )
                     changes["additional_cleanup_targets_json"] = (target,)
+                    new_additional_ack_target = True
                 elif (
                     mismatch is not None
                     and existing_target.provisioning_mismatch is None
                 ):
                     changes["additional_cleanup_targets_json"] = (
                         replace(existing_target, provisioning_mismatch=mismatch),
+                    )
+                elif (
+                    mismatch is not None
+                    and existing_target.provisioning_mismatch != mismatch
+                ):
+                    connection.rollback()
+                    raise OllamaLeaseConflictError(
+                        f"Lease '{lease.lease_id}' additional mismatch is immutable"
                     )
             if candidate_id is not None:
                 changes["ambiguous_create_candidate_id"] = candidate_id
@@ -2153,9 +2163,13 @@ class SQLiteOllamaLeaseRepository:
             elif provider_error is not None:
                 changes["last_provider_error"] = provider_error
 
+            if additional_ack_target and not changes:
+                connection.commit()
+                return current
+
             new_state = current.state
             teardown_state = current.teardown_state
-            if additional_ack_target:
+            if new_additional_ack_target:
                 new_state = OllamaLeaseState.RELEASING
                 teardown_state = OllamaTeardownState.PENDING
                 changes.update(
@@ -2201,8 +2215,10 @@ class SQLiteOllamaLeaseRepository:
                 OllamaLeaseState.RECONCILE_REQUIRED,
             }:
                 new_state = OllamaLeaseState.WAITING_FOR_MODEL
-            if current.state is OllamaLeaseState.RELEASING and (
-                mismatch is not None or provider_error is not None
+            if (
+                current.state is OllamaLeaseState.RELEASING
+                and not additional_ack_target
+                and (mismatch is not None or provider_error is not None)
             ):
                 if (
                     current.provider_resource_id is not None
@@ -2911,21 +2927,12 @@ class SQLiteOllamaLeaseRepository:
                 )
             current = _lease_from_row(row)
             if (
-                current.request_fingerprint != lease.request_fingerprint
-                or current.provision_attempt_id != lease.provision_attempt_id
+                not _cleanup_lineage_is_compatible(lease, current)
                 or current.provider_resource_id != provider_resource_id
             ):
                 connection.rollback()
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' changed teardown lineage"
-                )
-            if current.state is OllamaLeaseState.TERMINATED:
-                connection.commit()
-                return current
-            if current.state is not OllamaLeaseState.RELEASING:
-                connection.rollback()
-                raise OllamaLeaseConflictError(
-                    f"Lease '{lease.lease_id}' is not releasing its exact resource"
                 )
             if provider_error is None:
                 if current.cleanup_intent is None or cleanup_receipt is None:
@@ -2946,7 +2953,11 @@ class SQLiteOllamaLeaseRepository:
                 ):
                     connection.rollback()
                     raise ValueError("Successful cleanup requires a billing schedule")
-                require_aware(billing_next_check_at, "billing schedule")
+                if billing_next_check_at is not None:
+                    require_aware(billing_next_check_at, "billing schedule")
+                if current.cleanup_receipt is not None:
+                    connection.commit()
+                    return current
                 all_cleanup_complete = all(
                     target.cleanup_receipt is not None
                     for target in current.additional_cleanup_targets
@@ -2994,11 +3005,24 @@ class SQLiteOllamaLeaseRepository:
                 if retry_at <= now:
                     connection.rollback()
                     raise ValueError("Cleanup retry must be in the future")
+                if current.cleanup_receipt is not None:
+                    connection.commit()
+                    return current
                 changes = {
                     "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
                     "last_provider_error": provider_error,
                     "reconcile_after": retry_at,
                 }
+            if current.state is OllamaLeaseState.TERMINATED:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' has no retained teardown outcome"
+                )
+            if current.state is not OllamaLeaseState.RELEASING:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' is not releasing its exact resource"
+                )
             changes.update(
                 {
                     "route_url": None,
