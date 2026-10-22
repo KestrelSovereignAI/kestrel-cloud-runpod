@@ -31,12 +31,13 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   nested JSON or unexpected HTTP success statuses, remain ambiguous and require
   reconciliation before retrying. Hide container environment and arguments in
   request representations.
-- Advance the Ollama SQLite writer contract to version 3 so drained version-2
-  writers cannot mutate lifecycle evidence. Historical rows keep unknown
+- Advance the Ollama SQLite writer contract to version 6 so explicitly drained
+  older writers cannot mutate lifecycle evidence. Historical rows keep unknown
   cleanup and cost provenance; only a strictly current request proven never to
   have reached provider admission may record no provider effect.
-- Require Core 0.53.37 for provider-neutral refresh of cached terminal inference
-  evidence as well as the canonical joined-effect owner used by this adapter.
+- Require Core 0.53.41 for provider-neutral refresh of cached terminal inference
+  evidence, the canonical joined-effect owner, and direct-node execution-control
+  classification used by this adapter.
 
 ## [0.15.1] - 2026-10-20
 
