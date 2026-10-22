@@ -37,7 +37,6 @@ from .models import (
     assess_pod_mounts,
     environment_values_sha256,
     normalize_cuda_floor,
-    validate_endpoint_mounts,
 )
 from .ollama_contracts import (
     OllamaCleanupBasis,
@@ -489,13 +488,17 @@ class RunpodOllamaCapacityProvider:
             resource_name=created.name,
         )
 
-    async def observe_provisioning(
+    async def _read_original_provisioning(
         self,
         intent: OllamaProvisioningIntent,
         resource: ProvisionedOllamaResource,
-        *,
-        reconciled_after_ambiguous_create: bool = False,
-    ) -> OllamaProvisioningReceipt:
+    ) -> tuple[
+        EndpointResource | PodResource,
+        Mapping[str, Any],
+        PodRealizedPlacement | None,
+        OllamaProviderRatePrecision | None,
+        datetime,
+    ]:
         if (
             resource.resource_type is not intent.resource_type
             or resource.resource_name != intent.resource_name
@@ -547,6 +550,18 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider readback evidence is incomplete or invalid"
             ) from exc
+        return observed, normalized, placement, precision, readback_at
+
+    async def observe_provisioning(
+        self,
+        intent: OllamaProvisioningIntent,
+        resource: ProvisionedOllamaResource,
+        *,
+        reconciled_after_ambiguous_create: bool = False,
+    ) -> OllamaProvisioningReceipt:
+        observed, normalized, placement, precision, readback_at = (
+            await self._read_original_provisioning(intent, resource)
+        )
         if observed.created_at is None or observed.environment_sha256 is None:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider omitted original provisioning evidence"
@@ -595,21 +610,33 @@ class RunpodOllamaCapacityProvider:
         intent: OllamaProvisioningIntent | None = None,
         provisioning: OllamaProvisioningReceipt | None = None,
     ) -> OllamaReadinessObservation:
-        if (intent is None) is not (provisioning is None):
-            raise RunPodManagerError(
-                "Ollama readiness authority must be supplied as one complete pair"
+        if intent is None or provisioning is None:
+            raise OllamaProvisioningEvidenceError(
+                "Ollama readiness requires original provisioning authority"
             )
+        try:
+            provisioning.validate_intent(intent)
+        except ValueError as exc:
+            raise OllamaProvisioningEvidenceError(
+                "Ollama readiness provisioning receipt is unbound"
+            ) from exc
+        if (
+            provisioning.provider_resource_id != resource.provider_resource_id
+            or provisioning.resource_type is not resource.resource_type
+            or provisioning.resource_name != resource.resource_name
+        ):
+            raise OllamaProvisioningEvidenceError(
+                "Ollama readiness resource does not bind its provisioning receipt"
+            )
+        observed, _normalized, _placement, _precision, _readback_at = (
+            await self._read_original_provisioning(intent, resource)
+        )
         if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
-            endpoint = await asyncio.to_thread(
-                self.client.get_endpoint, resource.provider_resource_id
-            )
-            endpoint.require_valid_fields(context="v2 Ollama Endpoint readiness")
-            validate_endpoint_mounts(
-                endpoint.raw,
-                (self.deployment.profile.network_volume_id,)
-                if self.deployment.profile.network_volume_id
-                else (),
-            )
+            if not isinstance(observed, EndpointResource):
+                raise OllamaProvisioningEvidenceError(
+                    "Ollama Endpoint readiness readback has the wrong type"
+                )
+            endpoint = observed
             base_url = endpoint.request_urls.get("base")
             health_url = endpoint.request_urls.get("health")
             provider_ready = bool(
@@ -625,10 +652,11 @@ class RunpodOllamaCapacityProvider:
             )
             bearer_token = self._serverless_api_key
         else:
-            pod = await asyncio.to_thread(
-                self.client.get_pod, resource.provider_resource_id
-            )
-            pod.require_valid_fields(context="v2 Ollama Pod readiness")
+            if not isinstance(observed, PodResource):
+                raise OllamaProvisioningEvidenceError(
+                    "Ollama Pod readiness readback has the wrong type"
+                )
+            pod = observed
             base_url = _pod_base_url(
                 resource.provider_resource_id,
                 pod.raw,
@@ -666,10 +694,7 @@ class RunpodOllamaCapacityProvider:
                 intent=intent,
                 provisioning=provisioning,
             )
-            if base_url
-            and provider_ready
-            and intent is not None
-            and provisioning is not None
+            if base_url and provider_ready
             else None
         )
         return OllamaReadinessObservation(

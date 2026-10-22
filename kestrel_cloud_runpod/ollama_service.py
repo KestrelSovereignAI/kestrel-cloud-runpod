@@ -781,6 +781,11 @@ class OllamaLeaseService:
         intent, provisioning = self._provisioning_authority(lease)
         try:
             observation = await self.provider.observe(resource, intent, provisioning)
+        except OllamaProvisioningMismatchError as exc:
+            mismatched = self._persist_provisioning_mismatch(lease, exc)
+            return await self._release(
+                mismatched, reason="provisioning_evidence_mismatch"
+            )
         except RunPodManagerError as exc:
             now = self._now()
             failed = self.repository.compare_and_set(
@@ -886,6 +891,11 @@ class OllamaLeaseService:
             intent, provisioning = self._provisioning_authority(lease)
             observation = await self.provider.observe(
                 resource_from_lease(lease), intent, provisioning
+            )
+        except OllamaProvisioningMismatchError as exc:
+            mismatched = self._persist_provisioning_mismatch(lease, exc)
+            return await self._release(
+                mismatched, reason="provisioning_evidence_mismatch"
             )
         except RunPodManagerError as exc:
             now = self._now()
@@ -1128,6 +1138,8 @@ class OllamaLeaseService:
                         lease.provisioning_intent,
                         lease.provisioning_receipt,
                     )
+                except OllamaProvisioningMismatchError as exc:
+                    lease = self._persist_provisioning_mismatch(lease, exc)
                 except RunPodManagerError as exc:
                     lease = self.repository.record_runtime_telemetry(
                         lease,

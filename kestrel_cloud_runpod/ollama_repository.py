@@ -1741,33 +1741,16 @@ class SQLiteOllamaLeaseRepository:
         unknown = set(changes).difference(self._COLUMNS)
         if unknown:
             raise ValueError(f"Unsupported Ollama lease updates: {sorted(unknown)}")
-        serialized = {key: _db_value(value) for key, value in changes.items()}
-        serialized["updated_at"] = serialized.get(
-            "updated_at", iso_datetime(datetime.now(UTC))
-        )
-        assignments = ", ".join(f"{key} = ?" for key in serialized)
-        values = [*serialized.values(), lease.lease_id, lease.revision]
+        changes = dict(changes)
+        changes.setdefault("updated_at", datetime.now(UTC))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                f"""UPDATE ollama_leases
-                    SET {assignments}, revision = revision + 1,
-                        writer_epoch = writer_epoch + 1
-                    WHERE lease_id = ? AND revision = ?""",
-                values,
+            return self._update_locked(
+                connection,
+                lease,
+                changes,
+                "compare and set",
             )
-            if cursor.rowcount != 1:
-                connection.rollback()
-                raise OllamaLeaseConflictError(
-                    f"Lease '{lease.lease_id}' changed concurrently; reconcile it"
-                )
-            row = connection.execute(
-                "SELECT * FROM ollama_leases WHERE lease_id = ?", (lease.lease_id,)
-            ).fetchone()
-            connection.commit()
-        if row is None:
-            raise RunPodManagerError("Updated Ollama lease disappeared")
-        return _lease_from_row(row)
 
     def claim_cleanup_attempt(
         self, lease: OllamaLease, *, now: datetime
@@ -2655,6 +2638,14 @@ class SQLiteOllamaLeaseRepository:
             connection.execute("BEGIN IMMEDIATE")
             current = self._locked_lease(connection, lease.lease_id)
             if (
+                current.billing_last_checked_at is not None
+                and now < current.billing_last_checked_at
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' rejected a stale billing poll clock"
+                )
+            if (
                 current.state is not OllamaLeaseState.TERMINATED
                 or current.cleanup_intent is None
                 or current.cleanup_receipt is None
@@ -2917,15 +2908,17 @@ class SQLiteOllamaLeaseRepository:
         if cursor.rowcount != 1:
             connection.rollback()
             raise OllamaLeaseConflictError(
-                f"Lease '{lease.lease_id}' changed during {context}"
+                f"Lease '{lease.lease_id}' changed concurrently during {context}"
             )
         row = connection.execute(
             "SELECT * FROM ollama_leases WHERE lease_id = ?", (lease.lease_id,)
         ).fetchone()
-        connection.commit()
         if row is None:
+            connection.rollback()
             raise RunPodManagerError(f"Ollama lease disappeared during {context}")
-        return _lease_from_row(row)
+        updated = _lease_from_row(row)
+        connection.commit()
+        return updated
 
     def record_teardown_outcome(
         self,

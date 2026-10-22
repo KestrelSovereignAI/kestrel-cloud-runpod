@@ -10,6 +10,20 @@ import (
 	"time"
 )
 
+func waitForTelemetryRequests(requests *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		requests.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func TestStartupTelemetryCarriesOriginalBindingAndMonotonicIdentity(t *testing.T) {
 	started := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	binding := strings.Repeat("b", 64)
@@ -61,6 +75,10 @@ func TestStartupTelemetryCarriesOriginalBindingAndMonotonicIdentity(t *testing.T
 func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRequests := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
 	_, upstream := testUpstream(t, func(writer http.ResponseWriter, _ *http.Request) {
 		entered <- struct{}{}
 		<-release
@@ -76,6 +94,12 @@ func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) 
 		`{"model":"registry.example/team/model:v1","prompt":"private-two"}`,
 	}
 	var requests sync.WaitGroup
+	defer func() {
+		releaseRequests()
+		if !waitForTelemetryRequests(&requests, 5*time.Second) {
+			t.Errorf("inference handlers did not join after releasing their barrier")
+		}
+	}()
 	requests.Add(len(privateBodies))
 	for _, body := range privateBodies {
 		go func(payload string) {
@@ -90,8 +114,13 @@ func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) 
 			}
 		}(body)
 	}
-	<-entered
-	<-entered
+	for range privateBodies {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("inference handler did not reach the telemetry barrier")
+		}
+	}
 	time.Sleep(time.Millisecond)
 	inFlight := state.snapshot(config)
 	if inFlight.InferenceStarted != 2 || inFlight.InferenceInFlight != 2 {
@@ -100,8 +129,10 @@ func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) 
 	if inFlight.InferenceBusyMilliseconds < 1 {
 		t.Fatalf("concurrent busy duration = %d", inFlight.InferenceBusyMilliseconds)
 	}
-	close(release)
-	requests.Wait()
+	releaseRequests()
+	if !waitForTelemetryRequests(&requests, 5*time.Second) {
+		t.Fatal("inference handlers did not join after releasing their barrier")
+	}
 	completed := state.snapshot(config)
 	if completed.InferenceCompleted != 2 || completed.InferenceInFlight != 0 {
 		t.Fatalf("completed counters = completed %d, active %d", completed.InferenceCompleted, completed.InferenceInFlight)
