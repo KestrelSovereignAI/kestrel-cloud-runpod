@@ -50,7 +50,9 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseState,
     OllamaLeaseTeardownError,
     OllamaLifecycleBillingState,
+    OllamaProvisioningEvidenceError,
     OllamaProvisioningMismatchError,
+    OllamaProvisioningMismatchReason,
     OllamaResourceType,
     OllamaTeardownState,
     ProvisionedOllamaResource,
@@ -269,6 +271,51 @@ def _provider(
         control_plane_api_key=control_plane_api_key,
         http_transport=transport,
         clock=MutableClock(),
+    )
+
+
+async def _readiness_authority(provider, mode):
+    request = make_request(
+        provider._clock,
+        mode=mode,
+        max_authorized_cost=5.0,
+    )
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    prepared = provider.validate_runtime_request(
+        request,
+        plan,
+        provision_requested_at=provider._clock(),
+    )
+    resource = await provider.provision(prepared)
+    if mode is OllamaLeaseMode.DEDICATED_POD:
+        assert isinstance(provider.client, _ControlClient)
+        pod = provider.client.pod
+        assert pod is not None
+        provider.client.pod = replace(
+            pod,
+            status="RUNNING",
+            raw={
+                **pod.raw,
+                "runtime": {
+                    "ports": [{"private": 11434, "type": "http"}],
+                },
+            },
+        )
+    receipt = await provider.observe_provisioning(prepared.intent, resource)
+    return resource, prepared.intent, receipt, prepared
+
+
+def _runtime_telemetry_response(prepared):
+    return httpx.Response(
+        200,
+        json=runtime_telemetry_payload(
+            prepared.runtime_telemetry_binding_sha256,
+            prepared.intent.provision_requested_at.isoformat(),
+        ),
     )
 
 
@@ -525,14 +572,11 @@ async def test_ollama_creation_carries_the_accepted_cuda_floor(mode, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ollama_refuses_unaccepted_global_storage_before_workload_requests():
+async def test_ollama_refuses_unaccepted_global_storage_before_workload_requests(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
     client = _ControlClient()
-    client.endpoint = replace(
-        client.endpoint,
-        raw={
-            "mounts": {"network": [], "global": [{"volumeId": "unquoted-volume"}]},
-        },
-    )
     seen = []
 
     def handler(request):
@@ -540,66 +584,118 @@ async def test_ollama_refuses_unaccepted_global_storage_before_workload_requests
         return httpx.Response(200)
 
     provider = _provider(client=client, transport=httpx.MockTransport(handler))
-    resource = ProvisionedOllamaResource(
-        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
-        provider_resource_id="endpoint-1",
-        resource_name="resource",
+    resource, intent, receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
     )
-    with pytest.raises(RunPodManagerError, match="global mounts"):
-        await provider.observe(resource)
+    client.endpoint = replace(
+        client.endpoint,
+        raw={
+            **client.endpoint.raw,
+            "mounts": {
+                "network": [],
+                "global": [{"volumeId": "unquoted-volume"}],
+            },
+        },
+    )
+    with pytest.raises(OllamaProvisioningMismatchError) as mismatch:
+        await provider.observe(resource, intent, receipt)
+    assert (
+        mismatch.value.evidence.reason
+        is OllamaProvisioningMismatchReason.ENDPOINT_POLICY
+    )
+    assert (
+        mismatch.value.evidence.provider_resource_id
+        == resource.provider_resource_id
+    )
+    mismatch.value.evidence.validate_intent(intent)
     assert seen == []
 
 
 @pytest.mark.asyncio
-async def test_observe_requires_provider_health_and_reads_exact_model():
+async def test_observe_without_authority_refuses_before_workload_probe(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+
+    provider = _provider(transport=httpx.MockTransport(handler))
+    resource, _intent, _receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+
+    with pytest.raises(OllamaProvisioningEvidenceError):
+        await provider.observe(resource, None, None)
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_observe_requires_provider_health_and_reads_exact_model(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
     requests = []
+    authority = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.headers["Authorization"] == f"Bearer {_SERVERLESS_TOKEN}"
         if request.url.path == "/ping":
             return httpx.Response(200)
+        if request.url.path == "/kestrel/telemetry":
+            return _runtime_telemetry_response(authority["prepared"])
         return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
 
     provider = _provider(transport=httpx.MockTransport(handler))
-    resource = ProvisionedOllamaResource(
-        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
-        provider_resource_id="endpoint-1",
-        resource_name="resource",
+    resource, intent, receipt, prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
     )
+    authority["prepared"] = prepared
 
-    observation = await provider.observe(resource)
+    observation = await provider.observe(resource, intent, receipt)
 
     assert observation.provider_ready is True
     assert observation.has_model("qwen3:8b")
-    assert [request.url.path for request in requests] == ["/ping", "/api/tags"]
+    assert observation.runtime_telemetry is not None
+    assert [request.url.path for request in requests] == [
+        "/ping",
+        "/api/tags",
+        "/kestrel/telemetry",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_pod_observation_uses_v2_status_and_runtime_route():
+async def test_pod_observation_uses_v2_status_and_runtime_route(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    authority = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
         if "Authorization" not in request.headers:
             return httpx.Response(401)
         assert request.headers["Authorization"] == f"Bearer {_POD_TOKEN}"
         if request.url.path == "/ping":
             return httpx.Response(200)
+        if request.url.path == "/kestrel/telemetry":
+            return _runtime_telemetry_response(authority["prepared"])
         return httpx.Response(200, json={"models": []})
 
     provider = _provider(transport=httpx.MockTransport(handler))
-    resource = ProvisionedOllamaResource(
-        resource_type=OllamaResourceType.POD,
-        provider_resource_id="pod-1",
-        resource_name="resource",
+    resource, intent, receipt, prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.DEDICATED_POD
     )
+    authority["prepared"] = prepared
 
-    observation = await provider.observe(resource)
+    observation = await provider.observe(resource, intent, receipt)
 
     assert observation.provider_ready is True
-    assert observation.route_url == "https://pod-1-11434.proxy.runpod.net"
+    assert observation.route_url == "https://pod-evidence-1-11434.proxy.runpod.net"
+    assert observation.runtime_telemetry is not None
 
 
 @pytest.mark.asyncio
-async def test_pod_initializing_health_is_not_ready():
+async def test_pod_initializing_health_is_not_ready(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+
     def handler(request: httpx.Request) -> httpx.Response:
         if "Authorization" not in request.headers:
             return httpx.Response(401)
@@ -607,31 +703,31 @@ async def test_pod_initializing_health_is_not_ready():
             return httpx.Response(204)
         return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
 
-    observation = await _provider(transport=httpx.MockTransport(handler)).observe(
-        ProvisionedOllamaResource(
-            resource_type=OllamaResourceType.POD,
-            provider_resource_id="pod-1",
-            resource_name="resource",
-        )
+    provider = _provider(transport=httpx.MockTransport(handler))
+    resource, intent, receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.DEDICATED_POD
     )
+    observation = await provider.observe(resource, intent, receipt)
 
     assert observation.provider_ready is False
     assert observation.model_names == ()
 
 
 @pytest.mark.asyncio
-async def test_pod_observation_fails_closed_when_route_allows_anonymous_access():
+async def test_pod_observation_fails_closed_when_route_allows_anonymous_access(
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
 
     provider = _provider(transport=httpx.MockTransport(handler))
-    resource = ProvisionedOllamaResource(
-        resource_type=OllamaResourceType.POD,
-        provider_resource_id="pod-1",
-        resource_name="resource",
+    resource, intent, receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.DEDICATED_POD
     )
 
-    observation = await provider.observe(resource)
+    observation = await provider.observe(resource, intent, receipt)
 
     assert observation.provider_ready is False
     assert observation.model_names == ()
@@ -664,20 +760,19 @@ async def test_model_pull_is_owned_by_the_digest_verifying_runtime():
 
 
 @pytest.mark.asyncio
-async def test_serverless_initializing_health_is_not_ready():
+async def test_serverless_initializing_health_is_not_ready(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/ping":
             return httpx.Response(204)
         return httpx.Response(200, json={"models": []})
 
     provider = _provider(transport=httpx.MockTransport(handler))
-    observation = await provider.observe(
-        ProvisionedOllamaResource(
-            resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
-            provider_resource_id="endpoint-1",
-            resource_name="resource",
-        )
+    resource, intent, receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
     )
+    observation = await provider.observe(resource, intent, receipt)
 
     assert observation.provider_ready is False
 
@@ -1087,6 +1182,331 @@ def native_provisioning():
         thread.join(timeout=5)
         server.server_close()
         assert not thread.is_alive()
+
+
+def _native_readiness_provider(fixture_provider, state, clock):
+    state["workload_calls"] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["workload_calls"].append(
+            (request.url.path, "Authorization" in request.headers)
+        )
+        if "Authorization" not in request.headers:
+            return httpx.Response(401)
+        if request.url.path == "/ping":
+            return httpx.Response(200)
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+        if request.url.path == "/kestrel/telemetry":
+            environment = state["request"]["env"]
+            return httpx.Response(
+                200,
+                json=runtime_telemetry_payload(
+                    environment["KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"],
+                    environment["KESTREL_OLLAMA_PROVISION_REQUESTED_AT"],
+                ),
+            )
+        return httpx.Response(404)
+
+    provider = _provider(
+        client=fixture_provider.client,
+        deployment=fixture_provider.deployment,
+        transport=httpx.MockTransport(handler),
+    )
+    provider._clock = clock
+    return provider
+
+
+def _apply_readiness_policy_drift(state, mode):
+    if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER:
+        workers = dict(state["readback"]["workers"])
+        workers.update({"min": 4, "max": 4})
+        state["replace_on_get"] = {"workers": workers}
+        return
+    gpu = dict(state["readback"]["gpu"])
+    gpu["count"] = 2
+    state["replace_on_get"] = {"gpu": gpu}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, id="endpoint"),
+        pytest.param(OllamaLeaseMode.DEDICATED_POD, id="pod"),
+    ],
+)
+async def test_readiness_revalidates_original_policy_before_workload_probe(
+    native_provisioning, tmp_path, monkeypatch, mode
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"readiness-policy-{mode.value}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode, max_authorized_cost=5.0)
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    waiting = await service.acquire(request, plan=plan, wait_until_ready=False)
+    intent = waiting.provisioning_intent
+    receipt = waiting.provisioning_receipt
+    assert intent is not None and receipt is not None
+    resource = ProvisionedOllamaResource(
+        intent.resource_type,
+        receipt.provider_resource_id,
+        intent.resource_name,
+    )
+    _apply_readiness_policy_drift(state, mode)
+
+    with pytest.raises(OllamaProvisioningMismatchError):
+        await provider.observe(resource, intent, receipt)
+
+    assert state["workload_calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "invalid_evidence"),
+    [
+        pytest.param(
+            OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            {"workers": {"min": 0, "max": 1}},
+            id="endpoint",
+        ),
+        pytest.param(
+            OllamaLeaseMode.DEDICATED_POD,
+            {"gpu": None},
+            id="pod",
+        ),
+    ],
+)
+async def test_readiness_invalid_policy_evidence_stays_unavailable_not_mismatch(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+    mode,
+    invalid_evidence,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"readiness-unavailable-{mode.value}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode, max_authorized_cost=5.0)
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    waiting = await service.acquire(request, plan=plan, wait_until_ready=False)
+    intent = waiting.provisioning_intent
+    receipt = waiting.provisioning_receipt
+    assert intent is not None and receipt is not None
+    state["replace_on_get"] = invalid_evidence
+
+    with pytest.raises(OllamaProvisioningEvidenceError):
+        await provider.observe(
+            ProvisionedOllamaResource(
+                intent.resource_type,
+                receipt.provider_resource_id,
+                intent.resource_name,
+            ),
+            intent,
+            receipt,
+        )
+
+    assert state["workload_calls"] == []
+    assert repository.get(waiting.lease_id).provisioning_mismatch is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_confirmed_drift_precedes_invalid_optional_route_evidence(
+    native_provisioning, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "readiness-mismatch-precedence.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    waiting = await service.acquire(
+        request, plan=serverless_plan(), wait_until_ready=False
+    )
+    intent = waiting.provisioning_intent
+    receipt = waiting.provisioning_receipt
+    assert intent is not None and receipt is not None
+    workers = dict(state["readback"]["workers"])
+    workers.update({"min": 4, "max": 4})
+    state["replace_on_get"] = {"workers": workers, "requestUrls": 17}
+
+    with pytest.raises(OllamaProvisioningMismatchError):
+        await provider.observe(
+            ProvisionedOllamaResource(
+                intent.resource_type,
+                receipt.provider_resource_id,
+                intent.resource_name,
+            ),
+            intent,
+            receipt,
+        )
+
+    assert state["workload_calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service_path", ["initial", "ready", "final_cleanup"])
+async def test_service_persists_readiness_drift_and_joins_exact_cleanup(
+    native_provisioning, tmp_path, monkeypatch, service_path
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"readiness-service-{service_path}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    waiting = await service.acquire(
+        request, plan=serverless_plan(), wait_until_ready=False
+    )
+    assert waiting.state is OllamaLeaseState.WAITING_FOR_MODEL
+    if service_path != "initial":
+        ready = await service.reconcile_lease(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+        assert ready.state is OllamaLeaseState.READY
+    calls_before_drift = tuple(state["workload_calls"])
+    _apply_readiness_policy_drift(state, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER)
+
+    if service_path == "initial":
+        closed = await service.reconcile_lease(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+    elif service_path == "ready":
+        closed = await service.get(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+    else:
+        closed = await service.release(
+            request.lease_id,
+            owner_id=request.owner_id,
+            workload_id=request.workload_id,
+        )
+
+    durable = repository.get(request.lease_id)
+    assert closed.state is OllamaLeaseState.TERMINATED
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.provisioning_mismatch is not None
+    assert durable.provisioning_mismatch.reason.value == "endpoint_policy"
+    assert tuple(state["workload_calls"]) == calls_before_drift
+    assert state["calls"][-2:] == [
+        ("DELETE", "/v2/serverless/endpoint-evidence-1"),
+        ("GET", "/v2/serverless/endpoint-evidence-1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_readiness_foreign_exact_get_never_gains_route_or_cleanup_authority(
+    native_provisioning, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "readiness-foreign-exact-get.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    waiting = await service.acquire(
+        request, plan=serverless_plan(), wait_until_ready=False
+    )
+    assert waiting.provider_resource_id == "endpoint-evidence-1"
+    state["calls"].clear()
+    state["replace_on_get"] = {"id": "foreign-endpoint"}
+
+    closed = await service.reconcile_lease(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    durable = repository.get(request.lease_id)
+    assert closed.state is OllamaLeaseState.TERMINATED
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.route_url is None
+    assert durable.provisioning_mismatch is not None
+    assert durable.provisioning_mismatch.reason.value == "resource_identity"
+    assert state["workload_calls"] == []
+    assert state["calls"] == [
+        ("GET", "/v2/serverless/endpoint-evidence-1"),
+        ("DELETE", "/v2/serverless/endpoint-evidence-1"),
+        ("GET", "/v2/serverless/endpoint-evidence-1"),
+    ]
+    assert all("foreign-endpoint" not in path for _method, path in state["calls"])
 
 
 @pytest.mark.asyncio

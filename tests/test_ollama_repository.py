@@ -418,6 +418,94 @@ async def _selected_pod_billing_lease(
     return repository, selected, observed_at
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_outcome",
+    [
+        pytest.param("provider_error", id="provider-error"),
+        pytest.param("exact_receipt", id="exact-receipt"),
+    ],
+)
+async def test_stale_billing_outcome_cannot_poison_a_newer_successful_poll(
+    tmp_path, stale_outcome
+):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    observation = selected.lifecycle_billing_observations[0]
+    stale_snapshot = selected
+    newer_repository = SQLiteOllamaLeaseRepository(repository.path)
+    newer_received_at = observed_at + timedelta(hours=2)
+    newer = newer_repository.record_billing_outcome(
+        selected,
+        now=newer_received_at,
+        next_check_at=newer_received_at + timedelta(hours=1),
+        observation=observation,
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+    stale_received_at = observed_at + timedelta(hours=1)
+    outcome = (
+        {"provider_error": "stale provider billing failure"}
+        if stale_outcome == "provider_error"
+        else {"observation": observation}
+    )
+
+    with pytest.raises(OllamaLeaseConflictError, match="billing.*older|stale"):
+        repository.record_billing_outcome(
+            stale_snapshot,
+            now=stale_received_at,
+            next_check_at=stale_received_at + timedelta(hours=1),
+            maximum_observations=8,
+            maximum_bytes=100_000,
+            **outcome,
+        )
+
+    restarted = SQLiteOllamaLeaseRepository(repository.path).get(selected.lease_id)
+    assert restarted == newer
+    assert restarted.billing_last_checked_at == newer_received_at
+    assert restarted.lifecycle_billing_latest_reference.received_at == (
+        newer_received_at
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_time_billing_error_replay_preserves_successful_reference(tmp_path):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    original_reference = selected.lifecycle_billing_latest_reference
+
+    replayed = repository.record_billing_outcome(
+        selected,
+        now=observed_at,
+        next_check_at=observed_at + timedelta(hours=1),
+        provider_error="same-time provider billing retry",
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert replayed.lifecycle_billing_latest_reference == original_reference
+    assert replayed.lifecycle_billing_selection == selected.lifecycle_billing_selection
+    assert replayed.lifecycle_billing_observations == (
+        selected.lifecycle_billing_observations
+    )
+    assert replayed.billing_last_checked_at == observed_at
+    assert replayed.billing_last_provider_error == "same-time provider billing retry"
+
+
+@pytest.mark.asyncio
+async def test_invalid_candidate_row_is_decoded_before_repository_commit(tmp_path):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+
+    with pytest.raises(RunPodManagerError, match="billing latest reference"):
+        repository.compare_and_set(
+            selected,
+            changes={
+                "billing_last_checked_at": observed_at - timedelta(microseconds=1),
+            },
+        )
+
+    restarted = SQLiteOllamaLeaseRepository(repository.path).get(selected.lease_id)
+    assert restarted == selected
+
+
 def _revised_telemetry(
     original: OllamaRuntimeTelemetryObservation,
     **snapshot_changes,
