@@ -119,3 +119,56 @@ func TestProxyTelemetryCountsConcurrentInferenceAsOneBusyInterval(t *testing.T) 
 		}
 	}
 }
+
+func TestProxyTelemetryClassifiesEveryUnsuccessfulInferenceResponse(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		wantCompleted uint64
+		wantFailed    uint64
+	}{
+		{"implicit OK", 0, 1, 0},
+		{"OK", http.StatusOK, 1, 0},
+		{"No Content", http.StatusNoContent, 1, 0},
+		{"Found", http.StatusFound, 0, 1},
+		{"Bad Request", http.StatusBadRequest, 0, 1},
+		{"Not Found", http.StatusNotFound, 0, 1},
+		{"Too Many Requests", http.StatusTooManyRequests, 0, 1},
+		{"Internal Server Error", http.StatusInternalServerError, 0, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, upstream := testUpstream(t, func(writer http.ResponseWriter, _ *http.Request) {
+				if test.status != 0 {
+					writer.WriteHeader(test.status)
+				}
+			})
+			config := testConfig(upstream)
+			state := newStartupState("cache_hit", time.Now())
+			handler := newRuntimeProxy(config, state, time.Now)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(
+				response,
+				authorizedRequest(
+					t,
+					http.MethodPost,
+					"/api/chat",
+					`{"model":"registry.example/team/model:v1","messages":[]}`,
+				),
+			)
+			wantStatus := test.status
+			if wantStatus == 0 {
+				wantStatus = http.StatusOK
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("proxy returned %d, want %d", response.Code, wantStatus)
+			}
+			snapshot := state.snapshot(config)
+			if snapshot.InferenceStarted != 1 || snapshot.InferenceInFlight != 0 ||
+				snapshot.InferenceCompleted != test.wantCompleted ||
+				snapshot.InferenceFailed != test.wantFailed {
+				t.Fatalf("unexpected inference counters for status %d: %#v", test.status, snapshot)
+			}
+		})
+	}
+}

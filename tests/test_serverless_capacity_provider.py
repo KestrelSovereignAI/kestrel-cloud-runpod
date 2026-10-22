@@ -217,6 +217,78 @@ class _PlannedControl:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "error_kind",
+    ["clean-404", "unknown-404", "structural-404", "authorization"],
+)
+async def test_serverless_cleanup_only_accepts_one_clean_canonical_404(
+    error_kind,
+) -> None:
+    """Exact-ID cleanup must retain the canonical error type and clean graph."""
+
+    class UnknownNotFoundError(RunPodAPIError):
+        pass
+
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+    activation = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+    error_type = UnknownNotFoundError if error_kind == "unknown-404" else RunPodAPIError
+    status_code = 401 if error_kind == "authorization" else 404
+    error = error_type(
+        title="Not found" if status_code == 404 else "Unauthorized",
+        detail="bounded Serverless cleanup response",
+        status_code=status_code,
+    )
+    if error_kind == "structural-404":
+        error.__cause__ = ValueError("invalid endpoint response")
+    control.get_error = error
+
+    if error_kind == "clean-404":
+        assert await provider._cleanup_endpoint_resource(activation) is None
+    else:
+        with pytest.raises(error_type) as caught:
+            await provider._cleanup_endpoint_resource(activation)
+        assert caught.value is error
+    assert control.get_calls[-1] == activation.endpoint_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readback", ["foreign-id", "wrong-type"])
+async def test_serverless_cleanup_requires_exact_typed_endpoint_readback(
+    readback,
+) -> None:
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+    activation = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+    control.readback = (
+        replace(control.readback, id="foreign-endpoint")
+        if readback == "foreign-id"
+        else SimpleNamespace(id=activation.endpoint_id)
+    )
+
+    with pytest.raises(ServerlessEndpointCleanupError, match="did not match"):
+        await provider._cleanup_endpoint_resource(activation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "changes",
     [
         {"mounts": {"network": [], "global": [{"volumeId": "unquoted-global"}]}},

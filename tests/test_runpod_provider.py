@@ -367,10 +367,7 @@ def test_direct_provider_lifecycle_and_v2_logs():
 
     assert provider.stop_pod("pod-123")["status"] == "EXITED"
     assert provider.resume_pod("pod-123")["status"] == "STARTING"
-    assert provider.terminate_pod("pod-123") == {
-        "id": "pod-123",
-        "status": "TERMINATED",
-    }
+    assert provider.terminate_pod("pod-123") == {"id": "pod-123"}
     assert provider.get_logs("pod-123", tail=2) == "first\nsecond"
     assert client.actions == [
         ("pod-123", "stop"),

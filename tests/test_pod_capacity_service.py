@@ -26,6 +26,7 @@ from kestrel_cloud_runpod.models import (
     GPUOffer,
     PodResource,
     RunPodAmbiguousResultError,
+    RunPodAPIError,
     RunPodManagerError,
 )
 from kestrel_cloud_runpod.pod_capacity_contracts import (
@@ -997,6 +998,7 @@ async def test_acknowledged_invalid_create_retains_exact_pod_custody_and_cost_un
     class AcknowledgingControlClient:
         def __init__(self) -> None:
             self.actions: list[tuple[str, str]] = []
+            self.reads: list[str] = []
 
         def list_gpus(self, **_kwargs):
             return (
@@ -1039,6 +1041,16 @@ async def test_acknowledged_invalid_create_retains_exact_pod_custody_and_cost_un
         def pod_action(self, pod_id, action):
             self.actions.append((pod_id, action))
 
+        def get_pod(self, pod_id):
+            self.reads.append(pod_id)
+            raise RunPodAPIError(
+                title="Not found",
+                detail="Exact acknowledged Pod is absent",
+                status_code=404,
+                method="GET",
+                resource=f"/pods/{pod_id}",
+            )
+
     client = AcknowledgingControlClient()
     provider = RunpodPodCapacityProvider(
         DirectRunPodProvider(api_key="", client=client), clock=clock
@@ -1054,9 +1066,12 @@ async def test_acknowledged_invalid_create_retains_exact_pod_custody_and_cost_un
     assert durable is not None
     assert durable.provider_pod_id == "pod-acknowledged-invalid-cost"
     assert durable.creation_uncertain is False
+    assert durable.cleanup_state is PodCapacityCleanupState.COMPLETE
+    assert durable.billing_state is PodCapacityBillingState.UNRESOLVED
     assert durable.settlement_ready is False
     assert durable.billing_receipt is None
     assert client.actions == [("pod-acknowledged-invalid-cost", "terminate")]
+    assert client.reads == ["pod-acknowledged-invalid-cost"]
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from .pod_capacity_contracts import (
 from .serverless_capacity_contracts import (
     ServerlessEndpointHourCost,
     serverless_endpoint_hour_cost_totals,
+    validate_serverless_endpoint_hour_coverage,
 )
 
 _URL_RE = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
@@ -1972,6 +1973,24 @@ class OllamaLifecycleBillingObservation:
             or self.first_observed_at < cleanup.verified_absent_at
         ):
             raise ValueError("Ollama billing observation does not bind lifecycle")
+        if self.resource_type is OllamaResourceType.POD:
+            pod_billing_receipt = self.pod_billing_receipt
+            if pod_billing_receipt is None:
+                raise ValueError("Ollama Pod billing payload is invalid")
+            pod_billing_receipt.validate_lifecycle_coverage(
+                provider_pod_id=provisioning.provider_resource_id,
+                created_at=provisioning.provider_created_at,
+                verified_absent_at=cleanup.verified_absent_at,
+                observed_at=self.first_observed_at,
+            )
+        else:
+            validate_serverless_endpoint_hour_coverage(
+                self.serverless_endpoint_hour_costs,
+                endpoint_id=provisioning.provider_resource_id,
+                started_at=provisioning.provider_created_at,
+                coverage_until=cleanup.verified_absent_at,
+                observed_at=self.first_observed_at,
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {

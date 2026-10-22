@@ -11,7 +11,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .billing import billing_amounts, exact_decimal_sum
-from .clients import RunpodControlPlaneClient, RunpodServerlessClient
+from .clients import (
+    RunpodControlPlaneClient,
+    RunpodServerlessClient,
+    is_exact_runpod_not_found,
+)
 from .effect_custody import await_owned_effect
 from .models import (
     Availability,
@@ -770,10 +774,19 @@ class RunpodServerlessCapacityProvider:
             endpoint = await asyncio.to_thread(
                 self.control_client.get_endpoint, activation.endpoint_id
             )
+            if (
+                type(endpoint) is not EndpointResource
+                or endpoint.id != activation.endpoint_id
+            ):
+                raise ServerlessEndpointCleanupError(
+                    "Serverless cleanup readback did not match the activated endpoint",
+                    endpoint_name=activation.endpoint_name,
+                    endpoint_id=activation.endpoint_id,
+                )
             endpoint.require_valid_fields(context="v2 Serverless cleanup readback")
             return endpoint
         except RunPodAPIError as exc:
-            if exc.status_code != 404:
+            if not is_exact_runpod_not_found(exc):
                 raise
             return None
 

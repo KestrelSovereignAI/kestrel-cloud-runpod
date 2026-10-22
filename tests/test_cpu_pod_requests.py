@@ -2,7 +2,9 @@
 
 import json
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import httpx
 import pytest
@@ -125,19 +127,33 @@ def test_cpu_flavor_is_required(cpu_id):
 @pytest.mark.parametrize(
     "fields",
     [
-        {"global_networking": True},
-        {"global_networking": 0},
-        {"mounts": {"persistent": {"size": 10, "path": "/workspace"}}},
-        {"mounts": {"persistent": None}},
-        {"mounts": {"global": []}},
-        {"mounts": {"unknown": []}},
-        {"mounts": []},
-        {"mounts": {"network": None}},
-        {"mounts": {"network": ()}},
-        {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
-        {"mounts": {"network": [{"volumeId": "v"}]}},
-        {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
-        {"mounts": {"network": [{"volumeId": "v", "path": "/v", "extra": True}]}},
+        pytest.param({"global_networking": True}, id="fields0"),
+        pytest.param({"global_networking": 0}, id="fields1"),
+        pytest.param(
+            {"mounts": {"persistent": {"size": 10, "path": "/workspace"}}},
+            id="fields2",
+        ),
+        pytest.param({"mounts": {"persistent": None}}, id="fields3"),
+        pytest.param({"mounts": {"global": []}}, id="fields4"),
+        pytest.param({"mounts": {"unknown": []}}, id="fields5"),
+        pytest.param({"mounts": []}, id="fields6"),
+        pytest.param({"mounts": {"network": None}}, id="fields7"),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
+            id="fields9",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v"}]}},
+            id="fields10",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
+            id="fields11",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v", "path": "/v", "extra": True}]}},
+            id="fields12",
+        ),
     ],
 )
 def test_cpu_rejects_unsupported_networking_and_storage(fields):
@@ -170,6 +186,45 @@ def test_cpu_request_deeply_owns_environment_and_mount_payload():
     ) as client:
         client.create_pod(request)
     assert len(calls) == 1
+
+
+def test_frozen_cpu_request_supports_ordinary_dataclass_replacement():
+    original = cpu_request(
+        mounts={"network": [{"volumeId": "owned-volume", "path": "/workspace"}]},
+        env={"PRIVATE": "original"},
+    )
+    replaced = replace(original, name="cpu-browser-next")
+
+    assert replaced.name == "cpu-browser-next"
+    assert replaced.to_payload() == {
+        **original.to_payload(),
+        "name": "cpu-browser-next",
+    }
+
+
+@pytest.mark.parametrize("outer_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("network_kind", ["list", "tuple"])
+@pytest.mark.parametrize("populated", [False, True])
+def test_cpu_mount_sequences_have_one_immutable_value_policy(
+    outer_kind, network_kind, populated
+):
+    mount = {"volumeId": "owned-volume", "path": "/workspace"}
+    items = [mount] if populated else []
+    network = items if network_kind == "list" else tuple(items)
+    mutable_outer = {"network": network}
+    mounts = mutable_outer if outer_kind == "dict" else MappingProxyType(mutable_outer)
+    original = cpu_request(mounts=mounts)
+    first = replace(original, name="cpu-browser-next")
+    second = replace(first, name="cpu-browser-final")
+    expected = [{"volumeId": "owned-volume", "path": "/workspace"}] if populated else []
+    assert second.to_payload()["mounts"] == {"network": expected}
+
+    mount["volumeId"] = "foreign"
+    mutable_outer["network"] = []
+    returned = second.to_payload()
+    if populated:
+        returned["mounts"]["network"][0]["volumeId"] = "mutated"
+    assert second.to_payload()["mounts"] == {"network": expected}
 
 
 def test_cpu_create_inspect_and_delete_use_existing_v2_transport():

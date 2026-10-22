@@ -12,7 +12,9 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
 from urllib.parse import quote, urlparse
 
+import httpcore
 import httpx
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .cpu_catalog import CpuCatalogSnapshot, validate_cpu_query
 from .models import (
@@ -39,12 +41,40 @@ from .models import (
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_RETRYABLE_TRANSPORT_PAIRS = {
+    httpx.ConnectTimeout: httpcore.ConnectTimeout,
+    httpx.ReadTimeout: httpcore.ReadTimeout,
+    httpx.WriteTimeout: httpcore.WriteTimeout,
+    httpx.PoolTimeout: httpcore.PoolTimeout,
+    httpx.ConnectError: httpcore.ConnectError,
+    httpx.ReadError: httpcore.ReadError,
+    httpx.WriteError: httpcore.WriteError,
+    httpx.RemoteProtocolError: httpcore.RemoteProtocolError,
+}
 _RATE_LIMIT_RESET_RE = re.compile(r"(?:^|[,;]\s*)reset=(\d+(?:\.\d+)?)", re.IGNORECASE)
 DEFAULT_USER_AGENT = "kestrel-cloud-runpod/v2"
 
 
 def _is_retryable_runpod_status(status_code: int | None) -> bool:
     return status_code in _RETRYABLE_STATUSES
+
+
+def _is_retryable_httpx_transport_error(error: httpx.HTTPError) -> bool:
+    """Recognize one reviewed public HTTPX -> HTTPCore transport pair.
+
+    This is transport-category evidence only. It never authorizes replay of a
+    mutating method, and it deliberately ignores diagnostic implicit context.
+    Unknown subclasses and any additional explicit cause/control graph fail
+    closed.
+    """
+
+    if is_execution_control_error(error):
+        return False
+    expected_core_type = _RETRYABLE_TRANSPORT_PAIRS.get(type(error))
+    if expected_core_type is None:
+        return False
+    core_error = error.__cause__
+    return type(core_error) is expected_core_type and core_error.__cause__ is None
 
 
 def is_retryable_runpod_api_error(error: RunPodAPIError) -> bool:
@@ -56,11 +86,29 @@ def is_retryable_runpod_api_error(error: RunPodAPIError) -> bool:
     does not grant permission to repeat an arbitrary HTTP method.
     """
 
-    if type(error) not in {RunPodAPIError, RunPodAmbiguousResultError}:
+    if (
+        type(error) not in {RunPodAPIError, RunPodAmbiguousResultError}
+        or is_execution_control_error(error)
+    ):
         return False
     if _is_retryable_runpod_status(error.status_code):
-        return True
-    return error.status_code is None and isinstance(error.__cause__, httpx.HTTPError)
+        return error.__cause__ is None
+    return (
+        error.status_code is None
+        and isinstance(error.__cause__, httpx.HTTPError)
+        and _is_retryable_httpx_transport_error(error.__cause__)
+    )
+
+
+def is_exact_runpod_not_found(error: RunPodAPIError) -> bool:
+    """Return whether one canonical response proves the requested ID absent."""
+
+    return (
+        type(error) is RunPodAPIError
+        and error.status_code == 404
+        and error.__cause__ is None
+        and not is_execution_control_error(error)
+    )
 
 
 class RunpodTransport:
@@ -286,7 +334,11 @@ class RunpodTransport:
                     json=json_body,
                 )
             except httpx.HTTPError as exc:
-                if safe_to_retry and attempt < self.max_safe_retries:
+                if (
+                    safe_to_retry
+                    and _is_retryable_httpx_transport_error(exc)
+                    and attempt < self.max_safe_retries
+                ):
                     self._sleep(_fallback_backoff(attempt))
                     attempt += 1
                     continue

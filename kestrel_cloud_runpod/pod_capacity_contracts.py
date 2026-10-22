@@ -16,6 +16,7 @@ from typing import Any, Protocol
 
 from pydantic import SecretStr
 
+from .billing import billing_hour_bounds
 from .models import (
     CloudType,
     ComputeProduct,
@@ -693,6 +694,29 @@ class PodBillingReceipt:
             raise ValueError(
                 "Missing provider Pod identity is valid only before billable capacity"
             )
+
+    def validate_lifecycle_coverage(
+        self,
+        *,
+        provider_pod_id: str,
+        created_at: datetime,
+        verified_absent_at: datetime,
+        observed_at: datetime,
+    ) -> None:
+        """Bind this receipt to every canonical hour of one exact Pod lifecycle."""
+
+        billed_from, billed_until = billing_hour_bounds(created_at, verified_absent_at)
+        require_aware(observed_at, "observed_at")
+        if observed_at < billed_until:
+            raise ValueError("Pod billing coverage window is still open")
+        billed_seconds = int((billed_until - billed_from).total_seconds())
+        if (
+            self.provider_pod_id != provider_pod_id
+            or self.billed_from != billed_from
+            or self.billed_until != billed_until
+            or self.billed_seconds != billed_seconds
+        ):
+            raise ValueError("Pod billing coverage does not bind its lifecycle")
 
     def to_dict(self) -> dict[str, Any]:
         return {

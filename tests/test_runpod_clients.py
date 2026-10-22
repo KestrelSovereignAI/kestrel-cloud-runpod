@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 
+import httpcore
 import httpx
 import pytest
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from pod_capacity_test_support import native_httpx_connect_failure
 
 from kestrel_cloud_runpod.clients import (
     DEFAULT_USER_AGENT,
@@ -362,9 +367,30 @@ def test_api_error_retry_disposition_uses_the_transport_policy(status_code, expe
     assert is_retryable_runpod_api_error(error) is expected
 
 
-def test_statusless_api_error_requires_the_original_httpx_failure_cause():
+_PUBLIC_TRANSPORT_PAIRS = (
+    (httpx.ConnectTimeout, httpcore.ConnectTimeout),
+    (httpx.ReadTimeout, httpcore.ReadTimeout),
+    (httpx.WriteTimeout, httpcore.WriteTimeout),
+    (httpx.PoolTimeout, httpcore.PoolTimeout),
+    (httpx.ConnectError, httpcore.ConnectError),
+    (httpx.ReadError, httpcore.ReadError),
+    (httpx.WriteError, httpcore.WriteError),
+    (httpx.RemoteProtocolError, httpcore.RemoteProtocolError),
+)
+
+
+def _public_transport_pair(
+    outer_type: type[httpx.TransportError],
+    core_type: type[Exception],
+) -> httpx.TransportError:
     request = httpx.Request("GET", "https://api.runpod.io/v2/pods/test")
-    transport = httpx.ConnectError("connection failed", request=request)
+    outer = outer_type("transport failed", request=request)
+    outer.__cause__ = core_type("transport failed")
+    return outer
+
+
+def test_statusless_api_error_requires_the_original_httpx_failure_cause():
+    transport = _public_transport_pair(httpx.ConnectError, httpcore.ConnectError)
     try:
         raise RunPodAPIError(
             title="Runpod transport failed",
@@ -413,6 +439,346 @@ def test_statusless_api_error_requires_the_original_httpx_failure_cause():
         status_code=503,
     )
     assert not is_retryable_runpod_api_error(unknown)
+
+
+def test_statusless_http_response_error_is_not_transport_retry_evidence():
+    request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/exact")
+    response = httpx.Response(401, request=request)
+    response_error = httpx.HTTPStatusError(
+        "authorization denied", request=request, response=response
+    )
+    error = RunPodAPIError(
+        title="Runpod request failed",
+        detail="HTTPStatusError",
+    )
+    error.__cause__ = response_error
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+@pytest.mark.parametrize(("outer_type", "core_type"), _PUBLIC_TRANSPORT_PAIRS)
+def test_exact_public_transport_pairs_are_retryable(outer_type, core_type):
+    transport = _public_transport_pair(outer_type, core_type)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    error.__cause__ = transport
+
+    assert is_retryable_runpod_api_error(error)
+
+
+@pytest.mark.parametrize(("outer_type", "core_type"), _PUBLIC_TRANSPORT_PAIRS)
+def test_bare_public_httpx_transport_error_does_not_grant_retry_authority(
+    outer_type, core_type
+):
+    del core_type
+    request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/exact")
+    transport = outer_type("transport failed", request=request)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    error.__cause__ = transport
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+def test_retryable_status_cannot_hide_an_explicit_structural_cause():
+    error = RunPodAPIError(
+        title="Runpod request failed",
+        detail="structural response failure",
+        status_code=503,
+    )
+    structural = ValueError("invalid response body")
+    error.__cause__ = structural
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+def test_retryable_status_without_explicit_cause_remains_retryable():
+    canonical = RunPodAPIError(
+        title="Runpod unavailable",
+        detail="retry later",
+        status_code=503,
+    )
+    assert is_retryable_runpod_api_error(canonical)
+
+
+def _native_httpx_stream_failure(kind: str) -> httpx.TransportError:
+    """Capture real synchronous stream failures against an owned loopback peer."""
+
+    release = threading.Event()
+    server_done = threading.Event()
+    server_errors: list[BaseException] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2.0)
+        port = listener.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                with listener.accept()[0] as connection:
+                    if kind == "write-timeout":
+                        release.wait(1.0)
+                        return
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        part = connection.recv(65_536)
+                        if not part:
+                            raise RuntimeError("loopback client closed before headers")
+                        request += part
+                    if kind == "read-timeout":
+                        connection.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+                        )
+                        release.wait(1.0)
+                    elif kind == "malformed-protocol":
+                        connection.sendall(b"NOT HTTP\r\n\r\n")
+                    elif kind == "truncated-protocol":
+                        connection.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"
+                        )
+                    else:
+                        raise AssertionError(f"unsupported native failure kind: {kind}")
+            # Every original background failure is retained and asserted below.
+            except BaseException as exc:  # noqa: BLE001
+                server_errors.append(exc)
+            finally:
+                server_done.set()
+
+        server = threading.Thread(target=serve, name=f"runpod-{kind}-peer")
+        server.start()
+        try:
+            socket_options = None
+            content = None
+            if kind == "write-timeout":
+                socket_options = [(socket.SOL_SOCKET, socket.SO_SNDBUF, 1_024)]
+                chunk = b"x" * (1024 * 1024)
+                content = (chunk for _ in range(1_024))
+            transport = httpx.HTTPTransport(socket_options=socket_options)
+            timeout = httpx.Timeout(0.5, read=0.05, write=0.05, pool=0.5)
+            with httpx.Client(
+                transport=transport,
+                timeout=timeout,
+                trust_env=False,
+            ) as client:
+                method = client.post if kind == "write-timeout" else client.get
+                with pytest.raises(httpx.TransportError) as raised:
+                    if content is None:
+                        method(f"http://127.0.0.1:{port}/")
+                    else:
+                        method(f"http://127.0.0.1:{port}/", content=content)
+        finally:
+            release.set()
+            server_done.wait(2.0)
+            server.join(2.0)
+
+    assert not server.is_alive()
+    assert server_errors == []
+    return raised.value
+
+
+def _blocked_httpx_error(kind: str) -> httpx.HTTPError:
+    """Build finite public exception graphs while retaining every original node."""
+
+    request = httpx.Request("GET", "https://api.runpod.io/v2/pods")
+    if kind == "http-status":
+        return httpx.HTTPStatusError(
+            "authorization denied",
+            request=request,
+            response=httpx.Response(401, request=request),
+        )
+    public_pairs: dict[str, tuple[type[httpx.HTTPError], type[Exception]]] = {
+        "structural": (httpx.ConnectError, httpcore.ConnectError),
+        "control": (httpx.ConnectError, httpcore.ConnectError),
+        "mixed-group": (httpx.ConnectError, httpcore.ConnectError),
+        "cycle": (httpx.ConnectError, httpcore.ConnectError),
+        "local-protocol": (httpx.LocalProtocolError, httpcore.LocalProtocolError),
+        "unsupported-protocol": (
+            httpx.UnsupportedProtocol,
+            httpcore.UnsupportedProtocol,
+        ),
+        "proxy": (httpx.ProxyError, httpcore.ProxyError),
+    }
+    if kind == "unknown-transport":
+
+        class UnknownTransportError(httpx.TransportError):
+            pass
+
+        outer: httpx.HTTPError = UnknownTransportError(
+            "unknown transport", request=request
+        )
+        outer.__cause__ = httpcore.ConnectError("connection failed")
+        return outer
+    outer_type, core_type = public_pairs[kind]
+    outer = outer_type("transport failed", request=request)
+    core = core_type("transport failed")
+    outer.__cause__ = core
+    if kind == "structural":
+        core.__cause__ = ValueError("invalid transport state")
+    elif kind == "control":
+        core.__cause__ = ExecutionAuthorityError("original authority retired")
+    elif kind == "mixed-group":
+        core.__cause__ = ExceptionGroup(
+            "mixed transport graph",
+            [
+                TimeoutError("native timeout"),
+                ExecutionAuthorityError("original authority retired"),
+            ],
+        )
+    elif kind == "cycle":
+        structural = ValueError("cyclic structural failure")
+        core.__cause__ = structural
+        structural.__cause__ = core
+    return outer
+
+
+def _explicit_graph_ids(error: BaseException) -> tuple[int, ...]:
+    seen: set[int] = set()
+    pending = [error]
+    ordered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        ordered.append(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return tuple(ordered)
+
+
+def test_native_httpx_httpcore_socket_chain_is_retryable_at_safe_ingress():
+    transport_error = native_httpx_connect_failure()
+    api_error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=type(transport_error).__name__,
+    )
+    api_error.__cause__ = transport_error
+    assert is_retryable_runpod_api_error(api_error)
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise transport_error
+        return httpx.Response(200, json=_page("pods", []))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert client.list_pods() == ()
+    assert len(calls) == 2
+    assert api_error.__cause__ is transport_error
+
+
+@pytest.mark.parametrize(
+    ("kind", "outer_type", "core_type"),
+    [
+        ("read-timeout", httpx.ReadTimeout, httpcore.ReadTimeout),
+        (
+            "malformed-protocol",
+            httpx.RemoteProtocolError,
+            httpcore.RemoteProtocolError,
+        ),
+        (
+            "truncated-protocol",
+            httpx.RemoteProtocolError,
+            httpcore.RemoteProtocolError,
+        ),
+        ("write-timeout", httpx.WriteTimeout, httpcore.WriteTimeout),
+    ],
+)
+def test_native_stream_failure_retains_exact_public_transport_pair(
+    kind, outer_type, core_type
+):
+    transport_error = _native_httpx_stream_failure(kind)
+    assert type(transport_error) is outer_type
+    assert type(transport_error.__cause__) is core_type
+    assert transport_error.__cause__.__cause__ is None
+    assert transport_error.__cause__.__context__ is not None
+
+    api_error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    api_error.__cause__ = transport_error
+    assert is_retryable_runpod_api_error(api_error)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "structural",
+        "control",
+        "mixed-group",
+        "cycle",
+        "unknown-transport",
+        "local-protocol",
+        "unsupported-protocol",
+        "proxy",
+        "http-status",
+    ],
+)
+def test_transport_graph_blockers_never_grant_retry_authority(kind):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=type(transport_error).__name__,
+    )
+    error.__cause__ = transport_error
+
+    assert not is_retryable_runpod_api_error(error)
+    assert error.__cause__ is transport_error
+    assert _explicit_graph_ids(transport_error) == original_graph
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "structural",
+        "control",
+        "mixed-group",
+        "cycle",
+        "unknown-transport",
+        "local-protocol",
+        "unsupported-protocol",
+        "proxy",
+        "http-status",
+    ],
+)
+def test_safe_method_ingress_never_retries_a_blocked_transport_graph(kind):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise transport_error
+        return httpx.Response(200, json=_page("pods", []))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(RunPodAPIError) as caught:
+        client.list_pods()
+    assert caught.value.__cause__ is transport_error
+    assert len(calls) == 1
+    assert _explicit_graph_ids(transport_error) == original_graph
 
 
 def test_safe_get_retries_using_retry_after_and_records_rate_limit():

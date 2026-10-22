@@ -15,7 +15,11 @@ from typing import Any
 import httpx
 
 from .billing import exact_decimal_integer_scale
-from .clients import RunpodControlPlaneClient, is_retryable_runpod_api_error
+from .clients import (
+    RunpodControlPlaneClient,
+    is_exact_runpod_not_found,
+    is_retryable_runpod_api_error,
+)
 from .models import (
     Availability,
     ComputeProduct,
@@ -94,6 +98,24 @@ def _raise_teardown_api_error(error: RunPodAPIError) -> None:
             "Runpod Ollama cleanup remains retryable"
         ) from error
     raise error.with_traceback(error.__traceback__)
+
+
+def _validate_exact_cleanup_readback(
+    observed: object,
+    resource: ProvisionedOllamaResource,
+) -> None:
+    expected_type = (
+        EndpointResource
+        if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else PodResource
+    )
+    if (
+        type(observed) is not expected_type
+        or observed.id != resource.provider_resource_id
+    ):
+        raise OllamaLeaseConflictError(
+            "Runpod cleanup readback did not match the original resource identity"
+        )
 
 
 @dataclass(frozen=True)
@@ -696,7 +718,7 @@ class RunpodOllamaCapacityProvider:
                     self.client.pod_action, resource.provider_resource_id, "terminate"
                 )
         except RunPodAPIError as exc:
-            if exc.status_code != 404:
+            if not is_exact_runpod_not_found(exc):
                 _raise_teardown_api_error(exc)
             delete_acknowledged = False
         read_resource = (
@@ -705,9 +727,11 @@ class RunpodOllamaCapacityProvider:
             else self.client.get_pod
         )
         try:
-            await asyncio.to_thread(read_resource, resource.provider_resource_id)
+            observed = await asyncio.to_thread(
+                read_resource, resource.provider_resource_id
+            )
         except RunPodAPIError as exc:
-            if exc.status_code == 404:
+            if is_exact_runpod_not_found(exc):
                 receipt = OllamaCleanupReceipt(
                     cleanup_intent_id=cleanup_intent.cleanup_intent_id,
                     verified_absent_at=self._clock(),
@@ -720,6 +744,7 @@ class RunpodOllamaCapacityProvider:
                 receipt.validate_intent(cleanup_intent)
                 return receipt
             _raise_teardown_api_error(exc)
+        _validate_exact_cleanup_readback(observed, resource)
         raise OllamaLeaseTeardownError(
             "Original Ollama resource is still present after teardown; reconcile it"
         )

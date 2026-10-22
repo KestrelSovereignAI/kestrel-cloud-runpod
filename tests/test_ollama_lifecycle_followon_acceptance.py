@@ -22,6 +22,7 @@ from ollama_test_support import (
 from test_ollama_provider import _ControlClient, _provider
 
 from kestrel_cloud_runpod import read_exact_serverless_billing
+from kestrel_cloud_runpod.billing import billing_hour_bounds
 from kestrel_cloud_runpod.inference_provider import _lease_metadata
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
@@ -38,6 +39,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
 )
 from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
+from kestrel_cloud_runpod.pod_capacity_contracts import PodBillingReceipt
 from kestrel_cloud_runpod.serverless_capacity_contracts import (
     serverless_endpoint_hour_cost_totals,
 )
@@ -260,6 +262,214 @@ async def test_runpod_provider_uses_exact_generic_pod_billing_binding(
     assert observed.pod_billing_receipt.provider_pod_id == provider_pod_id
     assert observed.provider_finality_confirmed is False
     assert len(state["calls"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "coverage", ["exact", "exact_zero", "zero", "short", "shifted", "open"]
+)
+async def test_pod_lifecycle_billing_requires_its_exact_canonical_hour_bounds(
+    tmp_path,
+    coverage,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(pod_plan(rate=0.5))
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"pod-lifecycle-coverage-{coverage}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.DEDICATED_POD,
+        hard_deadline=clock() + timedelta(hours=4),
+        max_authorized_cost=5.0,
+    )
+    ready = await service.acquire(request, plan=pod_plan(rate=0.5))
+    clock.advance(2 * 3600 + 1)
+    terminated = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+    intent = terminated.provisioning_intent
+    provisioning = terminated.provisioning_receipt
+    cleanup_intent = terminated.cleanup_intent
+    cleanup = terminated.cleanup_receipt
+    assert intent is not None and provisioning is not None
+    assert cleanup_intent is not None and cleanup is not None
+    assert provisioning.pod_realized_placement is not None
+    first, until = billing_hour_bounds(
+        provisioning.provider_created_at, cleanup.verified_absent_at
+    )
+    if coverage in {"exact", "exact_zero", "open"}:
+        billed_from, billed_until = first, until
+    elif coverage == "zero":
+        billed_from = billed_until = first
+    elif coverage == "short":
+        billed_from, billed_until = first, until - timedelta(hours=1)
+    else:
+        billed_from, billed_until = (
+            first + timedelta(hours=1),
+            until + timedelta(hours=1),
+        )
+    actual = Decimal(0) if coverage in {"zero", "exact_zero"} else Decimal("0.75")
+    receipt_reconciled_at = max(until, billed_until) + timedelta(hours=1)
+    observed_at = (
+        cleanup.verified_absent_at + (until - cleanup.verified_absent_at) / 2
+        if coverage == "open"
+        else receipt_reconciled_at
+    )
+    receipt = PodBillingReceipt(
+        provider_billing_id=f"pod-lifecycle-{coverage}",
+        provider_pod_id=provisioning.provider_resource_id,
+        billed_from=billed_from,
+        billed_until=billed_until,
+        billed_seconds=int((billed_until - billed_from).total_seconds()),
+        hourly_price_usd=provisioning.pod_realized_placement.hourly_rate_usd,
+        actual_cost_usd=actual,
+        reconciled_at=receipt_reconciled_at,
+    )
+    observation = OllamaLifecycleBillingObservation(
+        intent_sha256=intent.intent_sha256,
+        provisioning_receipt_id=provisioning.receipt_id,
+        cleanup_receipt_id=cleanup.cleanup_receipt_id,
+        lease_id=intent.lease_id,
+        provision_attempt_id=intent.provision_attempt_id,
+        resource_type=intent.resource_type,
+        provider_resource_id=provisioning.provider_resource_id,
+        cost_scope="pod_lifecycle",
+        provider_capacity_actual_cost_usd=actual,
+        first_observed_at=observed_at,
+        pod_billing_receipt=receipt,
+    )
+
+    if coverage in {"exact", "exact_zero"}:
+        selected = repository.record_billing_outcome(
+            terminated,
+            now=observed_at,
+            next_check_at=observed_at + timedelta(hours=1),
+            observation=observation,
+            maximum_observations=8,
+            maximum_bytes=100_000,
+        )
+        assert selected.lifecycle_billing_state is OllamaLifecycleBillingState.SELECTED
+        return
+    with pytest.raises(ValueError, match="coverage"):
+        repository.record_billing_outcome(
+            terminated,
+            now=observed_at,
+            next_check_at=observed_at + timedelta(hours=1),
+            observation=observation,
+            maximum_observations=8,
+            maximum_bytes=100_000,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("coverage", "accepted"),
+    [
+        ("exact", True),
+        ("gap", False),
+        ("duplicate", False),
+        ("out_of_order", False),
+        ("foreign", False),
+        ("open", False),
+    ],
+)
+async def test_serverless_lifecycle_billing_requires_complete_ordered_hours(
+    tmp_path,
+    billing_server,
+    coverage,
+    accepted,
+):
+    _state, exact_provider, billing_clock, _, _, activation = billing_server
+    clock = MutableClock()
+    provider = _LifecycleBillingProvider(
+        serverless_plan(),
+        control_client=exact_provider.control_client,
+        billing_clock=billing_clock,
+        endpoint_id=activation.endpoint_id,
+    )
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / f"serverless-lifecycle-coverage-{coverage}.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+    ready = await service.acquire(request, plan=serverless_plan())
+    clock.advance(2 * 3600 + 1)
+    terminated = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+    intent = terminated.provisioning_intent
+    provisioning = terminated.provisioning_receipt
+    cleanup = terminated.cleanup_receipt
+    assert intent is not None and provisioning is not None and cleanup is not None
+    billing_clock.value = activation.readback_at + timedelta(hours=4)
+    observed = await provider.observe_lifecycle_billing(intent, provisioning, cleanup)
+    assert observed is not None
+    hours = observed.serverless_endpoint_hour_costs
+    assert len(hours) >= 2
+    if coverage == "exact":
+        changed = hours
+    elif coverage == "gap":
+        changed = hours[:-1]
+    elif coverage == "duplicate":
+        changed = (*hours, hours[-1])
+    elif coverage == "out_of_order":
+        changed = tuple(reversed(hours))
+    elif coverage == "foreign":
+        changed = (replace(hours[0], endpoint_id="foreign-endpoint"), *hours[1:])
+    else:
+        changed = hours
+
+    rejected = False
+    try:
+        candidate = replace(
+            observed,
+            serverless_endpoint_hour_costs=tuple(changed),
+            provider_capacity_actual_cost_usd=serverless_endpoint_hour_cost_totals(
+                tuple(changed)
+            )["actual_cost_usd"],
+            first_observed_at=(
+                changed[-1].utc_hour_end - timedelta(microseconds=1)
+                if coverage == "open"
+                else observed.first_observed_at
+            ),
+        )
+        stored = repository.record_billing_outcome(
+            terminated,
+            now=billing_clock(),
+            next_check_at=billing_clock() + timedelta(hours=1),
+            observation=candidate,
+            maximum_observations=8,
+            maximum_bytes=100_000,
+        )
+    except ValueError:
+        rejected = True
+    if accepted:
+        assert not rejected
+        assert stored.lifecycle_billing_state is OllamaLifecycleBillingState.SELECTED
+    else:
+        assert rejected, f"{coverage} Serverless hours reached durable selection"
 
 
 @pytest.mark.asyncio
