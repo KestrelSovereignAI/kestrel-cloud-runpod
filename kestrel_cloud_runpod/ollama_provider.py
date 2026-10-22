@@ -1020,9 +1020,15 @@ class _ProvisioningAssessment:
         if name not in fields:
             fields.append(name)
 
-    def record_resource_field(self, category: str, field_path: str) -> None:
+    def record_resource_field(
+        self,
+        category: str,
+        field_path: str,
+        *,
+        required: bool = True,
+    ) -> None:
         state = self.observed.field_evidence.state(field_path)
-        if state is ResourceFieldState.MISSING:
+        if state is ResourceFieldState.MISSING and required:
             self.missing(category, field_path)
         elif state is ResourceFieldState.INVALID:
             self.invalid(category, field_path)
@@ -1174,6 +1180,7 @@ def _validate_endpoint_provisioning(
         provider_resource_id=provider_resource_id,
         observed_at=observed_at,
     )
+    assessment.record_resource_field("runtime", "requestUrls", required=False)
     assessment.record_resource_field("policy", "type")
     if (
         endpoint.field_evidence.state("type") is ResourceFieldState.PRESENT

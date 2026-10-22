@@ -1726,6 +1726,258 @@ async def test_native_confirmed_mismatch_wins_over_missing_optional_evidence(
 
 
 @pytest.mark.asyncio
+async def test_native_invalid_endpoint_request_urls_cannot_complete_ack_evidence(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["replace_on_get"] = {"requestUrls": 17}
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "invalid-ack-urls.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    with pytest.raises(RunPodManagerError, match="requestUrls"):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+
+    durable = repository.get(request.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert durable.provider_resource_id == "endpoint-evidence-1"
+    assert durable.creation_uncertain is True
+    assert durable.provisioning_receipt is None
+    assert durable.provisioning_mismatch is None
+    assert durable.route_url is None
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+
+@pytest.mark.asyncio
+async def test_native_invalid_endpoint_request_urls_keep_discovery_untrusted(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["ambiguous_post"] = True
+    state["inventory_visible"] = False
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "invalid-discovery-urls.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    with pytest.raises(RunPodManagerError):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    state["inventory_visible"] = True
+    state["replace_on_get"] = {"requestUrls": 17}
+    current = (await service.reconcile())[0]
+
+    assert current.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert current.provider_resource_id is None
+    assert current.ambiguous_create_candidate_id == "endpoint-evidence-1"
+    assert current.creation_uncertain is True
+    assert current.provisioning_receipt is None
+    assert current.provisioning_mismatch is None
+    assert current.route_url is None
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+    clock.advance(int((current.hard_deadline - clock()).total_seconds()) + 1)
+    await service.reconcile()
+    expired = repository.get(request.lease_id)
+    assert expired is not None
+    assert expired.provider_resource_id is None
+    assert expired.ambiguous_create_candidate_id == "endpoint-evidence-1"
+    assert expired.provisioning_receipt is None
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+
+@pytest.mark.asyncio
+async def test_native_valid_endpoint_request_urls_complete_ack_evidence(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "valid-ack-urls.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    completed = await service.acquire(
+        request,
+        plan=serverless_plan(),
+        wait_until_ready=False,
+    )
+
+    assert completed.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert completed.provider_resource_id == "endpoint-evidence-1"
+    assert completed.provisioning_receipt is not None
+    assert completed.provisioning_mismatch is None
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+
+@pytest.mark.asyncio
+async def test_native_missing_endpoint_request_urls_remain_optional_until_readiness(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["drop_on_get"] = ("requestUrls",)
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "missing-ack-urls.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    completed = await service.acquire(
+        request,
+        plan=serverless_plan(),
+        wait_until_ready=False,
+    )
+
+    assert completed.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert completed.provisioning_receipt is not None
+    assert completed.route_url is None
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+
+@pytest.mark.asyncio
+async def test_native_request_url_invalidity_does_not_mask_owned_ack_mismatch(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["replace_on_get"] = {
+        "requestUrls": 17,
+        "image": "wrong.invalid/runtime@sha256:" + "f" * 64,
+    }
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "invalid-urls-owned-mismatch.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    with pytest.raises(RunPodManagerError, match="does not match"):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+
+    durable = repository.get(request.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.provider_resource_id == "endpoint-evidence-1"
+    assert durable.provisioning_mismatch is not None
+    assert durable.provisioning_mismatch.reason.value == "image_or_environment"
+    assert state["calls"][-2:] == [
+        ("DELETE", "/v2/serverless/endpoint-evidence-1"),
+        ("GET", "/v2/serverless/endpoint-evidence-1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_request_url_invalidity_does_not_authorize_mismatched_discovery(
+    native_provisioning,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["ambiguous_post"] = True
+    state["inventory_visible"] = False
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "invalid-urls-discovery-mismatch.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        max_authorized_cost=5.0,
+    )
+
+    with pytest.raises(RunPodManagerError):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    state["inventory_visible"] = True
+    state["replace_on_get"] = {
+        "requestUrls": 17,
+        "image": "wrong.invalid/runtime@sha256:" + "f" * 64,
+    }
+    current = (await service.reconcile())[0]
+
+    assert current.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert current.provider_resource_id is None
+    assert current.ambiguous_create_candidate_id == "endpoint-evidence-1"
+    assert current.provisioning_receipt is None
+    assert current.provisioning_mismatch is None
+    assert current.ambiguous_candidate_mismatch is not None
+    assert current.ambiguous_candidate_mismatch.reason.value == "image_or_environment"
+    assert not any(method == "DELETE" for method, _path in state["calls"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("missing_update", "wrong_update"),
     [
