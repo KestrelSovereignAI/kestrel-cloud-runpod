@@ -45,7 +45,10 @@ dependencies = [
     # ModuleNotFoundError.  Floor matches the SDK's, the lowest in the
     # ecosystem; Ed25519 has been present since 2.6.
     "cryptography>=42.0",
-    "httpx>=0.27.0,<1",
+    # Public HTTPX -> HTTPCore exception pairs are part of the bounded
+    # transport-category evidence used by safe reads and reconciliation.
+    "httpcore>=1.0.9,<1.1",
+    "httpx>=0.28.1,<0.29",
     "pydantic>=2.10.0,<3",
     "requests>=2.32.0,<3",
 ]

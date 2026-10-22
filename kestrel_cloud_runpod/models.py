@@ -654,7 +654,7 @@ class CpuPodCreateRequest(_PodContainerRequest):
             if not isinstance(self.mounts, Mapping) or set(self.mounts) - {"network"}:
                 raise ValueError("CPU Pods support only an explicit network mount")
             network = self.mounts.get("network", [])
-            if not isinstance(network, list) or len(network) > 1:
+            if not isinstance(network, (list, tuple)) or len(network) > 1:
                 raise ValueError("CPU Pods support at most one network mount")
             for mount in network:
                 if (

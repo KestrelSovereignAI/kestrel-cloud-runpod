@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import httpcore
 import httpx
 import pytest
 from jsonschema import Draft202012Validator
@@ -24,6 +25,7 @@ from ollama_test_support import (
     runtime_telemetry_payload,
     serverless_plan,
 )
+from pod_capacity_test_support import native_httpx_connect_failure
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.models import (
@@ -718,6 +720,85 @@ async def test_teardown_treats_already_absent_resource_as_success():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resource_type", list(OllamaResourceType))
+@pytest.mark.parametrize("failure_stage", ["delete", "readback"])
+@pytest.mark.parametrize("unknown_subclass", [False, True])
+@pytest.mark.parametrize("structural_cause", [False, True])
+async def test_only_canonical_404_can_prove_exact_resource_absence(
+    monkeypatch,
+    resource_type,
+    failure_stage,
+    unknown_subclass,
+    structural_cause,
+):
+    class UnknownNotFoundError(RunPodAPIError):
+        pass
+
+    client = _ControlClient()
+    resource = ProvisionedOllamaResource(
+        resource_type=resource_type,
+        provider_resource_id="endpoint-1"
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else "pod-1",
+        resource_name="resource",
+    )
+    error_type = UnknownNotFoundError if unknown_subclass else RunPodAPIError
+    error = error_type(
+        title="Not found",
+        detail="exact resource is absent",
+        status_code=404,
+    )
+    if structural_cause:
+        error.__cause__ = ValueError("structural parser failure")
+    readback_ids = []
+    original_get_endpoint = client.get_endpoint
+    original_get_pod = client.get_pod
+
+    def clean_readback(resource_id):
+        readback_ids.append(resource_id)
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            return original_get_endpoint(resource_id)
+        return original_get_pod(resource_id)
+
+    def fail_delete(resource_id):
+        client.absent.add(resource_id)
+        raise error
+
+    def fail_action(resource_id, action):
+        assert action == "terminate"
+        client.absent.add(resource_id)
+        raise error
+
+    def fail_readback(resource_id):
+        readback_ids.append(resource_id)
+        raise error
+
+    if failure_stage == "delete":
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            monkeypatch.setattr(client, "delete_endpoint", fail_delete)
+            monkeypatch.setattr(client, "get_endpoint", clean_readback)
+        else:
+            monkeypatch.setattr(client, "pod_action", fail_action)
+            monkeypatch.setattr(client, "get_pod", clean_readback)
+    elif resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+        monkeypatch.setattr(client, "get_endpoint", fail_readback)
+    else:
+        monkeypatch.setattr(client, "get_pod", fail_readback)
+
+    provider = _provider(client=client)
+    if unknown_subclass or structural_cause:
+        with pytest.raises(error_type) as caught:
+            await provider.teardown(resource, _cleanup_intent(resource))
+        assert caught.value is error
+        if failure_stage == "delete":
+            assert readback_ids == []
+    else:
+        receipt = await provider.teardown(resource, _cleanup_intent(resource))
+        assert receipt.verified_absent_at is not None
+        assert readback_ids == [resource.provider_resource_id]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["typed_transport", "statusless", "malformed"])
 async def test_teardown_retry_disposition_requires_canonical_transport_evidence(case):
     client = _ControlClient()
@@ -727,8 +808,7 @@ async def test_teardown_retry_disposition_requires_canonical_transport_evidence(
         status_code=200 if case == "malformed" else None,
     )
     if case == "typed_transport":
-        request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/test")
-        api_error.__cause__ = httpx.ConnectError("connection failed", request=request)
+        api_error.__cause__ = native_httpx_connect_failure()
     elif case == "malformed":
         api_error.__cause__ = ValueError("invalid JSON")
     client.delete_error = api_error
@@ -2801,6 +2881,218 @@ async def test_native_cleanup_auth_failure_stops_before_second_owned_target(
     assert durable.state is OllamaLeaseState.RELEASING
     assert durable.cleanup_receipt is None
     assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+async def test_statusless_http_authorization_response_stops_later_owned_cleanup(
+    tmp_path,
+):
+    request = httpx.Request(
+        "DELETE", "https://api.runpod.io/v2/serverless/provider-001"
+    )
+    response = httpx.Response(401, request=request)
+    response_error = httpx.HTTPStatusError(
+        "authorization denied", request=request, response=response
+    )
+    api_error = RunPodAPIError(
+        title="Runpod request failed",
+        detail="HTTPStatusError",
+    )
+    api_error.__cause__ = response_error
+
+    class StatuslessAuthorizationClient(_ControlClient):
+        def __init__(self):
+            super().__init__()
+            self.delete_ids = []
+
+        def delete_endpoint(self, endpoint_id):
+            self.delete_ids.append(endpoint_id)
+            if endpoint_id == "provider-001":
+                raise api_error
+            return super().delete_endpoint(endpoint_id)
+
+        def get_endpoint(self, endpoint_id):
+            self._require_present(endpoint_id)
+            return replace(self.endpoint, id=endpoint_id)
+
+    client = StatuslessAuthorizationClient()
+    provider = _provider(client=client)
+    service, claimed = await _claimed_two_target_cleanup(
+        tmp_path,
+        provider,
+        admission_provider=FakeOllamaProvider(serverless_plan()),
+        database_name="statusless-http-auth.sqlite3",
+    )
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test statusless response blocker",
+        )
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+    else:
+        pytest.fail("provider authentication failure was not retained")
+
+    assert any(error is api_error for error in _explicit_error_graph(caught))
+    assert client.delete_ids == ["provider-001"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker_kind", ["structural", "control", "group", "cycle"])
+async def test_transport_graph_blocker_stops_later_owned_cleanup(
+    tmp_path,
+    blocker_kind,
+):
+    """An HTTPX carrier cannot hide a structural or execution-control blocker."""
+
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    request = httpx.Request(
+        "DELETE", "https://api.runpod.io/v2/serverless/provider-001"
+    )
+    transport = httpx.ConnectError("connection failed", request=request)
+    core = httpcore.ConnectError("connection failed")
+    transport.__cause__ = core
+    if blocker_kind == "structural":
+        core.__cause__ = ValueError("invalid transport state")
+    elif blocker_kind == "control":
+        core.__cause__ = ExecutionAuthorityError("original authority retired")
+    elif blocker_kind == "group":
+        core.__cause__ = ExceptionGroup(
+            "mixed transport graph",
+            [
+                TimeoutError("native timeout"),
+                ExecutionAuthorityError("original authority retired"),
+            ],
+        )
+    else:
+        structural = ValueError("cyclic structural failure")
+        core.__cause__ = structural
+        structural.__cause__ = core
+    api_error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail="ConnectError",
+    )
+    api_error.__cause__ = transport
+
+    class BlockedTransportClient(_ControlClient):
+        def __init__(self):
+            super().__init__()
+            self.delete_ids = []
+
+        def delete_endpoint(self, endpoint_id):
+            self.delete_ids.append(endpoint_id)
+            if endpoint_id == "provider-001":
+                raise api_error
+            return super().delete_endpoint(endpoint_id)
+
+        def get_endpoint(self, endpoint_id):
+            self._require_present(endpoint_id)
+            return replace(self.endpoint, id=endpoint_id)
+
+    client = BlockedTransportClient()
+    provider = _provider(client=client)
+    service, claimed = await _claimed_two_target_cleanup(
+        tmp_path,
+        provider,
+        admission_provider=FakeOllamaProvider(serverless_plan()),
+        database_name=f"transport-graph-{blocker_kind}.sqlite3",
+    )
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test blocked transport graph",
+        )
+    except BaseException as error:  # noqa: BLE001 - exact graph is asserted
+        caught = error
+    else:
+        pytest.fail("blocked transport graph was not retained")
+
+    assert any(error is api_error for error in _explicit_error_graph(caught))
+    assert client.delete_ids == ["provider-001"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is None
+    assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("readback", "allows_later_owned_target"),
+    [("exact", True), ("foreign-id", False), ("wrong-type", False)],
+)
+async def test_cleanup_retry_requires_exact_typed_resource_readback(
+    tmp_path,
+    readback,
+    allows_later_owned_target,
+):
+    class CleanupReadbackClient(_ControlClient):
+        def __init__(self):
+            super().__init__()
+            self.delete_ids = []
+
+        def delete_endpoint(self, endpoint_id):
+            self.delete_ids.append(endpoint_id)
+            if endpoint_id != "provider-001":
+                return super().delete_endpoint(endpoint_id)
+
+        def get_endpoint(self, endpoint_id):
+            self._require_present(endpoint_id)
+            if endpoint_id != "provider-001":
+                return replace(self.endpoint, id=endpoint_id)
+            if readback == "exact":
+                return replace(self.endpoint, id=endpoint_id)
+            if readback == "foreign-id":
+                return replace(self.endpoint, id="foreign-endpoint")
+            return PodResource(
+                id=endpoint_id,
+                name=self.endpoint.name,
+                status="RUNNING",
+                gpu_id="gpu-pod",
+                gpu_count=1,
+                cost_per_hr=Decimal("0.5"),
+                raw={"runtime": {"ports": []}},
+            )
+
+    client = CleanupReadbackClient()
+    provider = _provider(client=client)
+    service, claimed = await _claimed_two_target_cleanup(
+        tmp_path,
+        provider,
+        admission_provider=FakeOllamaProvider(serverless_plan()),
+        database_name=f"cleanup-readback-{readback}.sqlite3",
+    )
+
+    try:
+        await service._teardown_all_effects(
+            claimed,
+            reason="test exact cleanup readback identity",
+        )
+    except BaseException as error:  # noqa: BLE001 - custody is asserted below
+        caught = error
+    else:
+        pytest.fail("still-present cleanup outcome was not retained")
+    assert _explicit_error_graph(caught)
+
+    expected_ids = (
+        ["provider-001", "late-original-ack"]
+        if allows_later_owned_target
+        else ["provider-001"]
+    )
+    assert client.delete_ids == expected_ids
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    assert durable.cleanup_receipt is None
+    if allows_later_owned_target:
+        assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+    else:
+        assert durable.additional_cleanup_targets[0].cleanup_receipt is None
 
 
 @pytest.mark.asyncio

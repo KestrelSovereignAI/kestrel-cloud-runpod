@@ -752,9 +752,13 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 		})
 		runtime.proxy.ServeHTTP(tracked, request)
 		stopCancellation()
+		responseStatus := tracked.status
+		if responseStatus == 0 {
+			responseStatus = http.StatusOK
+		}
 		finish(
 			request.Context().Err() != nil,
-			tracked.status >= http.StatusInternalServerError,
+			responseStatus < http.StatusOK || responseStatus >= http.StatusMultipleChoices,
 		)
 		return
 	}

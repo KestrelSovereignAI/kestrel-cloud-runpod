@@ -528,7 +528,10 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 - `kestrel-sovereign>=0.53.41,<1` — canonical joined-effect custody,
   provider-neutral inference terminal-evidence refresh, and direct-node
   execution-control classification
-- `httpx>=0.27,<1`
+- `httpcore>=1.0.9,<1.1` and `httpx>=0.28.1,<0.29` — reviewed public
+  transport exception pairs for bounded safe-read retry classification;
+  implicit backend context is diagnostic only and mutating requests are never
+  automatically retried
 - `requests>=2.32,<3`
 
 ## Development

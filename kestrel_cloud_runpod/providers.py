@@ -181,7 +181,7 @@ class DirectRunPodProvider(GPUProvider):
         pod = self.client.pod_action(pod_id, "stop")
         if pod is not None:
             pod.require_valid_fields(context="v2 Pod stop")
-        return dict(pod.raw) if pod is not None else {"id": pod_id, "status": "EXITED"}
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def resume_pod(self, pod_id: str, gpu_count: int = 1) -> Dict[str, Any]:
         """Start the stopped Pod on its retained machine assignment."""
@@ -191,9 +191,7 @@ class DirectRunPodProvider(GPUProvider):
         pod = self.client.pod_action(pod_id, "start")
         if pod is not None:
             pod.require_valid_fields(context="v2 Pod start")
-        return (
-            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "STARTING"}
-        )
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def terminate_pod(self, pod_id: str) -> Dict[str, Any]:
         """Permanently terminate a Pod through the v2 action contract."""
@@ -201,9 +199,7 @@ class DirectRunPodProvider(GPUProvider):
         pod = self.client.pod_action(pod_id, "terminate")
         if pod is not None:
             pod.require_valid_fields(context="v2 Pod termination")
-        return (
-            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "TERMINATED"}
-        )
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def list_pods(self) -> List[Dict[str, Any]]:
         pods = self.client.list_pods()
