@@ -2277,6 +2277,15 @@ class SQLiteOllamaLeaseRepository:
                     f"Lease '{lease.lease_id}' disappeared before cleanup"
                 )
             current = _lease_from_row(row)
+            if not _cleanup_lineage_is_compatible(
+                lease,
+                current,
+                phase=_CleanupLineagePhase.PRIMARY_INTENT,
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed cleanup lineage"
+                )
             if current.cleanup_intent is not None:
                 connection.commit()
                 return current
@@ -2326,6 +2335,16 @@ class SQLiteOllamaLeaseRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._locked_lease(connection, lease.lease_id)
+            if not _cleanup_lineage_is_compatible(
+                lease,
+                current,
+                phase=_CleanupLineagePhase.ADDITIONAL_INTENT,
+                provider_resource_id=provider_resource_id,
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed additional cleanup lineage"
+                )
             intent = current.provisioning_intent
             if intent is None or current.state is not OllamaLeaseState.RELEASING:
                 connection.rollback()
@@ -2333,20 +2352,21 @@ class SQLiteOllamaLeaseRepository:
                     f"Lease '{lease.lease_id}' lacks additional cleanup authority"
                 )
             targets = list(current.additional_cleanup_targets)
-            index = next(
-                (
-                    offset
-                    for offset, item in enumerate(targets)
-                    if item.provider_resource_id == provider_resource_id
-                ),
-                None,
+            target_match = _additional_cleanup_target(
+                current.additional_cleanup_targets,
+                provider_resource_id,
             )
-            if index is None:
+            if target_match is None:
                 connection.rollback()
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' has no matching cleanup target"
                 )
-            target = targets[index]
+            index, target = target_match
+            if target.cleanup_receipt is not None:
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed additional cleanup lineage"
+                )
             if target.cleanup_intent is not None:
                 connection.commit()
                 return current
@@ -2391,51 +2411,38 @@ class SQLiteOllamaLeaseRepository:
         require_aware(now, "additional teardown outcome")
         if (cleanup_receipt is None) == (provider_error is None):
             raise ValueError("Additional cleanup requires one outcome")
+        if provider_error is not None:
+            if retry_at is None:
+                raise ValueError("Failed cleanup requires a retry schedule")
+            require_aware(retry_at, "additional cleanup retry")
+            if retry_at <= now:
+                raise ValueError("Additional cleanup retry must be in the future")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._locked_lease(connection, lease.lease_id)
-            if (
-                current.request_fingerprint != lease.request_fingerprint
-                or current.provision_attempt_id != lease.provision_attempt_id
-                or current.state is not OllamaLeaseState.RELEASING
+            if not _cleanup_lineage_is_compatible(
+                lease,
+                current,
+                phase=_CleanupLineagePhase.ADDITIONAL_OUTCOME,
+                provider_resource_id=provider_resource_id,
             ):
                 connection.rollback()
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' changed additional cleanup lineage"
                 )
             targets = list(current.additional_cleanup_targets)
-            index = next(
-                (
-                    offset
-                    for offset, item in enumerate(targets)
-                    if item.provider_resource_id == provider_resource_id
-                ),
-                None,
+            target_match = _additional_cleanup_target(
+                current.additional_cleanup_targets,
+                provider_resource_id,
             )
-            if index is None:
+            if target_match is None:
                 connection.rollback()
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' has no matching cleanup target"
                 )
-            target = targets[index]
-            if target.cleanup_receipt is not None:
-                connection.commit()
-                return current
-            if provider_error is not None:
-                if retry_at is None:
-                    connection.rollback()
-                    raise ValueError("Failed cleanup requires a retry schedule")
-                require_aware(retry_at, "additional cleanup retry")
-                if retry_at <= now:
-                    connection.rollback()
-                    raise ValueError("Additional cleanup retry must be in the future")
-                changes: dict[str, Any] = {
-                    "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
-                    "last_provider_error": provider_error,
-                    "reconcile_after": retry_at,
-                }
-            else:
-                if target.cleanup_intent is None or cleanup_receipt is None:
+            index, target = target_match
+            if cleanup_receipt is not None:
+                if target.cleanup_intent is None:
                     connection.rollback()
                     raise OllamaLeaseConflictError(
                         f"Lease '{lease.lease_id}' additional cleanup lacks intent"
@@ -2447,6 +2454,29 @@ class SQLiteOllamaLeaseRepository:
                     raise OllamaLeaseConflictError(
                         f"Lease '{lease.lease_id}' received unbound additional cleanup"
                     ) from exc
+            if current.state is not OllamaLeaseState.RELEASING and not (
+                current.state is OllamaLeaseState.TERMINATED
+                and target.cleanup_receipt is not None
+            ):
+                connection.rollback()
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease.lease_id}' changed additional cleanup lineage"
+                )
+            if target.cleanup_receipt is not None:
+                connection.commit()
+                return current
+            if provider_error is not None:
+                changes: dict[str, Any] = {
+                    "teardown_state": OllamaTeardownState.RETRYABLE_FAILURE,
+                    "last_provider_error": provider_error,
+                    "reconcile_after": retry_at,
+                }
+            else:
+                if cleanup_receipt is None:
+                    connection.rollback()
+                    raise OllamaLeaseConflictError(
+                        f"Lease '{lease.lease_id}' additional cleanup lacks intent"
+                    )
                 targets[index] = replace(target, cleanup_receipt=cleanup_receipt)
                 all_cleanup_complete = current.cleanup_receipt is not None and all(
                     item.cleanup_receipt is not None for item in targets
@@ -3682,8 +3712,68 @@ def _additional_cleanup_targets_are_evidence_prefix(
     return True
 
 
-def _cleanup_lineage_is_compatible(stale: OllamaLease, current: OllamaLease) -> bool:
+class _CleanupLineagePhase(Enum):
+    STRICT = "strict"
+    PRIMARY_INTENT = "primary_intent"
+    ADDITIONAL_INTENT = "additional_intent"
+    ADDITIONAL_OUTCOME = "additional_outcome"
+
+
+def _additional_cleanup_target(
+    targets: tuple[OllamaAdditionalCleanupTarget, ...],
+    provider_resource_id: str,
+) -> tuple[int, OllamaAdditionalCleanupTarget] | None:
+    return next(
+        (
+            (offset, target)
+            for offset, target in enumerate(targets)
+            if target.provider_resource_id == provider_resource_id
+        ),
+        None,
+    )
+
+
+def _cleanup_lineage_is_compatible(
+    stale: OllamaLease,
+    current: OllamaLease,
+    *,
+    phase: _CleanupLineagePhase = _CleanupLineagePhase.STRICT,
+    provider_resource_id: str | None = None,
+) -> bool:
     """Validate the immutable cleanup authority plus a monotonic target suffix."""
+
+    if not isinstance(phase, _CleanupLineagePhase):
+        return False
+    if phase in {
+        _CleanupLineagePhase.ADDITIONAL_INTENT,
+        _CleanupLineagePhase.ADDITIONAL_OUTCOME,
+    }:
+        if provider_resource_id is None:
+            return False
+        stale_target_match = _additional_cleanup_target(
+            stale.additional_cleanup_targets,
+            provider_resource_id,
+        )
+        current_target_match = _additional_cleanup_target(
+            current.additional_cleanup_targets,
+            provider_resource_id,
+        )
+        if stale_target_match is None or current_target_match is None:
+            return False
+        if (
+            phase is _CleanupLineagePhase.ADDITIONAL_OUTCOME
+            and stale_target_match[1].cleanup_intent is None
+        ):
+            return False
+    elif provider_resource_id is not None:
+        return False
+
+    primary_intent_is_compatible = current.cleanup_intent == stale.cleanup_intent
+    if (
+        phase is not _CleanupLineagePhase.STRICT
+        and stale.cleanup_intent is None
+    ):
+        primary_intent_is_compatible = True
 
     return (
         current.lease_id == stale.lease_id
@@ -3697,7 +3787,7 @@ def _cleanup_lineage_is_compatible(stale: OllamaLease, current: OllamaLease) -> 
         and current.resource_type is stale.resource_type
         and current.resource_name == stale.resource_name
         and current.provider_resource_id == stale.provider_resource_id
-        and current.cleanup_intent == stale.cleanup_intent
+        and primary_intent_is_compatible
         and (
             stale.cleanup_receipt is None
             or current.cleanup_receipt == stale.cleanup_receipt
