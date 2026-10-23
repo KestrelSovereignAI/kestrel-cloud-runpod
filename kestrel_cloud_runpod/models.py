@@ -12,6 +12,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 CONTROL_PLANE_BASE_URL = "https://api.runpod.io/v2"
 SERVERLESS_DATA_PLANE_BASE_URL = "https://api.runpod.ai/v2"
 _URL_RE = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
@@ -851,7 +853,9 @@ def _optional_evidence_value(
         return None
     try:
         return parser(source[key])
-    except (RunPodManagerError, TypeError, ValueError, OverflowError):
+    except (RunPodManagerError, TypeError, ValueError, OverflowError) as error:
+        if is_execution_control_error(error):
+            raise
         invalid.append(field_path)
         return None
 

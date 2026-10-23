@@ -16,6 +16,7 @@ from pod_capacity_test_support import (
     record_control_injection,
 )
 
+import kestrel_cloud_runpod.models as runpod_models
 from kestrel_cloud_runpod.clients import (
     DEFAULT_USER_AGENT,
     RunpodControlPlaneClient,
@@ -1122,6 +1123,57 @@ def test_paid_create_decoder_control_carrier_preserves_exact_graph(
         client.close()
 
 
+@pytest.mark.parametrize("resource_kind", ["pod", "endpoint"])
+def test_paid_create_optional_evidence_control_carrier_preserves_exact_graph(
+    monkeypatch,
+    resource_kind,
+):
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("optional evidence execution control"),
+        grouped=True,
+    )
+    structural = explicit.exceptions[1]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        payload = _pod(env={"SAFE": "value"})
+        if resource_kind == "endpoint":
+            payload = _endpoint(env={"SAFE": "value"})
+        return httpx.Response(201, json=payload)
+
+    def controlled_environment(_value):
+        raise carrier
+
+    monkeypatch.setattr(
+        runpod_models,
+        "environment_values_sha256",
+        controlled_environment,
+    )
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        if resource_kind == "pod":
+            create = client.create_pod
+            request = PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        else:
+            create = client.create_endpoint
+            request = _endpoint_request()
+
+        with pytest.raises(RunPodManagerError) as caught:
+            create(request)
+
+        assert caught.value is carrier
+        assert carrier.__cause__ is explicit
+        assert explicit.exceptions == (control, structural)
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize("body", [{}, {"id": "endpoint-ack", "name": None}])
 def test_endpoint_create_without_a_usable_identity_remains_ambiguous(body):
     calls = []
@@ -1159,6 +1211,30 @@ def test_endpoint_create_retains_identity_and_invalid_optional_evidence():
     with pytest.raises(RunPodManagerError, match="requestUrls") as raised:
         resource.require_valid_fields(context="v2 Endpoint create")
     assert "must-not-leak" not in str(raised.value)
+
+
+def test_pod_create_retains_identity_and_invalid_optional_evidence():
+    payload = _pod(cost="not-a-number", env={"PRIVATE": "must-not-leak"})
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(201, json=payload)
+        ),
+    )
+    try:
+        resource = client.create_pod(
+            PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        )
+
+        assert resource.id == "pod-123"
+        assert resource.cost_per_hr is None
+        assert resource.field_evidence.state("cost") is ResourceFieldState.INVALID
+        assert resource.raw["env"] == {"PRIVATE": "[REDACTED]"}
+        with pytest.raises(RunPodManagerError, match="cost") as raised:
+            resource.require_valid_fields(context="v2 Pod create")
+        assert "must-not-leak" not in str(raised.value)
+    finally:
+        client.close()
 
 
 def test_pod_action_timeout_is_ambiguous_and_not_retried():

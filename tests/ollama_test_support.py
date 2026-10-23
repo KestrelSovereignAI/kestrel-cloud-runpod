@@ -94,7 +94,6 @@ class OwnedSpawnProcesses:
     queues_closed: bool = field(default=False, init=False)
 
     def __enter__(self) -> Self:
-        entered = False
         try:
             for process in self.processes:
                 started = False
@@ -108,11 +107,13 @@ class OwnedSpawnProcesses:
                         partially_started = False
                     if started or partially_started:
                         self.started.append(process)
-            entered = True
             return self
-        finally:
-            if not entered:
-                self._cleanup()
+        except BaseException as opening:
+            self._cleanup()
+            terminal = self._terminal_cleanup_error(opening)
+            if terminal is None:
+                raise
+            raise terminal
 
     def join(self) -> None:
         """Bound the normal join while leaving substantive assertions to callers."""
@@ -123,77 +124,82 @@ class OwnedSpawnProcesses:
     def __exit__(self, error_type, error, traceback) -> bool:
         del error_type, traceback
         self._cleanup()
-        if self.cleanup_failures and error is None:
-            raise AssertionError(
-                "owned spawn-process cleanup did not finish cleanly"
-            ) from self.cleanup_failures[0]
-        if self.forced_cleanup and error is None:
-            raise AssertionError(
-                "owned spawn-process cleanup required forced termination"
-            )
+        terminal = self._terminal_cleanup_error(error)
+        if terminal is not None:
+            raise terminal
         return False
+
+    def _terminal_cleanup_error(
+        self, error: BaseException | None
+    ) -> BaseException | None:
+        failures = list(self.cleanup_failures)
+        if self.forced_cleanup:
+            failures.append(
+                AssertionError(
+                    "owned spawn-process cleanup required forced termination"
+                )
+            )
+        if not failures:
+            return None
+        terminal = execution_terminal_error(
+            None
+            if isinstance(error, GeneratorExit)
+            and not is_execution_control_error(error)
+            else error,
+            *failures,
+            retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if terminal is None:
+            return AssertionError("owned spawn-process cleanup lost its failure")
+        return terminal
 
     def _cleanup(self) -> None:
         if self.final_exitcodes or self.queues_closed:
             return
+
+        def attempt(action: Callable[[], Any]) -> bool:
+            try:
+                action()
+            except BaseException as error:  # noqa: BLE001 - retain every cleanup error
+                self.cleanup_failures.append(error)
+                return False
+            return True
+
+        def observe(action: Callable[[], Any], default: Any) -> Any:
+            try:
+                return action()
+            except BaseException as error:  # noqa: BLE001 - retain observation failure
+                self.cleanup_failures.append(error)
+                return default
+
         for gate in self.gates:
-            try:
-                gate.set()
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
+            attempt(gate.set)
         for process in self.started:
-            try:
-                process.join(timeout=self.join_timeout)
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
-            try:
-                alive = process.is_alive()
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
-                alive = True
+            attempt(lambda process=process: process.join(timeout=self.join_timeout))
+            alive = observe(process.is_alive, True)
             if alive:
-                try:
-                    self.forced_cleanup.append(process.pid)
-                    process.terminate()
-                    process.join(timeout=self.join_timeout)
-                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                    self.cleanup_failures.append(exc)
-            try:
-                alive = process.is_alive()
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
-                alive = True
+                self.forced_cleanup.append(
+                    observe(lambda process=process: process.pid, None)
+                )
+                attempt(process.terminate)
+                attempt(lambda process=process: process.join(timeout=self.join_timeout))
+            alive = observe(process.is_alive, True)
             if alive:
-                try:
-                    process.kill()
-                    process.join(timeout=self.join_timeout)
-                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                    self.cleanup_failures.append(exc)
-            try:
-                alive = process.is_alive()
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
-                alive = True
+                attempt(process.kill)
+                attempt(lambda process=process: process.join(timeout=self.join_timeout))
+            alive = observe(process.is_alive, True)
             if alive:
                 self.cleanup_failures.append(
                     AssertionError("owned spawn process did not terminate")
                 )
-            try:
-                self.final_exitcodes.append(process.exitcode)
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
-            if not alive:
-                try:
-                    process.close()
-                    self.closed_processes += 1
-                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                    self.cleanup_failures.append(exc)
+            exitcode = observe(lambda process=process: process.exitcode, None)
+            self.final_exitcodes.append(exitcode)
+            if not alive and attempt(process.close):
+                self.closed_processes += 1
         for queue in self.queues:
-            try:
-                queue.close()
-                queue.join_thread()
-            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
-                self.cleanup_failures.append(exc)
+            attempt(queue.close)
+            attempt(queue.join_thread)
         self.queues_closed = True
 
 
