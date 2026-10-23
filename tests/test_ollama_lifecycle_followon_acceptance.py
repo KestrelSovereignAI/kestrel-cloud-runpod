@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing import get_context
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
+    OwnedLoopbackHTTPServer,
+    OwnedSpawnProcesses,
     make_request,
     pod_plan,
     runtime_telemetry_payload,
@@ -90,6 +95,111 @@ class _LifecycleBillingProvider(FakeOllamaProvider):
             first_observed_at=self.billing_clock(),
             serverless_endpoint_hour_costs=hours,
         )
+
+
+def _telemetry_loopback_cleanup_characterization_child(failure_stage, results):
+    """Exercise the actual telemetry test and rescue only captured resources."""
+
+    module_globals = globals()
+    real_server_type = module_globals["ThreadingHTTPServer"]
+    real_threading = module_globals["threading"]
+    events = []
+    captured = {
+        "server": None,
+        "server_shutdown": None,
+        "server_close": None,
+        "thread": None,
+        "thread_join": None,
+    }
+    explicit = ValueError("telemetry fixture cleanup explicit cause")
+    injected = RuntimeError(f"telemetry fixture failed during {failure_stage}")
+    injected.__cause__ = explicit
+
+    def server_factory(*args, **kwargs):
+        server = real_server_type(*args, **kwargs)
+        captured["server"] = server
+        captured["server_shutdown"] = server.shutdown
+        captured["server_close"] = server.server_close
+
+        def observed_shutdown():
+            events.append("server-shutdown")
+            captured["server_shutdown"]()
+            if failure_stage == "server-shutdown":
+                raise injected
+
+        def observed_close():
+            events.append("server-close")
+            captured["server_close"]()
+            if failure_stage == "server-close":
+                raise injected
+
+        server.shutdown = observed_shutdown
+        server.server_close = observed_close
+        return server
+
+    def thread_factory(*args, **kwargs):
+        thread = real_threading.Thread(*args, **kwargs)
+        captured["thread"] = thread
+        captured["thread_join"] = thread.join
+        original_start = thread.start
+        if failure_stage == "thread-start":
+
+            def fail_start():
+                events.append("thread-start")
+                original_start()
+                raise injected
+
+            thread.start = fail_start
+        else:
+
+            def observed_start():
+                events.append("thread-start")
+                original_start()
+
+            thread.start = observed_start
+
+        def observed_join(*, timeout):
+            events.append("thread-join")
+            captured["thread_join"](timeout=timeout)
+            if failure_stage == "thread-join":
+                raise injected
+
+        thread.join = observed_join
+        return thread
+
+    module_globals["ThreadingHTTPServer"] = server_factory
+    module_globals["threading"] = SimpleNamespace(Thread=thread_factory)
+    caught = None
+    rescue_needed = []
+    try:
+        asyncio.run(
+            test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding()
+        )
+    except BaseException as error:  # noqa: BLE001 - characterize exact fixture error
+        caught = error
+    finally:
+        module_globals["ThreadingHTTPServer"] = real_server_type
+        module_globals["threading"] = real_threading
+        if captured["server"] is not None and "server-shutdown" not in events:
+            rescue_needed.append("server-shutdown")
+            captured["server_shutdown"]()
+        if captured["thread"] is not None and "thread-join" not in events:
+            rescue_needed.append("thread-join")
+            captured["thread_join"](timeout=5)
+        if captured["server"] is not None and "server-close" not in events:
+            rescue_needed.append("server-close")
+            captured["server_close"]()
+
+    thread = captured["thread"]
+    results.put(
+        {
+            "caught_is_injected": caught is injected,
+            "cause_is_explicit": caught is not None and caught.__cause__ is explicit,
+            "events": tuple(events),
+            "rescue_needed": tuple(rescue_needed),
+            "thread_alive": thread is not None and thread.is_alive(),
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -840,14 +950,25 @@ async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding():
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    def server_factory():
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        return server
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=server_factory,
+        thread_factory=lambda server: threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        ),
+        client_factory=lambda _server: None,
+    )
     valid_payload = dict(payload)
-    try:
+    with owner:
+        assert owner.server is not None
+        base_url = f"http://127.0.0.1:{owner.server.server_port}"
         observed = await provider._runtime_telemetry(
-            f"http://127.0.0.1:{server.server_port}",
+            base_url,
             bearer_token=bearer,
             intent=prepared.intent,
             provisioning=provisioning,
@@ -855,16 +976,11 @@ async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding():
         payload["placement_and_image_pull_wall_ms"] = 1
         with pytest.raises(RunPodManagerError, match="telemetry is invalid"):
             await provider._runtime_telemetry(
-                f"http://127.0.0.1:{server.server_port}",
+                base_url,
                 bearer_token=bearer,
                 intent=prepared.intent,
                 provisioning=provisioning,
             )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-        assert not thread.is_alive()
 
     assert requests == [
         ("/kestrel/telemetry", f"Bearer {bearer}"),
@@ -878,6 +994,37 @@ async def test_runtime_telemetry_uses_real_loopback_bearer_and_exact_binding():
     encoded = json.dumps(observed.to_dict(), sort_keys=True)
     assert bearer not in encoded
     assert request.model not in encoded
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["thread-start", "server-shutdown", "thread-join", "server-close"],
+)
+def test_runtime_telemetry_loopback_attempts_every_owned_cleanup(
+    failure_stage,
+):
+    context = get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_telemetry_loopback_cleanup_characterization_child,
+        args=(failure_stage, results),
+    )
+    with OwnedSpawnProcesses((process,), gates=(), queues=(results,)) as ownership:
+        ownership.join()
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        observed = results.get(timeout=2)
+
+    assert observed["caught_is_injected"] is True
+    assert observed["cause_is_explicit"] is True
+    assert observed["thread_alive"] is False
+    assert observed["rescue_needed"] == ()
+    assert set(observed["events"]) == {
+        "thread-start",
+        "server-shutdown",
+        "thread-join",
+        "server-close",
+    }
 
 
 @pytest.mark.asyncio

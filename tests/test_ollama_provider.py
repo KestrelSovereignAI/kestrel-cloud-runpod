@@ -55,6 +55,7 @@ from kestrel_cloud_runpod.models import (
     environment_values_sha256,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaCleanupBasis,
     OllamaCleanupIntent,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -1389,6 +1390,106 @@ async def test_only_canonical_404_can_prove_exact_resource_absence(
         receipt = await provider.teardown(resource, _cleanup_intent(resource))
         assert receipt.verified_absent_at is not None
         assert readback_ids == [resource.provider_resource_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource_type", "error_type"),
+    [
+        pytest.param(
+            OllamaResourceType.SERVERLESS_ENDPOINT,
+            ValueError,
+            id="endpoint-value",
+        ),
+        pytest.param(OllamaResourceType.POD, RecursionError, id="pod-recursion"),
+    ],
+)
+async def test_native_absence_problem_decoder_control_is_not_404(
+    monkeypatch,
+    native_teardown,
+    resource_type,
+    error_type,
+):
+    provider, state = native_teardown
+    carrier, control, explicit = execution_control_carrier(
+        error_type("problem decoder execution control"),
+        grouped=True,
+    )
+    structural = explicit.exceptions[1]
+    original_json = httpx.Response.json
+
+    def controlled_json(response, **kwargs):
+        if response.status_code == 404:
+            raise carrier
+        return original_json(response, **kwargs)
+
+    monkeypatch.setattr(httpx.Response, "json", controlled_json)
+    resource = ProvisionedOllamaResource(resource_type, "original-1", "original")
+
+    with pytest.raises(error_type) as caught:
+        await provider.teardown(resource, _cleanup_intent(resource))
+
+    assert caught.value is carrier
+    assert carrier.__cause__ is explicit
+    assert explicit.exceptions == (control, structural)
+    path = (
+        "/v2/serverless/original-1"
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else "/v2/pods/original-1"
+    )
+    action = (
+        ("DELETE", path)
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else ("POST", path + "/action")
+    )
+    assert state["calls"] == [action, ("GET", path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_type",
+    [
+        pytest.param(
+            OllamaResourceType.SERVERLESS_ENDPOINT,
+            id="serverless-endpoint",
+        ),
+        pytest.param(OllamaResourceType.POD, id="pod"),
+    ],
+)
+async def test_native_absence_ordinary_malformed_problem_remains_canonical_404(
+    monkeypatch,
+    native_teardown,
+    resource_type,
+):
+    provider, state = native_teardown
+    original_json = httpx.Response.json
+
+    def malformed_json(response, **kwargs):
+        if response.status_code == 404:
+            raise ValueError("ordinary malformed problem JSON")
+        return original_json(response, **kwargs)
+
+    monkeypatch.setattr(httpx.Response, "json", malformed_json)
+    resource = ProvisionedOllamaResource(resource_type, "original-1", "original")
+    intent = _cleanup_intent(resource)
+
+    receipt = await provider.teardown(resource, intent)
+
+    assert receipt.cleanup_intent_id == intent.cleanup_intent_id
+    receipt.validate_intent(intent)
+    assert receipt.verified_absent_at is not None
+    assert receipt.basis is OllamaCleanupBasis.DELETE_ACKNOWLEDGED
+    path = (
+        "/v2/serverless/original-1"
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else "/v2/pods/original-1"
+    )
+    action = (
+        ("DELETE", path)
+        if resource_type is OllamaResourceType.SERVERLESS_ENDPOINT
+        else ("POST", path + "/action")
+    )
+    assert state["calls"] == [action, ("GET", path)]
 
 
 @pytest.mark.asyncio

@@ -2011,6 +2011,13 @@ class OllamaLifecycleBillingObservation:
             pod_billing_receipt = self.pod_billing_receipt
             if pod_billing_receipt is None:
                 raise ValueError("Ollama Pod billing payload is invalid")
+            realized_placement = provisioning.pod_realized_placement
+            if (
+                realized_placement is None
+                or pod_billing_receipt.hourly_price_usd
+                != realized_placement.hourly_rate_usd
+            ):
+                raise ValueError("Ollama Pod billing rate does not bind lifecycle")
             pod_billing_receipt.validate_lifecycle_coverage(
                 provider_pod_id=provisioning.provider_resource_id,
                 created_at=provisioning.provider_created_at,

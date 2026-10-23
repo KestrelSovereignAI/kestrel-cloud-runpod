@@ -927,7 +927,9 @@ def _problem_from_response(response: httpx.Response) -> dict[str, Any]:
     errors: tuple[str, ...] = ()
     try:
         payload = response.json()
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError) as error:
+        if is_execution_control_error(error):
+            raise
         payload = None
     if isinstance(payload, Mapping):
         if isinstance(payload.get("title"), str):

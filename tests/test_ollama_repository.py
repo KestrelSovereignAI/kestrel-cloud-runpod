@@ -14,6 +14,7 @@ from multiprocessing import get_context
 from pickle import PicklingError
 
 import pytest
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
@@ -23,6 +24,7 @@ from ollama_test_support import (
     release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
+from pod_capacity_test_support import execution_control_carrier
 
 from kestrel_cloud_runpod.inference_provider import _lease_metadata
 from kestrel_cloud_runpod.models import RunPodManagerError
@@ -360,6 +362,36 @@ def _never_finishing_owned_process():
         time.sleep(1)
 
 
+def _put_owned_process_result(results):
+    results.put("owned-result")
+
+
+def _rescue_test_processes(processes, *gates):
+    """Finitely rescue only this test's captured local spawn processes."""
+
+    for gate in gates:
+        gate.set()
+    forced = []
+    for process in processes:
+        try:
+            alive = process.is_alive()
+        except ValueError:
+            continue
+        if alive:
+            process.join(timeout=2)
+        if process.is_alive():
+            forced.append(process.pid)
+            process.terminate()
+            process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        if process.is_alive():
+            pytest.fail(f"Owned test process {process.pid} remained alive after rescue")
+        process.close()
+    return tuple(forced)
+
+
 async def _terminated_pod_billing_evidence(
     tmp_path, *, actual=Decimal(1), database_name="selected-billing.sqlite3"
 ):
@@ -450,6 +482,149 @@ async def _selected_pod_billing_lease(
     )
     assert selected.lifecycle_billing_latest_reference.received_at == observed_at
     return repository, selected, observed_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rate_case", "actual"),
+    [
+        pytest.param("exact", Decimal(1), id="exact"),
+        pytest.param("mismatch", Decimal(1), id="mismatch"),
+        pytest.param("mismatch", Decimal(0), id="mismatch-zero-cost"),
+    ],
+)
+async def test_pod_lifecycle_billing_binds_original_realized_rate(
+    tmp_path,
+    rate_case,
+    actual,
+):
+    (
+        _repository,
+        terminated,
+        _observed_at,
+        observation,
+    ) = await _terminated_pod_billing_evidence(
+        tmp_path,
+        actual=actual,
+        database_name=f"billing-rate-{rate_case}-{actual}.sqlite3",
+    )
+    intent = terminated.provisioning_intent
+    provisioning = terminated.provisioning_receipt
+    cleanup_intent = terminated.cleanup_intent
+    cleanup = terminated.cleanup_receipt
+    receipt = observation.pod_billing_receipt
+    assert intent is not None
+    assert provisioning is not None
+    assert provisioning.pod_realized_placement is not None
+    assert cleanup_intent is not None
+    assert cleanup is not None
+    assert receipt is not None
+    assert observation.provider_capacity_actual_cost_usd == actual
+    candidate = observation
+    if rate_case == "mismatch":
+        candidate = replace(
+            observation,
+            pod_billing_receipt=replace(
+                receipt,
+                hourly_price_usd=receipt.hourly_price_usd + Decimal("0.1"),
+            ),
+        )
+
+    if rate_case == "exact":
+        candidate.validate_lifecycle(intent, provisioning, cleanup_intent, cleanup)
+    else:
+        with pytest.raises(ValueError, match="realized.*rate|rate.*lifecycle"):
+            candidate.validate_lifecycle(
+                intent,
+                provisioning,
+                cleanup_intent,
+                cleanup,
+            )
+
+
+@pytest.mark.asyncio
+async def test_repository_rejects_pod_billing_rate_drift_atomically(tmp_path):
+    (
+        repository,
+        terminated,
+        observed_at,
+        observation,
+    ) = await _terminated_pod_billing_evidence(
+        tmp_path,
+        database_name="billing-rate-atomic.sqlite3",
+    )
+    receipt = observation.pod_billing_receipt
+    assert receipt is not None
+    drifted = replace(
+        observation,
+        pod_billing_receipt=replace(
+            receipt,
+            hourly_price_usd=receipt.hourly_price_usd + Decimal("0.1"),
+        ),
+    )
+    durable_before = repository.get(terminated.lease_id)
+    files_before = _database_files(repository.path)
+
+    with pytest.raises(ValueError, match="realized.*rate|rate.*lifecycle"):
+        repository.record_billing_outcome(
+            terminated,
+            now=observed_at,
+            next_check_at=observed_at + timedelta(hours=1),
+            observation=drifted,
+            maximum_observations=8,
+            maximum_bytes=100_000,
+        )
+
+    assert repository.get(terminated.lease_id) == durable_before
+    assert _database_files(repository.path) == files_before
+
+
+@pytest.mark.asyncio
+async def test_repository_decode_rejects_fault_injected_pod_billing_rate_drift(
+    tmp_path,
+):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    original = selected.lifecycle_billing_observations[0]
+    receipt = original.pod_billing_receipt
+    assert receipt is not None
+    drifted = replace(
+        original,
+        pod_billing_receipt=replace(
+            receipt,
+            hourly_price_usd=receipt.hourly_price_usd + Decimal("0.1"),
+        ),
+    )
+    assert selected.lifecycle_billing_selection is not None
+    selection = replace(
+        selected.lifecycle_billing_selection,
+        observation_id=drifted.observation_id,
+    )
+    latest = OllamaLifecycleBillingLatestReference.known(
+        drifted.observation_id,
+        received_at=observed_at,
+    )
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v7")
+        connection.execute(
+            """
+            UPDATE ollama_leases
+               SET lifecycle_billing_observations_json = ?,
+                   lifecycle_billing_selection_json = ?,
+                   lifecycle_billing_latest_reference_json = ?,
+                   revision = revision + 1,
+                   writer_epoch = writer_epoch + 1
+             WHERE lease_id = ?
+            """,
+            (
+                json.dumps([drifted.to_dict()], sort_keys=True, separators=(",", ":")),
+                json.dumps(selection.to_dict(), sort_keys=True, separators=(",", ":")),
+                json.dumps(latest.to_dict(), sort_keys=True, separators=(",", ":")),
+                selected.lease_id,
+            ),
+        )
+
+    with pytest.raises(RunPodManagerError, match="Stored Ollama billing is unbound"):
+        repository.get(selected.lease_id)
 
 
 async def _versioned_contract_examples(tmp_path, *, database_name):
@@ -1723,6 +1898,158 @@ def test_owned_processes_report_forced_termination_as_failure():
     assert ownership.forced_cleanup[0] is not None
     assert len(ownership.final_exitcodes) == 1
     assert ownership.closed_processes == 1
+
+
+@pytest.mark.parametrize(
+    "body_type",
+    [
+        pytest.param(RuntimeError, id="ordinary-control"),
+        pytest.param(GeneratorExit, id="generator-close-control"),
+    ],
+)
+def test_owned_processes_compose_body_and_all_cleanup_failures(body_type):
+    context = get_context("spawn")
+    gate = context.Event()
+    cleanup_error = RuntimeError("owned gate release failed")
+    events = []
+
+    class FailingGate:
+        def set(self):
+            events.append("gate-set")
+            gate.set()
+            raise cleanup_error
+
+    process = context.Process(target=_wait_for_owned_process_release, args=(gate,))
+    ownership = OwnedSpawnProcesses((process,), gates=(FailingGate(),), queues=())
+    body, control, explicit = execution_control_carrier(
+        body_type("owned body failed"), grouped=True
+    )
+    forced_rescue = ()
+    try:
+        with pytest.raises(BaseExceptionGroup) as caught, ownership:
+            raise body
+    finally:
+        forced_rescue = _rescue_test_processes((process,), gate)
+
+    assert caught.value.exceptions == (body, cleanup_error)
+    assert is_execution_control_error(caught.value)
+    assert body.__cause__ is explicit
+    assert explicit.exceptions[0] is control
+    assert events == ["gate-set"]
+    assert forced_rescue == ()
+    assert ownership.final_exitcodes == [0]
+    assert ownership.closed_processes == 1
+
+
+def test_owned_processes_attempt_later_children_after_baseexception_group():
+    context = get_context("spawn")
+    first_gate = context.Event()
+    second_gate = context.Event()
+    ordinary = ValueError("first gate cleanup failed")
+    grouped = BaseExceptionGroup("first gate group", [ordinary])
+    events = []
+
+    class FailingFirstGate:
+        def set(self):
+            events.append("first-gate")
+            first_gate.set()
+            raise grouped
+
+    class ObservedSecondGate:
+        def set(self):
+            events.append("second-gate")
+            second_gate.set()
+
+    processes = (
+        context.Process(target=_wait_for_owned_process_release, args=(first_gate,)),
+        context.Process(target=_wait_for_owned_process_release, args=(second_gate,)),
+    )
+    ownership = OwnedSpawnProcesses(
+        processes,
+        gates=(FailingFirstGate(), ObservedSecondGate()),
+        queues=(),
+    )
+    forced_rescue = ()
+    try:
+        with pytest.raises(BaseExceptionGroup) as caught, ownership:
+            pass
+    finally:
+        forced_rescue = _rescue_test_processes(
+            processes,
+            first_gate,
+            second_gate,
+        )
+
+    assert caught.value is grouped
+    assert events == ["first-gate", "second-gate"]
+    assert second_gate.is_set()
+    assert ownership.final_exitcodes == [0, 0]
+    assert ownership.closed_processes == 2
+    assert forced_rescue == ()
+
+
+def test_owned_processes_attempt_queue_join_after_close_failure():
+    context = get_context("spawn")
+    results = context.Queue()
+    events = []
+    close_error = ValueError("parent queue close failed")
+
+    class FailingQueue:
+        def close(self):
+            events.append("queue-close")
+            results.close()
+            raise close_error
+
+        def join_thread(self):
+            events.append("queue-join")
+            results.join_thread()
+
+    process = context.Process(target=_put_owned_process_result, args=(results,))
+    ownership = OwnedSpawnProcesses((process,), gates=(), queues=(FailingQueue(),))
+    with pytest.raises(ValueError) as caught, ownership:
+        ownership.join()
+        assert results.get(timeout=2) == "owned-result"
+
+    assert caught.value is close_error
+    assert events == ["queue-close", "queue-join"]
+    assert ownership.final_exitcodes == [0]
+    assert ownership.closed_processes == 1
+    assert ownership.queues_closed is True
+
+
+def test_owned_processes_compose_second_start_and_prior_child_cleanup_failure():
+    context = get_context("spawn")
+    gate = context.Event()
+    cleanup_error = RuntimeError("first child gate cleanup failed")
+
+    class FailingGate:
+        def set(self):
+            gate.set()
+            raise cleanup_error
+
+    def unpickleable_local_target():
+        pytest.fail("unpickleable child target unexpectedly ran")
+
+    first = context.Process(target=_wait_for_owned_process_release, args=(gate,))
+    second = context.Process(target=unpickleable_local_target)
+    ownership = OwnedSpawnProcesses((first, second), gates=(FailingGate(),), queues=())
+    forced_rescue = ()
+    try:
+        with (
+            pytest.raises((AttributeError, PicklingError), match="pickle") as caught,
+            ownership,
+        ):
+            pytest.fail("unpickleable second process unexpectedly started")
+    finally:
+        forced_rescue = _rescue_test_processes((first, second), gate)
+
+    assert type(caught.value) in {AttributeError, PicklingError}
+    assert "unpickleable_local_target" in str(caught.value)
+    assert caught.value.__cause__ is cleanup_error
+    assert ownership.cleanup_failures == [cleanup_error]
+    assert ownership.final_exitcodes == [0]
+    assert ownership.closed_processes == 1
+    assert forced_rescue == ()
 
 
 def test_runtime_refuses_incomplete_current_schema_before_any_ddl(tmp_path):
