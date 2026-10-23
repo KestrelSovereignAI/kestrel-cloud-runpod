@@ -1,27 +1,35 @@
 """Persistence, idempotency, and restart tests for Ollama leases."""
 
+import asyncio
 import hashlib
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from multiprocessing import get_context
+from pickle import PicklingError
 
 import pytest
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
+    OwnedSpawnProcesses,
     make_request,
     pod_plan,
+    release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
 
 from kestrel_cloud_runpod.inference_provider import _lease_metadata
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaAdditionalCleanupTarget,
+    OllamaCleanupBasis,
+    OllamaCleanupReceipt,
     OllamaLeaseConflictError,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
@@ -30,6 +38,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLifecycleBillingObservation,
     OllamaLifecycleBillingSelection,
     OllamaLifecycleBillingState,
+    OllamaProvisioningEvidenceError,
     OllamaProvisioningEvidenceState,
     OllamaProvisioningMismatchEvidence,
     OllamaProvisioningMismatchReason,
@@ -40,6 +49,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     normalize_new_ollama_request_money,
 )
 from kestrel_cloud_runpod.ollama_repository import (
+    _CURRENT_WRITER_CONTRACT_VERSION,
     OllamaWriterDrainAttestation,
     SQLiteOllamaLeaseRepository,
     _db_value,
@@ -50,12 +60,12 @@ from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 from kestrel_cloud_runpod.pod_capacity_contracts import PodBillingReceipt
 
 _WRITER_TRIGGERS = (
-    "ollama_writer_insert_v6",
-    "ollama_writer_update_v6",
-    "ollama_writer_delete_v6",
-    "ollama_provisioning_evidence_insert_v6",
-    "ollama_provisioning_evidence_update_v6",
-    "ollama_lifecycle_evidence_update_v6",
+    "ollama_writer_insert_v7",
+    "ollama_writer_update_v7",
+    "ollama_writer_delete_v7",
+    "ollama_provisioning_evidence_insert_v7",
+    "ollama_provisioning_evidence_update_v7",
+    "ollama_lifecycle_evidence_update_v7",
 )
 _WRITER_COLUMNS = (
     "ambiguous_create_candidate_id",
@@ -295,6 +305,21 @@ def _persistent_database_files(database):
     }
 
 
+def _raw_database_snapshot(database):
+    with closing(sqlite3.connect(database)) as connection:
+        schema = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            )
+        )
+        columns = tuple(connection.execute("PRAGMA table_xinfo(ollama_leases)"))
+        rows = tuple(
+            connection.execute("SELECT * FROM ollama_leases ORDER BY lease_id")
+        )
+    return schema, columns, rows
+
+
 def _migrate_legacy_database_process(database, gate, results):
     gate.wait(timeout=10)
     try:
@@ -324,6 +349,15 @@ def _claim_reconciliation_process(database, gate, results, now, retry_at):
         retry_at=retry_at,
     )
     results.put(None if claimed is None else claimed.revision)
+
+
+def _wait_for_owned_process_release(gate):
+    gate.wait(timeout=10)
+
+
+def _never_finishing_owned_process():
+    while True:
+        time.sleep(1)
 
 
 async def _terminated_pod_billing_evidence(
@@ -418,6 +452,630 @@ async def _selected_pod_billing_lease(
     return repository, selected, observed_at
 
 
+async def _versioned_contract_examples(tmp_path, *, database_name):
+    repository, selected, _observed_at = await _selected_pod_billing_lease(
+        tmp_path, database_name=database_name
+    )
+    intent = selected.provisioning_intent
+    receipt = selected.provisioning_receipt
+    cleanup_intent = selected.cleanup_intent
+    cleanup_receipt = selected.cleanup_receipt
+    telemetry = selected.runtime_telemetry_observations[-1]
+    billing = selected.lifecycle_billing_observations[0]
+    selection = selected.lifecycle_billing_selection
+    assert intent is not None
+    assert receipt is not None
+    assert cleanup_intent is not None
+    assert cleanup_receipt is not None
+    assert selection is not None
+    mismatch = OllamaProvisioningMismatchEvidence(
+        intent_sha256=intent.intent_sha256,
+        lease_id=intent.lease_id,
+        provision_attempt_id=intent.provision_attempt_id,
+        resource_type=intent.resource_type,
+        provider_resource_id=receipt.provider_resource_id,
+        observed_resource_name=intent.resource_name,
+        observed_at=receipt.readback_at,
+        readback_sha256="c" * 64,
+        reason=OllamaProvisioningMismatchReason.RUNTIME,
+    )
+    additional = OllamaAdditionalCleanupTarget(
+        intent_sha256=intent.intent_sha256,
+        lease_id=intent.lease_id,
+        provision_attempt_id=intent.provision_attempt_id,
+        resource_type=intent.resource_type,
+        resource_name=intent.resource_name,
+        provider_resource_id="additional-owned-resource",
+        source="original_post_ack",
+    )
+    return repository, {
+        "provisioning-intent": (intent, "evidence_version", 1),
+        "provisioning-receipt": (receipt, "evidence_version", 1),
+        "provisioning-mismatch": (mismatch, "evidence_version", 1),
+        "cleanup-intent": (cleanup_intent, "evidence_version", 1),
+        "cleanup-receipt": (cleanup_receipt, "evidence_version", 1),
+        "additional-cleanup-target": (additional, "evidence_version", 1),
+        "runtime-snapshot": (telemetry.snapshot, "schema_version", 2),
+        "runtime-observation": (telemetry, "evidence_version", 1),
+        "billing-observation": (billing, "evidence_version", 1),
+        "billing-selection": (selection, "policy_version", 1),
+    }
+
+
+_VERSIONED_CONTRACT_NAMES = (
+    "provisioning-intent",
+    "provisioning-receipt",
+    "provisioning-mismatch",
+    "cleanup-intent",
+    "cleanup-receipt",
+    "additional-cleanup-target",
+    "runtime-snapshot",
+    "runtime-observation",
+    "billing-observation",
+    "billing-selection",
+)
+
+_VERSIONED_CONTRACT_ERROR_MESSAGES = {
+    "provisioning-intent": "Unsupported Ollama provisioning intent version",
+    "provisioning-receipt": "Unsupported Ollama provisioning receipt version",
+    "provisioning-mismatch": "Unsupported Ollama provisioning mismatch version",
+    "cleanup-intent": "Unsupported Ollama cleanup intent version",
+    "cleanup-receipt": "Unsupported Ollama cleanup receipt version",
+    "additional-cleanup-target": "Unsupported Ollama additional cleanup target version",
+    "runtime-snapshot": "Unsupported Ollama telemetry schema",
+    "runtime-observation": "Unsupported Ollama telemetry observation version",
+    "billing-observation": "Ollama billing cannot claim provider finality",
+    "billing-selection": "Ollama billing selection is invalid",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract_name", _VERSIONED_CONTRACT_NAMES)
+@pytest.mark.parametrize(
+    "bad_version",
+    [pytest.param(True, id="bool"), pytest.param(1.0, id="equal-float")],
+)
+async def test_versioned_ollama_contracts_reject_non_integer_versions(
+    tmp_path, contract_name, bad_version
+):
+    _repository, examples = await _versioned_contract_examples(
+        tmp_path,
+        database_name=f"contract-{contract_name}-{type(bad_version).__name__}.sqlite3",
+    )
+    value, field, expected = examples[contract_name]
+    if expected == 2 and isinstance(bad_version, float):
+        bad_version = 2.0
+
+    with pytest.raises(ValueError) as error:
+        replace(value, **{field: bad_version})
+    assert type(error.value) is ValueError
+    assert str(error.value) == _VERSIONED_CONTRACT_ERROR_MESSAGES[contract_name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract_name", _VERSIONED_CONTRACT_NAMES)
+async def test_versioned_ollama_contracts_round_trip_exact_integer_versions(
+    tmp_path, contract_name
+):
+    _repository, examples = await _versioned_contract_examples(
+        tmp_path, database_name=f"contract-exact-{contract_name}.sqlite3"
+    )
+    value, field, expected = examples[contract_name]
+
+    assert type(getattr(value, field)) is int
+    assert getattr(value, field) == expected
+    assert type(value).from_dict(value.to_dict()) == value
+
+
+class _UnavailableFirstProvisioningReadbackProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.readback_available = False
+
+    async def observe_provisioning(self, intent, resource, **kwargs):
+        if not self.readback_available:
+            raise OllamaProvisioningEvidenceError(
+                "original provisioning readback is unavailable"
+            )
+        return await super().observe_provisioning(intent, resource, **kwargs)
+
+
+class _BlockedProvisioningProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.entered = asyncio.Event()
+        self.finish = asyncio.Event()
+
+    async def provision(self, prepared):
+        self.entered.set()
+        await self.finish.wait()
+        return await super().provision(prepared)
+
+
+def _raw_lease_row(database, lease_id):
+    with closing(sqlite3.connect(database)) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM ollama_leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def _fork_repository(repository, tmp_path, *, name, lease_id):
+    database = tmp_path / name
+    with (
+        closing(sqlite3.connect(repository.path)) as source,
+        closing(sqlite3.connect(database)) as target,
+    ):
+        source.backup(target)
+    forked = SQLiteOllamaLeaseRepository(database)
+    lease = forked.get(lease_id)
+    assert lease is not None
+    return forked, lease
+
+
+async def _pending_without_receipt(tmp_path, *, database_name):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / database_name)
+    provider = _UnavailableFirstProvisioningReadbackProvider()
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    with pytest.raises(OllamaProvisioningEvidenceError):
+        await service.acquire(
+            make_request(clock), plan=serverless_plan(), wait_until_ready=False
+        )
+    pending = repository.get("lease-001")
+    assert pending is not None
+    assert pending.provisioning_intent is not None
+    assert pending.provider_resource_id is not None
+    assert pending.provisioning_receipt is None
+    provider.readback_available = True
+    return clock, repository, provider, pending
+
+
+def _provisioning_mismatch(lease, *, provider_resource_id):
+    intent = lease.provisioning_intent
+    assert intent is not None
+    return OllamaProvisioningMismatchEvidence(
+        intent_sha256=intent.intent_sha256,
+        lease_id=intent.lease_id,
+        provision_attempt_id=intent.provision_attempt_id,
+        resource_type=intent.resource_type,
+        provider_resource_id=provider_resource_id,
+        observed_resource_name=intent.resource_name,
+        observed_at=intent.provision_requested_at,
+        readback_sha256="d" * 64,
+        reason=OllamaProvisioningMismatchReason.RUNTIME,
+    )
+
+
+async def _first_write_version_transition(tmp_path, case):
+    if case == "provisioning-intent":
+        clock = MutableClock()
+        repository = SQLiteOllamaLeaseRepository(tmp_path / "before.sqlite3")
+        before, _inserted = repository.insert_request(make_request(clock), now=clock())
+        candidate_repository, _candidate = _fork_repository(
+            repository, tmp_path, name="candidate.sqlite3", lease_id=before.lease_id
+        )
+        provider = _BlockedProvisioningProvider()
+        service = OllamaLeaseService(
+            repository=candidate_repository,
+            provider=provider,
+            poll_interval_seconds=1,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+        task = asyncio.create_task(
+            service.acquire(
+                make_request(clock), plan=serverless_plan(), wait_until_ready=False
+            )
+        )
+        try:
+            await asyncio.wait_for(provider.entered.wait(), timeout=5)
+            candidate_row = _raw_lease_row(candidate_repository.path, before.lease_id)
+        finally:
+            await release_gates_and_boundedly_join_owned_tasks(task, provider.finish)
+        task.result()
+        return repository, before, candidate_row
+
+    if case in {"billing-observation", "billing-selection"}:
+        (
+            repository,
+            before,
+            observed_at,
+            observation,
+        ) = await _terminated_pod_billing_evidence(
+            tmp_path, database_name="before.sqlite3"
+        )
+        candidate_repository, candidate = _fork_repository(
+            repository, tmp_path, name="candidate.sqlite3", lease_id=before.lease_id
+        )
+        candidate_repository.record_billing_outcome(
+            candidate,
+            now=observed_at,
+            next_check_at=observed_at + timedelta(hours=1),
+            observation=observation,
+            maximum_observations=8,
+            maximum_bytes=100_000,
+        )
+        return (
+            repository,
+            before,
+            _raw_lease_row(candidate_repository.path, before.lease_id),
+        )
+
+    clock, repository, provider, pending = await _pending_without_receipt(
+        tmp_path, database_name="before.sqlite3"
+    )
+    intent = pending.provisioning_intent
+    assert intent is not None
+    resource = ProvisionedOllamaResource(
+        resource_type=intent.resource_type,
+        provider_resource_id=pending.provider_resource_id,
+        resource_name=intent.resource_name,
+    )
+
+    if case == "provisioning-receipt":
+        before = pending
+        candidate_repository, candidate = _fork_repository(
+            repository, tmp_path, name="candidate.sqlite3", lease_id=before.lease_id
+        )
+        receipt = await provider.observe_provisioning(intent, resource)
+        candidate_repository.record_provisioning_outcome(
+            candidate, now=clock(), receipt=receipt
+        )
+    elif case == "provisioning-mismatch":
+        before = pending
+        candidate_repository, candidate = _fork_repository(
+            repository, tmp_path, name="candidate.sqlite3", lease_id=before.lease_id
+        )
+        candidate_repository.record_provisioning_outcome(
+            candidate,
+            now=clock(),
+            mismatch=_provisioning_mismatch(
+                candidate, provider_resource_id=candidate.provider_resource_id
+            ),
+        )
+    elif case == "ambiguous-candidate-mismatch":
+        candidate_resource = replace(resource, provider_resource_id="candidate-id")
+        before = repository.record_provisioning_outcome(
+            pending, now=clock(), ambiguous_candidate=candidate_resource
+        )
+        candidate_repository, candidate = _fork_repository(
+            repository, tmp_path, name="candidate.sqlite3", lease_id=before.lease_id
+        )
+        candidate_repository.record_provisioning_outcome(
+            candidate,
+            now=clock(),
+            mismatch=_provisioning_mismatch(
+                candidate, provider_resource_id="candidate-id"
+            ),
+            candidate_mismatch=True,
+        )
+    elif case in {
+        "cleanup-intent",
+        "cleanup-receipt",
+        "additional-target",
+        "additional-target-mismatch",
+        "additional-cleanup-intent",
+        "additional-cleanup-receipt",
+        "runtime-observation",
+        "runtime-snapshot",
+    }:
+        receipt = await provider.observe_provisioning(intent, resource)
+        ready_for_observation = repository.record_provisioning_outcome(
+            pending, now=clock(), receipt=receipt
+        )
+        if case in {"runtime-observation", "runtime-snapshot"}:
+            before = ready_for_observation
+            candidate_repository, candidate = _fork_repository(
+                repository,
+                tmp_path,
+                name="candidate.sqlite3",
+                lease_id=before.lease_id,
+            )
+            observation = await provider.observe(resource, intent, receipt)
+            assert observation.runtime_telemetry is not None
+            candidate_repository.record_runtime_telemetry(
+                candidate,
+                observation.runtime_telemetry,
+                now=clock(),
+                maximum_observations=8,
+                maximum_bytes=100_000,
+            )
+        elif case in {"cleanup-intent", "cleanup-receipt"}:
+            releasing = repository.compare_and_set(
+                ready_for_observation,
+                changes={
+                    "state": OllamaLeaseState.RELEASING,
+                    "teardown_state": OllamaTeardownState.PENDING,
+                    "route_url": None,
+                    "termination_reason": "test first-write evidence",
+                },
+            )
+            before = releasing
+            if case == "cleanup-receipt":
+                before = repository.record_cleanup_intent(
+                    releasing,
+                    now=clock(),
+                    termination_reason="test first-write evidence",
+                )
+            candidate_repository, candidate = _fork_repository(
+                repository,
+                tmp_path,
+                name="candidate.sqlite3",
+                lease_id=before.lease_id,
+            )
+            if case == "cleanup-intent":
+                candidate_repository.record_cleanup_intent(
+                    candidate,
+                    now=clock(),
+                    termination_reason="test first-write evidence",
+                )
+            else:
+                cleanup_intent = candidate.cleanup_intent
+                assert cleanup_intent is not None
+                cleanup_receipt = OllamaCleanupReceipt(
+                    cleanup_intent_id=cleanup_intent.cleanup_intent_id,
+                    verified_absent_at=(
+                        cleanup_intent.delete_started_at + timedelta(microseconds=1)
+                    ),
+                    basis=OllamaCleanupBasis.DELETE_ACKNOWLEDGED,
+                )
+                candidate_repository.record_teardown_outcome(
+                    candidate,
+                    provider_resource_id=candidate.provider_resource_id,
+                    now=clock(),
+                    accrued_estimated_cost=candidate.accrued_estimated_cost,
+                    termination_reason="test first-write evidence",
+                    cleanup_receipt=cleanup_receipt,
+                    billing_next_check_at=clock() + timedelta(hours=1),
+                )
+        else:
+            late_resource = replace(resource, provider_resource_id="late-original-ack")
+            if case == "additional-target":
+                before = ready_for_observation
+            else:
+                with_target = repository.record_provisioning_outcome(
+                    ready_for_observation,
+                    now=clock(),
+                    acknowledged_resource=late_resource,
+                )
+                before = with_target
+                if case == "additional-cleanup-receipt":
+                    before = repository.record_additional_cleanup_intent(
+                        with_target,
+                        provider_resource_id=late_resource.provider_resource_id,
+                        now=clock(),
+                        termination_reason="test first-write evidence",
+                    )
+            candidate_repository, candidate = _fork_repository(
+                repository,
+                tmp_path,
+                name="candidate.sqlite3",
+                lease_id=before.lease_id,
+            )
+            if case == "additional-target":
+                candidate_repository.record_provisioning_outcome(
+                    candidate,
+                    now=clock(),
+                    acknowledged_resource=late_resource,
+                )
+            elif case == "additional-target-mismatch":
+                candidate_repository.record_provisioning_outcome(
+                    candidate,
+                    now=clock(),
+                    acknowledged_resource=late_resource,
+                    mismatch=_provisioning_mismatch(
+                        candidate,
+                        provider_resource_id=late_resource.provider_resource_id,
+                    ),
+                )
+            elif case == "additional-cleanup-intent":
+                candidate_repository.record_additional_cleanup_intent(
+                    candidate,
+                    provider_resource_id=late_resource.provider_resource_id,
+                    now=clock(),
+                    termination_reason="test first-write evidence",
+                )
+            else:
+                target = candidate.additional_cleanup_targets[0]
+                assert target.cleanup_intent is not None
+                candidate_repository.record_additional_cleanup_outcome(
+                    candidate,
+                    provider_resource_id=late_resource.provider_resource_id,
+                    now=clock(),
+                    accrued_estimated_cost=candidate.accrued_estimated_cost,
+                    termination_reason="test first-write evidence",
+                    cleanup_receipt=OllamaCleanupReceipt(
+                        cleanup_intent_id=target.cleanup_intent.cleanup_intent_id,
+                        verified_absent_at=(
+                            target.cleanup_intent.delete_started_at
+                            + timedelta(microseconds=1)
+                        ),
+                        basis=OllamaCleanupBasis.DELETE_ACKNOWLEDGED,
+                    ),
+                )
+    else:
+        raise AssertionError(f"Unsupported first-write transition case: {case}")
+
+    return (
+        repository,
+        before,
+        _raw_lease_row(candidate_repository.path, before.lease_id),
+    )
+
+
+_FIRST_WRITE_VERSION_CASES = (
+    pytest.param(
+        "provisioning-intent",
+        "provisioning_intent_json",
+        "$.evidence_version",
+        "json('true')",
+        id="provisioning-intent",
+    ),
+    pytest.param(
+        "provisioning-receipt",
+        "provisioning_receipt_json",
+        "$.evidence_version",
+        "json('true')",
+        id="provisioning-receipt",
+    ),
+    pytest.param(
+        "provisioning-mismatch",
+        "provisioning_mismatch_json",
+        "$.evidence_version",
+        "json('true')",
+        id="provisioning-mismatch",
+    ),
+    pytest.param(
+        "ambiguous-candidate-mismatch",
+        "ambiguous_candidate_mismatch_json",
+        "$.evidence_version",
+        "json('true')",
+        id="ambiguous-candidate-mismatch",
+    ),
+    pytest.param(
+        "cleanup-intent",
+        "cleanup_intent_json",
+        "$.evidence_version",
+        "json('true')",
+        id="cleanup-intent",
+    ),
+    pytest.param(
+        "cleanup-receipt",
+        "cleanup_receipt_json",
+        "$.evidence_version",
+        "json('true')",
+        id="cleanup-receipt",
+    ),
+    pytest.param(
+        "additional-target",
+        "additional_cleanup_targets_json",
+        "$[0].evidence_version",
+        "json('true')",
+        id="additional-target",
+    ),
+    pytest.param(
+        "additional-target-mismatch",
+        "additional_cleanup_targets_json",
+        "$[0].provisioning_mismatch.evidence_version",
+        "json('true')",
+        id="additional-target-mismatch",
+    ),
+    pytest.param(
+        "additional-cleanup-intent",
+        "additional_cleanup_targets_json",
+        "$[0].cleanup_intent.evidence_version",
+        "json('true')",
+        id="additional-cleanup-intent",
+    ),
+    pytest.param(
+        "additional-cleanup-receipt",
+        "additional_cleanup_targets_json",
+        "$[0].cleanup_receipt.evidence_version",
+        "json('true')",
+        id="additional-cleanup-receipt",
+    ),
+    pytest.param(
+        "runtime-observation",
+        "runtime_telemetry_observations_json",
+        "$[0].evidence_version",
+        "json('true')",
+        id="runtime-observation",
+    ),
+    pytest.param(
+        "runtime-snapshot",
+        "runtime_telemetry_observations_json",
+        "$[0].snapshot.schema_version",
+        "2.0",
+        id="runtime-snapshot-equal-real",
+    ),
+    pytest.param(
+        "billing-observation",
+        "lifecycle_billing_observations_json",
+        "$[0].evidence_version",
+        "json('true')",
+        id="billing-observation",
+    ),
+    pytest.param(
+        "billing-selection",
+        "lifecycle_billing_selection_json",
+        "$.policy_version",
+        "json('true')",
+        id="billing-selection",
+    ),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,column,json_path,replacement", _FIRST_WRITE_VERSION_CASES
+)
+async def test_writer_trigger_rejects_non_integer_first_write_version_types(
+    tmp_path, case, column, json_path, replacement
+):
+    repository, before, candidate_row = await _first_write_version_transition(
+        tmp_path, case
+    )
+    before_row = _raw_lease_row(repository.path, before.lease_id)
+    assert candidate_row["lease_id"] == before_row["lease_id"]
+    assert candidate_row["revision"] == before_row["revision"] + 1
+    refusal = None
+    accepted_row = None
+    accepted_json_type = None
+    with closing(sqlite3.connect(repository.path)) as connection:
+        columns = tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_xinfo(ollama_leases)")
+            if row[1] != "lease_id"
+        )
+        assignments = []
+        values = []
+        for name in columns:
+            if name == column:
+                assignments.append(f'"{name}" = json_set(?, ?, {replacement})')
+                values.extend((candidate_row[name], json_path))
+            else:
+                assignments.append(f'"{name}" = ?')
+                values.append(candidate_row[name])
+        values.append(before.lease_id)
+        try:
+            connection.execute(
+                f"UPDATE ollama_leases SET {', '.join(assignments)} WHERE lease_id = ?",
+                values,
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            refusal = exc
+            connection.rollback()
+        else:
+            accepted_row = _raw_lease_row(repository.path, before.lease_id)
+            accepted_json_type = connection.execute(
+                f'SELECT json_type("{column}", ?) FROM ollama_leases '
+                "WHERE lease_id = ?",
+                (json_path, before.lease_id),
+            ).fetchone()[0]
+
+    if refusal is not None:
+        assert "invalid Ollama " in str(refusal)
+        assert " evidence mutation" in str(refusal)
+        assert _raw_lease_row(repository.path, before.lease_id) == before_row
+    else:
+        assert accepted_row is not None
+        assert accepted_row[column] != candidate_row[column]
+        assert accepted_json_type == ("real" if replacement == "2.0" else "true")
+    assert isinstance(refusal, sqlite3.IntegrityError), (
+        f"writer trigger admitted non-integer {case} version evidence"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "stale_outcome",
@@ -491,6 +1149,93 @@ async def test_same_time_billing_error_replay_preserves_successful_reference(tmp
 
 
 @pytest.mark.asyncio
+async def test_same_time_success_after_error_refreshes_latest_reference(tmp_path):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    original = selected.lifecycle_billing_observations[0]
+    retry_at = observed_at + timedelta(hours=1)
+    failed = repository.record_billing_outcome(
+        selected,
+        now=retry_at,
+        next_check_at=retry_at + timedelta(hours=1),
+        provider_error="same-time provider billing retry",
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    refreshed = repository.record_billing_outcome(
+        failed,
+        now=retry_at,
+        next_check_at=retry_at + timedelta(hours=1),
+        observation=original,
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert refreshed.lifecycle_billing_observations == (original,)
+    assert refreshed.lifecycle_billing_corrections == ()
+    assert refreshed.lifecycle_billing_selection == selected.lifecycle_billing_selection
+    assert refreshed.lifecycle_billing_latest_reference.observation_id == (
+        original.observation_id
+    )
+    assert refreshed.lifecycle_billing_latest_reference.received_at == retry_at
+    assert refreshed.billing_last_checked_at == retry_at
+    assert refreshed.billing_last_provider_error is None
+    assert SQLiteOllamaLeaseRepository(repository.path).get(selected.lease_id) == (
+        refreshed
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_time_revised_success_after_error_appends_one_correction(tmp_path):
+    repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
+    original = selected.lifecycle_billing_observations[0]
+    assert original.pod_billing_receipt is not None
+    retry_at = observed_at + timedelta(hours=1)
+    revised_receipt = replace(
+        original.pod_billing_receipt,
+        provider_billing_id="pod-billing-same-time-revision",
+        actual_cost_usd=Decimal("0.5"),
+        reconciled_at=retry_at,
+    )
+    revised = replace(
+        original,
+        provider_capacity_actual_cost_usd=Decimal("0.5"),
+        first_observed_at=retry_at,
+        pod_billing_receipt=revised_receipt,
+    )
+    failed = repository.record_billing_outcome(
+        selected,
+        now=retry_at,
+        next_check_at=retry_at + timedelta(hours=1),
+        provider_error="same-time provider billing retry",
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    corrected = repository.record_billing_outcome(
+        failed,
+        now=retry_at,
+        next_check_at=retry_at + timedelta(hours=1),
+        observation=revised,
+        maximum_observations=8,
+        maximum_bytes=100_000,
+    )
+
+    assert corrected.lifecycle_billing_observations == (original, revised)
+    assert len(corrected.lifecycle_billing_corrections) == 1
+    assert corrected.lifecycle_billing_selection == selected.lifecycle_billing_selection
+    assert corrected.lifecycle_billing_latest_reference.observation_id == (
+        revised.observation_id
+    )
+    assert corrected.lifecycle_billing_latest_reference.received_at == retry_at
+    assert corrected.billing_last_checked_at == retry_at
+    assert corrected.billing_last_provider_error is None
+    assert SQLiteOllamaLeaseRepository(repository.path).get(selected.lease_id) == (
+        corrected
+    )
+
+
+@pytest.mark.asyncio
 async def test_invalid_candidate_row_is_decoded_before_repository_commit(tmp_path):
     repository, selected, observed_at = await _selected_pod_billing_lease(tmp_path)
 
@@ -504,6 +1249,195 @@ async def test_invalid_candidate_row_is_decoded_before_repository_commit(tmp_pat
 
     restarted = SQLiteOllamaLeaseRepository(repository.path).get(selected.lease_id)
     assert restarted == selected
+
+
+def _install_writer_contract_poison(database, *, event, lease_id):
+    """Fault-inject a post-write decode failure without invalid public DTOs.
+
+    This deliberately removes the canonical current-writer update guard before
+    installing the observer. It is an atomicity control, not a valid-schema
+    input incident.
+    """
+
+    quoted_lease_id = lease_id.replace("'", "''")
+    update_trigger = f"ollama_writer_update_v{_CURRENT_WRITER_CONTRACT_VERSION}"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(f"DROP TRIGGER {update_trigger}")
+        connection.execute(
+            f"""CREATE TRIGGER test_poison_{event.lower()}ed_writer_version
+                AFTER {event} ON ollama_leases
+                WHEN NEW.lease_id = '{quoted_lease_id}'
+                BEGIN
+                  UPDATE ollama_leases
+                     SET writer_contract_version = 99
+                   WHERE lease_id = NEW.lease_id;
+                END"""
+        )
+
+
+@pytest.mark.asyncio
+async def test_provisioning_outcome_rolls_back_when_updated_row_cannot_decode(
+    tmp_path,
+):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "provisioning-decode.sqlite3")
+    provider = _UnavailableFirstProvisioningReadbackProvider()
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    with pytest.raises(OllamaProvisioningEvidenceError):
+        await service.acquire(
+            make_request(clock), plan=serverless_plan(), wait_until_ready=False
+        )
+    pending = repository.get("lease-001")
+    assert pending is not None
+    assert pending.provisioning_intent is not None
+    assert pending.provider_resource_id is not None
+    assert pending.provisioning_receipt is None
+    provider.readback_available = True
+    receipt = await provider.observe_provisioning(
+        pending.provisioning_intent,
+        ProvisionedOllamaResource(
+            resource_type=pending.resource_type,
+            provider_resource_id=pending.provider_resource_id,
+            resource_name=pending.resource_name,
+        ),
+    )
+    before = _raw_lease_row(repository.path, pending.lease_id)
+    _install_writer_contract_poison(
+        repository.path, event="UPDATE", lease_id=pending.lease_id
+    )
+
+    with pytest.raises(RunPodManagerError, match="writer contract"):
+        repository.record_provisioning_outcome(
+            pending,
+            now=clock(),
+            receipt=receipt,
+        )
+
+    assert _raw_lease_row(repository.path, pending.lease_id) == before
+    assert repository.get(pending.lease_id) == pending
+
+
+@pytest.mark.asyncio
+async def test_teardown_outcome_rolls_back_when_updated_row_cannot_decode(
+    tmp_path,
+):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "teardown-decode.sqlite3")
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock), plan=serverless_plan())
+    releasing = repository.compare_and_set(
+        ready,
+        changes={
+            "state": OllamaLeaseState.RELEASING,
+            "teardown_state": OllamaTeardownState.PENDING,
+            "route_url": None,
+            "termination_reason": "test decode before teardown commit",
+        },
+    )
+    admitted = repository.record_cleanup_intent(
+        releasing,
+        now=clock(),
+        termination_reason="test decode before teardown commit",
+    )
+    assert admitted.cleanup_intent is not None
+    cleanup_receipt = OllamaCleanupReceipt(
+        cleanup_intent_id=admitted.cleanup_intent.cleanup_intent_id,
+        verified_absent_at=(
+            admitted.cleanup_intent.delete_started_at + timedelta(microseconds=1)
+        ),
+        basis=OllamaCleanupBasis.DELETE_ACKNOWLEDGED,
+    )
+    before = _raw_lease_row(repository.path, admitted.lease_id)
+    _install_writer_contract_poison(
+        repository.path, event="UPDATE", lease_id=admitted.lease_id
+    )
+
+    with pytest.raises(RunPodManagerError, match="writer contract"):
+        repository.record_teardown_outcome(
+            admitted,
+            provider_resource_id=admitted.provider_resource_id,
+            now=clock(),
+            accrued_estimated_cost=admitted.accrued_estimated_cost,
+            termination_reason="test decode before teardown commit",
+            cleanup_receipt=cleanup_receipt,
+            billing_next_check_at=clock() + timedelta(hours=1),
+        )
+
+    assert _raw_lease_row(repository.path, admitted.lease_id) == before
+    assert repository.get(admitted.lease_id) == admitted
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_claim_rolls_back_when_updated_row_cannot_decode(tmp_path):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "claim-decode.sqlite3")
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock), plan=serverless_plan())
+    durable_before = repository.get(ready.lease_id)
+    assert durable_before is not None
+    assert ready.route_url is not None
+    assert ready.provider_health_url is not None
+    assert durable_before.route_url is None
+    assert durable_before.provider_health_url is None
+    before = _raw_lease_row(repository.path, ready.lease_id)
+    _install_writer_contract_poison(
+        repository.path, event="UPDATE", lease_id=ready.lease_id
+    )
+
+    with pytest.raises(RunPodManagerError, match="writer contract"):
+        repository.claim_for_reconciliation(
+            ready,
+            now=clock(),
+            retry_at=clock() + timedelta(seconds=1),
+        )
+
+    assert _raw_lease_row(repository.path, ready.lease_id) == before
+    assert repository.get(ready.lease_id) == durable_before
+
+
+def test_request_insert_rolls_back_when_inserted_row_cannot_decode(tmp_path):
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "insert-decode.sqlite3")
+    update_trigger = f"ollama_writer_update_v{_CURRENT_WRITER_CONTRACT_VERSION}"
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        connection.execute(f"DROP TRIGGER {update_trigger}")
+        connection.execute(
+            """CREATE TRIGGER test_poison_inserted_writer_version
+               AFTER INSERT ON ollama_leases
+               BEGIN
+                 UPDATE ollama_leases
+                    SET writer_contract_version = 99
+                  WHERE lease_id = NEW.lease_id;
+               END"""
+        )
+
+    with pytest.raises(RunPodManagerError, match="writer contract"):
+        repository.insert_request(make_request(clock), now=clock())
+
+    with closing(sqlite3.connect(repository.path)) as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM ollama_leases").fetchone()[0] == 0
+        )
 
 
 def _revised_telemetry(
@@ -546,6 +1480,39 @@ def test_insert_is_idempotent_and_survives_repository_restart(tmp_path):
     assert duplicate == first
     assert duplicate.state is OllamaLeaseState.REQUESTED
     assert request_from_lease(duplicate) == make_request(clock)
+
+
+def test_current_writer_contract_v7_is_installed_exactly(tmp_path):
+    clock = MutableClock()
+    database = tmp_path / "writer-v7.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    lease, inserted = repository.insert_request(make_request(clock), now=clock())
+    assert inserted is True
+
+    with closing(sqlite3.connect(database)) as connection:
+        default = next(
+            row[4]
+            for row in connection.execute("PRAGMA table_xinfo(ollama_leases)")
+            if row[1] == "writer_contract_version"
+        )
+        triggers = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'ollama_leases'"
+            )
+        }
+
+    assert lease.writer_contract_version == 7
+    assert default == "7"
+    assert triggers == {
+        "ollama_writer_insert_v7",
+        "ollama_writer_update_v7",
+        "ollama_writer_delete_v7",
+        "ollama_provisioning_evidence_insert_v7",
+        "ollama_provisioning_evidence_update_v7",
+        "ollama_lifecycle_evidence_update_v7",
+    }
 
 
 async def _cleanup_claim_with_late_target(tmp_path, *, database_name):
@@ -689,19 +1656,73 @@ def test_two_processes_cannot_claim_one_reconciliation_visit(tmp_path):
         )
         for _index in range(2)
     ]
-    for process in processes:
-        process.start()
-    gate.set()
-    for process in processes:
-        process.join(timeout=15)
-        assert not process.is_alive()
-        assert process.exitcode == 0
-
-    observed = [results.get(timeout=2) for _process in processes]
-    results.close()
-    results.join_thread()
+    with OwnedSpawnProcesses(
+        tuple(processes), gates=(gate,), queues=(results,)
+    ) as ownership:
+        gate.set()
+        ownership.join()
+        for process in processes:
+            assert not process.is_alive()
+            assert process.exitcode == 0
+        observed = [results.get(timeout=2) for _process in processes]
     assert observed.count(None) == 1
     assert len([revision for revision in observed if revision is not None]) == 1
+
+
+def test_owned_processes_preserve_body_failure_and_join_every_child():
+    context = get_context("spawn")
+    gate = context.Event()
+    processes = tuple(
+        context.Process(target=_wait_for_owned_process_release, args=(gate,))
+        for _index in range(2)
+    )
+    ownership = OwnedSpawnProcesses(processes, gates=(gate,), queues=())
+
+    with pytest.raises(AssertionError, match="body failure is primary"), ownership:
+        raise AssertionError("body failure is primary")
+
+    assert ownership.cleanup_failures == []
+    assert ownership.forced_cleanup == []
+    assert ownership.final_exitcodes == [0, 0]
+    assert ownership.closed_processes == 2
+
+
+def test_owned_processes_join_first_child_when_second_start_fails():
+    context = get_context("spawn")
+    gate = context.Event()
+
+    def unpickleable_local_target():
+        pytest.fail("unpickleable child target unexpectedly ran")
+
+    first = context.Process(target=_wait_for_owned_process_release, args=(gate,))
+    second = context.Process(target=unpickleable_local_target)
+    ownership = OwnedSpawnProcesses((first, second), gates=(gate,), queues=())
+
+    with (
+        pytest.raises((AttributeError, PicklingError), match="pickle") as caught,
+        ownership,
+    ):
+        pytest.fail("unpickleable second process unexpectedly started")
+
+    assert "unpickleable_local_target" in str(caught.value)
+    assert ownership.cleanup_failures == []
+    assert ownership.forced_cleanup == []
+    assert ownership.final_exitcodes == [0]
+    assert ownership.closed_processes == 1
+
+
+def test_owned_processes_report_forced_termination_as_failure():
+    context = get_context("spawn")
+    process = context.Process(target=_never_finishing_owned_process)
+    ownership = OwnedSpawnProcesses((process,), gates=(), queues=(), join_timeout=0.1)
+
+    with pytest.raises(AssertionError, match="forced termination"), ownership:
+        pass
+
+    assert len(ownership.forced_cleanup) == 1
+    assert ownership.forced_cleanup[0] is not None
+    assert len(ownership.final_exitcodes) == 1
+    assert ownership.closed_processes == 1
 
 
 def test_runtime_refuses_incomplete_current_schema_before_any_ddl(tmp_path):
@@ -724,7 +1745,7 @@ def test_attested_migration_repairs_supported_incomplete_current_schema(tmp_path
     repository.insert_request(make_request(clock), now=clock())
     current = SQLiteOllamaLeaseRepository(database).get("lease-001")
     assert current is not None
-    assert current.writer_contract_version == 6
+    assert current.writer_contract_version == 7
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("ALTER TABLE ollama_leases DROP COLUMN maximum_compute_cost")
 
@@ -734,15 +1755,15 @@ def test_attested_migration_repairs_supported_incomplete_current_schema(tmp_path
 
     lease = migrated.get("lease-001")
     assert lease.provisioning_evidence_state is OllamaProvisioningEvidenceState.REQUIRED
-    assert lease.writer_contract_version == 6
+    assert lease.writer_contract_version == 7
 
 
 @pytest.mark.asyncio
-async def test_attested_v6_trigger_repair_preserves_every_current_fact(tmp_path):
+async def test_attested_v7_trigger_repair_preserves_every_current_fact(tmp_path):
     repository, selected, _observed_at = await _selected_pod_billing_lease(tmp_path)
     before = selected.to_dict()
     with closing(sqlite3.connect(repository.path)) as connection, connection:
-        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v6")
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v7")
 
     migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
         repository.path,
@@ -757,6 +1778,48 @@ async def test_attested_v6_trigger_repair_preserves_every_current_fact(tmp_path)
     assert retained.lifecycle_billing_latest_reference == (
         selected.lifecycle_billing_latest_reference
     )
+
+
+@pytest.mark.asyncio
+async def test_synthetic_v6_shape_migrates_to_v7_with_only_fence_counters_changed(
+    tmp_path,
+):
+    """Exercise the migrator shape; native e091 proves authentic v6 separately."""
+
+    repository, selected, _observed_at = await _selected_pod_billing_lease(
+        tmp_path, database_name="synthetic-v6-to-v7.sqlite3"
+    )
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("UPDATE ollama_leases SET writer_contract_version = 6")
+        _rewrite_writer_contract_default(connection, 6)
+    predecessor = _raw_lease_row(repository.path, selected.lease_id)
+    before_files = _database_files(repository.path)
+
+    with pytest.raises(RunPodManagerError, match="drained-writer migration"):
+        SQLiteOllamaLeaseRepository(repository.path)
+    assert _database_files(repository.path) == before_files
+
+    migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        repository.path,
+        attestation=_drain_attestation(repository.path),
+    )
+    retained = migrated.get(selected.lease_id)
+    assert retained is not None
+    migrated_row = _raw_lease_row(repository.path, selected.lease_id)
+    expected = dict(predecessor)
+    expected.update(
+        {
+            "writer_contract_version": 7,
+            "revision": predecessor["revision"] + 1,
+            "writer_epoch": predecessor["writer_epoch"] + 1,
+        }
+    )
+    assert migrated_row == expected
+    assert retained.writer_contract_version == 7
+    assert retained.revision == selected.revision + 1
+    assert retained.writer_epoch == selected.writer_epoch + 1
 
 
 def test_attested_migration_preserves_previous_writer_contract_authority(tmp_path):
@@ -778,11 +1841,11 @@ def test_attested_migration_preserves_previous_writer_contract_authority(tmp_pat
     assert (
         retained.provisioning_evidence_state is OllamaProvisioningEvidenceState.REQUIRED
     )
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.ambiguous_candidate_mismatch is None
 
 
-def test_attested_v2_to_v6_migration_retains_authority_but_not_cost_proof(tmp_path):
+def test_attested_v2_to_v7_migration_retains_authority_but_not_cost_proof(tmp_path):
     database = tmp_path / "v2-writer.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     clock = MutableClock()
@@ -799,7 +1862,7 @@ def test_attested_v2_to_v6_migration_retains_authority_but_not_cost_proof(tmp_pa
     retained = migrated.get(original.lease_id)
 
     assert retained.request_fingerprint == original.request_fingerprint
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.runtime_telemetry_state is OllamaRuntimeTelemetryState.UNKNOWN
     assert retained.runtime_telemetry_observations == ()
     assert retained.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
@@ -811,13 +1874,13 @@ def test_attested_v2_to_v6_migration_retains_authority_but_not_cost_proof(tmp_pa
     ("writer_version", "downgrade"),
     ((4, _downgrade_to_v4_writer), (5, _downgrade_to_v5_schema)),
 )
-async def test_v4_or_v5_to_v6_migration_preserves_every_lifecycle_fact(
+async def test_v4_or_v5_to_v7_migration_preserves_every_lifecycle_fact(
     tmp_path, writer_version, downgrade
 ):
     repository, selected, observed_at = await _selected_pod_billing_lease(
         tmp_path,
         actual=Decimal("0.12345678901234567890123456789"),
-        database_name=f"v{writer_version}-to-v6.sqlite3",
+        database_name=f"v{writer_version}-to-v7.sqlite3",
     )
     original = selected.lifecycle_billing_observations[0]
     assert original.pod_billing_receipt is not None
@@ -889,7 +1952,7 @@ async def test_v4_or_v5_to_v6_migration_preserves_every_lifecycle_fact(
         before.pop(field, None)
         after.pop(field, None)
     assert after == before
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.writer_epoch == before_epoch + 1
     assert retained.revision == before_revision + 1
     assert retained.lifecycle_billing_corrections == (
@@ -915,7 +1978,7 @@ async def test_v4_or_v5_to_v6_migration_preserves_every_lifecycle_fact(
     assert retained_metadata["lifecycle_billing_latest_received_at"] is None
 
 
-def test_v3_requires_drain_then_migrates_to_v6_without_restamping_authority(
+def test_v3_requires_drain_then_migrates_to_v7_without_restamping_authority(
     tmp_path,
 ):
     database = tmp_path / "v3-writer.sqlite3"
@@ -938,7 +2001,7 @@ def test_v3_requires_drain_then_migrates_to_v6_without_restamping_authority(
     retained = migrated.get(original.lease_id)
 
     assert retained is not None
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.provisioning_evidence_state is original.provisioning_evidence_state
     assert retained.reconcile_after == original.updated_at
     assert retained.additional_cleanup_targets == ()
@@ -947,7 +2010,7 @@ def test_v3_requires_drain_then_migrates_to_v6_without_restamping_authority(
 
 
 @pytest.mark.asyncio
-async def test_v3_retention_sentinel_migrates_to_explicit_v6_retention_state(
+async def test_v3_retention_sentinel_migrates_to_explicit_v7_retention_state(
     tmp_path,
 ) -> None:
     """Translate the exact v3 bounded-retention sentinel, not arbitrary errors."""
@@ -991,7 +2054,7 @@ async def test_v3_retention_sentinel_migrates_to_explicit_v6_retention_state(
     )
     retained = migrated.get(selected.lease_id)
     assert retained is not None
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.lifecycle_billing_state is (
         OllamaLifecycleBillingState.CORRECTION_PENDING
     )
@@ -1045,7 +2108,7 @@ async def test_v3_arbitrary_billing_error_is_not_promoted_to_retention_proof(
         )
 
 
-def test_v1_writer_contract_requires_real_v6_drain_and_cannot_regain_authority(
+def test_v1_writer_contract_requires_real_v7_drain_and_cannot_regain_authority(
     tmp_path,
 ):
     from test_ollama_service import _persist_uncertain_creation
@@ -1085,7 +2148,7 @@ def test_v1_writer_contract_requires_real_v6_drain_and_cannot_regain_authority(
         database, attestation=_drain_attestation(database)
     )
     retained = migrated.get(request.lease_id)
-    assert retained.writer_contract_version == 6
+    assert retained.writer_contract_version == 7
     assert retained.provisioning_mismatch == mismatch
     assert retained.provider_resource_id == "owned-mismatch"
     assert retained.state is OllamaLeaseState.RELEASING
@@ -1122,7 +2185,7 @@ def test_v1_writer_contract_requires_real_v6_drain_and_cannot_regain_authority(
             )
 
 
-def test_v1_drain_attestation_cannot_target_the_v6_contract(tmp_path):
+def test_v1_drain_attestation_cannot_target_the_v7_contract(tmp_path):
     database = tmp_path / "wrong-target.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     repository.insert_request(make_request(MutableClock()), now=MutableClock()())
@@ -1134,7 +2197,7 @@ def test_v1_drain_attestation_cannot_target_the_v6_contract(tmp_path):
     assert _database_files(database) == before
 
 
-def test_v6_runtime_rejects_unknown_future_writer_contract_without_repair(tmp_path):
+def test_v7_runtime_rejects_unknown_future_writer_contract_without_repair(tmp_path):
     database = tmp_path / "future-writer.sqlite3"
     repository = SQLiteOllamaLeaseRepository(database)
     clock = MutableClock()
@@ -1431,7 +2494,7 @@ def test_runtime_refuses_noncanonical_trigger_sql_before_any_ddl(tmp_path, mutat
     database = tmp_path / "noncanonical-trigger.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with closing(sqlite3.connect(database)) as connection, connection:
-        name = "ollama_provisioning_evidence_insert_v6"
+        name = "ollama_provisioning_evidence_insert_v7"
         sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
             (name,),
@@ -1493,8 +2556,8 @@ def test_wal_resident_incomplete_writer_columns_are_not_silently_repaired(tmp_pa
     database = tmp_path / "partial-wal.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with _live_wal_connection(database) as writer:
-        writer.execute("DROP TRIGGER ollama_provisioning_evidence_insert_v6")
-        writer.execute("DROP TRIGGER ollama_provisioning_evidence_update_v6")
+        writer.execute("DROP TRIGGER ollama_provisioning_evidence_insert_v7")
+        writer.execute("DROP TRIGGER ollama_provisioning_evidence_update_v7")
         writer.execute(
             "ALTER TABLE ollama_leases DROP COLUMN provisioning_mismatch_json"
         )
@@ -1510,9 +2573,9 @@ def test_wal_resident_incomplete_writer_triggers_are_not_silently_repaired(tmp_p
     database = tmp_path / "partial-trigger-wal.sqlite3"
     SQLiteOllamaLeaseRepository(database)
     with _live_wal_connection(database) as writer:
-        writer.execute("DROP TRIGGER ollama_writer_delete_v6")
+        writer.execute("DROP TRIGGER ollama_writer_delete_v7")
         writer.execute(
-            """CREATE TRIGGER ollama_writer_delete_v6
+            """CREATE TRIGGER ollama_writer_delete_v7
                BEFORE DELETE ON ollama_leases
                BEGIN SELECT 1; END"""
         )
@@ -1555,7 +2618,7 @@ def test_attested_legacy_migration_classifies_every_row_evidence_unknown(
     )
     lease = repository.get("lease-001")
 
-    assert lease.writer_contract_version == 6
+    assert lease.writer_contract_version == 7
     assert lease.writer_epoch == 0
     assert (
         lease.provisioning_evidence_state
@@ -1668,6 +2731,45 @@ def test_attested_migration_atomically_scrubs_historical_ready_route(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        pytest.param("state", "not-a-lease-state", id="invalid-state"),
+        pytest.param("updated_at", "not-an-aware-timestamp", id="invalid-timestamp"),
+    ],
+)
+def test_historical_migration_decodes_every_candidate_before_destructive_ddl(
+    tmp_path, column, invalid_value
+):
+    database = tmp_path / f"invalid-historical-{column}.sqlite3"
+    _legacy_database(database, state="ready", saved_route=True)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            f"UPDATE ollama_leases SET {column} = ? WHERE lease_id = ?",
+            (invalid_value, "lease-001"),
+        )
+    before = _raw_database_snapshot(database)
+
+    with pytest.raises(RunPodManagerError, match="previous writer evidence is invalid"):
+        SQLiteOllamaLeaseRepository.migrate_legacy_database(
+            database, attestation=_drain_attestation(database)
+        )
+
+    assert _raw_database_snapshot(database) == before
+    with closing(sqlite3.connect(database)) as connection:
+        names = {
+            row[1] for row in connection.execute("PRAGMA table_xinfo(ollama_leases)")
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "writer_contract_version" not in names
+    assert "_ollama_leases_drained_source" not in tables
+
+
 def test_attested_legacy_migration_rolls_back_every_schema_change_on_failure(
     tmp_path, monkeypatch
 ):
@@ -1713,7 +2815,7 @@ def test_concurrent_attested_initializers_observe_only_complete_writer_fence(
     with ThreadPoolExecutor(max_workers=2) as executor:
         leases = tuple(executor.map(lambda _index: migrate(), range(2)))
 
-    assert all(lease.writer_contract_version == 6 for lease in leases)
+    assert all(lease.writer_contract_version == 7 for lease in leases)
     assert all(
         lease.provisioning_evidence_state
         is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
@@ -1744,20 +2846,18 @@ def test_concurrent_process_initializers_observe_only_complete_writer_fence(
         )
         for _index in range(2)
     ]
-    for process in processes:
-        process.start()
-    gate.set()
-    for process in processes:
-        process.join(timeout=15)
-        assert not process.is_alive()
-        assert process.exitcode == 0
-
-    observed = sorted(results.get(timeout=2) for _process in processes)
-    results.close()
-    results.join_thread()
+    with OwnedSpawnProcesses(
+        tuple(processes), gates=(gate,), queues=(results,)
+    ) as ownership:
+        gate.set()
+        ownership.join()
+        for process in processes:
+            assert not process.is_alive()
+            assert process.exitcode == 0
+        observed = sorted(results.get(timeout=2) for _process in processes)
     assert observed == [
-        ("ok", 6, "historical_unknown"),
-        ("ok", 6, "historical_unknown"),
+        ("ok", 7, "historical_unknown"),
+        ("ok", 7, "historical_unknown"),
     ]
 
 
@@ -1917,6 +3017,63 @@ def test_startup_route_scrub_advances_revision_and_writer_epoch(tmp_path):
     assert restarted.writer_epoch == routed.writer_epoch + 1
 
 
+def test_startup_route_scrub_decodes_every_changed_row_before_commit(tmp_path):
+    """Fault-inject an undecodable row to prove the whole scrub rolls back."""
+
+    database = tmp_path / "route-scrub-decode.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    clock = MutableClock()
+    original, _ = repository.insert_request(make_request(clock), now=clock())
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.row_factory = sqlite3.Row
+        columns = tuple(
+            row[1] for row in connection.execute("PRAGMA table_xinfo(ollama_leases)")
+        )
+        source = dict(
+            connection.execute(
+                "SELECT * FROM ollama_leases WHERE lease_id = ?",
+                (original.lease_id,),
+            ).fetchone()
+        )
+        source.update(
+            {
+                "lease_id": "undecodable-route-lease",
+                "workload_id": "undecodable-route-workload",
+                "mode": "invalid-mode",
+            }
+        )
+        connection.execute(
+            f"INSERT INTO ollama_leases ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _column in columns)})",
+            tuple(source[column] for column in columns),
+        )
+        connection.execute(
+            """UPDATE ollama_leases
+                  SET route_url = 'https://private.invalid',
+                      provider_health_url = 'https://private.invalid/ping',
+                      revision = revision + 1,
+                      writer_epoch = writer_epoch + 1"""
+        )
+        before = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM ollama_leases ORDER BY lease_id"
+            ).fetchall()
+        )
+
+    with pytest.raises(ValueError, match="invalid-mode.*OllamaLeaseMode"):
+        SQLiteOllamaLeaseRepository(database)
+
+    with closing(sqlite3.connect(database)) as connection:
+        after = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM ollama_leases ORDER BY lease_id"
+            ).fetchall()
+        )
+    assert after == before
+
+
 def test_reused_lease_id_with_changed_request_is_rejected(tmp_path):
     clock = MutableClock()
     repository = SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3")
@@ -2055,8 +3212,8 @@ def test_recovery_preserves_an_already_accepted_integer_fingerprint(
     constraints = request.constraints.__dict__.copy()
     constraints["cloud"] = request.constraints.cloud.value
     with closing(sqlite3.connect(database)) as connection, connection:
-        connection.execute("DROP TRIGGER ollama_writer_update_v6")
-        connection.execute("DROP TRIGGER ollama_provisioning_evidence_update_v6")
+        connection.execute("DROP TRIGGER ollama_writer_update_v7")
+        connection.execute("DROP TRIGGER ollama_provisioning_evidence_update_v7")
         connection.execute(
             """UPDATE ollama_leases
                SET request_fingerprint = ?, constraints_json = ?,
@@ -2644,7 +3801,7 @@ async def test_orphaned_billing_latest_reference_fails_readback_and_projection(
         orphaned.to_dict()
 
     with closing(sqlite3.connect(repository.path)) as connection, connection:
-        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v6")
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v7")
         connection.execute(
             """
             UPDATE ollama_leases

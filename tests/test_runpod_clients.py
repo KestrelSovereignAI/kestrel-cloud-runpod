@@ -10,20 +10,27 @@ import httpcore
 import httpx
 import pytest
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-from pod_capacity_test_support import native_httpx_connect_failure
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    native_httpx_connect_failure,
+    record_control_injection,
+)
 
 from kestrel_cloud_runpod.clients import (
     DEFAULT_USER_AGENT,
     RunpodControlPlaneClient,
     RunpodServerlessClient,
+    RunpodTransport,
     is_retryable_runpod_api_error,
 )
 from kestrel_cloud_runpod.models import (
     CloudType,
     ComputeProduct,
     EndpointCreateRequest,
+    EndpointResource,
     EndpointUpdateRequest,
     PodCreateRequest,
+    PodResource,
     ResourceFieldState,
     RunPodAmbiguousResultError,
     RunPodAPIError,
@@ -774,11 +781,190 @@ def test_safe_method_ingress_never_retries_a_blocked_transport_graph(kind):
         sleep=lambda _: None,
         http_transport=httpx.MockTransport(handler),
     )
-    with pytest.raises(RunPodAPIError) as caught:
-        client.list_pods()
-    assert caught.value.__cause__ is transport_error
+    if kind in {"control", "mixed-group"}:
+        with pytest.raises(type(transport_error)) as caught:
+            client.list_pods()
+        assert caught.value is transport_error
+    else:
+        with pytest.raises(RunPodAPIError) as caught:
+            client.list_pods()
+        assert type(caught.value) is RunPodAPIError
+        assert caught.value.__cause__ is transport_error
     assert len(calls) == 1
     assert _explicit_graph_ids(transport_error) == original_graph
+
+
+@pytest.mark.parametrize(
+    ("kind", "method"),
+    [
+        pytest.param("control", "GET", id="safe-get"),
+        pytest.param("mixed-group", "GET", id="safe-get-explicit-group"),
+        pytest.param("control", "POST", id="mutating-post"),
+    ],
+)
+def test_request_transport_preserves_exact_execution_control(
+    kind, method, record_property
+):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        record_control_injection(record_property, f"request-{kind}-{method.lower()}")
+        raise transport_error
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(type(transport_error)) as caught:
+        transport.request_json(method, "/pods", json_body={"name": "x"})
+
+    assert caught.value is transport_error
+    assert len(calls) == 1
+    assert _explicit_graph_ids(transport_error) == original_graph
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["open-stream", "active", "deadline"],
+)
+def test_sse_preserves_exact_execution_control(monkeypatch, boundary, record_property):
+    transport_error = _blocked_httpx_error("control")
+    original_graph = _explicit_graph_ids(transport_error)
+    closed = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def read(self):
+            return b""
+
+        def iter_lines(self):
+            record_control_injection(record_property, f"sse-{boundary}")
+            raise transport_error
+
+        def close(self):
+            closed.append(True)
+
+    class Stream:
+        def __enter__(self):
+            return Response()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            if boundary == "open-stream":
+                record_control_injection(record_property, f"sse-{boundary}")
+                raise transport_error
+            return Stream()
+
+    class ImmediateTimer:
+        daemon = False
+
+        def __init__(self, _seconds, callback):
+            self.callback = callback
+
+        def start(self):
+            self.callback()
+
+        def cancel(self):
+            pass
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+    )
+    transport._client = Client()
+    if boundary == "deadline":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.clients.threading.Timer", ImmediateTimer
+        )
+
+    with pytest.raises(type(transport_error)) as caught:
+        tuple(
+            transport.iter_sse(
+                "/logs",
+                stream_window_seconds=1 if boundary == "deadline" else None,
+            )
+        )
+
+    assert caught.value is transport_error
+    assert _explicit_graph_ids(transport_error) == original_graph
+    assert closed == ([True] if boundary == "deadline" else [])
+
+
+@pytest.mark.parametrize("boundary", ["open-stream", "active", "deadline"])
+def test_sse_retains_ordinary_normalization_contract(monkeypatch, boundary):
+    transport_error = httpx.ConnectError("ordinary stream failure")
+    closed = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def read(self):
+            return b""
+
+        def iter_lines(self):
+            raise transport_error
+
+        def close(self):
+            closed.append(True)
+
+    class Stream:
+        def __enter__(self):
+            return Response()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            if boundary == "open-stream":
+                raise transport_error
+            return Stream()
+
+    class ImmediateTimer:
+        daemon = False
+
+        def __init__(self, _seconds, callback):
+            self.callback = callback
+
+        def start(self):
+            self.callback()
+
+        def cancel(self):
+            pass
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+    )
+    transport._client = Client()
+    if boundary == "deadline":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.clients.threading.Timer", ImmediateTimer
+        )
+
+    if boundary == "deadline":
+        assert tuple(transport.iter_sse("/logs", stream_window_seconds=1)) == ()
+        assert closed == [True]
+    else:
+        with pytest.raises(RunPodAPIError) as raised:
+            tuple(transport.iter_sse("/logs"))
+        assert raised.value.__cause__ is transport_error
+        assert closed == []
 
 
 def test_safe_get_retries_using_retry_after_and_records_rate_limit():
@@ -886,6 +1072,54 @@ def test_create_timeout_is_ambiguous_and_not_retried():
 
     assert calls == 1
     assert raised.value.detail == "ReadTimeout"
+
+
+@pytest.mark.parametrize("resource_kind", ["pod", "endpoint"])
+def test_paid_create_decoder_control_carrier_preserves_exact_graph(
+    monkeypatch,
+    resource_kind,
+):
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("decoder execution control"),
+        grouped=True,
+    )
+    structural = explicit.exceptions[1]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        payload = _pod() if resource_kind == "pod" else _endpoint()
+        return httpx.Response(201, json=payload)
+
+    def fail_decode(_value):
+        raise carrier
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        if resource_kind == "pod":
+            monkeypatch.setattr(PodResource, "from_dict", staticmethod(fail_decode))
+            create = client.create_pod
+            request = PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        else:
+            monkeypatch.setattr(
+                EndpointResource, "from_dict", staticmethod(fail_decode)
+            )
+            create = client.create_endpoint
+            request = _endpoint_request()
+
+        with pytest.raises(RunPodManagerError) as caught:
+            create(request)
+
+        assert caught.value is carrier
+        assert carrier.__cause__ is explicit
+        assert explicit.exceptions == (control, structural)
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize("body", [{}, {"id": "endpoint-ack", "name": None}])

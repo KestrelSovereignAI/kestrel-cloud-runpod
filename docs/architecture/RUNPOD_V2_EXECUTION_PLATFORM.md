@@ -351,18 +351,21 @@ Confirmed fields are checked before reporting independent omissions so missing
 evidence cannot hide a known policy violation on an owned resource.
 
 The lease aggregate has one writer contract. Every insert starts at contract
-version 6/epoch 1, and every update must advance both the revision CAS and the
+version 7/epoch 1, and every update must advance both the revision CAS and the
 writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
-and deletes. Version 6 also prevents a retained version-1 through version-5
+and deletes. Version 7 also prevents a retained version-1 through version-6
 binary or migrator from reinstalling its weaker trigger set over a newer
-aggregate. Its explicit drained version-4 or version-5 migration changes only writer
-metadata and revision; accepted intent, provisioning, cleanup, telemetry,
-billing, correction, retention, scheduling, route, and cost facts remain exact.
-Because those predecessors retained a deduplicated billing fact set rather
-than receipt arrival order, existing facts migrate with an explicit
-`historical_unknown` latest-reference state. The first successful, exact,
-original-bound version-6 poll establishes the latest retained receipt without
-reordering facts, replacing the immutable selection, or erasing corrections.
+aggregate. Its explicit drained version-6 migration preserves every existing
+raw fact, including the billing latest-reference state, and changes only
+`writer_contract_version` from 6 to 7 while incrementing revision and writer
+epoch exactly once. The distinct drained version-4 or version-5 migrations
+preserve accepted intent, provisioning, cleanup, telemetry, billing,
+correction, retention, scheduling, route, and cost facts. Because those older
+predecessors retained a deduplicated billing fact set rather than receipt
+arrival order, their facts migrate with an explicit `historical_unknown`
+latest-reference state. The first successful, exact, original-bound version-7
+poll establishes the latest retained receipt without reordering facts,
+replacing the immutable selection, or erasing corrections.
 Runtime startup never upgrades a legacy database. Operators must
 first drain every old binary, admitted HTTP effect, and route holder, then call
 the explicit one-shot `migrate_legacy_database()` entry point with an attestation

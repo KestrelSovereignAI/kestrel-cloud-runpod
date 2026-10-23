@@ -1,9 +1,13 @@
 """Installed, locked, content-free Pod-capacity reconciler command tests."""
 
 import asyncio
+import errno
 import json
+import os
+import sys
 from importlib.metadata import distribution
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 from pod_capacity_test_support import (
@@ -12,6 +16,8 @@ from pod_capacity_test_support import (
     FakeCapacityProvider,
     FakeWorkloadTransport,
     MutableClock,
+    execution_control_carrier,
+    record_control_injection,
     request,
     service,
 )
@@ -23,12 +29,21 @@ from kestrel_cloud_runpod.pod_capacity_reconciler import (
     EXIT_OK,
     EXIT_RETRYABLE,
     EXIT_RUNTIME_ERROR,
+    PodCapacityReconcilerBusyError,
+    PodCapacityReconcilerConfigurationError,
     _exclusive_reconcile_lock,
+    load_service_factory,
     reconcile_once,
     run_cli,
 )
 
 FACTORY_REFERENCE = "catalog_host.runpod:build_capacity_service"
+
+
+def _module_os_proxy(**overrides):
+    attributes = vars(os).copy()
+    attributes.update(overrides)
+    return SimpleNamespace(**attributes)
 
 
 def test_distribution_installs_capacity_reconciler_entry_point() -> None:
@@ -234,3 +249,228 @@ def test_cli_runtime_error_is_typed_without_exposing_message(tmp_path) -> None:
         "status": "error",
     }
     assert leaked_secret not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "module-import",
+        "attribute",
+        "factory",
+        "runtime-timeout",
+        "runtime-manager",
+        "runtime-os",
+        "outer-busy",
+        "outer-configuration",
+        "lock-open",
+        "lock-posix",
+        "lock-windows",
+    ],
+)
+def test_reconciler_does_not_convert_execution_control_to_runtime_exit(
+    tmp_path, monkeypatch, boundary, record_property
+):
+    host_os_name = os.name
+    runtime, provider = _runtime(tmp_path)
+    error_type = {
+        "module-import": ImportError,
+        "attribute": AttributeError,
+        "runtime-timeout": TimeoutError,
+        "runtime-os": OSError,
+        "lock-open": OSError,
+        "lock-posix": OSError,
+        "lock-windows": OSError,
+        "outer-busy": PodCapacityReconcilerBusyError,
+        "outer-configuration": PodCapacityReconcilerConfigurationError,
+    }.get(boundary, RunPodManagerError)
+    carrier, control, explicit = execution_control_carrier(
+        error_type(f"reconciler {boundary} outcome remains unknown"),
+        grouped=True,
+    )
+
+    def inject() -> None:
+        record_control_injection(record_property, f"reconciler-{boundary}")
+
+    async def controlled_reconcile():
+        inject()
+        raise carrier
+
+    output = StringIO()
+
+    with pytest.raises(type(carrier)) as raised:
+        if boundary == "module-import":
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+                lambda _name: (inject(), (_ for _ in ()).throw(carrier))[1],
+            )
+            load_service_factory(FACTORY_REFERENCE)
+        elif boundary == "attribute":
+
+            class ControlledModule:
+                def __getattribute__(self, _name):
+                    inject()
+                    raise carrier
+
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+                lambda _name: ControlledModule(),
+            )
+            load_service_factory(FACTORY_REFERENCE)
+        elif boundary.startswith("lock-"):
+            if boundary == "lock-open":
+                monkeypatch.setattr(
+                    "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                    _module_os_proxy(
+                        open=lambda *_args, **_kwargs: (
+                            inject(),
+                            (_ for _ in ()).throw(carrier),
+                        )[1]
+                    ),
+                )
+            elif boundary == "lock-posix":
+                monkeypatch.setattr(
+                    "fcntl.flock",
+                    lambda *_args, **_kwargs: (
+                        inject(),
+                        (_ for _ in ()).throw(carrier),
+                    )[1],
+                )
+            else:
+                monkeypatch.setattr(
+                    "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                    _module_os_proxy(name="nt"),
+                )
+                monkeypatch.setitem(
+                    sys.modules,
+                    "msvcrt",
+                    SimpleNamespace(
+                        LK_NBLCK=1,
+                        locking=lambda *_args, **_kwargs: (
+                            inject(),
+                            (_ for _ in ()).throw(carrier),
+                        )[1],
+                    ),
+                )
+            with _exclusive_reconcile_lock(tmp_path / "capacity.sqlite3"):
+                raise AssertionError("controlled lock failure was suppressed")
+        else:
+            if boundary.startswith("runtime-"):
+                runtime.reconcile = controlled_reconcile
+
+            def factory():
+                if boundary in {"factory", "outer-busy", "outer-configuration"}:
+                    inject()
+                    raise carrier
+                return runtime
+
+            factory_loader = lambda _reference: (
+                (inject(), (_ for _ in ()).throw(carrier))[1]
+                if boundary in {"outer-busy", "outer-configuration"}
+                else factory
+            )
+            run_cli(
+                ["--service-factory", FACTORY_REFERENCE],
+                stdout=output,
+                factory_loader=factory_loader,
+            )
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    assert isinstance(explicit, BaseExceptionGroup)
+    assert explicit.exceptions[0] is control
+    assert output.getvalue() == ""
+    assert provider.create_calls == []
+    assert os.name == host_os_name
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "module-import",
+        "attribute",
+        "runtime-os",
+        "lock-open",
+        "lock-posix",
+        "lock-windows",
+    ],
+)
+def test_reconciler_retains_ordinary_normalization_contract(
+    tmp_path, monkeypatch, boundary
+):
+    host_os_name = os.name
+    runtime, provider = _runtime(tmp_path)
+    output = StringIO()
+
+    if boundary == "module-import":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+            lambda _name: (_ for _ in ()).throw(ImportError("missing module")),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            load_service_factory(FACTORY_REFERENCE)
+    elif boundary == "attribute":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+            lambda _name: SimpleNamespace(),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            load_service_factory(FACTORY_REFERENCE)
+    elif boundary == "runtime-os":
+
+        async def failed_reconcile():
+            raise OSError("ordinary runtime failure")
+
+        runtime.reconcile = failed_reconcile
+        assert (
+            run_cli(
+                ["--service-factory", FACTORY_REFERENCE],
+                stdout=output,
+                factory_loader=lambda _reference: lambda: runtime,
+            )
+            == EXIT_RUNTIME_ERROR
+        )
+        assert json.loads(output.getvalue()) == {
+            "status": "error",
+            "error_type": "OSError",
+        }
+    elif boundary == "lock-open":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+            _module_os_proxy(
+                open=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    OSError(errno.EIO, "ordinary lock-open failure")
+                )
+            ),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            with _exclusive_reconcile_lock(runtime.repository.path):
+                raise AssertionError("lock-open failure was suppressed")
+    else:
+        if boundary == "lock-posix":
+            monkeypatch.setattr(
+                "fcntl.flock",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    OSError(errno.EIO, "ordinary POSIX lock failure")
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                _module_os_proxy(name="nt"),
+            )
+            monkeypatch.setitem(
+                sys.modules,
+                "msvcrt",
+                SimpleNamespace(
+                    LK_NBLCK=1,
+                    locking=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        OSError(errno.EIO, "ordinary Windows lock failure")
+                    ),
+                ),
+            )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            with _exclusive_reconcile_lock(runtime.repository.path):
+                raise AssertionError("lock failure was suppressed")
+
+    assert provider.create_calls == []
+    assert os.name == host_os_name

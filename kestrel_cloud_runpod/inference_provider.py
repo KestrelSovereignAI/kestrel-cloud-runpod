@@ -26,6 +26,7 @@ from kestrel_sdk.llm import (
     InferenceProviderCapability,
     InferenceRoute,
 )
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from pydantic import SecretStr
 
 from .billing import (
@@ -119,7 +120,9 @@ class RunpodInferenceLeaseProvider:
     def capabilities(self) -> Sequence[InferenceProviderCapability]:
         try:
             runtime = self._get_runtime()
-        except InferenceLeaseProviderUnavailableError:
+        except InferenceLeaseProviderUnavailableError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ()
         return (
             InferenceProviderCapability(
@@ -134,7 +137,9 @@ class RunpodInferenceLeaseProvider:
     def is_available(self) -> bool:
         try:
             self._get_runtime()
-        except InferenceLeaseProviderUnavailableError:
+        except InferenceLeaseProviderUnavailableError as exc:
+            if is_execution_control_error(exc):
+                raise
             return False
         return True
 
@@ -165,7 +170,9 @@ class RunpodInferenceLeaseProvider:
                     plan,
                     provision_requested_at=now,
                 )
-            except RunPodManagerError:
+            except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 continue
             ready_seconds = runtime.policy.ready_seconds(mode)
             if ready_seconds > self._remaining_readiness_seconds(request, now):
@@ -274,6 +281,8 @@ class RunpodInferenceLeaseProvider:
                 plan = await runtime.service.provider.plan(internal_request)
                 runtime.service.validate_plan(internal_request, plan)
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise InferenceLeaseProvisioningError(
                     "Runpod could not refresh the selected Ollama capacity quote"
                 ) from exc
@@ -291,14 +300,20 @@ class RunpodInferenceLeaseProvider:
                 plan=plan,
             )
         except OllamaLeaseAuthorizationError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseOwnershipError(
                 "inference lease is owned by another agent"
             ) from exc
         except OllamaLeaseConflictError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseConstraintError(
                 "request_id already represents different Runpod constraints"
             ) from exc
         except (RunPodManagerError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             persisted = runtime.service.repository.get(lease_id)
             if persisted is None:
                 raise InferenceLeaseProvisioningError(
@@ -319,6 +334,8 @@ class RunpodInferenceLeaseProvider:
                 workload_id=internal.workload_id,
             )
         except OllamaLeaseAuthorizationError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseOwnershipError(
                 "inference lease is owned by another agent"
             ) from exc
@@ -338,10 +355,14 @@ class RunpodInferenceLeaseProvider:
                 workload_id=workload_id,
             )
         except OllamaLeaseAuthorizationError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseOwnershipError(
                 "inference lease is owned by another agent"
             ) from exc
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseProvisioningError(
                 "Runpod could not renew the inference lease idle deadline"
             ) from exc
@@ -366,12 +387,16 @@ class RunpodInferenceLeaseProvider:
                 workload_id=internal.workload_id,
             )
         except OllamaLeaseAuthorizationError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseOwnershipError(
                 "inference lease is owned by another agent"
             ) from exc
-        except RunPodManagerError:
+        except RunPodManagerError as exc:
             # Teardown failures are durable and retryable.  Returning RELEASING
             # lets core persist that route-less state and call release again.
+            if is_execution_control_error(exc):
+                raise
             internal = self._required(runtime.service, lease_id)
         return self._to_sdk_lease(internal, runtime=runtime)
 
@@ -410,6 +435,8 @@ class RunpodInferenceLeaseProvider:
                 route_key=route_key,
             )
         except (ImportError, OSError, RunPodManagerError, TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseProviderUnavailableError(
                 "Runpod inference provider configuration is unavailable"
             ) from exc

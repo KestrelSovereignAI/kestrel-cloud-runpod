@@ -27,7 +27,12 @@ from kestrel_sovereign.llm.inference_leases import InferenceLeaseCoordinator
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
+    pod_plan,
     serverless_plan,
+)
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
 )
 from pydantic import SecretStr
 
@@ -35,6 +40,8 @@ from kestrel_cloud_runpod.billing import exact_decimal_integer_scale
 from kestrel_cloud_runpod.inference_provider import RunpodInferenceLeaseProvider
 from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaLeaseAuthorizationError,
+    OllamaLeaseConflictError,
     OllamaLeaseMode,
     OllamaLeaseState,
     OllamaProvisioningEvidenceState,
@@ -121,6 +128,317 @@ def _adapter(tmp_path, clock, capacity=None, gpu_count=1):
         clock=clock,
     )
     return adapter, service, capacity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "capabilities-unavailable",
+        "is-available-unavailable",
+        "quote",
+        "acquire-plan",
+        "acquire-authorization",
+        "acquire-conflict",
+        "acquire-persisted-fallback",
+        "status-authorization",
+        "touch-authorization",
+        "touch-manager",
+        "release-authorization",
+        "release-manager",
+        "runtime-load",
+    ],
+)
+async def test_inference_adapter_preserves_exact_execution_control(
+    tmp_path, boundary, record_property
+):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    error_type = {
+        "capabilities-unavailable": InferenceLeaseProviderUnavailableError,
+        "is-available-unavailable": InferenceLeaseProviderUnavailableError,
+        "acquire-authorization": OllamaLeaseAuthorizationError,
+        "status-authorization": OllamaLeaseAuthorizationError,
+        "touch-authorization": OllamaLeaseAuthorizationError,
+        "release-authorization": OllamaLeaseAuthorizationError,
+        "acquire-conflict": OllamaLeaseConflictError,
+    }.get(boundary, RunPodManagerError)
+    carrier, control, explicit = execution_control_carrier(
+        error_type(f"{boundary} remains unknown"),
+        grouped=boundary == "release-manager",
+    )
+
+    async def raise_control(*_args, **_kwargs):
+        record_control_injection(record_property, boundary)
+        raise carrier
+
+    before = None
+    if boundary in {"capabilities-unavailable", "is-available-unavailable"}:
+
+        def raise_unavailable():
+            record_control_injection(record_property, boundary)
+            raise carrier
+
+        adapter._get_runtime = raise_unavailable
+
+        async def availability_operation():
+            if boundary == "capabilities-unavailable":
+                adapter.capabilities()
+            else:
+                adapter.is_available()
+
+        operation = availability_operation
+    elif boundary == "quote":
+        capacity.plan = raise_control
+        operation = lambda: adapter.quote(request)
+    elif boundary == "runtime-load":
+
+        class ControlledSettings(dict):
+            def get(self, *_args, **_kwargs):
+                record_control_injection(record_property, boundary)
+                raise carrier
+
+        adapter._runtime = None
+        adapter._injected = (
+            service,
+            _profile(),
+            ControlledSettings(),
+            lambda _resource_type: _ROUTE_KEY,
+        )
+
+        async def capabilities():
+            adapter.capabilities()
+
+        operation = capabilities
+    else:
+        quote = await adapter.quote(request)
+        if boundary == "acquire-plan":
+            capacity.plan = raise_control
+            operation = lambda: adapter.acquire(request, quote)
+        elif boundary.startswith("acquire-"):
+            if boundary == "acquire-persisted-fallback":
+                admitted = await adapter.acquire(request, quote)
+                before = service.repository.get(admitted.lease_id)
+            service.acquire = raise_control
+            operation = lambda: adapter.acquire(request, quote)
+        else:
+            admitted = await adapter.acquire(request, quote)
+            if boundary == "status-authorization":
+                before = service.repository.get(admitted.lease_id)
+                service.reconcile_lease = raise_control
+                operation = lambda: adapter.status(request.owner_id, admitted.lease_id)
+            else:
+                await adapter.status(request.owner_id, admitted.lease_id)
+                before = service.repository.get(admitted.lease_id)
+                if boundary in {"touch-authorization", "touch-manager"}:
+                    service.touch = raise_control
+                    operation = lambda: adapter.touch(
+                        request.owner_id, admitted.lease_id
+                    )
+                else:
+                    service.release = raise_control
+                    operation = lambda: adapter.release(
+                        request.owner_id, admitted.lease_id
+                    )
+
+    provision_calls = capacity.provision_calls
+    teardown_calls = capacity.teardown_calls
+    with pytest.raises(type(carrier)) as raised:
+        await operation()
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    if isinstance(explicit, BaseExceptionGroup):
+        assert explicit.exceptions[0] is control
+    else:
+        assert explicit is control
+    assert capacity.provision_calls == provision_calls
+    assert capacity.teardown_calls == teardown_calls
+    if before is not None:
+        assert service.repository.get(before.lease_id) == before
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected"),
+    [("capabilities", ()), ("is-available", False)],
+)
+def test_inference_adapter_preserves_ordinary_unavailable_fallback(
+    tmp_path, boundary, expected
+):
+    clock = MutableClock()
+    adapter, _service, _capacity = _adapter(tmp_path, clock)
+
+    def raise_unavailable():
+        raise InferenceLeaseProviderUnavailableError("ordinary unavailability")
+
+    adapter._get_runtime = raise_unavailable
+
+    actual = (
+        adapter.capabilities() if boundary == "capabilities" else adapter.is_available()
+    )
+
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "acquire-plan",
+        "acquire-authorization",
+        "acquire-conflict",
+        "acquire-persisted-fallback",
+        "status-authorization",
+        "touch-authorization",
+        "touch-manager",
+        "release-authorization",
+        "release-manager",
+        "runtime-load",
+    ],
+)
+async def test_inference_adapter_retains_ordinary_normalization_contract(
+    tmp_path, boundary
+) -> None:
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+
+    if boundary == "runtime-load":
+        ordinary = RunPodManagerError("ordinary runtime configuration failure")
+
+        class OrdinarySettings(dict):
+            def get(self, *_args, **_kwargs):
+                raise ordinary
+
+        adapter._runtime = None
+        adapter._injected = (
+            service,
+            _profile(),
+            OrdinarySettings(),
+            lambda _resource_type: _ROUTE_KEY,
+        )
+        assert adapter.capabilities() == ()
+        with pytest.raises(InferenceLeaseProviderUnavailableError) as raised:
+            await adapter.quote(request)
+        assert raised.value.__cause__ is ordinary
+        return
+
+    quote = await adapter.quote(request)
+    if boundary == "acquire-plan":
+        ordinary = RunPodManagerError("ordinary quote refresh failure")
+
+        async def failed_plan(*_args, **_kwargs):
+            raise ordinary
+
+        capacity.plan = failed_plan
+        with pytest.raises(InferenceLeaseProvisioningError) as raised:
+            await adapter.acquire(request, quote)
+        assert raised.value.__cause__ is ordinary
+        assert capacity.provision_calls == 0
+        return
+
+    error_type = {
+        "acquire-authorization": OllamaLeaseAuthorizationError,
+        "status-authorization": OllamaLeaseAuthorizationError,
+        "touch-authorization": OllamaLeaseAuthorizationError,
+        "release-authorization": OllamaLeaseAuthorizationError,
+        "acquire-conflict": OllamaLeaseConflictError,
+    }.get(boundary, RunPodManagerError)
+    ordinary = error_type(f"ordinary {boundary} failure")
+
+    async def failed_operation(*_args, **_kwargs):
+        raise ordinary
+
+    if boundary.startswith("acquire-"):
+        if boundary == "acquire-persisted-fallback":
+            admitted = await adapter.acquire(request, quote)
+            before = service.repository.get(admitted.lease_id)
+            assert before is not None
+        service.acquire = failed_operation
+        if boundary == "acquire-persisted-fallback":
+            result = await adapter.acquire(request, quote)
+            assert result.lease_id == admitted.lease_id
+            assert service.repository.get(admitted.lease_id) == before
+        else:
+            expected = (
+                InferenceLeaseOwnershipError
+                if boundary == "acquire-authorization"
+                else InferenceLeaseConstraintError
+            )
+            with pytest.raises(expected) as raised:
+                await adapter.acquire(request, quote)
+            assert raised.value.__cause__ is ordinary
+        return
+
+    admitted = await adapter.acquire(request, quote)
+    if boundary == "status-authorization":
+        service.reconcile_lease = failed_operation
+        with pytest.raises(InferenceLeaseOwnershipError) as raised:
+            await adapter.status(request.owner_id, admitted.lease_id)
+        assert raised.value.__cause__ is ordinary
+        return
+
+    await adapter.status(request.owner_id, admitted.lease_id)
+    if boundary.startswith("touch-"):
+        service.touch = failed_operation
+        expected = (
+            InferenceLeaseOwnershipError
+            if boundary == "touch-authorization"
+            else InferenceLeaseProvisioningError
+        )
+        with pytest.raises(expected) as raised:
+            await adapter.touch(request.owner_id, admitted.lease_id)
+        assert raised.value.__cause__ is ordinary
+        return
+
+    if boundary == "release-manager":
+
+        async def durable_failed_release(*_args, **_kwargs):
+            current = service.repository.get(admitted.lease_id)
+            assert current is not None
+            service.repository.compare_and_set(
+                current,
+                changes={
+                    "state": OllamaLeaseState.RELEASING,
+                    "route_url": None,
+                },
+            )
+            raise ordinary
+
+        service.release = durable_failed_release
+        result = await adapter.release(request.owner_id, admitted.lease_id)
+        assert result.state is InferenceLeaseState.RELEASING
+        assert result.route is None
+    else:
+        service.release = failed_operation
+        with pytest.raises(InferenceLeaseOwnershipError) as raised:
+            await adapter.release(request.owner_id, admitted.lease_id)
+        assert raised.value.__cause__ is ordinary
+
+
+@pytest.mark.asyncio
+async def test_quote_continues_after_one_ordinary_mode_failure(tmp_path):
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(serverless_plan())
+    attempts = []
+
+    async def plan(request):
+        attempts.append(request.mode)
+        if request.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER:
+            raise RunPodManagerError("ordinary serverless capacity miss")
+        return pod_plan()
+
+    capacity.plan = plan
+    adapter, _service, _capacity = _adapter(tmp_path, clock, capacity=capacity)
+
+    quote = await adapter.quote(_request(clock))
+
+    assert quote.metadata["mode"] == "dedicated_pod"
+    assert attempts == [
+        OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+        OllamaLeaseMode.DEDICATED_POD,
+    ]
 
 
 def test_dedicated_entry_point_loads_sdk_provider_contract():

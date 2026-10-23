@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .billing import billing_amounts, exact_decimal_sum
 from .clients import (
     RunpodControlPlaneClient,
@@ -243,6 +245,8 @@ class RunpodServerlessCapacityProvider:
                 asyncio.to_thread(self.control_client.create_endpoint, create_request)
             )
         except RunPodAmbiguousResultError as exc:
+            if is_execution_control_error(exc):
+                raise
             ambiguous = True
             after = await asyncio.to_thread(self.control_client.list_endpoints)
             for endpoint in after:
@@ -261,6 +265,8 @@ class RunpodServerlessCapacityProvider:
                 ) from exc
             created = named_after[0]
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointActivationError(
                 "Planned Serverless endpoint create failed",
                 endpoint_name=quote.endpoint_name,
@@ -298,6 +304,8 @@ class RunpodServerlessCapacityProvider:
                 data_center_id=quote.data_center_id,
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointActivationError(
                 "Created Serverless endpoint failed exact readback validation",
                 endpoint_name=quote.endpoint_name,
@@ -752,9 +760,13 @@ class RunpodServerlessCapacityProvider:
                     self.control_client.delete_endpoint, activation.endpoint_id
                 )
             )
-        except RunPodAmbiguousResultError:
+        except RunPodAmbiguousResultError as exc:
+            if is_execution_control_error(exc):
+                raise
             basis = "ambiguous_delete_verified_absent"
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointCleanupError(
                 "Serverless endpoint delete failed before absence was ambiguous",
                 endpoint_name=activation.endpoint_name,

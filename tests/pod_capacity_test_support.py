@@ -6,7 +6,7 @@ import hashlib
 import json
 import socket
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 import pytest
+from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+from ollama_test_support import OwnedLoopbackHTTPServer
 from pydantic import SecretStr
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
@@ -59,6 +61,33 @@ RECEIPT_SHA = "e" * 64
 ACK_SHA = "f" * 64
 PARAMETERS_SHA = "c" * 64
 IMAGE = "ghcr.io/kestrel/catalog-worker@sha256:" + "a" * 64
+
+
+def execution_control_carrier(
+    error: BaseException,
+    *,
+    grouped: bool = False,
+) -> tuple[BaseException, ExecutionCommitOutcomeError, BaseException]:
+    """Attach one real public-Core control graph without copying its nodes."""
+
+    control = ExecutionCommitOutcomeError("unknown")
+    explicit: BaseException = (
+        BaseExceptionGroup(
+            "control and structural evidence", [control, ValueError("x")]
+        )
+        if grouped
+        else control
+    )
+    error.__cause__ = explicit
+    return error, control, explicit
+
+
+def record_control_injection(
+    record_property: Callable[[str, object], None], boundary: str
+) -> None:
+    """Record the exact dependency entry that raised a control carrier."""
+
+    record_property("control_injection", boundary)
 
 
 def native_httpx_connect_failure() -> httpx.TransportError:
@@ -187,26 +216,27 @@ def native_pod_action_harness():
             else:
                 raise AssertionError(f"unsupported readback outcome: {outcome}")
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, name="pod-action-loopback")
-    thread.start()
-    client = RunpodControlPlaneClient(
-        api_key="local-loopback-only",
-        base_url=f"http://127.0.0.1:{server.server_port}/v2",
-        max_safe_retries=0,
+    def server_factory():
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        return server
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=server_factory,
+        thread_factory=lambda server: threading.Thread(
+            target=server.serve_forever,
+            name="pod-action-loopback",
+        ),
+        client_factory=lambda server: RunpodControlPlaneClient(
+            api_key="local-loopback-only",
+            base_url=f"http://127.0.0.1:{server.server_port}/v2",
+            max_safe_retries=0,
+        ),
     )
-    direct = DirectRunPodProvider("local-loopback-only", client=client)
-    adapter = RunpodPodCapacityProvider(direct)
-    try:
+    with owner as client:
+        direct = DirectRunPodProvider("local-loopback-only", client=client)
+        adapter = RunpodPodCapacityProvider(direct)
         yield state, direct, adapter
-    finally:
-        client.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-        if thread.is_alive():
-            raise AssertionError("Pod action loopback server did not terminate")
 
 
 def acknowledgement() -> dict[str, Any]:
@@ -368,6 +398,7 @@ class FakeCapacityProvider:
         self.terminate_calls: list[str] = []
         self.find_result: str | None = None
         self.create_error: Exception | None = None
+        self.error_callback: Callable[[str], None] | None = None
         self.realized: PodRealizedPlacement | None = realized_placement(clock)
         self.billing_receipt: PodBillingReceipt | None = None
         self.billing_calls: list[str] = []
@@ -406,6 +437,8 @@ class FakeCapacityProvider:
             }
         )
         if self.create_error is not None:
+            if self.error_callback is not None:
+                self.error_callback("create")
             raise self.create_error
         return CreatedPodCapacity(
             provider_pod_id="pod-catalog-1",

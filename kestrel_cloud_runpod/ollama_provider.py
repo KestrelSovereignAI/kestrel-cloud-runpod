@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .billing import exact_decimal_integer_scale
 from .clients import (
@@ -88,6 +89,8 @@ RUNPOD_SERVERLESS_MAX_IDLE_TIMEOUT_SECONDS = 3600
 def _raise_teardown_api_error(error: RunPodAPIError) -> None:
     """Translate only canonical provider retry/auth outcomes after exact I/O."""
 
+    if is_execution_control_error(error):
+        raise error.with_traceback(error.__traceback__)
     if error.status_code in {401, 403}:
         raise OllamaLeaseAuthorizationError(
             "Runpod rejected Ollama cleanup authorization"
@@ -300,6 +303,8 @@ class RunpodOllamaCapacityProvider:
                         )
                 decisions[product] = select_gpu(offers, requirements)
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 failures.append(f"{product.value}: {exc}")
         return select_ollama_plan(
             request,
@@ -547,6 +552,8 @@ class RunpodOllamaCapacityProvider:
         except (OllamaProvisioningEvidenceError, OllamaProvisioningMismatchError):
             raise
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider readback evidence is incomplete or invalid"
             ) from exc
@@ -559,9 +566,13 @@ class RunpodOllamaCapacityProvider:
         *,
         reconciled_after_ambiguous_create: bool = False,
     ) -> OllamaProvisioningReceipt:
-        observed, normalized, placement, precision, readback_at = (
-            await self._read_original_provisioning(intent, resource)
-        )
+        (
+            observed,
+            normalized,
+            placement,
+            precision,
+            readback_at,
+        ) = await self._read_original_provisioning(intent, resource)
         if observed.created_at is None or observed.environment_sha256 is None:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider omitted original provisioning evidence"
@@ -628,9 +639,13 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama readiness resource does not bind its provisioning receipt"
             )
-        observed, _normalized, _placement, _precision, _readback_at = (
-            await self._read_original_provisioning(intent, resource)
-        )
+        (
+            observed,
+            _normalized,
+            _placement,
+            _precision,
+            _readback_at,
+        ) = await self._read_original_provisioning(intent, resource)
         if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
             if not isinstance(observed, EndpointResource):
                 raise OllamaProvisioningEvidenceError(
@@ -857,8 +872,12 @@ class RunpodOllamaCapacityProvider:
                     raise RunPodManagerError("Ollama runtime telemetry is unavailable")
                 raw: object = response.json()
         except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodManagerError("Ollama runtime telemetry is unavailable") from exc
         except ValueError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodManagerError("Ollama runtime telemetry is invalid") from exc
         if not isinstance(raw, Mapping):
             raise RunPodManagerError("Ollama runtime telemetry is invalid")
@@ -883,6 +902,8 @@ class RunpodOllamaCapacityProvider:
             )
             return observation
         except (TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodManagerError("Ollama runtime telemetry is invalid") from exc
 
     async def _healthy(self, url: str, *, bearer_token: str | None) -> bool:
@@ -890,7 +911,9 @@ class RunpodOllamaCapacityProvider:
             async with self._http_client(bearer_token=bearer_token) as client:
                 response = await client.get(url)
                 return response.status_code == 200
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             return False
 
     async def _rejects_anonymous_requests(self, base_url: str) -> bool:
@@ -898,7 +921,9 @@ class RunpodOllamaCapacityProvider:
             async with self._http_client(bearer_token=None) as client:
                 response = await client.get(f"{base_url.rstrip('/')}/api/tags")
                 return response.status_code in {401, 403}
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             return False
 
     async def _models(
@@ -910,7 +935,9 @@ class RunpodOllamaCapacityProvider:
                 if response.status_code < 200 or response.status_code >= 300:
                     return ()
                 payload: object = response.json()
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             return ()
         if not isinstance(payload, Mapping):
             return ()
@@ -1230,7 +1257,9 @@ def _validate_endpoint_provisioning(
             continue
         try:
             actual = _typed_runtime_value(key, raw[key], context="Endpoint")
-        except OllamaProvisioningEvidenceError:
+        except OllamaProvisioningEvidenceError as exc:
+            if is_execution_control_error(exc):
+                raise
             assessment.invalid("runtime", key)
             continue
         accepted = _typed_runtime_value(key, expected.get(key), context="intent")
@@ -1278,7 +1307,9 @@ def _validate_endpoint_provisioning(
                 else:
                     actual = gpu_value[key]
                     accepted = expected_gpu.get(key)
-            except OllamaProvisioningEvidenceError:
+            except OllamaProvisioningEvidenceError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 assessment.invalid("policy", f"gpu.{key}")
                 continue
             if actual != accepted or (
@@ -1338,7 +1369,9 @@ def _validate_endpoint_provisioning(
         try:
             actual_values = _string_tuple(raw[key], f"Endpoint.{key}")
             accepted_values = _string_tuple(expected.get(key), f"intent.{key}")
-        except OllamaProvisioningEvidenceError:
+        except OllamaProvisioningEvidenceError as exc:
+            if is_execution_control_error(exc):
+                raise
             assessment.invalid("policy", key)
             continue
         if actual_values != accepted_values:
@@ -1508,7 +1541,9 @@ def _validate_pod_provisioning(
             continue
         try:
             actual = _typed_runtime_value(key, raw[key], context="Pod")
-        except OllamaProvisioningEvidenceError:
+        except OllamaProvisioningEvidenceError as exc:
+            if is_execution_control_error(exc):
+                raise
             assessment.invalid("runtime", key)
             continue
         if actual != accepted_runtime[key]:
@@ -1539,7 +1574,9 @@ def _validate_pod_provisioning(
     if "globalNetworking" in raw:
         try:
             networking_enabled = _pod_global_networking_enabled(raw["globalNetworking"])
-        except OllamaProvisioningEvidenceError:
+        except OllamaProvisioningEvidenceError as exc:
+            if is_execution_control_error(exc):
+                raise
             assessment.invalid("runtime", "globalNetworking")
         else:
             if networking_enabled != expected.get("globalNetworking"):
