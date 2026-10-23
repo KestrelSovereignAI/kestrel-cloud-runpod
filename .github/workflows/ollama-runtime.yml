@@ -64,6 +64,10 @@ jobs:
     name: Image, SBOM, and vulnerability gate
     needs: proxy-contract
     runs-on: ubuntu-latest
+    env:
+      # Image-layer caches can exceed Ubuntu's RAM-backed /tmp quota. Keep
+      # security-tool scratch in the runner's disk-backed job directory.
+      TMPDIR: ${{ runner.temp }}
     permissions:
       attestations: write # Publish GitHub provenance for the reviewed image digest.
       artifact-metadata: write # Link the immutable GHCR artifact to attestations.

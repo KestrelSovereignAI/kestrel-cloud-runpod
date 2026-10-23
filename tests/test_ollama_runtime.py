@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import OllamaLeaseMode
@@ -202,6 +203,22 @@ def test_runtime_workflow_scans_and_publishes_one_exact_image() -> None:
     assert workflow.count("subject-digest: ${{ steps.publish.outputs.digest }}") == 2
     assert "sbom-path: ollama-runtime.spdx.json" in workflow
     assert "KESTREL_OLLAMA_BEARER_TOKEN" in workflow
+
+
+def test_image_security_tools_share_runner_owned_scratch() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    )
+    security = workflow["jobs"]["image-security"]
+    expected = "${{ runner.temp }}"
+
+    assert security.get("env", {}).get("TMPDIR") == expected
+    # Both Syft and Trivy inherit this same job-scoped directory. A step must
+    # not quietly route one tool back into the runner's quota-limited /tmp.
+    assert all(
+        step.get("env", {}).get("TMPDIR", expected) == expected
+        for step in security["steps"]
+    )
 
 
 def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
