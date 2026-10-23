@@ -73,6 +73,53 @@ async def test_catalog_transport_retains_ordinary_error_contract(kind) -> None:
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+async def test_response_json_conversion_control_policy(mode, record_property):
+    carrier, control, explicit = execution_control_carrier(
+        ValueError("catalog response JSON remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    requests: list[httpx.Request] = []
+    injections: list[str] = []
+
+    class ControlledResponse(httpx.Response):
+        def json(self, **_kwargs):
+            injections.append("json")
+            record_control_injection(record_property, "catalog-response-json-" + mode)
+            raise carrier
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return ControlledResponse(200, request=request)
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+    caught = None
+    try:
+        await transport.health(BASE)
+    except (ValueError, CatalogPodTransportError) as error:
+        caught = error
+
+    assert len(requests) == 1
+    assert injections == ["json"]
+    if mode == "implicit-context":
+        assert type(caught) is CatalogPodTransportError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
+
+
 def _payload() -> dict[str, object]:
     return {
         "schema_version": 3,

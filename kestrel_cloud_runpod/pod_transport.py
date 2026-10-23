@@ -418,6 +418,8 @@ def _json_object(response: httpx.Response, operation: str) -> Mapping[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
+        if is_execution_control_error(exc):
+            raise
         raise CatalogPodTransportError(
             f"Catalog Pod {operation} response is not JSON"
         ) from exc

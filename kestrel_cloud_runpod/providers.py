@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from kestrel_sdk.config.constants import HTTP_TIMEOUT_DEFAULT, HTTP_TIMEOUT_QUICK
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .clients import RunpodControlPlaneClient
 from .models import (
@@ -164,6 +165,8 @@ class DirectRunPodProvider(GPUProvider):
         try:
             pod.require_valid_fields(context="v2 Pod create")
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodAcknowledgedResourceError(
                 resource_id=pod.id,
                 resource_name=pod.name,

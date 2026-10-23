@@ -175,6 +175,116 @@ async def test_manager_stop_retains_ordinary_metering_nonfatal_contract(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+async def test_readiness_detail_json_conversion_control_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    record_property,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=f"training:readiness-json:{mode}"
+    )
+    runtime = manager._get_training_pod_lease_service()
+    durable_before = runtime.repository.get(session.training_cleanup_token)
+    assert durable_before is not None
+    carrier, control, explicit = execution_control_carrier(
+        ValueError("training readiness detail JSON remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    calls: list[str] = []
+    injections: list[str] = []
+    durable_at_injection = None
+    durable_at_second_get = None
+
+    class ControlledResponse(httpx.Response):
+        def json(self, **_kwargs):
+            nonlocal durable_at_injection
+            durable_at_injection = runtime.repository.get(
+                session.training_cleanup_token
+            )
+            assert durable_at_injection is not None
+            injections.append("json")
+            record_control_injection(
+                record_property, "training-readiness-detail-json-" + mode
+            )
+            raise carrier
+
+    class ControlledClient(FakeWorkloadClient):
+        async def get(self, url: str):
+            nonlocal durable_at_second_get
+            calls.append(url)
+            if len(calls) == 1:
+                return ControlledResponse(
+                    503,
+                    text="loading",
+                    request=httpx.Request("GET", url),
+                )
+            durable_at_second_get = runtime.repository.get(
+                session.training_cleanup_token
+            )
+            assert durable_at_second_get is not None
+            return _response(url, 200, {"gpu": "test", "gpu_memory_gb": 24})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_: ControlledClient())
+    caught = None
+    try:
+        await manager._wait_for_training_ready(
+            session,
+            timeout=1,
+            poll_interval=0,
+        )
+    except (ValueError, RunPodManagerError) as error:
+        caught = error
+
+    assert injections == ["json"]
+    assert durable_at_injection is not None
+    assert durable_at_injection.revision == durable_before.revision + 1
+    assert (
+        replace(
+            durable_at_injection,
+            updated_at=durable_before.updated_at,
+            revision=durable_before.revision,
+        )
+        == durable_before
+    )
+    durable_after = runtime.repository.get(session.training_cleanup_token)
+    if mode == "implicit-context":
+        assert caught is None
+        assert len(calls) == 2
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+        assert durable_at_second_get is not None
+        assert durable_at_second_get.revision == durable_at_injection.revision + 1
+        assert (
+            replace(
+                durable_at_second_get,
+                updated_at=durable_at_injection.updated_at,
+                revision=durable_at_injection.revision,
+            )
+            == durable_at_injection
+        )
+        assert durable_after == durable_at_second_get
+    else:
+        assert calls == [session.backend_base_url + "/ready"]
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
+        assert durable_after == durable_at_injection
+    assert provider.stop_calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "boundary",
     [

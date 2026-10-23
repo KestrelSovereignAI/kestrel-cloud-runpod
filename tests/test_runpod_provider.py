@@ -8,6 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
+)
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.manager import RunPodManager
@@ -171,6 +175,61 @@ def test_direct_provider_never_exposes_invalid_partial_create_evidence():
     assert raised.value.resource_name == "kestrel-image"
     assert raised.value.reconcile_required is True
     assert "must-not-leak" not in str(raised.value)
+
+
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+def test_direct_create_validation_control_policy(mode, record_property):
+    client = _FakeControlClient()
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("Pod validation remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    injections: list[str] = []
+
+    class ControlledResource:
+        id = "pod-controlled-validation"
+        name = "kestrel-image"
+
+        def require_valid_fields(self, *, context: str):
+            assert context == "v2 Pod create"
+            injections.append(context)
+            record_control_injection(
+                record_property, "direct-create-validation-" + mode
+            )
+            raise carrier
+
+    def controlled_create(request):
+        client.create_request = request
+        return ControlledResource()
+
+    client.create_pod = controlled_create
+    provider = DirectRunPodProvider(api_key="", client=client)
+    caught = None
+    try:
+        provider.start_pod(_profile(), {"name": "kestrel-image"})
+    except RunPodManagerError as error:
+        caught = error
+
+    assert injections == ["v2 Pod create"]
+    assert client.create_request is not None
+    if mode == "implicit-context":
+        assert type(caught) is RunPodAcknowledgedResourceError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+        assert caught.resource_id == "pod-controlled-validation"
+        assert caught.resource_name == "kestrel-image"
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
 
 
 @pytest.mark.parametrize(

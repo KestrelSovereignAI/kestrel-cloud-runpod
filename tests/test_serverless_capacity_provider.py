@@ -227,6 +227,69 @@ class _PlannedControl:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+async def test_serverless_post_ack_validation_control_policy(mode, record_property):
+    control_client = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control_client,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("endpoint validation remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    injections: list[str] = []
+
+    class ControlledEndpoint:
+        id = "endpoint-controlled-validation"
+        name = accepted.endpoint_name
+
+        def require_valid_fields(self, *, context: str):
+            assert context == "v2 Serverless create"
+            injections.append(context)
+            record_control_injection(
+                record_property, "serverless-post-ack-validation-" + mode
+            )
+            raise carrier
+
+    control_client.created = ControlledEndpoint()
+    caught = None
+    try:
+        await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+    except RunPodManagerError as error:
+        caught = error
+
+    assert injections == ["v2 Serverless create"]
+    assert len(control_client.create_requests) == 1
+    assert control_client.get_calls == []
+    assert control_client.delete_calls == []
+    if mode == "implicit-context":
+        assert type(caught) is ServerlessEndpointActivationError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+        assert caught.endpoint_name == accepted.endpoint_name
+        assert caught.observed_endpoint_ids == ("endpoint-controlled-validation",)
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "boundary",
     [

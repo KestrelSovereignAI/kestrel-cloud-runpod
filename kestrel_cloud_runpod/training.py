@@ -229,7 +229,9 @@ class RunPodTrainingMixin:
                         try:
                             data = response.json()
                             detail = data.get("detail", "loading")
-                        except Exception:
+                        except Exception as exc:
+                            if is_execution_control_error(exc):
+                                raise
                             detail = response.text[:100]
 
                         # Check if another training is already running

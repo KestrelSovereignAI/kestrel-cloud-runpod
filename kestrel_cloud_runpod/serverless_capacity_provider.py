@@ -282,6 +282,8 @@ class RunpodServerlessCapacityProvider:
         try:
             created.require_valid_fields(context="v2 Serverless create")
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             # A syntactically valid POST acknowledgment owns this exact ID even
             # when an optional sibling cannot establish readiness.  Preserve
             # that cleanup locator without treating the invalid evidence as a

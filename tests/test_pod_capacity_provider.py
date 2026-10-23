@@ -13,8 +13,10 @@ from pod_capacity_test_support import (
     FakeWorkloadTransport,
     MutableClock,
     complete_pod_payload,
+    execution_control_carrier,
     native_pod_action_harness,
     profile,
+    record_control_injection,
     request,
     service,
 )
@@ -24,6 +26,7 @@ from kestrel_cloud_runpod.models import (
     Availability,
     BillingPage,
     GPUOffer,
+    RunPodAcknowledgedResourceError,
     RunPodAPIError,
     RunPodManagerError,
 )
@@ -70,6 +73,95 @@ def _spec(clock: MutableClock) -> PodCapacitySpec:
         capability_expires_at=item.bearer_expires_at,
         attempt_environment_sha256=attempt_environment_sha256(item.attempt_environment),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "acknowledged-direct",
+        "acknowledged-group",
+        "acknowledged-implicit-context",
+        "realized-clock-direct",
+        "realized-clock-group",
+        "realized-clock-implicit-context",
+    ],
+)
+async def test_capacity_create_conversion_control_policy(case, record_property):
+    boundary, mode = case.rsplit("-", 1)
+    if case.endswith("implicit-context"):
+        boundary = case.removesuffix("-implicit-context")
+        mode = "implicit-context"
+    clock = MutableClock()
+    spec = _spec(clock)
+    calls: list[str] = []
+    if boundary == "acknowledged":
+        original = RunPodAcknowledgedResourceError(
+            resource_id="pod-controlled-ack",
+            resource_name=spec.request.resource_name,
+        )
+    else:
+        original = RunPodManagerError("realized placement clock remains unknown")
+    carrier, control, explicit = execution_control_carrier(
+        original,
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+
+    def start_pod(_profile, _metadata):
+        calls.append("start")
+        if boundary == "acknowledged":
+            record_control_injection(record_property, case)
+            raise carrier
+        payload = complete_pod_payload(
+            pod_id="pod-controlled-clock", status="PROVISIONING"
+        )
+        payload["name"] = spec.request.resource_name
+        payload["_kestrel_placement"] = spec.request.quote.placement
+        return payload
+
+    def controlled_clock():
+        calls.append("clock")
+        record_control_injection(record_property, case)
+        raise carrier
+
+    provider = RunpodPodCapacityProvider(
+        SimpleNamespace(start_pod=start_pod),
+        clock=controlled_clock if boundary == "realized-clock" else clock,
+    )
+    caught = None
+    try:
+        await provider.create(
+            profile=profile(),
+            resource_name=spec.request.resource_name,
+            companion_id=spec.request.owner_id,
+            environment={"CATALOG_WORKER_MODE": "pod"},
+            capacity_spec=spec,
+        )
+    except RunPodManagerError as error:
+        caught = error
+
+    assert calls == (["start"] if boundary == "acknowledged" else ["start", "clock"])
+    if mode == "implicit-context":
+        assert type(caught) is PodCapacityCreatedMismatchError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+        assert caught.provider_pod_id == (
+            "pod-controlled-ack"
+            if boundary == "acknowledged"
+            else "pod-controlled-clock"
+        )
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
 
 
 def _billing_history(created, terminated, amount, *, partial=False) -> BillingPage:

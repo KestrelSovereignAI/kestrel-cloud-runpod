@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .clients import is_exact_runpod_not_found
 from .effect_custody import await_owned_effect
 from .models import (
@@ -277,6 +279,8 @@ class RunpodPodCapacityProvider:
                 asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
             )
         except RunPodAcknowledgedResourceError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PodCapacityCreatedMismatchError(exc.resource_id) from exc
         pod_id = result.get("id") or result.get("podId")
         if not isinstance(pod_id, str) or not pod_id:
@@ -305,6 +309,8 @@ class RunpodPodCapacityProvider:
                     result, pod_id, capacity_spec, self._now()
                 )
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise PodCapacityCreatedMismatchError(pod_id) from exc
         return CreatedTrainingPod(
             provider_pod_id=pod_id,
