@@ -831,6 +831,154 @@ def test_request_transport_preserves_exact_execution_control(
     assert _explicit_graph_ids(transport_error) == original_graph
 
 
+def _successful_response_json_case(operation, calls):
+    payload = _pod(status="RUNNING")
+    status_code = 200 if operation == "get" else 201
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(status_code, json=payload)
+
+    def fail_sleep(_seconds):
+        raise AssertionError("successful response decoding must not retry")
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=fail_sleep,
+        http_transport=httpx.MockTransport(handler),
+    )
+    if operation == "get":
+        return client, lambda: client.get_pod("pod-123"), "GET", "/v2/pods/pod-123"
+    return (
+        client,
+        lambda: client.create_pod(
+            PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        ),
+        "POST",
+        "/v2/pods",
+    )
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+def test_successful_response_json_valid_baseline(operation):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    try:
+        resource = invoke()
+
+        assert resource.id == "pod-123"
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+@pytest.mark.parametrize(
+    "error_type", [ValueError, RecursionError], ids=["value", "recursion"]
+)
+@pytest.mark.parametrize("grouped", [False, True], ids=["direct-cause", "group"])
+def test_successful_response_json_preserves_exact_execution_control(
+    monkeypatch,
+    operation,
+    error_type,
+    grouped,
+    record_property,
+):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    carrier, control, explicit = execution_control_carrier(
+        error_type("successful response decoder execution control"),
+        grouped=grouped,
+    )
+    original_graph = _explicit_graph_ids(carrier)
+
+    def controlled_json(response, *args, **kwargs):
+        del args, kwargs
+        assert response.status_code == (200 if operation == "get" else 201)
+        record_control_injection(
+            record_property,
+            f"successful-response-json-{operation}-{error_type.__name__}-"
+            f"{'group' if grouped else 'direct-cause'}",
+        )
+        raise carrier
+
+    monkeypatch.setattr(httpx.Response, "json", controlled_json)
+    try:
+        with pytest.raises(error_type) as caught:
+            invoke()
+
+        assert caught.value is carrier
+        assert type(caught.value) is error_type
+        assert carrier.__cause__ is explicit
+        if grouped:
+            assert explicit.exceptions[0] is control
+            assert len(explicit.exceptions) == 2
+        else:
+            assert explicit is control
+        assert _explicit_graph_ids(carrier) == original_graph
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+@pytest.mark.parametrize(
+    "error_type", [ValueError, RecursionError], ids=["value", "recursion"]
+)
+@pytest.mark.parametrize(
+    "context_only", [False, True], ids=["plain", "implicit-context"]
+)
+def test_successful_response_json_retains_ordinary_normalization_contract(
+    monkeypatch,
+    operation,
+    error_type,
+    context_only,
+):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    ordinary = error_type("ordinary successful response decoder failure")
+    implicit_control = ExecutionAuthorityError("implicit context is not authority")
+    if context_only:
+        ordinary.__context__ = implicit_control
+
+    def fail_json(response, *args, **kwargs):
+        del response, args, kwargs
+        raise ordinary
+
+    monkeypatch.setattr(httpx.Response, "json", fail_json)
+    expected_error = (
+        RunPodAPIError if operation == "get" else RunPodAmbiguousResultError
+    )
+    try:
+        with pytest.raises(expected_error) as caught:
+            invoke()
+
+        assert type(caught.value) is expected_error
+        assert caught.value.__cause__ is ordinary
+        assert ordinary.__context__ is (implicit_control if context_only else None)
+        assert caught.value.status_code == (200 if operation == "get" else 201)
+        assert caught.value.method == expected_method
+        assert caught.value.resource == (
+            "/pods/pod-123" if operation == "get" else "/pods"
+        )
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize(
     "boundary",
     ["open-stream", "active", "deadline"],

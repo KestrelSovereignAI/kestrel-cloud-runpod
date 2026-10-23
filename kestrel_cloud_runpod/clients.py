@@ -187,6 +187,8 @@ class RunpodTransport:
         try:
             payload = response.json()
         except (ValueError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
