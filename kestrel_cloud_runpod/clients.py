@@ -86,10 +86,10 @@ def is_retryable_runpod_api_error(error: RunPodAPIError) -> bool:
     does not grant permission to repeat an arbitrary HTTP method.
     """
 
-    if (
-        type(error) not in {RunPodAPIError, RunPodAmbiguousResultError}
-        or is_execution_control_error(error)
-    ):
+    if type(error) not in {
+        RunPodAPIError,
+        RunPodAmbiguousResultError,
+    } or is_execution_control_error(error):
         return False
     if _is_retryable_runpod_status(error.status_code):
         return error.__cause__ is None
@@ -181,7 +181,9 @@ class RunpodTransport:
         )
         if response.status_code == 204 or not response.content:
             return None
-        error_type = RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
+        error_type = (
+            RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
+        )
         try:
             payload = response.json()
         except (ValueError, RecursionError) as exc:
@@ -272,7 +274,9 @@ class RunpodTransport:
                         if event_id is not None:
                             self.last_sse_event_id = event_id
                         yield payload
-                except httpx.HTTPError:
+                except httpx.HTTPError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     if deadline_expired.is_set():
                         return
                     raise
@@ -280,6 +284,8 @@ class RunpodTransport:
                     if timer is not None:
                         timer.cancel()
         except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodAPIError(
                 title="Runpod transport failed",
                 detail=type(exc).__name__,
@@ -334,6 +340,8 @@ class RunpodTransport:
                     json=json_body,
                 )
             except httpx.HTTPError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 if (
                     safe_to_retry
                     and _is_retryable_httpx_transport_error(exc)
@@ -496,7 +504,9 @@ class RunpodControlPlaneClient:
             payload, product=product, vcpu_count=vcpu_count, observed_at=observed_at
         )
 
-    def create_pod(self, request: PodCreateRequest | CpuPodCreateRequest) -> PodResource:
+    def create_pod(
+        self, request: PodCreateRequest | CpuPodCreateRequest
+    ) -> PodResource:
         payload = self.transport.request_json(
             "POST",
             "/pods",
@@ -506,7 +516,9 @@ class RunpodControlPlaneClient:
         )
         try:
             return PodResource.from_dict(_required_payload(payload))
-        except (RunPodManagerError, RecursionError):
+        except (RunPodManagerError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
             # A malformed success receipt cannot turn a paid create into a
             # known failure. The caller retains custody and reconciles it.
             raise RunPodAmbiguousResultError(
@@ -595,7 +607,9 @@ class RunpodControlPlaneClient:
         )
         try:
             return EndpointResource.from_dict(_required_payload(payload))
-        except (RunPodManagerError, RecursionError):
+        except (RunPodManagerError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodAmbiguousResultError(
                 title="Unverified Endpoint creation response",
                 detail=(

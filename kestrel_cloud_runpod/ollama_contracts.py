@@ -56,6 +56,13 @@ def _positive_public_number(value: object) -> bool:
     )
 
 
+def _require_exact_int_version(value: object, expected: int, message: str) -> None:
+    """Reject equality-compatible bools/floats at every version boundary."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+        raise ValueError(message)
+
+
 _INTENT_KEYS = {
     "evidence_version",
     "lease_id",
@@ -708,8 +715,11 @@ class OllamaProvisioningIntent:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama provisioning intent version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama provisioning intent version",
+        )
         for name, value in (
             ("lease_id", self.lease_id),
             ("provision_attempt_id", self.provision_attempt_id),
@@ -898,8 +908,11 @@ class OllamaProvisioningReceipt:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama provisioning receipt version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama provisioning receipt version",
+        )
         for digest_name, digest in (
             ("intent_sha256", self.intent_sha256),
             ("request_fingerprint", self.request_fingerprint),
@@ -1079,8 +1092,11 @@ class OllamaProvisioningMismatchEvidence:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama provisioning mismatch version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama provisioning mismatch version",
+        )
         for digest_name, digest in (
             ("intent_sha256", self.intent_sha256),
             ("readback_sha256", self.readback_sha256),
@@ -1170,8 +1186,11 @@ class OllamaCleanupIntent:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama cleanup intent version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama cleanup intent version",
+        )
         _sha256(self.intent_sha256, "cleanup intent_sha256")
         _sha256(self.request_fingerprint, "cleanup request_fingerprint")
         for name, value in (
@@ -1293,8 +1312,11 @@ class OllamaCleanupReceipt:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama cleanup receipt version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama cleanup receipt version",
+        )
         if not isinstance(self.cleanup_intent_id, str) or not self.cleanup_intent_id:
             raise ValueError("Ollama cleanup receipt intent ID is invalid")
         require_aware(self.verified_absent_at, "cleanup verified_absent_at")
@@ -1358,8 +1380,11 @@ class OllamaAdditionalCleanupTarget:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama additional cleanup target version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama additional cleanup target version",
+        )
         _sha256(self.intent_sha256, "additional cleanup intent")
         for name, value in (
             ("lease_id", self.lease_id),
@@ -1537,8 +1562,9 @@ class OllamaRuntimeTelemetrySnapshot:
     schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2:
-            raise ValueError("Unsupported Ollama telemetry schema")
+        _require_exact_int_version(
+            self.schema_version, 2, "Unsupported Ollama telemetry schema"
+        )
         _sha256(self.telemetry_binding_sha256, "telemetry binding")
         for name, value in (
             ("runtime_version", self.runtime_version),
@@ -1771,8 +1797,11 @@ class OllamaRuntimeTelemetryObservation:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1:
-            raise ValueError("Unsupported Ollama telemetry observation version")
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Unsupported Ollama telemetry observation version",
+        )
         _sha256(self.intent_sha256, "telemetry intent")
         _sha256(self.snapshot_sha256, "telemetry snapshot")
         if self.snapshot_sha256 != _json_sha256(self.snapshot.to_dict()):
@@ -1892,7 +1921,12 @@ class OllamaLifecycleBillingObservation:
     evidence_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.evidence_version != 1 or self.provider_finality_confirmed is not False:
+        _require_exact_int_version(
+            self.evidence_version,
+            1,
+            "Ollama billing cannot claim provider finality",
+        )
+        if self.provider_finality_confirmed is not False:
             raise ValueError("Ollama billing cannot claim provider finality")
         _sha256(self.intent_sha256, "billing intent")
         require_aware(self.first_observed_at, "billing first_observed_at")
@@ -2066,7 +2100,10 @@ class OllamaLifecycleBillingSelection:
     policy_version: int = 1
 
     def __post_init__(self) -> None:
-        if not self.observation_id or self.policy_version != 1:
+        _require_exact_int_version(
+            self.policy_version, 1, "Ollama billing selection is invalid"
+        )
+        if not self.observation_id:
             raise ValueError("Ollama billing selection is invalid")
         require_aware(self.selected_at, "billing selected_at")
 
@@ -2298,7 +2335,7 @@ class OllamaLease:
     # silently meant something new would misread every existing row. Defaults
     # to a single GPU, which is what every pre-existing lease had.
     placement_gpu_count: int = 1
-    writer_contract_version: int = 6
+    writer_contract_version: int = 7
     writer_epoch: int = 1
     reconcile_after: datetime | None = None
     provisioning_evidence_state: OllamaProvisioningEvidenceState = (

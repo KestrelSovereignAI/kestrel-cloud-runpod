@@ -14,6 +14,7 @@ from typing import Any, Dict, NoReturn, Optional
 
 from kestrel_sdk.config.constants import RUNPOD_URL_POLL_INTERVAL
 from kestrel_sovereign.config import load_config
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .models import (
     CloudType,
@@ -315,6 +316,8 @@ class RunPodManagerCore:
                     f"for companion {session.companion_id}"
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to record GPU metering: {e}")
 
         payload = session.to_dict()

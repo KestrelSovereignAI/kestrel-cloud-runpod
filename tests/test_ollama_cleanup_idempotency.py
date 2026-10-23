@@ -14,6 +14,7 @@ from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
     make_request,
+    release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
 from test_ollama_provider import (
@@ -39,6 +40,21 @@ from kestrel_cloud_runpod.ollama_contracts import (
 from kestrel_cloud_runpod.ollama_provider import _raise_mismatch
 from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
+
+
+async def _bounded_owned_task_outcome(task, *, timeout=5):
+    """Observe one already-owned task without cancelling its ordered peer."""
+
+    _done, pending = await asyncio.wait({task}, timeout=timeout)
+    if pending:
+        raise AssertionError("owned Ollama effect did not finish after gate release")
+    if task.cancelled():
+        try:
+            task.result()
+        except asyncio.CancelledError as failure:
+            return failure
+    failure = task.exception()
+    return failure if failure is not None else task.result()
 
 
 def _secondary_resource(lease, resource_id="late-original-ack"):
@@ -198,6 +214,160 @@ async def test_completed_secondary_ack_replay_preserves_open_primary_disposition
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "retrying_resource",
+    ["primary", "additional"],
+    ids=["primary-retry-first", "additional-retry-first"],
+)
+async def test_partial_cleanup_success_preserves_retry_disposition_until_all_receipts(
+    tmp_path,
+    retrying_resource,
+):
+    service, claimed = await _claimed_two_target_cleanup(
+        tmp_path,
+        _TwoTargetCleanupProvider(),
+        database_name=f"partial-success-{retrying_resource}.sqlite3",
+    )
+    repository = service.repository
+    now = service._now()
+    retry_at = now + timedelta(seconds=10)
+    provider_error = f"{retrying_resource} teardown remains retryable"
+    assert claimed.provider_resource_id is not None
+    primary_intent = claimed.cleanup_intent
+    assert primary_intent is not None
+    primary_receipt = _absence_receipt(primary_intent)
+
+    if retrying_resource == "primary":
+        retrying = repository.record_teardown_outcome(
+            claimed,
+            provider_resource_id=claimed.provider_resource_id,
+            now=now,
+            accrued_estimated_cost=claimed.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            provider_error=provider_error,
+            retry_at=retry_at,
+        )
+        with_additional_intent = repository.record_additional_cleanup_intent(
+            retrying,
+            provider_resource_id="late-original-ack",
+            now=now,
+            termination_reason="test partial cleanup success",
+        )
+    else:
+        with_additional_intent = repository.record_additional_cleanup_intent(
+            claimed,
+            provider_resource_id="late-original-ack",
+            now=now,
+            termination_reason="test partial cleanup success",
+        )
+    additional = with_additional_intent.additional_cleanup_targets[0]
+    assert additional.cleanup_intent is not None
+    additional_receipt = _absence_receipt(additional.cleanup_intent)
+    receipt_now = max(
+        primary_receipt.verified_absent_at,
+        additional_receipt.verified_absent_at,
+    )
+    final_now = receipt_now + timedelta(microseconds=1)
+
+    if retrying_resource == "primary":
+        partial = repository.record_additional_cleanup_outcome(
+            with_additional_intent,
+            provider_resource_id=additional.provider_resource_id,
+            now=receipt_now,
+            accrued_estimated_cost=with_additional_intent.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            cleanup_receipt=additional_receipt,
+        )
+    else:
+        retrying = repository.record_additional_cleanup_outcome(
+            with_additional_intent,
+            provider_resource_id=additional.provider_resource_id,
+            now=now,
+            accrued_estimated_cost=with_additional_intent.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            provider_error=provider_error,
+            retry_at=retry_at,
+        )
+        partial = repository.record_teardown_outcome(
+            retrying,
+            provider_resource_id=claimed.provider_resource_id,
+            now=receipt_now,
+            accrued_estimated_cost=retrying.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            cleanup_receipt=primary_receipt,
+            billing_next_check_at=receipt_now,
+        )
+
+    reopened = SQLiteOllamaLeaseRepository(repository.path)
+    durable_partial = reopened.get(claimed.lease_id)
+    assert durable_partial == partial
+    assert durable_partial is not None
+    assert durable_partial.state is OllamaLeaseState.RELEASING
+    assert durable_partial.teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+    assert durable_partial.last_provider_error == provider_error
+    assert durable_partial.reconcile_after == retry_at
+    billing_before_final_receipt = (
+        durable_partial.lifecycle_billing_state,
+        durable_partial.lifecycle_billing_observations,
+        durable_partial.lifecycle_billing_selection,
+        durable_partial.lifecycle_billing_corrections,
+        durable_partial.lifecycle_billing_latest_reference,
+        durable_partial.billing_last_checked_at,
+        durable_partial.billing_next_check_at,
+        durable_partial.billing_last_provider_error,
+        durable_partial.billing_retention_exhausted,
+    )
+    if retrying_resource == "primary":
+        assert durable_partial.cleanup_receipt is None
+        assert durable_partial.additional_cleanup_targets[0].cleanup_receipt == (
+            additional_receipt
+        )
+    else:
+        assert durable_partial.cleanup_receipt == primary_receipt
+        assert durable_partial.additional_cleanup_targets[0].cleanup_receipt is None
+
+    if retrying_resource == "primary":
+        completed = reopened.record_teardown_outcome(
+            durable_partial,
+            provider_resource_id=claimed.provider_resource_id,
+            now=final_now,
+            accrued_estimated_cost=durable_partial.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            cleanup_receipt=primary_receipt,
+            billing_next_check_at=final_now,
+        )
+    else:
+        completed = reopened.record_additional_cleanup_outcome(
+            durable_partial,
+            provider_resource_id=additional.provider_resource_id,
+            now=final_now,
+            accrued_estimated_cost=durable_partial.accrued_estimated_cost,
+            termination_reason="test partial cleanup success",
+            cleanup_receipt=additional_receipt,
+        )
+
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.teardown_state is OllamaTeardownState.COMPLETE
+    assert completed.cleanup_receipt == primary_receipt
+    assert completed.additional_cleanup_targets[0].cleanup_receipt == (
+        additional_receipt
+    )
+    assert completed.last_provider_error is None
+    assert completed.reconcile_after == retry_at
+    assert (
+        completed.lifecycle_billing_state,
+        completed.lifecycle_billing_observations,
+        completed.lifecycle_billing_selection,
+        completed.lifecycle_billing_corrections,
+        completed.lifecycle_billing_latest_reference,
+        completed.billing_last_checked_at,
+        completed.billing_next_check_at,
+        completed.billing_last_provider_error,
+        completed.billing_retention_exhausted,
+    ) == billing_before_final_receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "disposition",
     ["pending", "retryable", "completed"],
     ids=["pending", "retryable", "completed"],
@@ -266,7 +436,7 @@ async def test_completed_secondary_delayed_mismatch_preserves_disposition(
 @pytest.mark.asyncio
 async def test_genuinely_new_secondary_ack_reopens_completed_primary_cleanup(tmp_path):
     provider = FakeOllamaProvider(serverless_plan())
-    _, service, ready = await _ready_two_target_cleanup(
+    _, service, _ready = await _ready_two_target_cleanup(
         tmp_path,
         provider,
         database_name="new-secondary-positive.sqlite3",
@@ -409,7 +579,7 @@ async def _two_service_primary_race(tmp_path, *, second_primary_fails, database_
         owned_tasks.append(second_task)
         await asyncio.wait_for(coordinator.second_primary_entered.wait(), timeout=5)
         coordinator.allow_first_primary.set()
-        first_result = (await asyncio.gather(first_task, return_exceptions=True))[0]
+        first_result = await _bounded_owned_task_outcome(first_task)
         after_first = repository.get(claimed.lease_id)
         assert after_first is not None
         assert after_first.cleanup_receipt is not None
@@ -417,7 +587,7 @@ async def _two_service_primary_race(tmp_path, *, second_primary_fails, database_
         retry_after_first = after_first.reconcile_after
         clock.advance(10)
         coordinator.allow_second_primary.set()
-        second_result = (await asyncio.gather(second_task, return_exceptions=True))[0]
+        second_result = await _bounded_owned_task_outcome(second_task)
         durable = SQLiteOllamaLeaseRepository(repository.path).get(claimed.lease_id)
         assert durable is not None
         return (
@@ -429,12 +599,11 @@ async def _two_service_primary_race(tmp_path, *, second_primary_fails, database_
             durable,
         )
     finally:
-        coordinator.allow_first_primary.set()
-        coordinator.allow_second_primary.set()
-        for task in owned_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*owned_tasks, return_exceptions=True)
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks,
+            coordinator.allow_first_primary,
+            coordinator.allow_second_primary,
+        )
 
 
 @pytest.mark.asyncio
@@ -582,22 +751,24 @@ async def test_raw_sql_cannot_replace_first_primary_cleanup_receipt(tmp_path):
     assert current.cleanup_intent is not None
     replacement = _absence_receipt(current.cleanup_intent, microseconds=2)
 
-    with closing(sqlite3.connect(service.repository.path)) as connection:
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                """UPDATE ollama_leases
+    with (
+        closing(sqlite3.connect(service.repository.path)) as connection,
+        pytest.raises(sqlite3.IntegrityError),
+    ):
+        connection.execute(
+            """UPDATE ollama_leases
                    SET cleanup_receipt_json = ?, revision = revision + 1,
                        writer_epoch = writer_epoch + 1
                    WHERE lease_id = ?""",
-                (
-                    json.dumps(
-                        replacement.to_dict(),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    current.lease_id,
+            (
+                json.dumps(
+                    replacement.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
-            )
+                current.lease_id,
+            ),
+        )
     retained = service.repository.get(current.lease_id)
     assert retained is not None
     assert retained.cleanup_receipt == current.cleanup_receipt
@@ -663,16 +834,12 @@ async def test_reconciler_continues_after_concurrent_primary_completion(tmp_path
         owned_tasks.append(external_task)
         await asyncio.wait_for(coordinator.first_primary_entered.wait(), timeout=5)
         coordinator.allow_first_primary.set()
-        external_result = (await asyncio.gather(external_task, return_exceptions=True))[
-            0
-        ]
+        external_result = await _bounded_owned_task_outcome(external_task)
         assert _contains_exception_identity(
             external_result, coordinator.first_secondary_error
         )
         coordinator.allow_second_primary.set()
-        reconcile_result = (
-            await asyncio.gather(reconcile_task, return_exceptions=True)
-        )[0]
+        reconcile_result = await _bounded_owned_task_outcome(reconcile_task)
 
         assert not isinstance(reconcile_result, BaseException), repr(reconcile_result)
         unrelated = SQLiteOllamaLeaseRepository(repository.path).get(
@@ -687,12 +854,11 @@ async def test_reconciler_continues_after_concurrent_primary_completion(tmp_path
         assert completed.cleanup_receipt is not None
         assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
     finally:
-        coordinator.allow_first_primary.set()
-        coordinator.allow_second_primary.set()
-        for task in owned_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*owned_tasks, return_exceptions=True)
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks,
+            coordinator.allow_first_primary,
+            coordinator.allow_second_primary,
+        )
 
 
 class _SecondaryRaceCoordinator:
@@ -778,14 +944,14 @@ async def _two_service_secondary_race(
         owned_tasks.append(second_task)
         await asyncio.wait_for(coordinator.second_entered.wait(), timeout=5)
         coordinator.allow_first.set()
-        first_result = (await asyncio.gather(first_task, return_exceptions=True))[0]
+        first_result = await _bounded_owned_task_outcome(first_task)
         after_first = repository.get(admitted.lease_id)
         assert after_first is not None
         assert after_first.state is OllamaLeaseState.TERMINATED
         first_receipt = after_first.additional_cleanup_targets[0].cleanup_receipt
         assert first_receipt is not None
         coordinator.allow_second.set()
-        second_result = (await asyncio.gather(second_task, return_exceptions=True))[0]
+        second_result = await _bounded_owned_task_outcome(second_task)
         durable = SQLiteOllamaLeaseRepository(repository.path).get(admitted.lease_id)
         assert durable is not None
         return (
@@ -797,12 +963,11 @@ async def _two_service_secondary_race(
             durable,
         )
     finally:
-        coordinator.allow_first.set()
-        coordinator.allow_second.set()
-        for task in owned_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*owned_tasks, return_exceptions=True)
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks,
+            coordinator.allow_first,
+            coordinator.allow_second,
+        )
 
 
 @pytest.mark.asyncio

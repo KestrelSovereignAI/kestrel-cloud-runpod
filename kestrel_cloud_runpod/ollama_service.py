@@ -180,6 +180,18 @@ def _provisioning_deadline_reached(lease: OllamaLease, now: datetime) -> bool:
     return now >= min(lease.readiness_deadline, lease.hard_deadline)
 
 
+def _earlier_reconciliation_deadline(
+    lease: OllamaLease, deadline: datetime
+) -> datetime:
+    """Keep every already-scheduled earlier visit while adding a cutoff."""
+
+    return (
+        deadline
+        if lease.reconcile_after is None
+        else min(lease.reconcile_after, deadline)
+    )
+
+
 _ALLOWED_TRANSITIONS: Mapping[OllamaLeaseState, frozenset[OllamaLeaseState]] = {
     OllamaLeaseState.REQUESTED: frozenset(
         {
@@ -348,6 +360,8 @@ class OllamaLeaseService:
                 provision_requested_at=provision_requested_at,
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             self._transition(
                 lease,
                 OllamaLeaseState.FAILED,
@@ -385,6 +399,8 @@ class OllamaLeaseService:
                     "Prepared Ollama provisioning does not bind the accepted request"
                 )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             self._transition(
                 lease,
                 OllamaLeaseState.FAILED,
@@ -447,12 +463,16 @@ class OllamaLeaseService:
         try:
             resource = await self.provider.provision(prepared)
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             lease = self._persist_provisioning_mismatch(
                 lease, exc, acknowledged_create=True
             )
             await self._release(lease, reason="provisioning_evidence_mismatch")
             raise
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             # A response decoding/placement failure can happen AFTER the
             # provider accepted POST. Only planning failures before this
             # admitted effect prove that no create was attempted.
@@ -488,10 +508,14 @@ class OllamaLeaseService:
             )
             _validate_provisioning_receipt(receipt, prepared.intent)
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             lease = self._persist_provisioning_mismatch(lease, exc)
             await self._release(lease, reason="provisioning_evidence_mismatch")
             raise
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             self.repository.record_provisioning_outcome(
                 lease,
                 now=self._now(),
@@ -550,13 +574,17 @@ class OllamaLeaseService:
         accrued = accrued_cost(lease, now)
         if now >= lease.hard_deadline or over_authorized_cost(lease, now):
             return await self._release(lease, reason="deadline_or_cost_cap")
+        idle_deadline = min(
+            now + timedelta(seconds=lease.idle_timeout_seconds),
+            lease.hard_deadline,
+        )
         touched = self.repository.compare_and_set(
             lease,
             changes={
                 "last_used_at": now,
-                "idle_deadline": min(
-                    now + timedelta(seconds=lease.idle_timeout_seconds),
-                    lease.hard_deadline,
+                "idle_deadline": idle_deadline,
+                "reconcile_after": _earlier_reconciliation_deadline(
+                    lease, idle_deadline
                 ),
                 "accrued_estimated_cost": accrued,
             },
@@ -600,6 +628,8 @@ class OllamaLeaseService:
             try:
                 lease = await self._reconcile_one(claimed.lease_id)
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 lease = self._record_reconcile_error(claimed.lease_id, exc)
             if lease is not None:
                 results.append(lease)
@@ -642,6 +672,8 @@ class OllamaLeaseService:
         try:
             reconciled = await self._reconcile_one(lease_id)
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             recorded = self._record_reconcile_error(lease_id, exc)
             if recorded is None:
                 raise
@@ -676,7 +708,9 @@ class OllamaLeaseService:
         if lease.state is OllamaLeaseState.RELEASING:
             try:
                 return await self._release(lease, reason="retry_teardown")
-            except OllamaLeaseTeardownError:
+            except OllamaLeaseTeardownError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 return self._required(lease.lease_id)
         if (
             lease.provisioning_mismatch is not None
@@ -686,7 +720,9 @@ class OllamaLeaseService:
                 return await self._release(
                     lease, reason="provisioning_evidence_mismatch"
                 )
-            except OllamaLeaseTeardownError:
+            except OllamaLeaseTeardownError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 return self._required(lease.lease_id)
         if lease.provisioning_mismatch is not None:
             return lease
@@ -716,7 +752,9 @@ class OllamaLeaseService:
         if hard_expired or idle_expired or over_cost or readiness_expired:
             try:
                 return await self._release(lease, reason="expired")
-            except OllamaLeaseTeardownError:
+            except OllamaLeaseTeardownError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 return self._required(lease.lease_id)
         if lease.state is OllamaLeaseState.WAITING_FOR_MODEL:
             return await self._check_readiness_once(lease)
@@ -741,7 +779,9 @@ class OllamaLeaseService:
                     )
                 },
             )
-        except OllamaLeaseConflictError:
+        except OllamaLeaseConflictError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Ollama lease %s changed again while recording reconcile failure",
                 lease_id,
@@ -768,8 +808,9 @@ class OllamaLeaseService:
             if now >= lease.readiness_deadline:
                 try:
                     await self._release(lease, reason="readiness_timeout")
-                except OllamaLeaseTeardownError:
-                    pass
+                except OllamaLeaseTeardownError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                 raise OllamaLeaseReadinessError(
                     f"Ollama lease '{lease.lease_id}' did not become model-ready"
                 )
@@ -782,11 +823,15 @@ class OllamaLeaseService:
         try:
             observation = await self.provider.observe(resource, intent, provisioning)
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             mismatched = self._persist_provisioning_mismatch(lease, exc)
             return await self._release(
                 mismatched, reason="provisioning_evidence_mismatch"
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             now = self._now()
             failed = self.repository.compare_and_set(
                 lease,
@@ -847,6 +892,8 @@ class OllamaLeaseService:
                     resource, observation.route_url, lease.model
                 )
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 return self.repository.compare_and_set(
                     lease, changes={"last_provider_error": sanitize_provider_error(exc)}
                 )
@@ -857,16 +904,18 @@ class OllamaLeaseService:
                 return await self._release(lease, reason="readiness_timeout")
             return lease
         provisioning_started = lease.provisioning_started_at or lease.created_at
+        idle_deadline = min(
+            now + timedelta(seconds=lease.idle_timeout_seconds),
+            lease.hard_deadline,
+        )
         ready = self._transition(
             lease,
             OllamaLeaseState.READY,
             ready_at=now,
             model_ready_at=now,
             last_used_at=now,
-            idle_deadline=min(
-                now + timedelta(seconds=lease.idle_timeout_seconds),
-                lease.hard_deadline,
-            ),
+            idle_deadline=idle_deadline,
+            reconcile_after=_earlier_reconciliation_deadline(lease, idle_deadline),
             cold_start_seconds=(now - provisioning_started).total_seconds(),
             last_provider_error=None,
         )
@@ -893,11 +942,15 @@ class OllamaLeaseService:
                 resource_from_lease(lease), intent, provisioning
             )
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             mismatched = self._persist_provisioning_mismatch(lease, exc)
             return await self._release(
                 mismatched, reason="provisioning_evidence_mismatch"
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             now = self._now()
             accrued = accrued_cost(lease, now)
             if (
@@ -999,6 +1052,8 @@ class OllamaLeaseService:
             )
             _validate_provisioning_receipt(receipt, intent)
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             lease = self._persist_provisioning_mismatch(lease, exc)
             if lease.provider_resource_id is not None:
                 return await self._release(
@@ -1006,6 +1061,8 @@ class OllamaLeaseService:
                 )
             return lease
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             failed = self.repository.record_provisioning_outcome(
                 lease,
                 now=self._now(),
@@ -1139,8 +1196,12 @@ class OllamaLeaseService:
                         lease.provisioning_receipt,
                     )
                 except OllamaProvisioningMismatchError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     lease = self._persist_provisioning_mismatch(lease, exc)
                 except RunPodManagerError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     lease = self.repository.record_runtime_telemetry(
                         lease,
                         None,
@@ -1320,8 +1381,7 @@ class OllamaLeaseService:
                             failures.append(outcome.provider_failure)
                 except BaseException as exc:  # noqa: BLE001
                     failures.append(exc)
-                    if not _is_recoverable_cleanup_setup_failure(exc):
-                        stop_cleanup = True
+                    stop_cleanup = True
                 if stop_cleanup:
                     lease = current
                     break
@@ -1404,6 +1464,8 @@ class OllamaLeaseService:
         try:
             cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
         except OllamaLeaseTeardownError as exc:
+            if is_execution_control_error(exc):
+                raise
             if type(exc) is not OllamaLeaseTeardownError:
                 raise
             return self._record_retryable_cleanup_outcome(
@@ -1461,6 +1523,8 @@ class OllamaLeaseService:
         try:
             cleanup_receipt = await self.provider.teardown(resource, cleanup_intent)
         except OllamaLeaseTeardownError as exc:
+            if is_execution_control_error(exc):
+                raise
             if type(exc) is not OllamaLeaseTeardownError:
                 raise
             return self._record_retryable_cleanup_outcome(
@@ -1521,6 +1585,8 @@ class OllamaLeaseService:
             try:
                 resource = await self.provider.discover_provisioning_resource(intent)
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 return self.repository.record_provisioning_outcome(
                     lease,
                     now=self._now(),
@@ -1548,14 +1614,20 @@ class OllamaLeaseService:
             )
             _validate_provisioning_receipt(receipt, intent)
         except OllamaProvisioningMismatchError as exc:
+            if is_execution_control_error(exc):
+                raise
             return self._persist_provisioning_mismatch(lease, exc)
         except OllamaProvisioningEvidenceError as exc:
+            if is_execution_control_error(exc):
+                raise
             return self.repository.record_provisioning_outcome(
                 lease,
                 now=self._now(),
                 provider_error=f"{reason}: {sanitize_provider_error(exc)}",
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             return self.repository.record_provisioning_outcome(
                 lease,
                 now=self._now(),
@@ -1621,6 +1693,8 @@ class OllamaLeaseService:
                     intent, provisioning, cleanup_intent, cleanup
                 )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             checked_at = self._now()
             return self.repository.record_billing_outcome(
                 lease,

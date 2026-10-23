@@ -11,6 +11,8 @@ from pod_capacity_test_support import (
     RESULT_SHA,
     TOKEN,
     acknowledgement,
+    execution_control_carrier,
+    record_control_injection,
 )
 from pydantic import SecretStr
 
@@ -23,6 +25,52 @@ from kestrel_cloud_runpod.pod_transport import (
 
 ATTEMPT = "attempt:catalog-run-0001"
 BASE = "https://pod-1-8080.proxy.runpod.net"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["timeout", "transport"])
+async def test_catalog_transport_preserves_exact_execution_control(
+    kind, record_property
+) -> None:
+    error_type = httpx.ReadTimeout if kind == "timeout" else httpx.ConnectError
+    carrier, control, explicit = execution_control_carrier(
+        error_type(f"catalog {kind} outcome remains unknown")
+    )
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        record_control_injection(record_property, f"catalog-transport-{kind}")
+        raise carrier
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(type(carrier)) as raised:
+        await transport.health(BASE)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit is control
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["timeout", "transport"])
+async def test_catalog_transport_retains_ordinary_error_contract(kind) -> None:
+    error_type = httpx.ReadTimeout if kind == "timeout" else httpx.ConnectError
+    ordinary = error_type(f"ordinary catalog {kind} failure")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise ordinary
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(CatalogPodTransportError) as raised:
+        await transport.health(BASE)
+
+    assert raised.value.__cause__ is ordinary
+    assert len(calls) == 1
 
 
 def _payload() -> dict[str, object]:

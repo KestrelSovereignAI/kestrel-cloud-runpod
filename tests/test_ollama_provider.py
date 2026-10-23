@@ -3,13 +3,16 @@
 import asyncio
 import json
 import sqlite3
+import sys
 import threading
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing import get_context
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import httpcore
@@ -19,14 +22,23 @@ from jsonschema import Draft202012Validator
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
+    OwnedLoopbackHTTPServer,
+    OwnedSpawnProcesses,
     make_request,
     non_compute_cost_policy,
     pod_plan,
+    release_gates_and_boundedly_join_owned_tasks,
     runtime_telemetry_payload,
     serverless_plan,
 )
-from pod_capacity_test_support import native_httpx_connect_failure
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    native_httpx_connect_failure,
+    native_pod_action_harness,
+    record_control_injection,
+)
 
+import kestrel_cloud_runpod.ollama_provider as ollama_provider_module
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.models import (
     Availability,
@@ -144,6 +156,7 @@ class _ControlClient:
         self.pod_request = None
         self.actions = []
         self.delete_error = None
+        self.error_callback = None
         self.absent = set()
         self.pod = None
         self.endpoint = EndpointResource(
@@ -234,6 +247,8 @@ class _ControlClient:
 
     def delete_endpoint(self, endpoint_id):
         if self.delete_error:
+            if self.error_callback is not None:
+                self.error_callback("delete")
             if self.delete_error.status_code == 404:
                 self.absent.add(endpoint_id)
             raise self.delete_error
@@ -307,6 +322,170 @@ async def _readiness_authority(provider, mode):
         )
     receipt = await provider.observe_provisioning(prepared.intent, resource)
     return resource, prepared.intent, receipt, prepared
+
+
+def _execution_control_carrier(error):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    control = ExecutionCommitOutcomeError("unknown")
+    error.__cause__ = control
+    return error, control
+
+
+@pytest.mark.asyncio
+async def test_plan_does_not_aggregate_a_manager_carried_execution_control():
+    client = _ControlClient()
+    carrier, control = _execution_control_carrier(
+        RunPodAPIError(
+            title="Control",
+            detail="catalog result remains unknown",
+            status_code=503,
+        )
+    )
+
+    def controlled_catalog(**_kwargs):
+        raise carrier
+
+    client.list_gpus = controlled_catalog
+    provider = _provider(client=client)
+
+    with pytest.raises(RunPodAPIError) as raised:
+        await provider.plan(make_request(MutableClock()))
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "carrier_type",
+    [RunPodAPIError, OllamaProvisioningEvidenceError],
+    ids=("ordinary-manager-wrapper", "typed-evidence-preserved"),
+)
+async def test_provisioning_readback_adapter_preserves_execution_control_graph(
+    monkeypatch, carrier_type
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider = _provider()
+    resource, intent, _receipt, _prepared = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+    if carrier_type is RunPodAPIError:
+        error = carrier_type(
+            title="Control",
+            detail="readback outcome remains unknown",
+            status_code=503,
+        )
+    else:
+        error = carrier_type("typed readback evidence remains unknown")
+    carrier, control = _execution_control_carrier(error)
+
+    def controlled_validation(*_args, **_kwargs):
+        raise carrier
+
+    monkeypatch.setattr(
+        ollama_provider_module,
+        "_validate_endpoint_provisioning",
+        controlled_validation,
+    )
+
+    with pytest.raises(carrier_type) as raised:
+        await provider.observe_provisioning(intent, resource)
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "endpoint-runtime",
+        "endpoint-gpu",
+        "endpoint-list",
+        "pod-runtime",
+        "pod-networking",
+    ],
+)
+async def test_typed_readback_field_adapter_does_not_erase_execution_control(
+    monkeypatch, boundary
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    mode = (
+        OllamaLeaseMode.DEDICATED_POD
+        if boundary.startswith("pod-")
+        else OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+    provider = _provider()
+    resource, intent, _receipt, _prepared = await _readiness_authority(provider, mode)
+    carrier, control = _execution_control_carrier(
+        OllamaProvisioningEvidenceError(f"{boundary} typed evidence remains unknown")
+    )
+    if boundary in {"endpoint-runtime", "pod-runtime"}:
+        original = ollama_provider_module._typed_runtime_value
+
+        def controlled_runtime_value(key, value, *, context):
+            if context == ("Pod" if boundary.startswith("pod-") else "Endpoint"):
+                raise carrier
+            return original(key, value, context=context)
+
+        monkeypatch.setattr(
+            ollama_provider_module, "_typed_runtime_value", controlled_runtime_value
+        )
+    elif boundary == "endpoint-gpu":
+        original = ollama_provider_module._required_int
+
+        def controlled_required_int(value, context):
+            if context == "Endpoint.gpu.count":
+                raise carrier
+            return original(value, context)
+
+        monkeypatch.setattr(
+            ollama_provider_module, "_required_int", controlled_required_int
+        )
+    elif boundary == "endpoint-list":
+        original = ollama_provider_module._string_tuple
+
+        def controlled_string_tuple(value, context):
+            if context == "Endpoint.dataCenterIds":
+                raise carrier
+            return original(value, context)
+
+        monkeypatch.setattr(
+            ollama_provider_module, "_string_tuple", controlled_string_tuple
+        )
+    else:
+
+        def controlled_global_networking(_value):
+            raise carrier
+
+        monkeypatch.setattr(
+            ollama_provider_module,
+            "_pod_global_networking_enabled",
+            controlled_global_networking,
+        )
+
+    observed = (
+        provider.client.pod
+        if mode is OllamaLeaseMode.DEDICATED_POD
+        else provider.client.endpoint
+    )
+    validator = (
+        ollama_provider_module._validate_pod_provisioning
+        if mode is OllamaLeaseMode.DEDICATED_POD
+        else ollama_provider_module._validate_endpoint_provisioning
+    )
+    assert observed is not None
+    with pytest.raises(OllamaProvisioningEvidenceError) as raised:
+        validator(
+            observed,
+            intent,
+            provider_resource_id=resource.provider_resource_id,
+            observed_at=intent.provision_requested_at,
+        )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
 
 
 def _runtime_telemetry_response(prepared):
@@ -536,12 +715,16 @@ async def test_prepared_request_is_single_use_safe_and_mutation_detected(monkeyp
 
     client.create_endpoint = delayed_create
     provision = asyncio.create_task(provider.provision(prepared))
-    assert await asyncio.to_thread(entered.wait, 5)
-    with pytest.raises(TypeError):
-        prepared.provider_request.env["KESTREL_OLLAMA_REQUIRED_MODEL"] = "wrong:latest"
-    with pytest.raises(TypeError):
-        prepared.provider_request.scaling["requestCount"] = 2
-    resume.set()
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        with pytest.raises(TypeError):
+            prepared.provider_request.env["KESTREL_OLLAMA_REQUIRED_MODEL"] = (
+                "wrong:latest"
+            )
+        with pytest.raises(TypeError):
+            prepared.provider_request.scaling["requestCount"] = 2
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(provision, resume)
     resource = await provision
 
     assert resource.provider_resource_id == "endpoint-1"
@@ -603,10 +786,7 @@ async def test_ollama_refuses_unaccepted_global_storage_before_workload_requests
         mismatch.value.evidence.reason
         is OllamaProvisioningMismatchReason.ENDPOINT_POLICY
     )
-    assert (
-        mismatch.value.evidence.provider_resource_id
-        == resource.provider_resource_id
-    )
+    assert mismatch.value.evidence.provider_resource_id == resource.provider_resource_id
     mismatch.value.evidence.validate_intent(intent)
     assert seen == []
 
@@ -662,6 +842,324 @@ async def test_observe_requires_provider_health_and_reads_exact_model(monkeypatc
         "/api/tags",
         "/kestrel/telemetry",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "serverless-health",
+        "serverless-models",
+        "pod-anonymous",
+        "pod-health",
+        "telemetry-http",
+        "telemetry-json",
+        "telemetry-contract",
+    ],
+)
+async def test_workload_probe_preserves_exact_execution_control(
+    monkeypatch, boundary, record_property
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    mode = (
+        OllamaLeaseMode.DEDICATED_POD
+        if boundary.startswith("pod-")
+        else OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+    caught_type = (
+        httpx.ConnectError
+        if boundary
+        in {
+            "serverless-health",
+            "serverless-models",
+            "pod-anonymous",
+            "pod-health",
+            "telemetry-http",
+        }
+        else ValueError
+    )
+    carrier, control = _execution_control_carrier(
+        caught_type(f"{boundary} outcome remains unknown")
+    )
+    requests: list[str] = []
+    authority = {}
+    telemetry_requested = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal telemetry_requested
+        path = request.url.path
+        requests.append(path)
+        if path == "/kestrel/telemetry":
+            telemetry_requested = True
+        target = {
+            "serverless-health": "/ping",
+            "serverless-models": "/api/tags",
+            "pod-anonymous": "/api/tags",
+            "pod-health": "/ping",
+            "telemetry-http": "/kestrel/telemetry",
+        }.get(boundary)
+        if target == path and (
+            boundary != "pod-anonymous" or "Authorization" not in request.headers
+        ):
+            record_control_injection(record_property, boundary)
+            raise carrier
+        if (
+            mode is OllamaLeaseMode.DEDICATED_POD
+            and "Authorization" not in request.headers
+        ):
+            return httpx.Response(401)
+        if path == "/ping":
+            return httpx.Response(200)
+        if path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+        if path == "/kestrel/telemetry":
+            return _runtime_telemetry_response(authority["prepared"])
+        raise AssertionError(path)
+
+    provider = _provider(transport=httpx.MockTransport(handler))
+    resource, intent, receipt, prepared = await _readiness_authority(provider, mode)
+    authority["prepared"] = prepared
+    if boundary == "telemetry-json":
+        original_json = httpx.Response.json
+
+        def controlled_json(response, **kwargs):
+            if response.request.url.path == "/kestrel/telemetry":
+                record_control_injection(record_property, boundary)
+                raise carrier
+            return original_json(response, **kwargs)
+
+        monkeypatch.setattr(httpx.Response, "json", controlled_json)
+    elif boundary == "telemetry-contract":
+        original_clock = provider._clock
+
+        def controlled_clock():
+            if telemetry_requested:
+                record_control_injection(record_property, boundary)
+                raise carrier
+            return original_clock()
+
+        provider._clock = controlled_clock
+
+    with pytest.raises(type(carrier)) as raised:
+        await provider.observe(resource, intent, receipt)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is control
+    assert (
+        requests
+        == {
+            "serverless-health": ["/ping"],
+            "serverless-models": ["/ping", "/api/tags"],
+            "pod-anonymous": ["/api/tags"],
+            "pod-health": ["/api/tags", "/ping"],
+            "telemetry-http": ["/ping", "/api/tags", "/kestrel/telemetry"],
+            "telemetry-json": ["/ping", "/api/tags", "/kestrel/telemetry"],
+            "telemetry-contract": ["/ping", "/api/tags", "/kestrel/telemetry"],
+        }[boundary]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "serverless-health",
+        "serverless-models",
+        "pod-anonymous",
+        "pod-health",
+        "telemetry-http",
+        "telemetry-json",
+        "telemetry-contract",
+    ],
+)
+async def test_workload_probe_retains_ordinary_normalization_contract(
+    monkeypatch, boundary
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    mode = (
+        OllamaLeaseMode.DEDICATED_POD
+        if boundary.startswith("pod-")
+        else OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+    requests = []
+    authority = {}
+    telemetry_requested = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal telemetry_requested
+        path = request.url.path
+        requests.append(path)
+        if path == "/kestrel/telemetry":
+            telemetry_requested = True
+        target = {
+            "serverless-health": "/ping",
+            "serverless-models": "/api/tags",
+            "pod-anonymous": "/api/tags",
+            "pod-health": "/ping",
+            "telemetry-http": "/kestrel/telemetry",
+        }.get(boundary)
+        if target == path and (
+            boundary != "pod-anonymous" or "Authorization" not in request.headers
+        ):
+            raise httpx.ConnectError(f"ordinary {boundary} failure")
+        if (
+            mode is OllamaLeaseMode.DEDICATED_POD
+            and "Authorization" not in request.headers
+        ):
+            return httpx.Response(401)
+        if path == "/ping":
+            return httpx.Response(200)
+        if path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:8b"}]})
+        if path == "/kestrel/telemetry":
+            return _runtime_telemetry_response(authority["prepared"])
+        raise AssertionError(path)
+
+    provider = _provider(transport=httpx.MockTransport(handler))
+    resource, intent, receipt, prepared = await _readiness_authority(provider, mode)
+    authority["prepared"] = prepared
+    if boundary == "telemetry-json":
+        original_json = httpx.Response.json
+
+        def invalid_json(response, **kwargs):
+            if response.request.url.path == "/kestrel/telemetry":
+                raise ValueError("ordinary invalid telemetry JSON")
+            return original_json(response, **kwargs)
+
+        monkeypatch.setattr(httpx.Response, "json", invalid_json)
+    elif boundary == "telemetry-contract":
+        original_clock = provider._clock
+
+        def invalid_clock():
+            if telemetry_requested:
+                raise ValueError("ordinary telemetry observation clock failure")
+            return original_clock()
+
+        provider._clock = invalid_clock
+
+    if boundary.startswith("telemetry-"):
+        with pytest.raises(RunPodManagerError) as raised:
+            await provider.observe(resource, intent, receipt)
+        assert type(raised.value.__cause__) in {
+            httpx.ConnectError,
+            ValueError,
+        }
+    else:
+        observation = await provider.observe(resource, intent, receipt)
+        if boundary == "serverless-health":
+            assert observation.provider_ready is False
+            assert observation.model_names == ("qwen3:8b",)
+        elif boundary == "serverless-models":
+            assert observation.provider_ready is True
+            assert observation.model_names == ()
+        else:
+            assert observation.provider_ready is False
+            assert observation.model_names == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["delete", "readback"])
+async def test_teardown_auth_translation_preserves_exact_execution_control(
+    phase, record_property
+):
+    client = _ControlClient()
+    carrier, control = _execution_control_carrier(
+        RunPodAPIError(
+            title="authorization",
+            detail="cleanup authorization remains unknown",
+            status_code=401,
+        )
+    )
+    if phase == "delete":
+        client.error_callback = lambda _phase: record_control_injection(
+            record_property, f"teardown-{phase}"
+        )
+        client.delete_error = carrier
+    else:
+
+        def controlled_readback(_endpoint_id):
+            record_control_injection(record_property, f"teardown-{phase}")
+            raise carrier
+
+        client.get_endpoint = controlled_readback
+    provider = _provider(client=client)
+    resource = ProvisionedOllamaResource(
+        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+        provider_resource_id="endpoint-1",
+        resource_name="resource",
+    )
+
+    with pytest.raises(RunPodAPIError) as raised:
+        await provider.teardown(resource, _cleanup_intent(resource))
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is control
+    assert client.actions == ([] if phase == "delete" else [("endpoint-1", "delete")])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "status_code"),
+    [
+        pytest.param("delete", 401, id="delete-401"),
+        pytest.param("delete", 403, id="delete-403"),
+        pytest.param("readback", 401, id="readback-401"),
+        pytest.param("readback", 403, id="readback-403"),
+    ],
+)
+async def test_teardown_auth_translation_retains_ordinary_contract(phase, status_code):
+    client = _ControlClient()
+    error = RunPodAPIError(
+        title="authorization",
+        detail="cleanup authorization was rejected",
+        status_code=status_code,
+    )
+    if phase == "delete":
+        client.delete_error = error
+    else:
+
+        def rejected_readback(_endpoint_id):
+            raise error
+
+        client.get_endpoint = rejected_readback
+    provider = _provider(client=client)
+    resource = ProvisionedOllamaResource(
+        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+        provider_resource_id="endpoint-1",
+        resource_name="resource",
+    )
+
+    with pytest.raises(OllamaLeaseAuthorizationError) as raised:
+        await provider.teardown(resource, _cleanup_intent(resource))
+
+    assert raised.value.__cause__ is error
+    assert client.actions == ([] if phase == "delete" else [("endpoint-1", "delete")])
+
+
+@pytest.mark.asyncio
+async def test_teardown_retryable_control_graph_is_not_reclassified():
+    client = _ControlClient()
+    carrier, control = _execution_control_carrier(
+        RunPodAPIError(
+            title="unavailable",
+            detail="cleanup outcome remains unknown",
+            status_code=503,
+        )
+    )
+    client.delete_error = carrier
+    provider = _provider(client=client)
+    resource = ProvisionedOllamaResource(
+        resource_type=OllamaResourceType.SERVERLESS_ENDPOINT,
+        provider_resource_id="endpoint-1",
+        resource_name="resource",
+    )
+
+    with pytest.raises(RunPodAPIError) as raised:
+        await provider.teardown(resource, _cleanup_intent(resource))
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is control
+    assert client.actions == []
 
 
 @pytest.mark.asyncio
@@ -968,22 +1466,17 @@ def native_teardown():
         def do_GET(self):
             self.respond(action=False)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    client = RunpodControlPlaneClient(
-        api_key="local-loopback-only",
-        base_url=f"http://127.0.0.1:{server.server_port}/v2",
-        max_safe_retries=0,
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=lambda: ThreadingHTTPServer(("127.0.0.1", 0), Handler),
+        thread_factory=lambda server: threading.Thread(target=server.serve_forever),
+        client_factory=lambda server: RunpodControlPlaneClient(
+            api_key="local-loopback-only",
+            base_url=f"http://127.0.0.1:{server.server_port}/v2",
+            max_safe_retries=0,
+        ),
     )
-    try:
+    with owner as client:
         yield _provider(client=client), state
-    finally:
-        client.close()
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-        assert not thread.is_alive()
 
 
 @pytest.fixture
@@ -1166,22 +1659,497 @@ def native_provisioning():
             state["present"] = False
             self.respond(204, {})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    client = RunpodControlPlaneClient(
-        api_key="local-loopback-only",
-        base_url=f"http://127.0.0.1:{server.server_port}/v2",
-        max_safe_retries=0,
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=lambda: ThreadingHTTPServer(("127.0.0.1", 0), Handler),
+        thread_factory=lambda server: threading.Thread(target=server.serve_forever),
+        client_factory=lambda server: RunpodControlPlaneClient(
+            api_key="local-loopback-only",
+            base_url=f"http://127.0.0.1:{server.server_port}/v2",
+            max_safe_retries=0,
+        ),
     )
-    try:
+    with owner as client:
         yield _provider(client=client), state
+
+
+def _native_loopback_fixture_ownership_child(
+    fixture_name,
+    failure_stage,
+    result_queue,
+):
+    """Exercise an actual fixture, then finitely rescue only captured resources."""
+
+    fixture_namespace = (
+        native_pod_action_harness.__wrapped__.__globals__
+        if fixture_name == "pod-action"
+        else globals()
+    )
+    real_threading = fixture_namespace["threading"]
+    real_server_type = fixture_namespace["ThreadingHTTPServer"]
+    real_client_type = fixture_namespace["RunpodControlPlaneClient"]
+    captured = {
+        "server": None,
+        "server_shutdown": None,
+        "server_close": None,
+        "thread": None,
+        "thread_join": None,
+        "client": None,
+        "client_close": None,
+    }
+    explicit_cause = ValueError("native fixture injected explicit cause")
+    injected = RuntimeError(
+        f"native fixture {fixture_name} failed during {failure_stage}"
+    )
+    injected.__cause__ = explicit_cause
+    monkeypatch = pytest.MonkeyPatch()
+
+    def server_factory(*args, **kwargs):
+        server = real_server_type(*args, **kwargs)
+        captured["server"] = server
+        captured["server_shutdown"] = server.shutdown
+        captured["server_close"] = server.server_close
+        if failure_stage == "server-shutdown":
+
+            def fail_shutdown():
+                captured["server_shutdown"]()
+                raise injected
+
+            server.shutdown = fail_shutdown
+        return server
+
+    def thread_factory(*args, **kwargs):
+        thread = real_threading.Thread(*args, **kwargs)
+        captured["thread"] = thread
+        captured["thread_join"] = thread.join
+        if failure_stage == "thread-start":
+            original_start = thread.start
+
+            def fail_start():
+                original_start()
+                raise injected
+
+            thread.start = fail_start
+        elif failure_stage == "thread-join":
+
+            def fail_join(*join_args, **join_kwargs):
+                captured["thread_join"](*join_args, **join_kwargs)
+                raise injected
+
+            thread.join = fail_join
+        return thread
+
+    def client_factory(*args, **kwargs):
+        if failure_stage == "client-constructor":
+            raise injected
+        client = real_client_type(*args, **kwargs)
+        captured["client"] = client
+        captured["client_close"] = client.close
+        if failure_stage == "client-close":
+
+            def fail_close():
+                captured["client_close"]()
+                raise injected
+
+            client.close = fail_close
+        return client
+
+    def resource_facts():
+        server = captured["server"]
+        thread = captured["thread"]
+        client = captured["client"]
+        server_open = server is not None and server.fileno() != -1
+        thread_alive = thread is not None and thread.is_alive()
+        client_open = client is not None and not client.transport._client.is_closed
+        return {
+            "server_open": server_open,
+            "thread_alive": thread_alive,
+            "client_present": client is not None,
+            "client_open": client_open,
+            "leaked": server_open or thread_alive or client_open,
+        }
+
+    def invoke_actual_fixture():
+        if fixture_name == "pod-action":
+            with native_pod_action_harness():
+                pass
+            return
+        fixture = (
+            native_teardown
+            if fixture_name == "native-teardown"
+            else native_provisioning
+        )
+        generator = fixture.__wrapped__()
+        try:
+            next(generator)
+            try:
+                next(generator)
+            except StopIteration:
+                pass
+        finally:
+            generator.close()
+
+    monkeypatch.setitem(fixture_namespace, "ThreadingHTTPServer", server_factory)
+    monkeypatch.setitem(
+        fixture_namespace,
+        "threading",
+        SimpleNamespace(Thread=thread_factory),
+    )
+    monkeypatch.setitem(fixture_namespace, "RunpodControlPlaneClient", client_factory)
+    if failure_stage == "provider-constructor":
+        if fixture_name == "pod-action":
+
+            def fail_provider(*_args, **_kwargs):
+                raise injected
+
+            monkeypatch.setitem(
+                fixture_namespace,
+                "DirectRunPodProvider",
+                fail_provider,
+            )
+        else:
+
+            def fail_provider(**_kwargs):
+                raise injected
+
+            monkeypatch.setattr(sys.modules[__name__], "_provider", fail_provider)
+
+    caught = None
+    pre_rescue = None
+    try:
+        try:
+            invoke_actual_fixture()
+        except BaseException as error:  # noqa: BLE001 - assert exact injected graph
+            caught = error
+        pre_rescue = resource_facts()
+        assert caught is injected
+        assert caught.__cause__ is explicit_cause
+        assert caught.__traceback__ is not None
     finally:
-        client.close()
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-        assert not thread.is_alive()
+        try:
+            client = captured["client"]
+            if client is not None and not client.transport._client.is_closed:
+                captured["client_close"]()
+        finally:
+            try:
+                thread = captured["thread"]
+                if thread is not None and thread.is_alive():
+                    captured["server_shutdown"]()
+            finally:
+                try:
+                    server = captured["server"]
+                    if server is not None and server.fileno() != -1:
+                        captured["server_close"]()
+                finally:
+                    thread = captured["thread"]
+                    if thread is not None:
+                        captured["thread_join"](
+                            timeout=5,
+                        )
+        monkeypatch.undo()
+
+    post_rescue = resource_facts()
+    assert pre_rescue is not None
+    assert not post_rescue["server_open"]
+    assert not post_rescue["thread_alive"]
+    assert not post_rescue["client_open"]
+    result_queue.put(
+        {
+            "fixture": fixture_name,
+            "failure_stage": failure_stage,
+            "pre_rescue": pre_rescue,
+            "post_rescue": post_rescue,
+            "exact_error": True,
+        }
+    )
+
+
+def test_owned_loopback_server_cleans_early_client_constructor_failure():
+    events = []
+    opening, control, explicit = execution_control_carrier(
+        RuntimeError("client constructor failed"),
+        grouped=True,
+    )
+
+    class Server:
+        server_port = 1
+
+        def serve_forever(self):
+            raise AssertionError("fake server target is not executed")
+
+        def shutdown(self):
+            events.append("server-shutdown")
+
+        def server_close(self):
+            events.append("server-close")
+
+    class Thread:
+        ident = None
+
+        def __init__(self):
+            self.alive = False
+
+        def start(self):
+            self.ident = 1
+            self.alive = True
+            events.append("thread-start")
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, *, timeout):
+            assert timeout == 5
+            events.append("thread-join")
+            self.alive = False
+
+    def client_factory(_server):
+        raise opening
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=Server,
+        thread_factory=lambda _server: Thread(),
+        client_factory=client_factory,
+    )
+
+    with pytest.raises(RuntimeError) as caught, owner:
+        raise AssertionError("client construction unexpectedly succeeded")
+
+    assert caught.value is opening
+    assert opening.__cause__ is explicit
+    assert explicit.exceptions[0] is control
+    assert events == [
+        "thread-start",
+        "server-shutdown",
+        "thread-join",
+        "server-close",
+    ]
+    assert owner.client is None
+    assert owner.cleanup_errors == ()
+
+
+@pytest.mark.parametrize(
+    "body_type",
+    [RuntimeError, GeneratorExit],
+    ids=["ordinary-control", "generator-close-control"],
+)
+def test_owned_loopback_server_retains_body_and_every_cleanup_failure(body_type):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    events = []
+    body, control, explicit = execution_control_carrier(
+        body_type("body failed"),
+        grouped=True,
+    )
+    client_error = ValueError("client close failed")
+    shutdown_error = RuntimeError("server shutdown failed")
+    join_error = OSError("thread join failed")
+    close_error = RuntimeError("server close failed")
+
+    class Server:
+        def serve_forever(self):
+            raise AssertionError("fake server target is not executed")
+
+        def shutdown(self):
+            events.append("server-shutdown")
+            raise shutdown_error
+
+        def server_close(self):
+            events.append("server-close")
+            raise close_error
+
+    class Thread:
+        ident = 1
+
+        def __init__(self):
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+            events.append("thread-start")
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, *, timeout):
+            assert timeout == 5
+            events.append("thread-join")
+            self.alive = False
+            raise join_error
+
+    class Client:
+        def close(self):
+            events.append("client-close")
+            raise client_error
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=Server,
+        thread_factory=lambda _server: Thread(),
+        client_factory=lambda _server: Client(),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught, owner:
+        raise body
+
+    assert is_execution_control_error(caught.value)
+    assert caught.value.exceptions == (
+        body,
+        client_error,
+        shutdown_error,
+        join_error,
+        close_error,
+    )
+    assert body.__cause__ is explicit
+    assert explicit.exceptions[0] is control
+    assert owner.cleanup_errors == (
+        client_error,
+        shutdown_error,
+        join_error,
+        close_error,
+    )
+    assert events == [
+        "thread-start",
+        "client-close",
+        "server-shutdown",
+        "thread-join",
+        "server-close",
+    ]
+
+
+def test_owned_loopback_server_reports_an_unsettled_thread_after_all_cleanup():
+    events = []
+
+    class Server:
+        def serve_forever(self):
+            raise AssertionError("fake server target is not executed")
+
+        def shutdown(self):
+            events.append("server-shutdown")
+
+        def server_close(self):
+            events.append("server-close")
+
+    class Thread:
+        ident = 1
+
+        def start(self):
+            events.append("thread-start")
+
+        def is_alive(self):
+            return True
+
+        def join(self, *, timeout):
+            assert timeout == 5
+            events.append("thread-join")
+
+    class Client:
+        def close(self):
+            events.append("client-close")
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=Server,
+        thread_factory=lambda _server: Thread(),
+        client_factory=lambda _server: Client(),
+    )
+
+    with (
+        pytest.raises(
+            AssertionError,
+            match="owned loopback server thread did not terminate",
+        ),
+        owner,
+    ):
+        pass
+
+    assert events == [
+        "thread-start",
+        "client-close",
+        "server-shutdown",
+        "thread-join",
+        "server-close",
+    ]
+    assert len(owner.cleanup_errors) == 1
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "failure_stage"),
+    [
+        pytest.param("pod-action", "thread-start", id="pod-action-thread-start"),
+        pytest.param(
+            "pod-action", "client-constructor", id="pod-action-client-constructor"
+        ),
+        pytest.param(
+            "pod-action", "provider-constructor", id="pod-action-provider-constructor"
+        ),
+        pytest.param("pod-action", "client-close", id="pod-action-client-close"),
+        pytest.param(
+            "native-teardown",
+            "client-constructor",
+            id="native-teardown-client-constructor",
+        ),
+        pytest.param(
+            "native-teardown",
+            "provider-constructor",
+            id="native-teardown-provider-constructor-control",
+        ),
+        pytest.param(
+            "native-teardown", "client-close", id="native-teardown-client-close"
+        ),
+        pytest.param(
+            "native-teardown",
+            "server-shutdown",
+            id="native-teardown-server-shutdown",
+        ),
+        pytest.param(
+            "native-provisioning",
+            "client-constructor",
+            id="native-provisioning-client-constructor",
+        ),
+        pytest.param(
+            "native-provisioning",
+            "provider-constructor",
+            id="native-provisioning-provider-constructor-control",
+        ),
+        pytest.param(
+            "native-provisioning",
+            "client-close",
+            id="native-provisioning-client-close",
+        ),
+        pytest.param(
+            "native-provisioning",
+            "thread-join",
+            id="native-provisioning-thread-join",
+        ),
+    ],
+)
+def test_native_loopback_fixture_failure_owns_every_started_resource(
+    fixture_name,
+    failure_stage,
+):
+    context = get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_native_loopback_fixture_ownership_child,
+        args=(fixture_name, failure_stage, result_queue),
+    )
+    ownership = OwnedSpawnProcesses(
+        (process,),
+        gates=(),
+        queues=(result_queue,),
+    )
+    with ownership:
+        result = result_queue.get(timeout=15)
+        ownership.join()
+
+    assert ownership.final_exitcodes == [0]
+    assert ownership.forced_cleanup == []
+    assert ownership.cleanup_failures == []
+    assert ownership.closed_processes == 1
+    assert result["fixture"] == fixture_name
+    assert result["failure_stage"] == failure_stage
+    assert result["exact_error"] is True
+    assert result["post_rescue"]["leaked"] is False
+    if failure_stage == "client-constructor":
+        assert result["pre_rescue"]["client_present"] is False
+    assert result["pre_rescue"]["leaked"] is False
 
 
 def _native_readiness_provider(fixture_provider, state, clock):
@@ -1594,7 +2562,7 @@ async def test_native_late_valid_receipt_survives_receiptless_completed_cleanup(
         service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
     )
     try:
-        await first_readback_entered.wait()
+        await asyncio.wait_for(first_readback_entered.wait(), timeout=5)
         closed = await service.release(
             request.lease_id,
             owner_id=request.owner_id,
@@ -1605,7 +2573,9 @@ async def test_native_late_valid_receipt_survives_receiptless_completed_cleanup(
         assert closed.cleanup_intent.provisioning_receipt_id is None
         assert closed.cleanup_receipt is not None
     finally:
-        first_readback_finished.set()
+        await release_gates_and_boundedly_join_owned_tasks(
+            acquire, first_readback_finished
+        )
 
     completed = await acquire
     durable = repository.get(request.lease_id)
@@ -1679,7 +2649,7 @@ async def test_native_late_first_receipt_enrolls_completed_cleanup_for_billing(
         service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
     )
     try:
-        await first_readback_entered.wait()
+        await asyncio.wait_for(first_readback_entered.wait(), timeout=5)
         clock.advance(3700)
         if enrollment_exclusion == "cleanup_incomplete":
 
@@ -1712,7 +2682,9 @@ async def test_native_late_first_receipt_enrolls_completed_cleanup_for_billing(
             assert closed.cleanup_receipt is not None
         assert closed.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
     finally:
-        first_readback_finished.set()
+        await release_gates_and_boundedly_join_owned_tasks(
+            acquire, first_readback_finished
+        )
 
     if enrollment_exclusion == "cleanup_incomplete":
         with pytest.raises(OllamaLeaseTeardownError):
@@ -3007,9 +3979,11 @@ async def test_native_wrong_name_post_ack_survives_concurrent_release(
                 workload_id=request.workload_id,
             )
     finally:
-        client.create_finish.set()
-        with pytest.raises(OllamaProvisioningMismatchError):
-            await acquire
+        await release_gates_and_boundedly_join_owned_tasks(
+            acquire, client.create_finish
+        )
+    with pytest.raises(OllamaProvisioningMismatchError):
+        await acquire
 
     durable = repository.get(request.lease_id)
     assert durable.state is OllamaLeaseState.TERMINATED
@@ -3088,7 +4062,9 @@ async def test_native_original_ack_survives_different_candidate_mismatch(
                 workload_id=request.workload_id,
             )
     finally:
-        client.create_finish.set()
+        await release_gates_and_boundedly_join_owned_tasks(
+            acquire, client.create_finish
+        )
 
     completed = await acquire
     assert completed.state is OllamaLeaseState.TERMINATED
@@ -3210,6 +4186,7 @@ async def _run_native_late_original_ack_with_cleanup_failure(
         http_transport=httpx.MockTransport(control_handler),
         max_safe_retries=0,
     )
+    owned_tasks = []
     try:
         deployment = replace(
             _deployment(), profile=replace(_profile(), image_name=_TEST_IMAGE)
@@ -3236,34 +4213,41 @@ async def _run_native_late_original_ack_with_cleanup_failure(
         acquire = asyncio.create_task(
             service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
         )
-        assert await asyncio.to_thread(post_entered.wait, 5)
-        adopted = await service.reconcile_lease(
-            request.lease_id,
-            owner_id=request.owner_id,
-            workload_id=request.workload_id,
-        )
-        assert adopted.state is OllamaLeaseState.READY
-        assert adopted.provider_resource_id == "candidate-valid"
-
-        state["final_telemetry"] = True
-        release = asyncio.create_task(
-            service.release(
+        owned_tasks.append(acquire)
+        try:
+            assert await asyncio.to_thread(post_entered.wait, 5)
+            adopted = await service.reconcile_lease(
                 request.lease_id,
                 owner_id=request.owner_id,
                 workload_id=request.workload_id,
             )
-        )
-        await asyncio.wait_for(final_telemetry_entered.wait(), timeout=5)
-        post_finished.set()
-        for _ in range(1_000):
-            await asyncio.sleep(0)
-            durable = repository.get(request.lease_id)
-            assert durable is not None
-            if durable.additional_cleanup_targets:
-                break
-        else:
-            pytest.fail("late original acknowledgment was not durably retained")
-        final_telemetry_finished.set()
+            assert adopted.state is OllamaLeaseState.READY
+            assert adopted.provider_resource_id == "candidate-valid"
+
+            state["final_telemetry"] = True
+            release = asyncio.create_task(
+                service.release(
+                    request.lease_id,
+                    owner_id=request.owner_id,
+                    workload_id=request.workload_id,
+                )
+            )
+            owned_tasks.append(release)
+            await asyncio.wait_for(final_telemetry_entered.wait(), timeout=5)
+            post_finished.set()
+            for _ in range(1_000):
+                await asyncio.sleep(0)
+                durable = repository.get(request.lease_id)
+                assert durable is not None
+                if durable.additional_cleanup_targets:
+                    break
+            else:
+                pytest.fail("late original acknowledgment was not durably retained")
+            final_telemetry_finished.set()
+        finally:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owned_tasks, post_finished, final_telemetry_finished
+            )
 
         results = await asyncio.gather(acquire, release, return_exceptions=True)
         result_evidence = [
@@ -3280,8 +4264,6 @@ async def _run_native_late_original_ack_with_cleanup_failure(
         assert completed is not None
         return state, result_evidence, delete_ids, completed
     finally:
-        post_finished.set()
-        final_telemetry_finished.set()
         client.close()
 
 
@@ -3380,6 +4362,10 @@ async def test_native_primary_cleanup_failure_does_not_starve_original_ack(
     assert completed.cleanup_receipt is None
     assert len(completed.additional_cleanup_targets) == 1
     assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
+    assert completed.teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+    assert completed.last_provider_error is not None
+    assert "primary delete unavailable" in completed.last_provider_error
+    assert completed.reconcile_after is not None
 
 
 class _TwoTargetCleanupProvider(FakeOllamaProvider):
@@ -3802,7 +4788,7 @@ async def test_native_structural_cleanup_failure_stops_before_second_owned_targe
 
 
 def _fail_repository_stage_once(
-    monkeypatch, repository, method_name, message, *, error=None
+    monkeypatch, repository, method_name, message, *, error=None, witness=None
 ):
     original = getattr(repository, method_name)
     failed = False
@@ -3811,6 +4797,8 @@ def _fail_repository_stage_once(
         nonlocal failed
         if not failed:
             failed = True
+            if witness is not None:
+                witness(*args, **kwargs)
             raise error if error is not None else sqlite3.OperationalError(message)
         return original(*args, **kwargs)
 
@@ -4317,21 +5305,37 @@ async def test_explicit_control_cause_cannot_make_integrity_carrier_recoverable(
 
 
 @pytest.mark.asyncio
-async def test_native_cleanup_outcome_busy_keeps_joining_known_targets(
+@pytest.mark.parametrize("sqlite_condition", ["busy", "locked"])
+async def test_native_cleanup_outcome_failure_stops_before_another_provider_effect(
     tmp_path,
     monkeypatch,
+    sqlite_condition,
 ):
-    """A genuine transient SQLite outcome error remains a cleanup permit."""
+    """A provider result without its durable receipt cannot permit another DELETE."""
 
     provider = _TwoTargetCleanupProvider()
     service, claimed = await _claimed_two_target_cleanup(tmp_path, provider)
-    transient = _native_sqlite_operational_error(tmp_path, "busy")
+    transient = _native_sqlite_operational_error(tmp_path, sqlite_condition)
+    primary_receipt_witness = []
+
+    def retain_primary_receipt_witness(lease, **_kwargs):
+        assert lease.cleanup_receipt is not None
+        primary_receipt_witness.append(lease.cleanup_receipt)
+
+    record_method = (
+        "record_teardown_outcome"
+        if sqlite_condition == "busy"
+        else "record_additional_cleanup_outcome"
+    )
     _fail_repository_stage_once(
         monkeypatch,
         service.repository,
-        "record_teardown_outcome",
+        record_method,
         "unused transient outcome error",
         error=transient,
+        witness=(
+            retain_primary_receipt_witness if sqlite_condition == "locked" else None
+        ),
     )
 
     try:
@@ -4345,7 +5349,34 @@ async def test_native_cleanup_outcome_busy_keeps_joining_known_targets(
         pytest.fail("transient cleanup outcome failure was not retained")
 
     assert _contains_exception_identity(caught, transient)
-    assert provider.teardown_resource_ids == ["provider-001", "late-original-ack"]
+    durable = service.repository.get(claimed.lease_id)
+    assert durable is not None
+    additional = durable.additional_cleanup_targets[0]
+    if sqlite_condition == "busy":
+        assert provider.teardown_resource_ids == ["provider-001"]
+        assert durable.cleanup_receipt is None
+        assert additional.cleanup_receipt is None
+    else:
+        assert len(primary_receipt_witness) == 1
+        assert provider.teardown_resource_ids == [
+            "provider-001",
+            "late-original-ack",
+        ]
+        assert durable.cleanup_intent == claimed.cleanup_intent
+        assert durable.cleanup_receipt is not None
+        assert durable.cleanup_receipt == primary_receipt_witness[0]
+        assert durable.cleanup_receipt.to_dict() == (
+            primary_receipt_witness[0].to_dict()
+        )
+        durable.cleanup_receipt.validate_intent(durable.cleanup_intent)
+        assert additional.provider_resource_id == "late-original-ack"
+        assert additional.cleanup_intent is not None
+        assert additional.cleanup_intent.provider_resource_id == (
+            additional.provider_resource_id
+        )
+        assert additional.cleanup_receipt is None
+        assert durable.state is OllamaLeaseState.RELEASING
+        assert durable.teardown_state is OllamaTeardownState.PENDING
 
 
 @pytest.mark.asyncio
@@ -5045,19 +6076,23 @@ async def test_native_concurrent_release_joins_one_exact_id_delete(
             workload_id=request.workload_id,
         )
     )
-    await asyncio.to_thread(client.delete_entered.wait, 5)
-    second = asyncio.create_task(
-        service.release(
-            request.lease_id,
-            owner_id=request.owner_id,
-            workload_id=request.workload_id,
-        )
-    )
+    owned_tasks = [first]
     try:
+        assert await asyncio.to_thread(client.delete_entered.wait, 5)
+        second = asyncio.create_task(
+            service.release(
+                request.lease_id,
+                owner_id=request.owner_id,
+                workload_id=request.workload_id,
+            )
+        )
+        owned_tasks.append(second)
         await asyncio.sleep(0.05)
         calls_while_first_delete_is_live = client.delete_calls
     finally:
-        client.delete_finish.set()
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks, client.delete_finish
+        )
     first_result, second_result = await asyncio.gather(first, second)
 
     assert first_result.state is OllamaLeaseState.TERMINATED

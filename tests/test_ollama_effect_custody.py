@@ -11,6 +11,7 @@ from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
     make_request,
+    release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
 
@@ -103,34 +104,6 @@ def service(tmp_path, provider, clock):
     )
 
 
-async def _release_gate_and_boundedly_join_owned_tasks(tasks, gate, *, timeout=5):
-    """Release a test barrier and prove every owned effect actually returned.
-
-    Cancellation is only a second bounded observation, not an unbounded join:
-    if any owned effect ignores both the released gate and cancellation, the
-    test fails explicitly and leaves process-level watchdog custody visible.
-    """
-
-    if isinstance(tasks, asyncio.Task):
-        tasks = (tasks,)
-    owned = frozenset(tasks)
-    assert owned
-    gate.set()
-    _done, pending = await asyncio.wait(owned, timeout=timeout)
-    for task in pending:
-        task.cancel("bounded test cleanup after released provider gate")
-    if pending:
-        _done, pending = await asyncio.wait(pending, timeout=timeout)
-    if pending:
-        pytest.fail(
-            "owned Ollama effect did not finish after gate release and "
-            "bounded cancellation observation"
-        )
-    for task in owned:
-        if not task.cancelled():
-            task.exception()
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("effect", ["create", "readback", "delete"])
 async def test_cancellation_joins_original_thread_and_durable_receipt(tmp_path, effect):
@@ -158,7 +131,7 @@ async def test_cancellation_joins_original_thread_and_durable_receipt(tmp_path, 
                 "caller escaped while original provider thread is live"
             )
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(task, provider.finish)
+        await release_gates_and_boundedly_join_owned_tasks(task, provider.finish)
         # Always collect the actual task, including when the RED assertion fails.
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -198,7 +171,7 @@ async def test_release_during_post_cannot_discard_late_exact_acknowledgment(tmp_
                 workload_id=request.workload_id,
             )
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(acquire, provider.finish)
+        await release_gates_and_boundedly_join_owned_tasks(acquire, provider.finish)
 
     completed = await acquire
     assert completed.state is OllamaLeaseState.TERMINATED
@@ -229,7 +202,7 @@ async def test_late_exact_ack_does_not_replace_a_different_untrusted_locator(tmp
                 workload_id=request.workload_id,
             )
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(acquire, provider.finish)
+        await release_gates_and_boundedly_join_owned_tasks(acquire, provider.finish)
 
     completed = await acquire
 
@@ -275,7 +248,7 @@ async def test_original_ack_folds_after_same_id_discovery_reaches_ready(tmp_path
         )
         assert reconciled.state is OllamaLeaseState.READY
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
     completed = await original
 
     assert completed.state is OllamaLeaseState.READY
@@ -311,12 +284,64 @@ async def test_original_ack_test_barrier_is_released_after_early_assertion(tmp_p
     except AssertionError as exc:
         observed_failure = exc
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
 
     completed = await original
     assert str(observed_failure) == "synthetic pre-release test failure"
     assert completed.provider_resource_id == provider.resource.provider_resource_id
     assert original.done()
+
+
+@pytest.mark.asyncio
+async def test_shared_owned_task_cleanup_retains_failure_before_entry_observation():
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def blocked():
+        entered.set()
+        await finish.wait()
+        return "settled"
+
+    owned = asyncio.create_task(blocked())
+    original_failure = AssertionError("synthetic failure before entry observation")
+    observed_failure = None
+    try:
+        raise original_failure
+    except AssertionError as exc:
+        observed_failure = exc
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(owned, finish)
+
+    assert observed_failure is original_failure
+    assert entered.is_set()
+    assert owned.result() == "settled"
+
+
+@pytest.mark.asyncio
+async def test_shared_owned_task_cleanup_retrieves_every_terminal_exception():
+    first_gate = asyncio.Event()
+    second_gate = asyncio.Event()
+    first_failure = RuntimeError("first owned task failed")
+    second_failure = ValueError("second owned task failed")
+
+    async def fail_after(gate, failure):
+        await gate.wait()
+        raise failure
+
+    owned = []
+    first = asyncio.create_task(fail_after(first_gate, first_failure))
+    owned.append(first)
+    try:
+        second = asyncio.create_task(fail_after(second_gate, second_failure))
+        owned.append(second)
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned, first_gate, second_gate
+        )
+
+    assert all(task.done() for task in owned)
+    assert owned[0].exception() is first_failure
+    assert owned[1].exception() is second_failure
 
 
 @pytest.mark.asyncio
@@ -360,7 +385,7 @@ async def test_different_valid_candidate_does_not_discard_original_post_custody(
         assert discovered.state is OllamaLeaseState.READY
         assert discovered.provider_resource_id == "different-complete-candidate"
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
     completed = await original
     assert completed.state in {
         OllamaLeaseState.RELEASING,
@@ -423,7 +448,7 @@ async def test_original_post_ack_reopens_only_cleanup_after_candidate_is_termina
         assert terminated_candidate.state is OllamaLeaseState.TERMINATED
         assert deleted == ["different-complete-candidate"]
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
     completed = await original
 
     assert completed.state is OllamaLeaseState.TERMINATED
@@ -509,7 +534,7 @@ async def test_second_exact_resource_failure_retains_primary_receipt_and_retry_s
         )
         assert terminated_candidate.cleanup_receipt is not None
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
 
     with pytest.raises(OllamaLeaseTeardownError, match="additional teardown"):
         await original
@@ -567,7 +592,7 @@ async def test_same_id_concurrent_readback_keeps_first_committed_receipt(tmp_pat
         assert reconciled.state is OllamaLeaseState.READY
         assert reconciled.provisioning_receipt is not None
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
     completed = await original
 
     assert completed.state is OllamaLeaseState.READY
@@ -629,7 +654,7 @@ async def test_late_mismatching_ack_preserves_prior_receipt_and_enters_cleanup(
         assert reconciled.provisioning_receipt is not None
         readiness_observe_calls = observe_calls
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(original, finish)
+        await release_gates_and_boundedly_join_owned_tasks(original, finish)
     with pytest.raises(OllamaProvisioningMismatchError):
         await original
 
@@ -693,7 +718,7 @@ async def test_unresolved_same_id_releases_join_before_provider_readback(tmp_pat
         owned.append(second)
         await asyncio.sleep(0)
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(owned, finish)
+        await release_gates_and_boundedly_join_owned_tasks(owned, finish)
     first_result = first.result()
     second_result = second.result()
 
@@ -731,7 +756,7 @@ async def test_late_ack_reopens_only_cleanup_after_concurrent_no_work_state(
             },
         )
     finally:
-        await _release_gate_and_boundedly_join_owned_tasks(acquire, provider.finish)
+        await release_gates_and_boundedly_join_owned_tasks(acquire, provider.finish)
 
     completed = await acquire
 
@@ -764,7 +789,7 @@ async def test_mismatch_cancellation_joins_same_known_id_teardown_and_ack(tmp_pa
             await asyncio.sleep(0)
             assert not task.done(), "caller escaped while mismatch teardown was live"
     finally:
-        provider.finish.set()
+        await release_gates_and_boundedly_join_owned_tasks(task, provider.finish)
         with pytest.raises(OllamaProvisioningMismatchError):
             await task
         assert await asyncio.to_thread(provider.completed.wait, 5)

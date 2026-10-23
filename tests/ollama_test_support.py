@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
+from typing import Any, Self
+
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 
 from kestrel_cloud_runpod.billing import (
     billing_exposure_ratio_float,
@@ -63,6 +71,271 @@ class MutableClock:
 
     async def sleep(self, seconds: float) -> None:
         self.advance(seconds)
+
+
+@dataclass
+class OwnedSpawnProcesses:
+    """Own a finite spawn-process cohort across every test failure path.
+
+    The queues used by these tests are receive-only in the parent. Every child
+    producer is settled before the parent closes its inherited queue handle and
+    joins any parent-local feeder thread; this is not a generic queue-drain API.
+    """
+
+    processes: tuple[Any, ...]
+    gates: tuple[Any, ...]
+    queues: tuple[Any, ...]
+    join_timeout: float = 15
+    started: list[Any] = field(default_factory=list, init=False)
+    forced_cleanup: list[int | None] = field(default_factory=list, init=False)
+    cleanup_failures: list[BaseException] = field(default_factory=list, init=False)
+    final_exitcodes: list[int | None] = field(default_factory=list, init=False)
+    closed_processes: int = field(default=0, init=False)
+    queues_closed: bool = field(default=False, init=False)
+
+    def __enter__(self) -> Self:
+        entered = False
+        try:
+            for process in self.processes:
+                started = False
+                try:
+                    process.start()
+                    started = True
+                finally:
+                    try:
+                        partially_started = process.pid is not None
+                    except ValueError:
+                        partially_started = False
+                    if started or partially_started:
+                        self.started.append(process)
+            entered = True
+            return self
+        finally:
+            if not entered:
+                self._cleanup()
+
+    def join(self) -> None:
+        """Bound the normal join while leaving substantive assertions to callers."""
+
+        for process in self.started:
+            process.join(timeout=self.join_timeout)
+
+    def __exit__(self, error_type, error, traceback) -> bool:
+        del error_type, traceback
+        self._cleanup()
+        if self.cleanup_failures and error is None:
+            raise AssertionError(
+                "owned spawn-process cleanup did not finish cleanly"
+            ) from self.cleanup_failures[0]
+        if self.forced_cleanup and error is None:
+            raise AssertionError(
+                "owned spawn-process cleanup required forced termination"
+            )
+        return False
+
+    def _cleanup(self) -> None:
+        if self.final_exitcodes or self.queues_closed:
+            return
+        for gate in self.gates:
+            try:
+                gate.set()
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+        for process in self.started:
+            try:
+                process.join(timeout=self.join_timeout)
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+            try:
+                alive = process.is_alive()
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+                alive = True
+            if alive:
+                try:
+                    self.forced_cleanup.append(process.pid)
+                    process.terminate()
+                    process.join(timeout=self.join_timeout)
+                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                    self.cleanup_failures.append(exc)
+            try:
+                alive = process.is_alive()
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+                alive = True
+            if alive:
+                try:
+                    process.kill()
+                    process.join(timeout=self.join_timeout)
+                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                    self.cleanup_failures.append(exc)
+            try:
+                alive = process.is_alive()
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+                alive = True
+            if alive:
+                self.cleanup_failures.append(
+                    AssertionError("owned spawn process did not terminate")
+                )
+            try:
+                self.final_exitcodes.append(process.exitcode)
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+            if not alive:
+                try:
+                    process.close()
+                    self.closed_processes += 1
+                except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                    self.cleanup_failures.append(exc)
+        for queue in self.queues:
+            try:
+                queue.close()
+                queue.join_thread()
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                self.cleanup_failures.append(exc)
+        self.queues_closed = True
+
+
+@dataclass
+class OwnedLoopbackHTTPServer:
+    """Own one loopback server, thread, and client across every exit path."""
+
+    server_factory: Callable[[], Any]
+    thread_factory: Callable[[Any], Any]
+    client_factory: Callable[[Any], Any]
+    join_timeout: float = 5
+    server: Any | None = field(default=None, init=False)
+    thread: Any | None = field(default=None, init=False)
+    client: Any | None = field(default=None, init=False)
+    cleanup_errors: tuple[BaseException, ...] = field(default=(), init=False)
+    _thread_start_returned: bool = field(default=False, init=False)
+    _cleaned: bool = field(default=False, init=False)
+
+    def __enter__(self) -> Any:
+        try:
+            self.server = self.server_factory()
+            self.thread = self.thread_factory(self.server)
+            self.thread.start()
+            self._thread_start_returned = True
+            self.client = self.client_factory(self.server)
+            return self.client
+        except BaseException as opening:
+            cleanup_errors = self._cleanup()
+            if not cleanup_errors:
+                raise
+            terminal = execution_terminal_error(
+                opening,
+                *cleanup_errors,
+                retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if terminal is None:
+                raise AssertionError("loopback ownership lost its opening failure")
+            raise terminal
+
+    def __exit__(self, error_type, error, traceback) -> bool:
+        del error_type, traceback
+        cleanup_errors = self._cleanup()
+        if not cleanup_errors:
+            return False
+        terminal = execution_terminal_error(
+            None
+            if isinstance(error, GeneratorExit)
+            and not is_execution_control_error(error)
+            else error,
+            *cleanup_errors,
+            retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if terminal is None:
+            raise AssertionError("loopback ownership lost its cleanup failure")
+        raise terminal
+
+    def _cleanup(self) -> tuple[BaseException, ...]:
+        if self._cleaned:
+            return self.cleanup_errors
+        errors: list[BaseException] = []
+
+        def attempt(action: Callable[[], Any]) -> None:
+            try:
+                action()
+            except BaseException as error:  # noqa: BLE001 - retain every cleanup error
+                errors.append(error)
+
+        if self.client is not None:
+            attempt(self.client.close)
+        thread_was_alive = False
+        thread_was_started = self._thread_start_returned
+        if self.thread is not None:
+            try:
+                thread_was_alive = self.thread.is_alive()
+            except BaseException as error:  # noqa: BLE001 - retain observation failure
+                errors.append(error)
+            try:
+                thread_was_started = (
+                    thread_was_started
+                    or thread_was_alive
+                    or getattr(self.thread, "ident", None) is not None
+                )
+            except BaseException as error:  # noqa: BLE001 - retain observation failure
+                errors.append(error)
+        if self.server is not None and thread_was_started:
+            attempt(self.server.shutdown)
+        if self.thread is not None and thread_was_started:
+            attempt(lambda: self.thread.join(timeout=self.join_timeout))
+        if self.server is not None:
+            attempt(self.server.server_close)
+        if self.thread is not None:
+            try:
+                thread_is_alive = self.thread.is_alive()
+            except BaseException as error:  # noqa: BLE001 - retain observation failure
+                errors.append(error)
+            else:
+                if thread_is_alive:
+                    errors.append(
+                        AssertionError("owned loopback server thread did not terminate")
+                    )
+        self.cleanup_errors = tuple(errors)
+        self._cleaned = True
+        return self.cleanup_errors
+
+
+async def release_gates_and_boundedly_join_owned_tasks(
+    tasks: asyncio.Task | tuple[asyncio.Task, ...] | list[asyncio.Task],
+    *gates,
+    timeout: float = 5,
+) -> None:
+    """Release test barriers and prove every owned task reached a terminal state.
+
+    Cancellation is a second bounded observation, not an unbounded join. A
+    cancellation-resistant tail remains an explicit harness failure for the
+    outside process-group watchdog to contain.
+    """
+
+    owned = (tasks,) if isinstance(tasks, asyncio.Task) else tuple(tasks)
+    if not owned:
+        raise AssertionError("owned Ollama task cleanup requires at least one task")
+    if not gates:
+        raise AssertionError("owned Ollama task cleanup requires a release gate")
+    for gate in gates:
+        gate.set()
+    done, pending = await asyncio.wait(frozenset(owned), timeout=timeout)
+    for task in done:
+        if not task.cancelled():
+            task.exception()
+    for task in pending:
+        task.cancel("bounded test cleanup after released provider gate")
+    if pending:
+        done, pending = await asyncio.wait(pending, timeout=timeout)
+        for task in done:
+            if not task.cancelled():
+                task.exception()
+    if pending:
+        raise AssertionError(
+            "owned Ollama effect did not finish after gate release and "
+            "bounded cancellation observation"
+        )
 
 
 def make_request(clock: MutableClock, **changes) -> OllamaLeaseRequest:
