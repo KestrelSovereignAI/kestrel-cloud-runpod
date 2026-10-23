@@ -22,10 +22,12 @@ from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_UPLOAD,
     POD_READY_TIMEOUT,
 )
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .models import (
     GPUProfile,
     RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
 )
@@ -151,6 +153,8 @@ class RunPodTrainingMixin:
                 response.raise_for_status()
                 payload: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodManagerError(
                 f"Training reconciliation status failed ({type(exc).__name__})"
             ) from exc
@@ -264,7 +268,9 @@ class RunPodTrainingMixin:
                             f"Unexpected /ready response: {response.status_code}"
                         )
 
-                except httpx.ConnectError:
+                except httpx.ConnectError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     service.record_operation_error(
                         cleanup_token, httpx.ConnectError("training readiness")
                     )
@@ -274,7 +280,9 @@ class RunPodTrainingMixin:
                         )
                         last_status = "connect_error"
 
-                except httpx.TimeoutException:
+                except httpx.TimeoutException as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     service.record_operation_error(
                         cleanup_token, httpx.TimeoutException("training readiness")
                     )
@@ -410,6 +418,8 @@ class RunPodTrainingMixin:
                     root_cleanup_token=root_cleanup_token,
                 )
             except TrainingPodLifecycleError as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Profile {profile_name} failed: {e}")
                 last_error = e
                 if e.billing_risk or e.cleanup_state not in {
@@ -502,9 +512,7 @@ class RunPodTrainingMixin:
 
     async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
         """
-        Start a pod for LoRA-based image generation.
-
-        Reuses an eligible stopped Pod before creating a new one.
+        Refuse the legacy ownerless LoRA inference admission path.
 
         Args:
             companion_id: Companion for tracking
@@ -513,16 +521,8 @@ class RunPodTrainingMixin:
             RunPodSession if started successfully, None otherwise
         """
         try:
-            profile = self._select_profile("image")
             ttl_seconds = 600  # 10 min for inference
 
-            # Try to resume a stopped inference pod first (much faster)
-            stopped_pod = await self.find_stopped_pod("lora_inference", "image")
-            if stopped_pod:
-                logger.info("Starting existing stopped inference Pod through Runpod v2")
-                return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
-
-            # No stopped pod found, create new one
             await self.start_session(
                 task_profile="image",
                 model_name="flux-with-lora",
@@ -537,9 +537,11 @@ class RunPodTrainingMixin:
             async with self._lock:
                 return self._session
 
-        except RunPodAmbiguousResultError:
+        except (RunPodAmbiguousResultError, RunPodLegacyAdmissionRetiredError):
             raise
         except RunPodManagerError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to start inference pod for {companion_id}: {e}")
             return None
 
@@ -584,10 +586,14 @@ class RunPodTrainingMixin:
             await self._release_after_cancellation(cleanup_token, "model readiness")
             raise
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             try:
                 await service.release(cleanup_token, reason="model readiness failure")
             except TrainingPodCleanupError as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    raise
                 raise cleanup_exc from exc
             raise
 
@@ -632,6 +638,8 @@ class RunPodTrainingMixin:
                 )
                 raise
             except httpx.ConnectError as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -640,6 +648,8 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except httpx.HTTPStatusError as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -648,6 +658,8 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except httpx.TimeoutException as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -656,12 +668,16 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except (ValueError, RunPodManagerError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 service.record_operation_error(cleanup_token, exc)
                 try:
                     await service.release(
                         cleanup_token, reason="invalid submission response"
                     )
                 except TrainingPodCleanupError as cleanup_exc:
+                    if is_execution_control_error(cleanup_exc):
+                        raise
                     raise cleanup_exc from exc
                 raise RunPodManagerError(
                     f"Training submission failed ({type(exc).__name__})"
@@ -674,6 +690,8 @@ class RunPodTrainingMixin:
             try:
                 await service.release(cleanup_token, reason="missing training job ID")
             except TrainingPodCleanupError as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    raise
                 raise cleanup_exc from error
             raise error
 
@@ -719,7 +737,9 @@ class RunPodTrainingMixin:
                         }
                     ):
                         recovered_job_id = raw_id
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             recovered_job_id = None
         if recovered_job_id:
             service.record_job(cleanup_token, recovered_job_id)
@@ -728,6 +748,8 @@ class RunPodTrainingMixin:
         try:
             await service.release(cleanup_token, reason="training submission failure")
         except TrainingPodCleanupError as cleanup_exc:
+            if is_execution_control_error(cleanup_exc):
+                raise
             raise cleanup_exc from cause
         raise RunPodManagerError(
             f"Training submission failed ({type(cause).__name__}); capacity was stopped"
@@ -765,6 +787,8 @@ class RunPodTrainingMixin:
                     return data
                 return None
             except (httpx.HTTPError, ValueError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 service.record_operation_error(cleanup_token, exc)
                 raise RunPodManagerError(
                     f"Training current-job observation failed ({type(exc).__name__})"
@@ -811,10 +835,14 @@ class RunPodTrainingMixin:
             await self._release_after_cancellation(cleanup_token, "job cancellation")
             raise
         except (httpx.HTTPError, ValueError, RunPodManagerError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             try:
                 await service.release(cleanup_token, reason="job cancellation failure")
             except TrainingPodCleanupError as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    raise
                 raise cleanup_exc from exc
             raise RunPodManagerError(
                 f"Training cancellation failed ({type(exc).__name__}); "
@@ -852,6 +880,8 @@ class RunPodTrainingMixin:
                 response.raise_for_status()
                 result: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training lock clear failed ({type(exc).__name__})"
@@ -892,6 +922,8 @@ class RunPodTrainingMixin:
                 response.raise_for_status()
                 result: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training status observation failed ({type(exc).__name__}); "
@@ -937,6 +969,8 @@ class RunPodTrainingMixin:
                 response.raise_for_status()
                 content = response.content
         except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training result download failed ({type(exc).__name__}); "

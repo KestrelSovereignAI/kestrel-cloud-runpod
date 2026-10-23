@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+import json
+import socket
+import threading
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+import httpcore
+import httpx
+import pytest
+from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+from ollama_test_support import OwnedLoopbackHTTPServer
 from pydantic import SecretStr
 
+from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.models import (
     Availability,
     CloudType,
@@ -33,12 +45,14 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
 from kestrel_cloud_runpod.pod_capacity_provider import (
     CreatedPodCapacity,
     PodCapacityObservation,
+    RunpodPodCapacityProvider,
 )
 from kestrel_cloud_runpod.pod_capacity_repository import (
     SQLitePodCapacityRepository,
 )
 from kestrel_cloud_runpod.pod_capacity_service import PodCapacityLeaseService
 from kestrel_cloud_runpod.pod_transport import CatalogPodWorkloadObservation
+from kestrel_cloud_runpod.providers import DirectRunPodProvider
 
 TOKEN = "catalog-pod-token-" + "x" * 40
 REQUEST_SHA = "b" * 64
@@ -47,6 +61,182 @@ RECEIPT_SHA = "e" * 64
 ACK_SHA = "f" * 64
 PARAMETERS_SHA = "c" * 64
 IMAGE = "ghcr.io/kestrel/catalog-worker@sha256:" + "a" * 64
+
+
+def execution_control_carrier(
+    error: BaseException,
+    *,
+    grouped: bool = False,
+) -> tuple[BaseException, ExecutionCommitOutcomeError, BaseException]:
+    """Attach one real public-Core control graph without copying its nodes."""
+
+    control = ExecutionCommitOutcomeError("unknown")
+    explicit: BaseException = (
+        BaseExceptionGroup(
+            "control and structural evidence", [control, ValueError("x")]
+        )
+        if grouped
+        else control
+    )
+    error.__cause__ = explicit
+    return error, control, explicit
+
+
+def record_control_injection(
+    record_property: Callable[[str, object], None], boundary: str
+) -> None:
+    """Record the exact dependency entry that raised a control carrier."""
+
+    record_property("control_injection", boundary)
+
+
+def native_httpx_connect_failure() -> httpx.TransportError:
+    """Capture the real HTTPX -> HTTPCore -> socket chain without external I/O."""
+
+    raised: httpx.TransportError | None = None
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        with httpx.Client(timeout=0.2, trust_env=False) as client:
+            try:
+                client.get(f"http://127.0.0.1:{port}/")
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                raised = exc
+    if raised is None:
+        raise AssertionError(
+            "owned closed loopback port unexpectedly accepted a request"
+        )
+    public_pair = {
+        httpx.ConnectError: httpcore.ConnectError,
+        httpx.ConnectTimeout: httpcore.ConnectTimeout,
+    }
+    if type(raised.__cause__) is not public_pair[type(raised)]:
+        raise AssertionError("native HTTPX failure omitted its exact HTTPCore cause")
+    if not isinstance(raised.__cause__.__context__, (OSError, TimeoutError)):
+        pytest.fail("native HTTPCore failure omitted its socket context")
+    return raised
+
+
+def complete_pod_payload(*, pod_id: str, status: str) -> dict[str, Any]:
+    return {
+        "id": pod_id,
+        "name": "catalog-pod-test",
+        "status": status,
+        "gpu": {"id": "NVIDIA RTX PRO 4500", "count": 1},
+        "cost": 0.4,
+        "cloud": "SECURE",
+        "dataCenterId": "US-TX-3",
+        "cudaVersion": "12.8",
+        "image": IMAGE,
+        "env": {"CATALOG_WORKER_MODE": "pod"},
+        "createdAt": "2026-08-02T12:00:00Z",
+    }
+
+
+@contextmanager
+def native_pod_action_harness():
+    """Serve deterministic v2 Pod action/readback responses on loopback only."""
+
+    state: dict[str, Any] = {
+        "pod_id": "pod-catalog-1",
+        "action_status": 204,
+        "action_payload": None,
+        "readback": "running",
+        "calls": [],
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def _json_response(self, status: int, payload: object) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            path = urlsplit(self.path).path
+            body = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            )
+            state["calls"].append((self.command, path, body))
+            if path != f"/v2/pods/{state['pod_id']}/action":
+                self._json_response(404, {"title": "not found"})
+                return
+            if state["action_status"] == 204:
+                self.send_response(204)
+                self.end_headers()
+                return
+            self._json_response(state["action_status"], state["action_payload"])
+
+        def do_GET(self) -> None:
+            path = urlsplit(self.path).path
+            state["calls"].append((self.command, path, None))
+            if path != f"/v2/pods/{state['pod_id']}":
+                self._json_response(404, {"title": "not found"})
+                return
+            outcome = state["readback"]
+            if outcome == "running":
+                self._json_response(
+                    200,
+                    complete_pod_payload(pod_id=state["pod_id"], status="RUNNING"),
+                )
+            elif outcome == "terminal":
+                self._json_response(
+                    200,
+                    complete_pod_payload(pod_id=state["pod_id"], status="TERMINATED"),
+                )
+            elif outcome == "absent":
+                self._json_response(404, {"title": "not found"})
+            elif outcome == "foreign":
+                self._json_response(
+                    200,
+                    complete_pod_payload(pod_id="pod-foreign", status="TERMINATED"),
+                )
+            elif outcome == "authorization":
+                self._json_response(401, {"title": "unauthorized"})
+            elif outcome == "structural":
+                body = b"{"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif outcome == "transport":
+                body = b'{"id":'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body) + 64))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+            else:
+                raise AssertionError(f"unsupported readback outcome: {outcome}")
+
+    def server_factory():
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        return server
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=server_factory,
+        thread_factory=lambda server: threading.Thread(
+            target=server.serve_forever,
+            name="pod-action-loopback",
+        ),
+        client_factory=lambda server: RunpodControlPlaneClient(
+            api_key="local-loopback-only",
+            base_url=f"http://127.0.0.1:{server.server_port}/v2",
+            max_safe_retries=0,
+        ),
+    )
+    with owner as client:
+        direct = DirectRunPodProvider("local-loopback-only", client=client)
+        adapter = RunpodPodCapacityProvider(direct)
+        yield state, direct, adapter
 
 
 def acknowledgement() -> dict[str, Any]:
@@ -208,6 +398,7 @@ class FakeCapacityProvider:
         self.terminate_calls: list[str] = []
         self.find_result: str | None = None
         self.create_error: Exception | None = None
+        self.error_callback: Callable[[str], None] | None = None
         self.realized: PodRealizedPlacement | None = realized_placement(clock)
         self.billing_receipt: PodBillingReceipt | None = None
         self.billing_calls: list[str] = []
@@ -246,6 +437,8 @@ class FakeCapacityProvider:
             }
         )
         if self.create_error is not None:
+            if self.error_callback is not None:
+                self.error_callback("create")
             raise self.create_error
         return CreatedPodCapacity(
             provider_pod_id="pod-catalog-1",

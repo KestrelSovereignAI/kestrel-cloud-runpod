@@ -10,17 +10,17 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NoReturn, Optional
 
 from kestrel_sdk.config.constants import RUNPOD_URL_POLL_INTERVAL
 from kestrel_sovereign.config import load_config
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .models import (
     CloudType,
     GPUProfile,
-    PlacementDecision,
     PodStatus,
-    RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
     sanitize_resource_payload,
@@ -241,55 +241,16 @@ class RunPodManagerCore:
         pod_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        profile = self._select_profile(task_profile)
-        ttl = self._validate_ttl(ttl_seconds)
-        chosen_model = model_name or profile.default_model
-        if not chosen_model:
-            raise RunPodManagerError(
-                "Model name is required when profile has no default_model configured"
-            )
-        metadata = metadata or {}
-        async with self._lock:
-            if self._session and self._session.is_active:
-                raise RunPodManagerError("A RunPod session is already active")
-            try:
-                response = await asyncio.to_thread(
-                    self.provider.start_pod, profile, metadata
-                )
-            except RunPodAmbiguousResultError:
-                # The POST may have succeeded. Preserve the typed reconciliation
-                # signal so no caller can create a replacement resource first.
-                raise
-            except RunPodManagerError as exc:
-                raise RunPodManagerError(f"Failed to create Pod: {exc}") from exc
-            pod_id = response.get("id") or response.get("podId")
-            if not pod_id:
-                raise RunPodManagerError("RunPod did not return a pod id")
-            placement = response.pop("_kestrel_placement", None)
-            if placement is not None and not isinstance(placement, PlacementDecision):
-                raise RunPodManagerError(
-                    "Runpod provider returned invalid placement metadata"
-                )
-            gpu = response.get("gpu") or {}
-            started_at = datetime.now(timezone.utc)
-            self._session = RunPodSession(
-                pod_id=pod_id,
-                profile=profile,
-                task_profile=task_profile,
-                model_name=chosen_model,
-                pod_type=pod_type or profile.pod_type,
-                status=PodStatus.PROVISIONING,
-                ttl_seconds=ttl,
-                started_at=started_at,
-                expires_at=started_at + timedelta(seconds=ttl),
-                gpu_type_id=(placement.gpu_id if placement else gpu.get("id")),
-                cost_per_hr=(
-                    placement.offered_cost_per_hr if placement else response.get("cost")
-                ),
-                placement=placement,
-            )
-        await self._wait_until_ready()
-        return await self.get_status()
+        """Refuse ownerless Pod creation before any provider operation."""
+
+        del task_profile, model_name, ttl_seconds, pod_type, metadata
+        self._refuse_legacy_admission()
+
+    @staticmethod
+    def _refuse_legacy_admission() -> NoReturn:
+        """Reject billable work that has no durable original-effect owner."""
+
+        raise RunPodLegacyAdmissionRetiredError
 
     async def get_status(self, refresh: bool = True) -> Dict[str, Any]:
         async with self._lock:
@@ -355,6 +316,8 @@ class RunPodManagerCore:
                     f"for companion {session.companion_id}"
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to record GPU metering: {e}")
 
         payload = session.to_dict()
@@ -399,43 +362,10 @@ class RunPodManagerCore:
     async def resume_stopped_pod(
         self, pod: Dict[str, Any], profile: GPUProfile, ttl_seconds: int
     ) -> RunPodSession:
-        """
-        Resume a stopped pod instead of creating new.
+        """Refuse ownerless stopped-Pod admission before any provider action."""
 
-        The v2 start action may need to place compute again.
-        """
-        pod_id = pod["id"]
-        gpu_count = (pod.get("gpu") or {}).get("count", pod.get("gpuCount", 1))
-        if not profile.default_model:
-            raise RunPodManagerError(
-                f"Profile '{profile.id}' has no default_model configured; "
-                "cannot resume Pod"
-            )
-
-        logger.info(f"Resuming stopped pod {pod_id} (faster than creating new)")
-        resumed = await asyncio.to_thread(self.provider.resume_pod, pod_id, gpu_count)
-        resumed_gpu = resumed.get("gpu") or pod.get("gpu") or {}
-
-        started_at = datetime.now(timezone.utc)
-        session = RunPodSession(
-            pod_id=pod_id,
-            profile=profile,
-            task_profile=profile.task_type,
-            model_name=profile.default_model,
-            pod_type=profile.pod_type,
-            status=PodStatus.PROVISIONING,
-            ttl_seconds=ttl_seconds,
-            started_at=started_at,
-            expires_at=started_at + timedelta(seconds=ttl_seconds),
-            gpu_type_id=resumed_gpu.get("id"),
-            cost_per_hr=resumed.get("cost", pod.get("cost")),
-        )
-
-        async with self._lock:
-            self._session = session
-
-        await self._wait_until_ready()
-        return session
+        del pod, profile, ttl_seconds
+        self._refuse_legacy_admission()
 
     async def get_logs(self, tail: int = 100) -> str:
         """Retrieves the last N lines of logs from the active pod."""
@@ -505,10 +435,9 @@ class RunPodManagerCore:
         """
         Wait for a RunPod session to be ready.
 
-        This is the public API for waiting after start_session() returns.
-        Note: start_session() already calls _wait_until_ready() internally,
-        so this is primarily useful when resuming a stopped pod or checking
-        readiness after an external event.
+        Legacy ownerless admission is retired. This remains useful when
+        resuming an already retained Pod or checking readiness after an
+        external event owned by a durable lifecycle service.
 
         Args:
             session: Session to wait for. Defaults to current session.

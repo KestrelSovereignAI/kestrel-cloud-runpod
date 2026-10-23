@@ -7,9 +7,15 @@ import pytest
 
 from kestrel_cloud_runpod.billing import (
     billing_amounts,
+    billing_exposure_ratio_float,
+    billing_exposure_sum_float,
     billing_hour_bounds,
     billing_identity_amount,
+    ceil_timedelta_seconds,
+    conservative_decimal_ratio_float,
+    exact_decimal_integer_scale,
     exact_decimal_sum,
+    floor_timedelta_seconds,
 )
 from kestrel_cloud_runpod.models import RunPodManagerError
 
@@ -45,6 +51,182 @@ def test_signed_sum_rejects_nonfinite_or_wrong_unit(invalid):
 
 def test_empty_sum_is_exact_zero():
     assert exact_decimal_sum(()) == Decimal(0)
+
+
+def test_sum_ignores_ambient_exponent_limits_and_traps():
+    with localcontext() as context:
+        context.prec = 2
+        context.Emin = -1
+        context.Emax = 1
+        assert exact_decimal_sum((Decimal("1e-5"), Decimal("1e-5"))) == Decimal("2e-5")
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ((Decimal("-0.0"),), Decimal("0.0")),
+        ((Decimal("1"), Decimal("0.0")), Decimal("1.0")),  # noqa: FURB157
+        ((Decimal("0"),), Decimal("0")),  # noqa: FURB157
+    ],
+)
+def test_exact_decimal_sum_preserves_published_zero_exponent(values, expected):
+    result = exact_decimal_sum(values)
+
+    assert result.as_tuple() == expected.as_tuple()
+
+
+def test_sum_rejects_pathological_exponent_span_before_large_allocation():
+    with pytest.raises(ValueError, match="supported exact range"):
+        exact_decimal_sum((Decimal("1e4096"), Decimal("1e-1")))
+
+
+def test_exposure_sum_uses_one_context_independent_directed_boundary():
+    with localcontext() as context:
+        context.prec = 2
+        context.Emin = -1
+        context.Emax = 1
+        assert (
+            billing_exposure_sum_float((Decimal("0.05091666666666667"), Decimal("0.2")))
+            == 0.2509166666666667
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "ceiling", "floor"),
+    [
+        (timedelta(seconds=1, microseconds=1), 2, 1),
+        (timedelta(seconds=2**34, microseconds=1), 2**34 + 1, 2**34),
+        (timedelta(microseconds=-1), 0, -1),
+    ],
+)
+def test_timedelta_second_bounds_are_integer_exact(value, ceiling, floor):
+    assert ceil_timedelta_seconds(value) == ceiling
+    assert floor_timedelta_seconds(value) == floor
+
+
+@pytest.mark.parametrize(
+    ("value", "multiplier", "expected"),
+    [
+        ("0.99", 1, "0.99"),
+        (
+            "9.999999999999999999999999999e99",
+            1001,
+            "1.0009999999999999999999999998999e103",
+        ),
+        ("1e-100", 1001, "1.001e-97"),
+        ("-0", 7, "0"),
+    ],
+)
+def test_integer_rate_scale_is_independent_of_ambient_context(
+    value, multiplier, expected
+):
+    with localcontext() as context:
+        context.prec = 1
+        assert exact_decimal_integer_scale(Decimal(value), multiplier) == Decimal(
+            expected
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "multiplier"),
+    [(Decimal("NaN"), 1), (Decimal(1), -1), (Decimal(1), True), (1, 1)],
+)
+def test_integer_rate_scale_rejects_invalid_inputs(value, multiplier):
+    with pytest.raises(ValueError):
+        exact_decimal_integer_scale(value, multiplier)
+
+
+@pytest.mark.parametrize(
+    ("value", "divisor", "expected"),
+    [
+        ("0.99", 1, 0.99),
+        ("2.97", 3, 0.99),
+        ("1.41", 3, 0.47),
+        ("5e-324", 1, 5e-324),
+        ("1.7976931348623157e308", 1, 1.7976931348623157e308),
+    ],
+)
+def test_conservative_ratio_uses_canonical_float_decimal_semantics(
+    value, divisor, expected
+):
+    with localcontext() as context:
+        context.prec = 1
+        result = conservative_decimal_ratio_float(Decimal(value), divisor)
+
+    assert result == expected
+    assert exact_decimal_integer_scale(Decimal(str(result)), divisor) <= Decimal(value)
+
+
+def test_conservative_ratio_rounds_toward_the_authorized_cap():
+    value = Decimal("1.9999999999999999")
+    result = conservative_decimal_ratio_float(value, 1)
+
+    assert result < 2.0
+    assert Decimal(str(result)) <= value
+
+
+@pytest.mark.parametrize(
+    ("value", "divisor"),
+    [
+        (Decimal("NaN"), 1),
+        (Decimal("Infinity"), 1),
+        (Decimal(0), 1),
+        (Decimal(-1), 1),
+        (Decimal("1e309"), 1),
+        (Decimal("1e-325"), 1),
+        (Decimal(1), 0),
+        (Decimal(1), True),
+        (1, 1),
+    ],
+)
+def test_conservative_ratio_rejects_unrepresentable_or_invalid_inputs(value, divisor):
+    with pytest.raises(ValueError):
+        conservative_decimal_ratio_float(value, divisor)
+
+
+@pytest.mark.parametrize(
+    ("value", "multiplier", "divisor", "minimum"),
+    [
+        ("0", 1, 1, "0"),
+        ("0.47", 3, 1, "1.41"),
+        ("1", 1, 3_600_000_000, "2.777777777777777777777777778e-10"),
+        ("1e-325", 1, 1, "1e-325"),
+        ("9.999999999999999e307", 1, 1, "9.999999999999999e307"),
+    ],
+)
+def test_exposure_ratio_never_rounds_below_exact_amount(
+    value, multiplier, divisor, minimum
+):
+    with localcontext() as context:
+        context.prec = 1
+        context.Emax = 1
+        context.Emin = -1
+        result = billing_exposure_ratio_float(
+            Decimal(value), multiplier=multiplier, divisor=divisor
+        )
+
+    assert Decimal(str(result)) >= Decimal(minimum)
+
+
+@pytest.mark.parametrize(
+    ("value", "multiplier", "divisor"),
+    [
+        (Decimal("NaN"), 1, 1),
+        (Decimal("Infinity"), 1, 1),
+        (Decimal(-1), 1, 1),
+        (Decimal(1), -1, 1),
+        (Decimal(1), True, 1),
+        (Decimal(1), 1, 0),
+        (Decimal(1), 1, True),
+        (Decimal("1e309"), 1, 1),
+        (1, 1, 1),
+    ],
+)
+def test_exposure_ratio_rejects_invalid_or_overflowing_inputs(
+    value, multiplier, divisor
+):
+    with pytest.raises(ValueError):
+        billing_exposure_ratio_float(value, multiplier=multiplier, divisor=divisor)
 
 
 @pytest.mark.parametrize(
@@ -90,7 +272,7 @@ def test_utc_hour_bounds_are_shared_and_half_open_across_offsets():
 @pytest.mark.parametrize(
     "start,end",
     [
-        (datetime(2026, 10, 20), datetime(2026, 10, 21, tzinfo=UTC)),
+        (datetime(2026, 10, 20), datetime(2026, 10, 21, tzinfo=UTC)),  # noqa: DTZ001
         (datetime(2026, 10, 20, tzinfo=UTC), datetime(2026, 10, 20, tzinfo=UTC)),
     ],
 )

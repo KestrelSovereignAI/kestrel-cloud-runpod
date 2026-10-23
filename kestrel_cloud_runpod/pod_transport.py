@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from pydantic import SecretStr
 
 from .models import RunPodManagerError
@@ -360,10 +361,14 @@ class CatalogPodWorkloadTransport:
             ) as client:
                 return await client.request(method, f"{base}{path}", json=json_payload)
         except httpx.TimeoutException as exc:
+            if is_execution_control_error(exc):
+                raise
             raise CatalogPodTransportError(
                 f"Catalog Pod {method.lower()} timed out"
             ) from exc
         except httpx.TransportError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise CatalogPodTransportError(
                 f"Catalog Pod {method.lower()} transport failed"
             ) from exc

@@ -10,8 +10,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .billing import billing_amounts, exact_decimal_sum
-from .clients import RunpodControlPlaneClient, RunpodServerlessClient
+from .clients import (
+    RunpodControlPlaneClient,
+    RunpodServerlessClient,
+    is_exact_runpod_not_found,
+)
 from .effect_custody import await_owned_effect
 from .models import (
     Availability,
@@ -185,6 +191,7 @@ class RunpodServerlessCapacityProvider:
             endpoint = await asyncio.to_thread(
                 self.control_client.get_endpoint, prior_receipt.endpoint_id
             )
+            endpoint.require_valid_fields(context="v2 Serverless replay readback")
             readback_digest = _validate_planned_endpoint_binding(
                 endpoint,
                 request.endpoint,
@@ -210,6 +217,8 @@ class RunpodServerlessCapacityProvider:
         )
 
         existing = await asyncio.to_thread(self.control_client.list_endpoints)
+        for endpoint in existing:
+            endpoint.require_valid_fields(context="v2 Serverless inventory")
         named_before = tuple(
             item for item in existing if item.name == quote.endpoint_name
         )
@@ -236,8 +245,14 @@ class RunpodServerlessCapacityProvider:
                 asyncio.to_thread(self.control_client.create_endpoint, create_request)
             )
         except RunPodAmbiguousResultError as exc:
+            if is_execution_control_error(exc):
+                raise
             ambiguous = True
             after = await asyncio.to_thread(self.control_client.list_endpoints)
+            for endpoint in after:
+                endpoint.require_valid_fields(
+                    context="v2 Serverless ambiguous-create inventory"
+                )
             named_after = tuple(
                 item for item in after if item.name == quote.endpoint_name
             )
@@ -250,6 +265,8 @@ class RunpodServerlessCapacityProvider:
                 ) from exc
             created = named_after[0]
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointActivationError(
                 "Planned Serverless endpoint create failed",
                 endpoint_name=quote.endpoint_name,
@@ -263,9 +280,22 @@ class RunpodServerlessCapacityProvider:
                 observed_endpoint_ids=(created.id,),
             )
         try:
+            created.require_valid_fields(context="v2 Serverless create")
+        except RunPodManagerError as exc:
+            # A syntactically valid POST acknowledgment owns this exact ID even
+            # when an optional sibling cannot establish readiness.  Preserve
+            # that cleanup locator without treating the invalid evidence as a
+            # successful activation receipt.
+            raise ServerlessEndpointActivationError(
+                "Created Serverless endpoint returned invalid policy evidence",
+                endpoint_name=quote.endpoint_name,
+                observed_endpoint_ids=(created.id,),
+            ) from exc
+        try:
             endpoint = await asyncio.to_thread(
                 self.control_client.get_endpoint, created.id
             )
+            endpoint.require_valid_fields(context="v2 Serverless create readback")
             readback_digest = _validate_planned_endpoint_binding(
                 endpoint,
                 request.endpoint,
@@ -274,6 +304,8 @@ class RunpodServerlessCapacityProvider:
                 data_center_id=quote.data_center_id,
             )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointActivationError(
                 "Created Serverless endpoint failed exact readback validation",
                 endpoint_name=quote.endpoint_name,
@@ -358,6 +390,8 @@ class RunpodServerlessCapacityProvider:
         _validate_planned_request_binding(request, quote)
 
         existing = await asyncio.to_thread(self.control_client.list_endpoints)
+        for endpoint in existing:
+            endpoint.require_valid_fields(context="v2 Serverless adoption inventory")
         named = tuple(item for item in existing if item.name == quote.endpoint_name)
         if len(named) != 1:
             # Zero: nothing to adopt here and now. Usually that means the
@@ -390,6 +424,7 @@ class RunpodServerlessCapacityProvider:
         endpoint = await asyncio.to_thread(
             self.control_client.get_endpoint, observed.id
         )
+        endpoint.require_valid_fields(context="v2 Serverless adoption readback")
 
         try:
             readback_digest = _validate_planned_endpoint_binding(
@@ -526,6 +561,7 @@ class RunpodServerlessCapacityProvider:
         endpoint = await asyncio.to_thread(
             self.control_client.get_endpoint, activation.endpoint_id
         )
+        endpoint.require_valid_fields(context="v2 Serverless submission readback")
         readback_digest = _validate_planned_endpoint_binding(
             endpoint,
             request.endpoint,
@@ -724,9 +760,13 @@ class RunpodServerlessCapacityProvider:
                     self.control_client.delete_endpoint, activation.endpoint_id
                 )
             )
-        except RunPodAmbiguousResultError:
+        except RunPodAmbiguousResultError as exc:
+            if is_execution_control_error(exc):
+                raise
             basis = "ambiguous_delete_verified_absent"
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointCleanupError(
                 "Serverless endpoint delete failed before absence was ambiguous",
                 endpoint_name=activation.endpoint_name,
@@ -743,11 +783,22 @@ class RunpodServerlessCapacityProvider:
     ) -> EndpointResource | None:
         """Only the exact-ID GET's typed 404 denotes a missing endpoint."""
         try:
-            return await asyncio.to_thread(
+            endpoint = await asyncio.to_thread(
                 self.control_client.get_endpoint, activation.endpoint_id
             )
+            if (
+                type(endpoint) is not EndpointResource
+                or endpoint.id != activation.endpoint_id
+            ):
+                raise ServerlessEndpointCleanupError(
+                    "Serverless cleanup readback did not match the activated endpoint",
+                    endpoint_name=activation.endpoint_name,
+                    endpoint_id=activation.endpoint_id,
+                )
+            endpoint.require_valid_fields(context="v2 Serverless cleanup readback")
+            return endpoint
         except RunPodAPIError as exc:
-            if exc.status_code != 404:
+            if not is_exact_runpod_not_found(exc):
                 raise
             return None
 
@@ -766,6 +817,8 @@ class RunpodServerlessCapacityProvider:
                 endpoint_id=activation.endpoint_id,
             )
         resources = await asyncio.to_thread(self.control_client.list_endpoints)
+        for endpoint in resources:
+            endpoint.require_valid_fields(context="v2 Serverless cleanup inventory")
         if any(
             item.id == activation.endpoint_id or item.name == activation.endpoint_name
             for item in resources
@@ -1179,6 +1232,7 @@ class RunpodServerlessCapacityProvider:
         endpoint = await asyncio.to_thread(
             self.control_client.get_endpoint, profile.endpoint_id
         )
+        endpoint.require_valid_fields(context="v2 Serverless quote readback")
         _validate_endpoint_binding(
             endpoint,
             profile,

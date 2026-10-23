@@ -38,6 +38,7 @@ func testConfig(upstream *url.URL) runtimeConfig {
 		PollInterval:       time.Millisecond,
 		PreloadModel:       true,
 		ContainerStartedAt: now,
+		TelemetryBinding:   strings.Repeat("b", 64),
 	}
 }
 
@@ -70,12 +71,13 @@ func toolModel(name, digest string) map[string]any {
 func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 	started := time.Now().UTC()
 	valid := map[string]string{
-		"KESTREL_OLLAMA_BEARER_TOKEN":            testToken,
-		"KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT": started.Add(time.Hour).Format(time.RFC3339),
-		"KESTREL_OLLAMA_ALLOWED_MODELS":          "registry.example/team/model:v1@sha256:" + strings.Repeat("a", 64),
-		"KESTREL_OLLAMA_REQUIRED_MODEL":          "registry.example/team/model:v1",
-		"KESTREL_OLLAMA_MODE":                    "dedicated_pod",
-		"KESTREL_OLLAMA_MODEL_STORAGE_PATH":      "/models",
+		"KESTREL_OLLAMA_BEARER_TOKEN":             testToken,
+		"KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT":  started.Add(time.Hour).Format(time.RFC3339),
+		"KESTREL_OLLAMA_ALLOWED_MODELS":           "registry.example/team/model:v1@sha256:" + strings.Repeat("a", 64),
+		"KESTREL_OLLAMA_REQUIRED_MODEL":           "registry.example/team/model:v1",
+		"KESTREL_OLLAMA_MODE":                     "dedicated_pod",
+		"KESTREL_OLLAMA_MODEL_STORAGE_PATH":       "/models",
+		"KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256": strings.Repeat("b", 64),
 	}
 	getenv := func(name string) string { return valid[name] }
 	config, err := loadConfig(getenv, started)
@@ -108,6 +110,40 @@ func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 				t.Fatal("expected fail-closed configuration error")
 			}
 		})
+	}
+}
+
+func TestRuntimeInitializationPreservesSuppliedNativeStartupOrigin(t *testing.T) {
+	// This is a deterministic native-clock contract check, not a simulated
+	// cache/GPU benchmark. Add preserves time.Now's monotonic component without
+	// sleeping; UTC is used only for the separately reported wall timestamp.
+	origin := time.Now().Add(-3 * time.Second)
+	state := newStartupState("cache_hit", origin)
+	state.ollamaProcessRunning = true
+	state.markReady()
+	config := testConfig(nil)
+	config.ContainerStartedAt = origin.UTC()
+	snapshot := state.snapshot(config)
+
+	if !state.containerStartedMono.Equal(origin) {
+		t.Fatalf(
+			"runtime replaced supplied native startup origin: got %v want %v",
+			state.containerStartedMono,
+			origin,
+		)
+	}
+	if snapshot.ContainerToReadyMilliseconds == nil || *snapshot.ContainerToReadyMilliseconds < 2_900 {
+		t.Fatalf(
+			"container-to-ready omitted pre-initialization work: %v",
+			snapshot.ContainerToReadyMilliseconds,
+		)
+	}
+	if !snapshot.ContainerStartedAt.Equal(origin.UTC()) {
+		t.Fatalf(
+			"reported wall start changed: got %v want %v",
+			snapshot.ContainerStartedAt,
+			origin.UTC(),
+		)
 	}
 }
 
@@ -146,7 +182,7 @@ func TestAnonymousAndWrongBearerAreDeniedOnEveryNonHealthSurface(t *testing.T) {
 	_, upstream := testUpstream(t, func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	tests := []struct {
 		method string
 		path   string
@@ -180,7 +216,7 @@ func TestExpiredBearerIsDenied(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	handler := newRuntimeProxy(config, &startupState{}, func() time.Time {
+	handler := newRuntimeProxy(config, newStartupState("test", time.Now()), func() time.Time {
 		return config.BearerTokenExpires.Add(time.Nanosecond)
 	})
 	response := httptest.NewRecorder()
@@ -202,7 +238,8 @@ func TestHealthIsPublicButFailClosedUntilExactModelReady(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	handler := newRuntimeProxy(config, state, time.Now)
 
 	for _, path := range []string{"/ping", "/health/ready"} {
@@ -251,7 +288,8 @@ func TestReadinessRevalidatesExactModelAndCapabilityExpiry(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 	state.markReady()
 
 	missing := httptest.NewRecorder()
@@ -285,7 +323,8 @@ func TestExactPinnedModelWithoutToolCapabilityNeverBecomesReady(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit"}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
 
 	err := bootstrap(context.Background(), config, state, http.DefaultClient)
 	if err == nil || !strings.Contains(err.Error(), `capability "tools"`) {
@@ -325,7 +364,7 @@ func TestModelManagementAndArbitraryModelsFailClosed(t *testing.T) {
 		upstreamCalls.Add(1)
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	tests := []struct {
 		path string
 		body string
@@ -358,7 +397,7 @@ func TestApprovedInferenceStripsWorkloadBearer(t *testing.T) {
 		requests <- request.Clone(context.Background())
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodPost, "/api/chat", `{"model":"registry.example/team/model:v1","messages":[]}`))
 	if response.Code != http.StatusOK {
@@ -367,6 +406,33 @@ func TestApprovedInferenceStripsWorkloadBearer(t *testing.T) {
 	upstreamRequest := <-requests
 	if upstreamRequest.Header.Get("Authorization") != "" {
 		t.Fatal("workload bearer was forwarded to Ollama")
+	}
+}
+
+func TestModelMetadataIsAuthorizedWithoutCountingInference(t *testing.T) {
+	_, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/show" {
+			t.Fatalf("unexpected upstream path %s", request.URL.Path)
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"model": "metadata"})
+	})
+	config := testConfig(upstream)
+	state := newStartupState("test", time.Now())
+	handler := newRuntimeProxy(config, state, time.Now)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authorizedRequest(
+		t,
+		http.MethodPost,
+		"/api/show",
+		`{"model":"registry.example/team/model:v1"}`,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("/api/show returned %d", response.Code)
+	}
+	observed := state.snapshot(config)
+	if observed.InferenceStarted != 0 || observed.InferenceCompleted != 0 ||
+		observed.InferenceInFlight != 0 || observed.InferenceBusyMilliseconds != 0 {
+		t.Fatalf("metadata request changed inference telemetry: %#v", observed)
 	}
 }
 
@@ -384,7 +450,7 @@ func TestOpenAIStreamingToolsAndToolCallsPassThroughUnchanged(t *testing.T) {
 		writer.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(writer, responseBody)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(
 		t, http.MethodPost, "/v1/chat/completions", requestBody,
@@ -407,7 +473,7 @@ func TestModelPolicyMatchesOllamaCaseInsensitiveLastKeyWinsParsing(t *testing.T)
 		upstreamCalls.Add(1)
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(
@@ -449,9 +515,13 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 		<-request.Context().Done()
 		close(cancelled)
 	})
-	server := httptest.NewServer(newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now))
+	config := testConfig(upstream)
+	state := newStartupState("test", time.Now())
+	server := httptest.NewServer(newRuntimeProxy(config, state, time.Now))
 	t.Cleanup(server.Close)
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/generate", strings.NewReader(`{"model":"registry.example/team/model:v1","prompt":"private","stream":true}`))
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+	request, _ := http.NewRequestWithContext(requestContext, http.MethodPost, server.URL+"/api/generate", strings.NewReader(`{"model":"registry.example/team/model:v1","prompt":"private","stream":true}`))
 	request.Header.Set("Authorization", "Bearer "+testToken)
 	response, err := server.Client().Do(request)
 	if err != nil {
@@ -461,11 +531,23 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 	if err != nil || line != "{\"chunk\":1}\n" {
 		t.Fatalf("streamed line %q, error %v", line, err)
 	}
+	cancelRequest()
 	_ = response.Body.Close()
 	select {
 	case <-cancelled:
 	case <-time.After(time.Second):
 		t.Fatal("upstream request context was not cancelled")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		snapshot := state.snapshot(config)
+		if snapshot.InferenceStarted == 1 && snapshot.InferenceCancelled == 1 && snapshot.InferenceInFlight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled inference counters = started %d, cancelled %d, active %d", snapshot.InferenceStarted, snapshot.InferenceCancelled, snapshot.InferenceInFlight)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -488,7 +570,8 @@ func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 		}
 	})
 	config := testConfig(upstream)
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	if err := bootstrap(context.Background(), config, state, http.DefaultClient); err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +610,8 @@ func TestBootstrapPullsOnlyRequiredPinAndRejectsDigestMismatch(t *testing.T) {
 	})
 	config := testConfig(upstream)
 	config.PreloadModel = false
-	state := &startupState{ollamaProcessRunning: true, strategy: "initializing"}
+	state := newStartupState("initializing", time.Now())
+	state.ollamaProcessRunning = true
 	err := bootstrap(context.Background(), config, state, http.DefaultClient)
 	if err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("expected digest mismatch, got %v", err)
@@ -547,8 +631,11 @@ func TestTelemetryIsAuthenticatedAndContainsNoCredentialOrModelName(t *testing.T
 	config := testConfig(upstream)
 	provision := config.ContainerStartedAt.Add(-2 * time.Second)
 	config.ProvisionRequested = &provision
-	state := &startupState{ollamaProcessRunning: true, strategy: "cache_hit", cacheHit: true}
+	state := newStartupState("cache_hit", time.Now())
+	state.ollamaProcessRunning = true
+	state.cacheHit = true
 	state.markReady()
+	state.setTerminalFailure()
 	handler := newRuntimeProxy(config, state, time.Now)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodGet, "/kestrel/telemetry", ""))
@@ -561,8 +648,11 @@ func TestTelemetryIsAuthenticatedAndContainsNoCredentialOrModelName(t *testing.T
 			t.Fatalf("telemetry leaked %q: %s", forbidden, body)
 		}
 	}
-	if !strings.Contains(body, `"placement_and_image_pull_ms":2000`) {
+	if !strings.Contains(body, `"placement_and_image_pull_wall_ms":2000`) {
 		t.Fatalf("telemetry omitted phase duration: %s", body)
+	}
+	if !strings.Contains(body, `"terminal_error":"runtime_initialization_failed"`) {
+		t.Fatalf("telemetry omitted typed terminal failure: %s", body)
 	}
 }
 
@@ -572,7 +662,7 @@ func TestRequestSizeLimitIsEnforcedBeforeUpstream(t *testing.T) {
 		calls.Add(1)
 		writer.WriteHeader(http.StatusOK)
 	})
-	handler := newRuntimeProxy(testConfig(upstream), &startupState{}, time.Now)
+	handler := newRuntimeProxy(testConfig(upstream), newStartupState("test", time.Now()), time.Now)
 	body := fmt.Sprintf(`{"model":"registry.example/team/model:v1","prompt":"%s"}`, strings.Repeat("x", maxRequestBytes))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, authorizedRequest(t, http.MethodPost, "/api/generate", body))

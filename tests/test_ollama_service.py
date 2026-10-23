@@ -1,32 +1,51 @@
 """Lifecycle, crash recovery, readiness, cost, and teardown tests."""
 
 import asyncio
+import hashlib
 import json
+import sqlite3
+from contextlib import closing
+from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal, localcontext
 
 import pytest
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
     make_request,
+    release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
 
-from kestrel_cloud_runpod.models import RunPodManagerError
+from kestrel_cloud_runpod.models import RunPodAPIError, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
+    OllamaCleanupBasis,
+    OllamaCleanupReceipt,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseReadinessError,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
+    OllamaLifecycleBillingState,
+    OllamaProvisioningEvidenceError,
+    OllamaProvisioningEvidenceState,
+    OllamaProvisioningMismatchError,
+    OllamaProvisioningMismatchEvidence,
+    OllamaProvisioningMismatchReason,
     OllamaResourceType,
+    OllamaRuntimeTelemetryState,
     OllamaTeardownState,
     ProvisionedOllamaResource,
     accrued_cost,
+    authorized_cost_deadline,
     provision_attempt_id,
     resource_name,
 )
-from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
+from kestrel_cloud_runpod.ollama_repository import (
+    SQLiteOllamaLeaseRepository,
+    request_from_lease,
+)
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 
 
@@ -40,9 +59,26 @@ def _service(tmp_path, clock, provider):
     )
 
 
+def _replace_runtime_snapshot(observation, **changes):
+    assert observation.runtime_telemetry is not None
+    snapshot = replace(observation.runtime_telemetry.snapshot, **changes)
+    canonical = json.dumps(
+        snapshot.to_dict(), sort_keys=True, separators=(",", ":")
+    ).encode()
+    telemetry = replace(
+        observation.runtime_telemetry,
+        snapshot=snapshot,
+        snapshot_sha256=hashlib.sha256(canonical).hexdigest(),
+    )
+    return replace(observation, runtime_telemetry=telemetry)
+
+
 def _persist_uncertain_creation(repository, request, clock):
     plan = serverless_plan()
     lease, _ = repository.insert_request(request, now=clock())
+    prepared = FakeOllamaProvider(plan).validate_runtime_request(
+        request, plan, provision_requested_at=clock()
+    )
     lease = repository.compare_and_set(
         lease,
         changes={
@@ -54,6 +90,13 @@ def _persist_uncertain_creation(repository, request, clock):
             "provision_attempt_id": provision_attempt_id(request),
             "provision_attempts": 1,
             "provisioning_started_at": clock(),
+            "provisioning_evidence_state": (
+                OllamaProvisioningEvidenceState.INTENT_RECORDED
+            ),
+            "provisioning_intent_json": prepared.intent,
+            "runtime_telemetry_binding_sha256": (
+                prepared.runtime_telemetry_binding_sha256
+            ),
             **_persisted_plan_changes(plan),
         },
     )
@@ -65,6 +108,7 @@ def _persist_uncertain_creation(repository, request, clock):
 def _persisted_plan_changes(plan):
     return {
         "offered_rate_per_hr": plan.placement.offered_cost_per_hr,
+        "placement_gpu_count": plan.placement.gpu_count,
         "estimated_cost": plan.estimated_cost,
         "estimated_compute_cost": plan.estimated_compute_cost,
         "maximum_compute_cost": plan.maximum_compute_cost,
@@ -78,6 +122,10 @@ def _persisted_plan_changes(plan):
         "maximum_concurrent_workers": plan.maximum_concurrent_workers,
         "estimated_billable_seconds": plan.estimated_billable_seconds,
         "maximum_billable_seconds": plan.maximum_billable_seconds,
+        "selected_gpu_id": plan.placement.gpu_id,
+        "selected_gpu_pool": plan.placement.gpu_pool,
+        "selected_gpu_name": plan.placement.gpu_name,
+        "catalog_observed_at": plan.placement.catalog_observed_at,
     }
 
 
@@ -113,6 +161,87 @@ async def test_duplicate_acquire_does_not_create_second_resource(tmp_path):
 
     assert second.lease_id == first.lease_id
     assert provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_integer_and_float_money_spellings_share_first_acceptance(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    base_request = make_request(clock)
+    integer_request = replace(
+        base_request,
+        max_authorized_cost=2,
+        constraints=replace(base_request.constraints, max_hourly_rate=1),
+    )
+    float_request = replace(
+        integer_request,
+        max_authorized_cost=2.0,
+        constraints=replace(integer_request.constraints, max_hourly_rate=1.0),
+    )
+
+    first = await service.acquire(integer_request)
+    repeated = await service.acquire(integer_request)
+    equivalent = await service.acquire(float_request)
+
+    assert first.request_fingerprint == repeated.request_fingerprint
+    assert first.request_fingerprint == equivalent.request_fingerprint
+    assert provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field_name", ["max_authorized_cost", "max_hourly_rate"])
+async def test_unrepresentable_public_integer_cost_fails_before_admission(
+    tmp_path, field_name
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    request = make_request(clock)
+    if field_name == "max_authorized_cost":
+        request = replace(request, max_authorized_cost=10**400)
+    else:
+        request = replace(
+            request,
+            constraints=replace(request.constraints, max_hourly_rate=10**400),
+        )
+
+    with pytest.raises(ValueError, match="represented as a finite float"):
+        await service.acquire(request)
+
+    assert provider.provision_calls == 0
+    assert service.repository.get(request.lease_id) is None
+
+
+@pytest.mark.asyncio
+async def test_requested_restart_recovers_exact_original_fingerprint_inputs(tmp_path):
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        requested_at=clock(),
+        readiness_timeout_seconds=73,
+    )
+    database = tmp_path / "leases.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    original, inserted = repository.insert_request(request, now=clock())
+    assert inserted is True
+    assert original.request_fingerprint == request.fingerprint
+    provider = FakeOllamaProvider(serverless_plan())
+
+    recovered_request = request_from_lease(
+        SQLiteOllamaLeaseRepository(database).get(request.lease_id)
+    )
+    assert recovered_request == request
+    restarted = _service(tmp_path, clock, provider)
+    reconciled = await restarted.reconcile()
+
+    assert provider.provision_calls == 1
+    assert reconciled[0].state in {
+        OllamaLeaseState.WAITING_FOR_MODEL,
+        OllamaLeaseState.READY,
+    }
+    assert reconciled[0].provisioning_intent is not None
+    assert reconciled[0].provisioning_intent.request_fingerprint == request.fingerprint
 
 
 @pytest.mark.asyncio
@@ -209,12 +338,12 @@ class _BlockingProvisionProvider(FakeOllamaProvider):
         self.entered = asyncio.Event()
         self.resume = asyncio.Event()
 
-    async def provision(self, **kwargs):
+    async def provision(self, prepared):
         self.provision_calls += 1
         self.resource = ProvisionedOllamaResource(
-            resource_type=kwargs["plan"].resource_type,
+            resource_type=prepared.intent.resource_type,
             provider_resource_id="provider-001",
-            resource_name=kwargs["resource_name"],
+            resource_name=prepared.intent.resource_name,
         )
         self.entered.set()
         await self.resume.wait()
@@ -229,12 +358,15 @@ async def test_concurrent_duplicate_acquire_cannot_double_provision(tmp_path):
     request = make_request(clock)
 
     winner = asyncio.create_task(service.acquire(request))
-    await provider.entered.wait()
-    duplicate = await service.acquire(request)
+    try:
+        await asyncio.wait_for(provider.entered.wait(), timeout=5)
+        duplicate = await service.acquire(request)
 
-    assert duplicate.state is OllamaLeaseState.PROVISIONING
-    assert provider.provision_calls == 1
-    provider.resume.set()
+        assert duplicate.state is OllamaLeaseState.RECONCILE_REQUIRED
+        assert "no attributable resource" in duplicate.last_provider_error
+        assert provider.provision_calls == 1
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(winner, provider.resume)
     assert (await winner).state is OllamaLeaseState.READY
 
 
@@ -257,6 +389,675 @@ async def test_release_is_idempotent(tmp_path):
     assert provider.teardown_calls == 1
 
 
+class _BlockingTeardownProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.teardown_entered = asyncio.Event()
+        self.teardown_finish = asyncio.Event()
+
+    async def teardown(self, resource, cleanup_intent):
+        del resource
+        self.teardown_calls += 1
+        self.teardown_entered.set()
+        await self.teardown_finish.wait()
+        return OllamaCleanupReceipt(
+            cleanup_intent_id=cleanup_intent.cleanup_intent_id,
+            verified_absent_at=cleanup_intent.delete_started_at,
+            basis=OllamaCleanupBasis.DELETE_ACKNOWLEDGED,
+        )
+
+
+class _ConcurrentFinalTelemetryFailureProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.repository = None
+        self.fail_final_observation = False
+
+    async def observe(self, resource, intent, provisioning):
+        if not self.fail_final_observation:
+            return await super().observe(resource, intent, provisioning)
+        current = self.repository.get(intent.lease_id)
+        assert current is not None
+        self.repository.compare_and_set(
+            current,
+            changes={"last_provider_error": "concurrent reconciler observation"},
+        )
+        raise RunPodManagerError("final telemetry temporarily unavailable")
+
+
+class _ControlFailureFinalTelemetryProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.fail_final_observation = False
+        self.fail_teardown = False
+
+    async def observe(self, resource, intent, provisioning):
+        if self.fail_final_observation:
+            from kestrel_sovereign.execution_custody import (
+                ExecutionCommitOutcomeError,
+            )
+
+            raise ExecutionCommitOutcomeError("unknown")
+        return await super().observe(resource, intent, provisioning)
+
+    async def teardown(self, resource, cleanup_intent):
+        if self.fail_teardown:
+            raise OllamaLeaseTeardownError("provider delete remains retryable")
+        return await super().teardown(resource, cleanup_intent)
+
+
+class _ManagerControlCarrierProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.observe_error = None
+        self.provisioning_error = None
+        self.billing_error = None
+        self.teardown_error = None
+
+    async def observe(self, resource, intent, provisioning):
+        if self.observe_error is not None:
+            raise self.observe_error
+        return await super().observe(resource, intent, provisioning)
+
+    async def observe_provisioning(
+        self, intent, resource, *, reconciled_after_ambiguous_create=False
+    ):
+        if self.provisioning_error is not None:
+            raise self.provisioning_error
+        return await super().observe_provisioning(
+            intent,
+            resource,
+            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
+        )
+
+    async def observe_lifecycle_billing(self, intent, provisioning, cleanup):
+        if self.billing_error is not None:
+            raise self.billing_error
+        return await super().observe_lifecycle_billing(intent, provisioning, cleanup)
+
+    async def teardown(self, resource, cleanup_intent):
+        if self.teardown_error is not None:
+            self.teardown_calls += 1
+            raise self.teardown_error
+        return await super().teardown(resource, cleanup_intent)
+
+
+def _manager_carried_control(kind, lease):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    control = ExecutionCommitOutcomeError("unknown")
+    if kind == "manager":
+        error = RunPodAPIError(
+            title="Control",
+            detail="provider outcome remains unknown",
+            status_code=503,
+        )
+    elif kind == "evidence":
+        error = OllamaProvisioningEvidenceError(
+            "provisioning evidence outcome remains unknown"
+        )
+    elif kind == "teardown":
+        error = OllamaLeaseTeardownError("teardown outcome remains unknown")
+    else:
+        intent = lease.provisioning_intent
+        assert intent is not None
+        error = OllamaProvisioningMismatchError(
+            "provisioning mismatch outcome remains unknown",
+            OllamaProvisioningMismatchEvidence(
+                intent_sha256=intent.intent_sha256,
+                lease_id=intent.lease_id,
+                provision_attempt_id=intent.provision_attempt_id,
+                resource_type=intent.resource_type,
+                provider_resource_id=(lease.provider_resource_id or "provider-001"),
+                observed_resource_name=intent.resource_name,
+                observed_at=intent.provision_requested_at,
+                readback_sha256="c" * 64,
+                reason=OllamaProvisioningMismatchReason.RUNTIME,
+            ),
+        )
+    error.__cause__ = control
+    return error, control
+
+
+class _ClaimingControlFailureFinalTelemetryProvider(FakeOllamaProvider):
+    """Move only scheduler metadata before surfacing native control evidence."""
+
+    def __init__(self, clock):
+        super().__init__(serverless_plan())
+        self.clock = clock
+        self.repository = None
+        self.fail_final_observation = False
+
+    async def observe(self, resource, intent, provisioning):
+        if not self.fail_final_observation:
+            return await super().observe(resource, intent, provisioning)
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+        current = self.repository.get(intent.lease_id)
+        assert current is not None
+        claimed = self.repository.claim_for_reconciliation(
+            current,
+            now=self.clock(),
+            retry_at=self.clock() + timedelta(seconds=1),
+        )
+        assert claimed is not None
+        raise ExecutionCommitOutcomeError("unknown")
+
+
+class _FinalTelemetryRetryProvider(FakeOllamaProvider):
+    def __init__(self):
+        super().__init__(serverless_plan())
+        self.observe_calls = 0
+
+    async def observe(self, resource, intent, provisioning):
+        self.observe_calls += 1
+        if self.observe_calls == 3:
+            raise RunPodManagerError("final telemetry temporarily unavailable")
+        observed = await super().observe(resource, intent, provisioning)
+        return _replace_runtime_snapshot(
+            observed, telemetry_revision=self.observe_calls
+        )
+
+
+class _ChangedStartupTelemetryProvider(FakeOllamaProvider):
+    def __init__(self, changes):
+        super().__init__(serverless_plan())
+        self.changes = changes
+
+    async def observe(self, resource, intent, provisioning):
+        observed = await super().observe(resource, intent, provisioning)
+        return _replace_runtime_snapshot(observed, **self.changes(intent))
+
+
+class _NoQuiesceProvider(FakeOllamaProvider):
+    def __init__(self, plan):
+        super().__init__(plan)
+        self.observe_calls = 0
+
+    async def observe(self, resource, intent, provisioning):
+        self.observe_calls += 1
+        observed = await super().observe(resource, intent, provisioning)
+        return _replace_runtime_snapshot(
+            observed, telemetry_revision=self.observe_calls
+        )
+
+    async def quiesce(self, resource, intent, provisioning):
+        del resource, intent, provisioning
+        raise RunPodManagerError("runtime quiescence is unavailable")
+
+
+class _PreAdmissionFailureProvider(FakeOllamaProvider):
+    async def plan(self, request):
+        del request
+        raise RunPodManagerError("deterministic pre-admission failure")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_release_joins_one_same_id_teardown(tmp_path):
+    clock = MutableClock()
+    provider = _BlockingTeardownProvider()
+    service = _service(tmp_path, clock, provider)
+    await service.acquire(make_request(clock))
+
+    first = asyncio.create_task(
+        service.release("lease-001", owner_id="owner-001", workload_id="workload-001")
+    )
+    owned_tasks = [first]
+    try:
+        await asyncio.wait_for(provider.teardown_entered.wait(), timeout=5)
+        second = asyncio.create_task(
+            service.release(
+                "lease-001", owner_id="owner-001", workload_id="workload-001"
+            )
+        )
+        owned_tasks.append(second)
+        await asyncio.sleep(0.05)
+        calls_while_first_teardown_is_live = provider.teardown_calls
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks, provider.teardown_finish
+        )
+
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.state is OllamaLeaseState.TERMINATED
+    assert second_result.state is OllamaLeaseState.TERMINATED
+    assert calls_while_first_teardown_is_live == 1
+    assert provider.teardown_calls == 1
+    assert first_result.teardown_attempts == 1
+    assert second_result.teardown_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_final_telemetry_failure_cannot_block_cleanup(tmp_path):
+    clock = MutableClock()
+    provider = _ConcurrentFinalTelemetryFailureProvider()
+    service = _service(tmp_path, clock, provider)
+    provider.repository = service.repository
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    released = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    assert released.state is OllamaLeaseState.TERMINATED
+    assert released.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+    assert released.cleanup_receipt is not None
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_claim_during_native_final_telemetry_failure_preserves_cleanup(
+    tmp_path,
+):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    clock = MutableClock()
+    provider = _ClaimingControlFailureFinalTelemetryProvider(clock)
+    service = _service(tmp_path, clock, provider)
+    provider.repository = service.repository
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.cleanup_receipt is not None
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        lambda intent: {"ready": False, "ready_at": None},
+        lambda intent: {"ollama_process_running": False},
+        lambda intent: {"terminal_error": "runtime_initialization_failed"},
+        lambda intent: {
+            "provision_requested_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "container_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "ollama_process_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "ollama_healthy_at": intent.provision_requested_at + timedelta(seconds=1),
+            "model_load_started_at": intent.provision_requested_at
+            + timedelta(seconds=1),
+            "model_ready_at": intent.provision_requested_at + timedelta(seconds=1),
+            "ready_at": intent.provision_requested_at + timedelta(seconds=1),
+        },
+    ],
+    ids=("not-ready", "process-stopped", "terminal-error", "changed-birth"),
+)
+async def test_ready_route_refresh_requires_original_bound_healthy_telemetry(
+    tmp_path, changes
+):
+    clock = MutableClock()
+    provider = _ChangedStartupTelemetryProvider(lambda _intent: {})
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock, idle_timeout_seconds=60))
+    original_deadline = ready.idle_deadline
+    provider.changes = changes
+    clock.advance(10)
+
+    with pytest.raises(OllamaLeaseReadinessError):
+        await service.touch(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.idle_deadline == original_deadline
+    assert durable.route_url is None
+
+
+@pytest.mark.asyncio
+async def test_final_telemetry_control_failure_is_rethrown_after_cleanup(tmp_path):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        is_execution_control_error,
+    )
+
+    clock = MutableClock()
+    provider = _ControlFailureFinalTelemetryProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    with pytest.raises(ExecutionCommitOutcomeError) as raised:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert is_execution_control_error(raised.value)
+    released = service.repository.get(ready.lease_id)
+    assert released is not None
+    assert released.state is OllamaLeaseState.TERMINATED
+    assert released.cleanup_receipt is not None
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_final_telemetry_control_and_cleanup_failure_are_both_retained(tmp_path):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    clock = MutableClock()
+    provider = _ControlFailureFinalTelemetryProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+    provider.fail_teardown = True
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert is_execution_control_error(raised.value)
+    assert any(
+        isinstance(error, OllamaLeaseTeardownError) for error in raised.value.exceptions
+    )
+    retained = service.repository.get(ready.lease_id)
+    assert retained is not None
+    assert retained.state is OllamaLeaseState.RELEASING
+    assert retained.cleanup_receipt is None
+
+
+@pytest.mark.asyncio
+async def test_final_telemetry_control_and_cleanup_claim_failure_are_both_retained(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    clock = MutableClock()
+    provider = _ControlFailureFinalTelemetryProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    provider.fail_final_observation = True
+
+    def changed_cleanup_lineage(_lease, *, now):
+        del now
+        raise OllamaLeaseConflictError("changed cleanup lineage")
+
+    monkeypatch.setattr(
+        service.repository, "claim_cleanup_attempt", changed_cleanup_lineage
+    )
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert any(is_execution_control_error(error) for error in raised.value.exceptions)
+    assert any(
+        isinstance(error, OllamaLeaseConflictError)
+        and "changed cleanup lineage" in str(error)
+        for error in raised.value.exceptions
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier_kind", ["manager", "mismatch"])
+async def test_final_observation_preserves_manager_carried_control_before_cleanup(
+    tmp_path, carrier_kind
+):
+    clock = MutableClock()
+    provider = _ManagerControlCarrierProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    carrier, control = _manager_carried_control(carrier_kind, ready)
+    provider.observe_error = carrier
+
+    with pytest.raises(type(carrier)) as raised:
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+    durable = service.repository.get(ready.lease_id)
+    assert durable is not None
+    assert durable.state is OllamaLeaseState.RELEASING
+    assert durable.cleanup_intent is not None
+    assert durable.cleanup_receipt is None
+    assert provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier_kind", ["manager", "mismatch"])
+async def test_waiting_readiness_preserves_manager_carried_control_without_mutation(
+    tmp_path, carrier_kind
+):
+    clock = MutableClock()
+    provider = _ManagerControlCarrierProvider()
+    service = _service(tmp_path, clock, provider)
+    waiting = await service.acquire(make_request(clock), wait_until_ready=False)
+    before = service.repository.get(waiting.lease_id)
+    assert before is not None
+    carrier, control = _manager_carried_control(carrier_kind, before)
+    provider.observe_error = carrier
+
+    with pytest.raises(type(carrier)) as raised:
+        await service.reconcile_lease(
+            waiting.lease_id,
+            owner_id=waiting.owner_id,
+            workload_id=waiting.workload_id,
+        )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+    assert service.repository.get(waiting.lease_id) == before
+    assert provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier_kind", ["manager", "mismatch"])
+async def test_ready_route_preserves_manager_carried_control_without_mutation(
+    tmp_path, carrier_kind
+):
+    clock = MutableClock()
+    provider = _ManagerControlCarrierProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    before = service.repository.get(ready.lease_id)
+    assert before is not None
+    carrier, control = _manager_carried_control(carrier_kind, before)
+    provider.observe_error = carrier
+
+    with pytest.raises(type(carrier)) as raised:
+        await service.get(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+    assert service.repository.get(ready.lease_id) == before
+    assert provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "carrier_kind"),
+    [
+        pytest.param("reconcile", "mismatch", id="creation-mismatch"),
+        pytest.param("release", "evidence", id="release-evidence"),
+        pytest.param("release", "mismatch", id="release-mismatch"),
+    ],
+)
+async def test_uncertain_creation_preserves_typed_manager_control_graph(
+    tmp_path, operation, carrier_kind
+):
+    clock = MutableClock()
+    request = make_request(clock)
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "uncertain.sqlite3")
+    pending = _persist_uncertain_creation(repository, request, clock)
+    provider = _ManagerControlCarrierProvider()
+    intent = pending.provisioning_intent
+    assert intent is not None
+    provider.find_result = replace(
+        provider.resource,
+        resource_type=intent.resource_type,
+        resource_name=intent.resource_name,
+    )
+    carrier, control = _manager_carried_control(carrier_kind, pending)
+    provider.provisioning_error = carrier
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    with pytest.raises(type(carrier)) as raised:
+        if operation == "reconcile":
+            await service.reconcile_lease(
+                pending.lease_id,
+                owner_id=pending.owner_id,
+                workload_id=pending.workload_id,
+            )
+        else:
+            await service.release(
+                pending.lease_id,
+                owner_id=pending.owner_id,
+                workload_id=pending.workload_id,
+            )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+    assert provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    ["releasing", "mismatch", "expired", "readiness-timeout"],
+)
+async def test_teardown_suppression_preserves_manager_carried_control(
+    tmp_path, boundary
+):
+    clock = MutableClock()
+    provider = _ManagerControlCarrierProvider()
+    service = _service(tmp_path, clock, provider)
+    request = make_request(clock)
+    if boundary == "readiness-timeout":
+        provider.provider_ready = False
+        lease = await service.acquire(request, wait_until_ready=False)
+    else:
+        lease = await service.acquire(request)
+    if boundary == "releasing":
+        provider.teardown_failures = 1
+        with pytest.raises(OllamaLeaseTeardownError, match="retryable"):
+            await service.release(
+                lease.lease_id,
+                owner_id=lease.owner_id,
+                workload_id=lease.workload_id,
+            )
+        lease = service.repository.get(lease.lease_id)
+        assert lease is not None
+    elif boundary == "mismatch":
+        mismatch, _unused_control = _manager_carried_control("mismatch", lease)
+        assert isinstance(mismatch, OllamaProvisioningMismatchError)
+        lease = service._persist_provisioning_mismatch(lease, mismatch)
+    elif boundary == "expired":
+        clock.advance((lease.idle_deadline - clock()).total_seconds())
+    else:
+        clock.advance((lease.readiness_deadline - clock()).total_seconds())
+    carrier, control = _manager_carried_control("teardown", lease)
+    provider.teardown_error = carrier
+
+    with pytest.raises(OllamaLeaseTeardownError) as raised:
+        if boundary == "readiness-timeout":
+            await service.acquire(request, wait_until_ready=True)
+        else:
+            await service.reconcile_lease(
+                lease.lease_id,
+                owner_id=lease.owner_id,
+                workload_id=lease.workload_id,
+            )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+
+
+@pytest.mark.asyncio
+async def test_billing_preserves_manager_carried_control_without_poll_mutation(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = _ManagerControlCarrierProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    terminated = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+    before = service.repository.get(terminated.lease_id)
+    assert before is not None
+    carrier, control = _manager_carried_control("manager", before)
+    provider.billing_error = carrier
+
+    with pytest.raises(RunPodAPIError) as raised:
+        await service.reconcile_lease(
+            terminated.lease_id,
+            owner_id=terminated.owner_id,
+            workload_id=terminated.workload_id,
+        )
+
+    assert raised.value is carrier
+    assert raised.value.__cause__ is control
+    assert service.repository.get(terminated.lease_id) == before
+
+
+@pytest.mark.asyncio
+async def test_accrued_multi_gpu_cost_is_independent_of_decimal_context(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(
+        serverless_plan(
+            rate=0.47,
+            estimated_cost=1.41,
+            maximum_compute_cost=2.82,
+            gpu_count=3,
+        )
+    )
+    service = _service(tmp_path, clock, provider)
+    request = make_request(
+        clock,
+        constraints=replace(make_request(clock).constraints, gpu_count=3),
+        max_authorized_cost=5.0,
+    )
+    lease = await service.acquire(request, wait_until_ready=False)
+    clock.advance(3600)
+
+    with localcontext() as context:
+        context.prec = 2
+        exposure = accrued_cost(lease, clock())
+
+    assert Decimal(str(exposure)) >= Decimal("1.41")
+
+
 @pytest.mark.asyncio
 async def test_teardown_failure_keeps_provider_id_and_reconciler_retries(tmp_path):
     clock = MutableClock()
@@ -273,12 +1074,464 @@ async def test_teardown_failure_keeps_provider_id_and_reconciler_retries(tmp_pat
     assert failed.provider_resource_id == "provider-001"
     assert failed.state is OllamaLeaseState.RELEASING
     assert failed.teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+    assert failed.cleanup_intent is not None
+    original_cleanup_intent = failed.cleanup_intent
+    clock.advance(60)
 
-    reconciled = await service.reconcile()
+    restarted = _service(tmp_path, clock, provider)
+    reconciled = await restarted.reconcile()
 
     assert reconciled[0].state is OllamaLeaseState.TERMINATED
     assert reconciled[0].provider_resource_id == "provider-001"
     assert reconciled[0].teardown_attempts == 2
+    assert reconciled[0].cleanup_intent == original_cleanup_intent
+    assert reconciled[0].cleanup_receipt is not None
+    assert reconciled[0].cleanup_receipt.cleanup_intent_id == (
+        original_cleanup_intent.cleanup_intent_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_telemetry_cannot_block_a_required_teardown_retry(tmp_path):
+    clock = MutableClock()
+    provider = _FinalTelemetryRetryProvider()
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+    provider.teardown_failures = 1
+
+    with pytest.raises(OllamaLeaseTeardownError, match="retryable"):
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+    retained = service.repository.get(ready.lease_id)
+    assert retained is not None
+    assert retained.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+
+    completed = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+    assert provider.teardown_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_migrated_v3_complete_telemetry_cannot_block_cleanup_retry(tmp_path):
+    from test_ollama_repository import (
+        _WRITER_TRIGGERS,
+        _downgrade_to_v3_schema,
+        _drain_attestation,
+    )
+
+    clock = MutableClock()
+    provider = _FinalTelemetryRetryProvider()
+    database = tmp_path / "v3-complete-retry.sqlite3"
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock))
+    provider.teardown_failures = 1
+    with pytest.raises(OllamaLeaseTeardownError, match="retryable"):
+        await service.release(
+            ready.lease_id,
+            owner_id=ready.owner_id,
+            workload_id=ready.workload_id,
+        )
+
+    # A genuine drained v3 database may already contain the old single-process
+    # COMPLETE assertion.  Migration preserves that historical fact; v4 must
+    # never regress it while recording an ordinary telemetry read failure.
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(
+            "UPDATE ollama_leases SET runtime_telemetry_state = 'complete'"
+        )
+        _downgrade_to_v3_schema(connection)
+    migrated = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        database, attestation=_drain_attestation(database)
+    )
+    retained = migrated.get(ready.lease_id)
+    assert retained is not None
+    assert retained.runtime_telemetry_state is OllamaRuntimeTelemetryState.COMPLETE
+
+    restarted = OllamaLeaseService(
+        repository=migrated,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    completed = await restarted.release(
+        retained.lease_id,
+        owner_id=retained.owner_id,
+        workload_id=retained.workload_id,
+    )
+
+    assert completed.state is OllamaLeaseState.TERMINATED
+    assert completed.runtime_telemetry_state is OllamaRuntimeTelemetryState.COMPLETE
+    assert completed.runtime_telemetry_last_provider_error == (
+        "final telemetry: final telemetry temporarily unavailable"
+    )
+    assert provider.teardown_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_capacity_preempts_older_ready_rows_in_a_bounded_batch(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    older = replace(make_request(clock), lease_id="older-ready")
+    await service.acquire(older)
+    clock.advance(1)
+    provider.resource = replace(provider.resource, provider_resource_id="provider-002")
+    expiring = replace(
+        make_request(clock),
+        lease_id="younger-expired",
+        hard_deadline=clock() + timedelta(seconds=10),
+        expected_session_seconds=5,
+        expected_active_seconds=1,
+    )
+    await service.acquire(expiring)
+    clock.advance(11)
+
+    first_batch = await service.reconcile()
+
+    assert [lease.lease_id for lease in first_batch] == [expiring.lease_id]
+    assert first_batch[0].state is OllamaLeaseState.TERMINATED
+    assert service.repository.get(older.lease_id).state is OllamaLeaseState.READY
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_schedule_never_delays_exact_cost_cutoff(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    request = replace(
+        make_request(clock), max_authorized_cost=0.3, idle_timeout_seconds=1800
+    )
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=3600,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(request)
+    cutoff = authorized_cost_deadline(ready)
+    assert clock() < cutoff < ready.hard_deadline
+
+    visited = await service.reconcile()
+    assert [item.lease_id for item in visited] == [ready.lease_id]
+    scheduled = service.repository.get(ready.lease_id)
+    assert scheduled is not None
+    assert scheduled.reconcile_after == cutoff
+
+    clock.advance((cutoff - clock()).total_seconds())
+    released = await service.reconcile()
+
+    assert [item.lease_id for item in released] == [ready.lease_id]
+    assert released[0].state is OllamaLeaseState.TERMINATED
+
+
+@pytest.mark.asyncio
+async def test_ready_transition_atomically_schedules_new_earlier_idle_cutoff(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "ready-idle.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=60,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    waiting = await service.acquire(
+        make_request(clock, idle_timeout_seconds=1), wait_until_ready=False
+    )
+    assert waiting.state is OllamaLeaseState.WAITING_FOR_MODEL
+
+    reconciled = await service.reconcile()
+
+    assert len(reconciled) == 1
+    ready = reconciled[0]
+    assert ready.state is OllamaLeaseState.READY
+    assert ready.idle_deadline == clock() + timedelta(seconds=1)
+    assert ready.reconcile_after == ready.idle_deadline
+
+
+@pytest.mark.asyncio
+async def test_ready_idle_cutoff_is_due_after_restart_and_tears_down_exact_id(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    database = tmp_path / "ready-idle-restart.sqlite3"
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=60,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    waiting = await service.acquire(
+        make_request(clock, idle_timeout_seconds=1), wait_until_ready=False
+    )
+    assert waiting.state is OllamaLeaseState.WAITING_FOR_MODEL
+    ready = (await service.reconcile())[0]
+    clock.advance(1)
+    restarted_repository = SQLiteOllamaLeaseRepository(database)
+
+    due = restarted_repository.list_for_reconciliation(now=clock())
+    restarted = OllamaLeaseService(
+        repository=restarted_repository,
+        provider=provider,
+        poll_interval_seconds=60,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    released = await restarted.reconcile()
+
+    assert [item.lease_id for item in due] == [ready.lease_id]
+    assert [item.lease_id for item in released] == [ready.lease_id]
+    assert released[0].state is OllamaLeaseState.TERMINATED
+    assert released[0].provider_resource_id == "provider-001"
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ready_idle_cutoff_claim_is_cas_serialized_after_restart(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    database = tmp_path / "ready-idle-cas.sqlite3"
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=60,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    await service.acquire(
+        make_request(clock, idle_timeout_seconds=1), wait_until_ready=False
+    )
+    ready = (await service.reconcile())[0]
+    clock.advance(1)
+    first = SQLiteOllamaLeaseRepository(database)
+    second = SQLiteOllamaLeaseRepository(database)
+    first_snapshot = first.get(ready.lease_id)
+    second_snapshot = second.get(ready.lease_id)
+    assert first_snapshot is not None
+    assert second_snapshot is not None
+    assert [item.lease_id for item in first.list_for_reconciliation(now=clock())] == [
+        ready.lease_id
+    ]
+
+    winner = first.claim_for_reconciliation(
+        first_snapshot,
+        now=clock(),
+        retry_at=clock() + timedelta(seconds=60),
+    )
+    loser = second.claim_for_reconciliation(
+        second_snapshot,
+        now=clock(),
+        retry_at=clock() + timedelta(seconds=60),
+    )
+
+    assert winner is not None
+    assert loser is None
+
+
+@pytest.mark.asyncio
+async def test_touch_preserves_an_earlier_visit_from_valid_service_history(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    database = tmp_path / "touch-schedule.sqlite3"
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=60,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock, idle_timeout_seconds=10))
+    scheduled = (await service.reconcile())[0]
+    assert scheduled.reconcile_after == ready.idle_deadline
+    clock.advance(1)
+
+    touched = await service.touch(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    assert touched.idle_deadline == clock() + timedelta(seconds=10)
+    assert touched.reconcile_after == scheduled.reconcile_after
+    assert touched.reconcile_after < touched.idle_deadline
+    restarted = SQLiteOllamaLeaseRepository(database).get(ready.lease_id)
+    assert restarted is not None
+    assert restarted.reconcile_after == scheduled.reconcile_after
+
+
+@pytest.mark.asyncio
+async def test_bounded_reconciliation_rotates_unchanged_ready_rows_across_restart(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    first_request = replace(make_request(clock), lease_id="ready-a")
+    await service.acquire(first_request)
+    clock.advance(1)
+    provider.resource = replace(provider.resource, provider_resource_id="provider-002")
+    second_request = replace(make_request(clock), lease_id="ready-b")
+    await service.acquire(second_request)
+
+    first_pass = await service.reconcile()
+    restarted = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    second_pass = await restarted.reconcile()
+
+    assert [item.lease_id for item in first_pass] == [first_request.lease_id]
+    assert [item.lease_id for item in second_pass] == [second_request.lease_id]
+
+
+@pytest.mark.asyncio
+async def test_permanent_cleanup_failure_yields_to_due_billing_after_restart(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    database = tmp_path / "leases.sqlite3"
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    billed_request = replace(make_request(clock), lease_id="billing-due")
+    billed = await service.acquire(billed_request)
+    billed = await service.release(
+        billed.lease_id,
+        owner_id=billed.owner_id,
+        workload_id=billed.workload_id,
+    )
+    clock.advance(1)
+    provider.resource = replace(provider.resource, provider_resource_id="provider-002")
+    failing_request = replace(make_request(clock), lease_id="cleanup-failing")
+    failing = await service.acquire(failing_request)
+    provider.teardown_failures = 10
+    with pytest.raises(OllamaLeaseTeardownError, match="retryable"):
+        await service.release(
+            failing.lease_id,
+            owner_id=failing.owner_id,
+            workload_id=failing.workload_id,
+        )
+    clock.advance(1)
+    # The failed cleanup has been due since t+2; make the billing visit newly
+    # due at t+3 so a batch of one first exercises the older failed row.
+    clock.advance(1)
+    billed = service.repository.compare_and_set(
+        billed, changes={"reconcile_after": clock()}
+    )
+
+    first_pass = await service.reconcile()
+    assert [item.lease_id for item in first_pass] == [failing_request.lease_id]
+    assert first_pass[0].teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+
+    restarted = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    second_pass = await restarted.reconcile()
+
+    assert [item.lease_id for item in second_pass] == [billed_request.lease_id]
+    assert second_pass[0].billing_last_checked_at == clock()
+    retained_failure = restarted.repository.get(failing_request.lease_id)
+    assert retained_failure is not None
+    assert retained_failure.reconcile_after == clock() + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_unchanged_reconcile_required_row_yields_to_due_billing_after_restart(
+    tmp_path,
+):
+    clock = MutableClock()
+    database = tmp_path / "leases.sqlite3"
+    repository = SQLiteOllamaLeaseRepository(database)
+    failing_request = replace(make_request(clock), lease_id="reconcile-failing")
+    failing = _persist_uncertain_creation(repository, failing_request, clock)
+    clock.advance(1)
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    billed_request = replace(make_request(clock), lease_id="billing-due")
+    billed = await service.acquire(billed_request)
+    billed = await service.release(
+        billed.lease_id,
+        owner_id=billed.owner_id,
+        workload_id=billed.workload_id,
+    )
+
+    first_pass = await service.reconcile()
+    assert [item.lease_id for item in first_pass] == [failing.lease_id]
+    retained_failure = repository.get(failing.lease_id)
+    assert retained_failure is not None
+    assert retained_failure.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert retained_failure.reconcile_after == clock() + timedelta(seconds=1)
+
+    restarted = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(database),
+        provider=provider,
+        poll_interval_seconds=1,
+        reconciliation_batch_size=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    second_pass = await restarted.reconcile()
+
+    assert [item.lease_id for item in second_pass] == [billed_request.lease_id]
+    assert second_pass[0].billing_last_checked_at == clock()
 
 
 @pytest.mark.asyncio
@@ -288,6 +1541,9 @@ async def test_restart_reconciles_resource_created_before_id_was_persisted(tmp_p
     repository = SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3")
     lease, _ = repository.insert_request(request, now=clock())
     plan = serverless_plan()
+    prepared = FakeOllamaProvider(plan).validate_runtime_request(
+        request, plan, provision_requested_at=clock()
+    )
     lease = repository.compare_and_set(
         lease,
         changes={
@@ -298,6 +1554,13 @@ async def test_restart_reconciles_resource_created_before_id_was_persisted(tmp_p
             "provision_attempt_id": provision_attempt_id(request),
             "provision_attempts": 1,
             "provisioning_started_at": clock(),
+            "provisioning_evidence_state": (
+                OllamaProvisioningEvidenceState.INTENT_RECORDED
+            ),
+            "provisioning_intent_json": prepared.intent,
+            "runtime_telemetry_binding_sha256": (
+                prepared.runtime_telemetry_binding_sha256
+            ),
             **_persisted_plan_changes(plan),
         },
     )
@@ -314,6 +1577,77 @@ async def test_restart_reconciles_resource_created_before_id_was_persisted(tmp_p
     assert results[0].state is OllamaLeaseState.READY
     assert results[0].provider_resource_id == "recovered-provider"
     assert provider.provision_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack", ["provider_id", "provisioning_receipt"])
+@pytest.mark.parametrize("committed_before_lost_ack", [False, True])
+async def test_restart_recovers_each_create_ack_crash_without_second_post(
+    tmp_path, monkeypatch, ack, committed_before_lost_ack
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    owner = _service(tmp_path, clock, provider)
+    request = make_request(clock)
+    original_compare_and_set = owner.repository.compare_and_set
+    original_attach = owner.repository.attach_provider_acknowledgment
+    original_outcome = owner.repository.record_provisioning_outcome
+    injected = False
+
+    def lose_receipt_ack(lease, *, changes):
+        nonlocal injected
+        is_target = ack == "provisioning_receipt" and (
+            "provisioning_receipt_json" in changes
+        )
+        if not injected and is_target:
+            injected = True
+            if committed_before_lost_ack:
+                original_compare_and_set(lease, changes=changes)
+            raise RunPodManagerError(f"simulated lost {ack} ACK")
+        return original_compare_and_set(lease, changes=changes)
+
+    def lose_provider_ack(lease, resource, *, now):
+        nonlocal injected
+        if not injected and ack == "provider_id":
+            injected = True
+            if committed_before_lost_ack:
+                original_attach(lease, resource, now=now)
+            raise RunPodManagerError(f"simulated lost {ack} ACK")
+        return original_attach(lease, resource, now=now)
+
+    def lose_outcome(lease, **outcome):
+        nonlocal injected
+        is_target = ack == "provisioning_receipt" and outcome.get("receipt") is not None
+        if not injected and is_target:
+            injected = True
+            if committed_before_lost_ack:
+                original_outcome(lease, **outcome)
+            raise RunPodManagerError(f"simulated lost {ack} ACK")
+        return original_outcome(lease, **outcome)
+
+    monkeypatch.setattr(owner.repository, "compare_and_set", lose_receipt_ack)
+    monkeypatch.setattr(
+        owner.repository, "attach_provider_acknowledgment", lose_provider_ack
+    )
+    monkeypatch.setattr(owner.repository, "record_provisioning_outcome", lose_outcome)
+    with pytest.raises(RunPodManagerError, match=f"lost {ack} ACK"):
+        await owner.acquire(request, wait_until_ready=False)
+
+    interrupted = SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3").get(
+        request.lease_id
+    )
+    assert provider.provision_calls == 1
+    assert interrupted.provisioning_intent is not None
+    if interrupted.provider_resource_id is None:
+        provider.find_result = provider.resource
+
+    restarted = _service(tmp_path, clock, provider)
+    reconciled = await restarted.reconcile()
+
+    assert reconciled[0].state is OllamaLeaseState.READY
+    assert reconciled[0].provisioning_receipt is not None
+    assert reconciled[0].provider_resource_id == provider.resource.provider_resource_id
+    assert provider.provision_calls == 1
 
 
 @pytest.mark.asyncio
@@ -460,6 +1794,56 @@ async def test_readiness_timeout_tears_down_without_publishing_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_planning_that_crosses_original_readiness_deadline_never_posts(tmp_path):
+    clock = MutableClock()
+
+    class SlowPlanningProvider(FakeOllamaProvider):
+        async def plan(self, request):
+            clock.advance(11)
+            return await super().plan(request)
+
+    provider = SlowPlanningProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+
+    lease = await service.acquire(
+        make_request(clock, readiness_timeout_seconds=10),
+        wait_until_ready=False,
+    )
+
+    assert lease.state is OllamaLeaseState.TERMINATED
+    assert lease.termination_reason == "expired"
+    assert lease.public_route_url is None
+    assert provider.provision_calls == 0
+    assert provider.teardown_calls == 0
+    assert lease.lifecycle_billing_state is OllamaLifecycleBillingState.NOT_APPLICABLE
+    assert lease.lifecycle_billing_observations == ()
+
+
+@pytest.mark.asyncio
+async def test_readiness_observation_crossing_deadline_cannot_publish_route(tmp_path):
+    clock = MutableClock()
+
+    class SlowReadinessProvider(FakeOllamaProvider):
+        async def observe(self, resource, intent, provisioning):
+            observation = await super().observe(resource, intent, provisioning)
+            clock.advance(11)
+            return observation
+
+    provider = SlowReadinessProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+
+    with pytest.raises(OllamaLeaseReadinessError, match="model-ready"):
+        await service.acquire(make_request(clock, readiness_timeout_seconds=10))
+
+    lease = service.repository.get("lease-001")
+    assert lease.state is OllamaLeaseState.TERMINATED
+    assert lease.termination_reason == "readiness_timeout"
+    assert lease.ready_at is None
+    assert lease.public_route_url is None
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_cost_cap_stops_slow_cold_start(tmp_path):
     clock = MutableClock()
     provider = FakeOllamaProvider(serverless_plan(rate=3.6, estimated_cost=0.001))
@@ -536,15 +1920,16 @@ class _InspectingPullProvider(FakeOllamaProvider):
 class _FlakyObserveProvider(FakeOllamaProvider):
     observe_calls = 0
 
-    async def observe(self, resource):
+    async def observe(self, resource, intent, provisioning):
         self.observe_calls += 1
         if self.observe_calls == 1:
             raise RunPodManagerError("temporary control-plane read failure")
-        return await super().observe(resource)
+        return await super().observe(resource, intent, provisioning)
 
 
 class _AlwaysFailingObserveProvider(FakeOllamaProvider):
-    async def observe(self, resource):
+    async def observe(self, resource, intent, provisioning):
+        del intent, provisioning
         raise RunPodManagerError("control-plane observation failed")
 
 
@@ -562,6 +1947,83 @@ async def test_transient_readiness_error_is_persisted_then_cleared_on_success(tm
 
 
 @pytest.mark.asyncio
+async def test_unretained_startup_telemetry_cannot_publish_a_ready_route(tmp_path):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=provider,
+        poll_interval_seconds=1,
+        maximum_evidence_bytes=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    waiting = await service.acquire(make_request(clock), wait_until_ready=False)
+
+    reconciled = await service.reconcile_lease(
+        waiting.lease_id,
+        owner_id=waiting.owner_id,
+        workload_id=waiting.workload_id,
+    )
+
+    assert reconciled.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert reconciled.public_route_url is None
+    assert reconciled.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+    assert reconciled.runtime_telemetry_observations == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        lambda _intent: {"ready": False, "ready_at": None},
+        lambda intent: {
+            "provision_requested_at": (
+                intent.provision_requested_at - timedelta(seconds=1)
+            ),
+            "placement_and_image_pull_wall_ms": 1000,
+        },
+    ],
+    ids=("runtime-not-ready", "birth-before-original-intent"),
+)
+async def test_contradictory_startup_telemetry_never_publishes_ready(tmp_path, changes):
+    clock = MutableClock()
+    provider = _ChangedStartupTelemetryProvider(changes)
+    service = _service(tmp_path, clock, provider)
+
+    lease = await service.acquire(make_request(clock), wait_until_ready=False)
+    reconciled = await service.reconcile_lease(
+        lease.lease_id,
+        owner_id=lease.owner_id,
+        workload_id=lease.workload_id,
+    )
+
+    assert reconciled.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert reconciled.public_route_url is None
+    assert reconciled.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_release_without_proven_runtime_quiescence_retains_partial_telemetry(
+    tmp_path,
+):
+    clock = MutableClock()
+    provider = _NoQuiesceProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    ready = await service.acquire(make_request(clock))
+
+    released = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    assert released.state is OllamaLeaseState.TERMINATED
+    assert released.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+    assert provider.teardown_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_service_rejects_provider_plan_above_cost_cap_before_creation(tmp_path):
     clock = MutableClock()
     provider = FakeOllamaProvider(serverless_plan(estimated_cost=5.0))
@@ -573,6 +2035,40 @@ async def test_service_rejects_provider_plan_above_cost_cap_before_creation(tmp_
     lease = service.repository.get("lease-001")
     assert lease.state is OllamaLeaseState.FAILED
     assert provider.provision_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_admission_failure_releases_without_cleanup_lineage(tmp_path):
+    clock = MutableClock()
+    provider = _PreAdmissionFailureProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    request = make_request(clock)
+
+    with pytest.raises(RunPodManagerError, match="pre-admission failure"):
+        await service.acquire(request)
+    failed = service.repository.get(request.lease_id)
+    assert failed is not None
+    assert failed.state is OllamaLeaseState.FAILED
+    assert provider.provision_calls == 0
+
+    released = await service.release(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+    repeated = await service.release(
+        request.lease_id,
+        owner_id=request.owner_id,
+        workload_id=request.workload_id,
+    )
+
+    assert released.state is OllamaLeaseState.TERMINATED
+    assert repeated.state is OllamaLeaseState.TERMINATED
+    assert released.lifecycle_billing_state is (
+        OllamaLifecycleBillingState.NOT_APPLICABLE
+    )
+    assert provider.provision_calls == 0
+    assert provider.teardown_calls == 0
 
 
 @pytest.mark.asyncio
@@ -751,11 +2247,52 @@ class _ObserveAdvancingProvider(FakeOllamaProvider):
         self._advance_seconds = advance_seconds
         self.advance_enabled = False
 
-    async def observe(self, resource):
-        observation = await super().observe(resource)
+    async def observe(self, resource, intent, provisioning):
+        observation = await super().observe(resource, intent, provisioning)
         if self.advance_enabled:
             self._clock.advance(self._advance_seconds)
         return observation
+
+
+class _BillingAdvancingProvider(FakeOllamaProvider):
+    """Make a missing provider-history read outlast one retry interval."""
+
+    def __init__(self, plan, *, clock, advance_seconds):
+        super().__init__(plan)
+        self._clock = clock
+        self._advance_seconds = advance_seconds
+
+    async def observe_lifecycle_billing(self, intent, provisioning, cleanup):
+        del intent, provisioning, cleanup
+        self._clock.advance(self._advance_seconds)
+
+
+@pytest.mark.asyncio
+async def test_slow_billing_read_schedules_retry_from_completed_observation(tmp_path):
+    clock = MutableClock()
+    capacity = _BillingAdvancingProvider(
+        serverless_plan(), clock=clock, advance_seconds=7200
+    )
+    service = _service(tmp_path, clock, capacity)
+    ready = await service.acquire(make_request(clock))
+    terminated = await service.release(
+        ready.lease_id,
+        owner_id=ready.owner_id,
+        workload_id=ready.workload_id,
+    )
+
+    reconciled = await service.reconcile_lease(
+        terminated.lease_id,
+        owner_id=terminated.owner_id,
+        workload_id=terminated.workload_id,
+    )
+
+    assert reconciled.lifecycle_billing_state is OllamaLifecycleBillingState.PENDING
+    assert reconciled.billing_last_checked_at == clock()
+    assert reconciled.billing_next_check_at == clock() + timedelta(hours=1)
+    assert reconciled.billing_last_provider_error == (
+        "provider lifecycle billing history is incomplete"
+    )
 
 
 @pytest.mark.asyncio

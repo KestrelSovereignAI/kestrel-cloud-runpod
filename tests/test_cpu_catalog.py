@@ -350,9 +350,9 @@ def test_missing_price_object_preserves_unknown():
         match(catalog)
 
 
-def test_mutated_request_cannot_bypass_cpu_syntax_during_matching():
+def test_caller_mutation_cannot_change_cpu_request_during_matching():
     mounts = {"network": [{"volumeId": "v", "path": "/workspace"}]}
     pod_request = request(mounts=mounts)
     mounts["persistent"] = {"size": 1, "path": "/other"}
-    with pytest.raises(ValueError, match="CPU Pod"):
-        match(pod_request=pod_request)
+    mounts["network"][0]["volumeId"] = "foreign"
+    assert match(pod_request=pod_request).cpu_id == "cpu5c"

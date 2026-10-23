@@ -12,7 +12,9 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
 from urllib.parse import quote, urlparse
 
+import httpcore
 import httpx
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .cpu_catalog import CpuCatalogSnapshot, validate_cpu_query
 from .models import (
@@ -39,8 +41,74 @@ from .models import (
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_RETRYABLE_TRANSPORT_PAIRS = {
+    httpx.ConnectTimeout: httpcore.ConnectTimeout,
+    httpx.ReadTimeout: httpcore.ReadTimeout,
+    httpx.WriteTimeout: httpcore.WriteTimeout,
+    httpx.PoolTimeout: httpcore.PoolTimeout,
+    httpx.ConnectError: httpcore.ConnectError,
+    httpx.ReadError: httpcore.ReadError,
+    httpx.WriteError: httpcore.WriteError,
+    httpx.RemoteProtocolError: httpcore.RemoteProtocolError,
+}
 _RATE_LIMIT_RESET_RE = re.compile(r"(?:^|[,;]\s*)reset=(\d+(?:\.\d+)?)", re.IGNORECASE)
 DEFAULT_USER_AGENT = "kestrel-cloud-runpod/v2"
+
+
+def _is_retryable_runpod_status(status_code: int | None) -> bool:
+    return status_code in _RETRYABLE_STATUSES
+
+
+def _is_retryable_httpx_transport_error(error: httpx.HTTPError) -> bool:
+    """Recognize one reviewed public HTTPX -> HTTPCore transport pair.
+
+    This is transport-category evidence only. It never authorizes replay of a
+    mutating method, and it deliberately ignores diagnostic implicit context.
+    Unknown subclasses and any additional explicit cause/control graph fail
+    closed.
+    """
+
+    if is_execution_control_error(error):
+        return False
+    expected_core_type = _RETRYABLE_TRANSPORT_PAIRS.get(type(error))
+    if expected_core_type is None:
+        return False
+    core_error = error.__cause__
+    return type(core_error) is expected_core_type and core_error.__cause__ is None
+
+
+def is_retryable_runpod_api_error(error: RunPodAPIError) -> bool:
+    """Classify one exact API outcome for durable reconciliation.
+
+    A missing status is retryable only when the canonical client retained its
+    original HTTPX failure as the explicit cause.  This prevents callers from
+    manufacturing retry authority with a nullable status alone.  This result
+    does not grant permission to repeat an arbitrary HTTP method.
+    """
+
+    if type(error) not in {
+        RunPodAPIError,
+        RunPodAmbiguousResultError,
+    } or is_execution_control_error(error):
+        return False
+    if _is_retryable_runpod_status(error.status_code):
+        return error.__cause__ is None
+    return (
+        error.status_code is None
+        and isinstance(error.__cause__, httpx.HTTPError)
+        and _is_retryable_httpx_transport_error(error.__cause__)
+    )
+
+
+def is_exact_runpod_not_found(error: RunPodAPIError) -> bool:
+    """Return whether one canonical response proves the requested ID absent."""
+
+    return (
+        type(error) is RunPodAPIError
+        and error.status_code == 404
+        and error.__cause__ is None
+        and not is_execution_control_error(error)
+    )
 
 
 class RunpodTransport:
@@ -113,10 +181,14 @@ class RunpodTransport:
         )
         if response.status_code == 204 or not response.content:
             return None
-        error_type = RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
+        error_type = (
+            RunPodAmbiguousResultError if ambiguous_on_failure else RunPodAPIError
+        )
         try:
             payload = response.json()
         except (ValueError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise error_type(
                 title="Invalid Runpod response",
                 detail="Expected a JSON object from the v2 API",
@@ -204,7 +276,9 @@ class RunpodTransport:
                         if event_id is not None:
                             self.last_sse_event_id = event_id
                         yield payload
-                except httpx.HTTPError:
+                except httpx.HTTPError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     if deadline_expired.is_set():
                         return
                     raise
@@ -212,6 +286,8 @@ class RunpodTransport:
                     if timer is not None:
                         timer.cancel()
         except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodAPIError(
                 title="Runpod transport failed",
                 detail=type(exc).__name__,
@@ -266,7 +342,13 @@ class RunpodTransport:
                     json=json_body,
                 )
             except httpx.HTTPError as exc:
-                if safe_to_retry and attempt < self.max_safe_retries:
+                if is_execution_control_error(exc):
+                    raise
+                if (
+                    safe_to_retry
+                    and _is_retryable_httpx_transport_error(exc)
+                    and attempt < self.max_safe_retries
+                ):
                     self._sleep(_fallback_backoff(attempt))
                     attempt += 1
                     continue
@@ -288,7 +370,7 @@ class RunpodTransport:
                 return response
             if (
                 safe_to_retry
-                and response.status_code in _RETRYABLE_STATUSES
+                and _is_retryable_runpod_status(response.status_code)
                 and attempt < self.max_safe_retries
             ):
                 self._sleep(_retry_delay(response.headers, attempt))
@@ -424,7 +506,9 @@ class RunpodControlPlaneClient:
             payload, product=product, vcpu_count=vcpu_count, observed_at=observed_at
         )
 
-    def create_pod(self, request: PodCreateRequest | CpuPodCreateRequest) -> PodResource:
+    def create_pod(
+        self, request: PodCreateRequest | CpuPodCreateRequest
+    ) -> PodResource:
         payload = self.transport.request_json(
             "POST",
             "/pods",
@@ -434,7 +518,9 @@ class RunpodControlPlaneClient:
         )
         try:
             return PodResource.from_dict(_required_payload(payload))
-        except (RunPodManagerError, RecursionError):
+        except (RunPodManagerError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
             # A malformed success receipt cannot turn a paid create into a
             # known failure. The caller retains custody and reconciles it.
             raise RunPodAmbiguousResultError(
@@ -514,16 +600,29 @@ class RunpodControlPlaneClient:
             raise RunPodManagerError(
                 "Legacy endpoint authority must upgrade before new spend"
             )
-        payload = _required_payload(
-            self.transport.request_json(
-                "POST",
-                "/serverless",
-                json_body=request.to_payload(),
-                expected_statuses=(201,),
-                ambiguous_on_failure=True,
-            )
+        payload = self.transport.request_json(
+            "POST",
+            "/serverless",
+            json_body=request.to_payload(),
+            expected_statuses=(201,),
+            ambiguous_on_failure=True,
         )
-        return EndpointResource.from_dict(payload)
+        try:
+            return EndpointResource.from_dict(_required_payload(payload))
+        except (RunPodManagerError, RecursionError) as exc:
+            if is_execution_control_error(exc):
+                raise
+            raise RunPodAmbiguousResultError(
+                title="Unverified Endpoint creation response",
+                detail=(
+                    "The successful create response omitted a usable identity; "
+                    "reconcile before retrying"
+                ),
+                status_code=201,
+                method="POST",
+                resource="/serverless",
+                rate_limit=self.transport.last_rate_limit,
+            ) from None
 
     def get_endpoint(self, endpoint_id: str) -> EndpointResource:
         payload = _required_payload(
@@ -830,7 +929,9 @@ def _problem_from_response(response: httpx.Response) -> dict[str, Any]:
     errors: tuple[str, ...] = ()
     try:
         payload = response.json()
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError) as error:
+        if is_execution_control_error(error):
+            raise
         payload = None
     if isinstance(payload, Mapping):
         if isinstance(payload.get("title"), str):

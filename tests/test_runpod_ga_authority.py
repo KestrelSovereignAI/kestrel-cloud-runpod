@@ -13,6 +13,7 @@ from kestrel_cloud_runpod.models import (
     EndpointResourceVersion,
     PodCreateRequest,
     RunPodManagerError,
+    RunPodMountPolicyMismatchError,
     normalize_cuda_floor,
     validate_endpoint_mounts,
 )
@@ -78,6 +79,21 @@ def test_endpoint_create_explicitly_binds_both_storage_representations():
         "global": [],
     }
     validate_endpoint_mounts(payload, ("accepted-volume",))
+
+
+def test_partial_allowed_endpoint_mount_evidence_is_unavailable_not_foreign():
+    with pytest.raises(RunPodManagerError) as raised:
+        validate_endpoint_mounts(
+            {
+                "mounts": {
+                    "network": [{"volumeId": "accepted-a"}, 17],
+                    "global": [],
+                }
+            },
+            ("accepted-a", "accepted-b"),
+        )
+
+    assert not isinstance(raised.value, RunPodMountPolicyMismatchError)
 
 
 def test_historical_spec_round_trips_without_rewriting_its_authority():

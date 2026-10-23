@@ -18,6 +18,7 @@ from .models import (
     GPUProfile,
     PlacementRequirements,
     PodCreateRequest,
+    RunPodAcknowledgedResourceError,
     RunPodManagerError,
 )
 from .placement import select_gpu
@@ -160,16 +161,27 @@ class DirectRunPodProvider(GPUProvider):
                 min_cuda_version=requirements.min_cuda_version,
             )
         )
+        try:
+            pod.require_valid_fields(context="v2 Pod create")
+        except RunPodManagerError as exc:
+            raise RunPodAcknowledgedResourceError(
+                resource_id=pod.id,
+                resource_name=pod.name,
+            ) from exc
         result = dict(pod.raw)
         result["_kestrel_placement"] = placement
         return result
 
     def get_status(self, pod_id: str) -> Dict[str, Any]:
-        return dict(self.client.get_pod(pod_id).raw)
+        pod = self.client.get_pod(pod_id)
+        pod.require_valid_fields(context="v2 Pod status")
+        return dict(pod.raw)
 
     def stop_pod(self, pod_id: str) -> Dict[str, Any]:
         pod = self.client.pod_action(pod_id, "stop")
-        return dict(pod.raw) if pod is not None else {"id": pod_id, "status": "EXITED"}
+        if pod is not None:
+            pod.require_valid_fields(context="v2 Pod stop")
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def resume_pod(self, pod_id: str, gpu_count: int = 1) -> Dict[str, Any]:
         """Start the stopped Pod on its retained machine assignment."""
@@ -177,20 +189,23 @@ class DirectRunPodProvider(GPUProvider):
         if gpu_count != 1:
             logger.debug("Runpod v2 start action uses the Pod's configured GPU count")
         pod = self.client.pod_action(pod_id, "start")
-        return (
-            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "STARTING"}
-        )
+        if pod is not None:
+            pod.require_valid_fields(context="v2 Pod start")
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def terminate_pod(self, pod_id: str) -> Dict[str, Any]:
         """Permanently terminate a Pod through the v2 action contract."""
 
         pod = self.client.pod_action(pod_id, "terminate")
-        return (
-            dict(pod.raw) if pod is not None else {"id": pod_id, "status": "TERMINATED"}
-        )
+        if pod is not None:
+            pod.require_valid_fields(context="v2 Pod termination")
+        return dict(pod.raw) if pod is not None else {"id": pod_id}
 
     def list_pods(self) -> List[Dict[str, Any]]:
-        return [dict(pod.raw) for pod in self.client.list_pods()]
+        pods = self.client.list_pods()
+        for pod in pods:
+            pod.require_valid_fields(context="v2 Pod inventory")
+        return [dict(pod.raw) for pod in pods]
 
     def get_logs(self, pod_id: str, tail: int = 100) -> str:
         """Collect the requested Pod log backfill from the v2 SSE endpoint."""

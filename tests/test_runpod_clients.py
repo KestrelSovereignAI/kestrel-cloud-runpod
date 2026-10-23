@@ -3,21 +3,36 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 
+import httpcore
 import httpx
 import pytest
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    native_httpx_connect_failure,
+    record_control_injection,
+)
 
+import kestrel_cloud_runpod.models as runpod_models
 from kestrel_cloud_runpod.clients import (
     DEFAULT_USER_AGENT,
     RunpodControlPlaneClient,
     RunpodServerlessClient,
+    RunpodTransport,
+    is_retryable_runpod_api_error,
 )
 from kestrel_cloud_runpod.models import (
     CloudType,
     ComputeProduct,
     EndpointCreateRequest,
+    EndpointResource,
     EndpointUpdateRequest,
     PodCreateRequest,
+    PodResource,
+    ResourceFieldState,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -73,6 +88,18 @@ def _endpoint(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def _endpoint_request() -> EndpointCreateRequest:
+    return EndpointCreateRequest(
+        name="catalog",
+        image="registry/catalog:sha",
+        gpu_pools=("BLACKWELL_48",),
+        endpoint_type="QUEUE",
+        scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
+        workers_min=0,
+        workers_max=2,
+    )
 
 
 def _network_volume(**overrides):
@@ -312,15 +339,7 @@ def test_rfc9457_problem_is_typed_and_does_not_expose_body():
         api_key="secret", http_transport=httpx.MockTransport(handler)
     )
     with pytest.raises(RunPodAPIError) as raised:
-        client.create_endpoint(
-            EndpointCreateRequest(
-                name="test",
-                image="example/image:sha",
-                gpu_pools=("bad",),
-                endpoint_type="QUEUE",
-                scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
-            )
-        )
+        client.create_endpoint(_endpoint_request())
 
     error = raised.value
     assert error.status_code == 422
@@ -329,6 +348,772 @@ def test_rfc9457_problem_is_typed_and_does_not_expose_body():
     assert error.rate_limit.raw == "limit=100, remaining=99, reset=30"
     assert error.rate_limit.policy == "100;w=60"
     assert "must-not-leak" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (429, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (None, False),
+        (200, False),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (500, False),
+    ],
+)
+def test_api_error_retry_disposition_uses_the_transport_policy(status_code, expected):
+    error = RunPodAPIError(
+        title="Runpod error",
+        detail="bounded test",
+        status_code=status_code,
+    )
+    assert is_retryable_runpod_api_error(error) is expected
+
+
+_PUBLIC_TRANSPORT_PAIRS = (
+    (httpx.ConnectTimeout, httpcore.ConnectTimeout),
+    (httpx.ReadTimeout, httpcore.ReadTimeout),
+    (httpx.WriteTimeout, httpcore.WriteTimeout),
+    (httpx.PoolTimeout, httpcore.PoolTimeout),
+    (httpx.ConnectError, httpcore.ConnectError),
+    (httpx.ReadError, httpcore.ReadError),
+    (httpx.WriteError, httpcore.WriteError),
+    (httpx.RemoteProtocolError, httpcore.RemoteProtocolError),
+)
+
+
+def _public_transport_pair(
+    outer_type: type[httpx.TransportError],
+    core_type: type[Exception],
+) -> httpx.TransportError:
+    request = httpx.Request("GET", "https://api.runpod.io/v2/pods/test")
+    outer = outer_type("transport failed", request=request)
+    outer.__cause__ = core_type("transport failed")
+    return outer
+
+
+def test_statusless_api_error_requires_the_original_httpx_failure_cause():
+    transport = _public_transport_pair(httpx.ConnectError, httpcore.ConnectError)
+    try:
+        raise RunPodAPIError(
+            title="Runpod transport failed",
+            detail="ConnectError",
+        ) from transport
+    except RunPodAPIError as error:
+        retained = error
+
+    assert is_retryable_runpod_api_error(retained)
+
+    malformed = RunPodAPIError(
+        title="Invalid Runpod response",
+        detail="Expected JSON",
+    )
+    malformed.__cause__ = ValueError("invalid JSON")
+    assert not is_retryable_runpod_api_error(malformed)
+
+    ambiguous = RunPodAmbiguousResultError(
+        title="Ambiguous mutation",
+        detail="provider outcome is unknown",
+        status_code=503,
+    )
+    assert is_retryable_runpod_api_error(ambiguous)
+
+    ambiguous_without_transport = RunPodAmbiguousResultError(
+        title="Ambiguous mutation",
+        detail="provider outcome is unknown",
+    )
+    assert not is_retryable_runpod_api_error(ambiguous_without_transport)
+
+    try:
+        raise RunPodAmbiguousResultError(
+            title="Ambiguous mutation",
+            detail="provider transport failed",
+        ) from transport
+    except RunPodAmbiguousResultError as ambiguous_transport:
+        retained_ambiguous = ambiguous_transport
+    assert is_retryable_runpod_api_error(retained_ambiguous)
+
+    class UnknownAPIError(RunPodAPIError):
+        pass
+
+    unknown = UnknownAPIError(
+        title="Unknown subclass",
+        detail="provider outcome is unknown",
+        status_code=503,
+    )
+    assert not is_retryable_runpod_api_error(unknown)
+
+
+def test_statusless_http_response_error_is_not_transport_retry_evidence():
+    request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/exact")
+    response = httpx.Response(401, request=request)
+    response_error = httpx.HTTPStatusError(
+        "authorization denied", request=request, response=response
+    )
+    error = RunPodAPIError(
+        title="Runpod request failed",
+        detail="HTTPStatusError",
+    )
+    error.__cause__ = response_error
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+@pytest.mark.parametrize(("outer_type", "core_type"), _PUBLIC_TRANSPORT_PAIRS)
+def test_exact_public_transport_pairs_are_retryable(outer_type, core_type):
+    transport = _public_transport_pair(outer_type, core_type)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    error.__cause__ = transport
+
+    assert is_retryable_runpod_api_error(error)
+
+
+@pytest.mark.parametrize(("outer_type", "core_type"), _PUBLIC_TRANSPORT_PAIRS)
+def test_bare_public_httpx_transport_error_does_not_grant_retry_authority(
+    outer_type, core_type
+):
+    del core_type
+    request = httpx.Request("DELETE", "https://api.runpod.io/v2/serverless/exact")
+    transport = outer_type("transport failed", request=request)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    error.__cause__ = transport
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+def test_retryable_status_cannot_hide_an_explicit_structural_cause():
+    error = RunPodAPIError(
+        title="Runpod request failed",
+        detail="structural response failure",
+        status_code=503,
+    )
+    structural = ValueError("invalid response body")
+    error.__cause__ = structural
+
+    assert not is_retryable_runpod_api_error(error)
+
+
+def test_retryable_status_without_explicit_cause_remains_retryable():
+    canonical = RunPodAPIError(
+        title="Runpod unavailable",
+        detail="retry later",
+        status_code=503,
+    )
+    assert is_retryable_runpod_api_error(canonical)
+
+
+def _native_httpx_stream_failure(kind: str) -> httpx.TransportError:
+    """Capture real synchronous stream failures against an owned loopback peer."""
+
+    release = threading.Event()
+    server_done = threading.Event()
+    server_errors: list[BaseException] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2.0)
+        port = listener.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                with listener.accept()[0] as connection:
+                    if kind == "write-timeout":
+                        release.wait(1.0)
+                        return
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        part = connection.recv(65_536)
+                        if not part:
+                            raise RuntimeError("loopback client closed before headers")
+                        request += part
+                    if kind == "read-timeout":
+                        connection.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+                        )
+                        release.wait(1.0)
+                    elif kind == "malformed-protocol":
+                        connection.sendall(b"NOT HTTP\r\n\r\n")
+                    elif kind == "truncated-protocol":
+                        connection.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"
+                        )
+                    else:
+                        raise AssertionError(f"unsupported native failure kind: {kind}")
+            # Every original background failure is retained and asserted below.
+            except BaseException as exc:  # noqa: BLE001
+                server_errors.append(exc)
+            finally:
+                server_done.set()
+
+        server = threading.Thread(target=serve, name=f"runpod-{kind}-peer")
+        server.start()
+        try:
+            socket_options = None
+            content = None
+            if kind == "write-timeout":
+                socket_options = [(socket.SOL_SOCKET, socket.SO_SNDBUF, 1_024)]
+                chunk = b"x" * (1024 * 1024)
+                content = (chunk for _ in range(1_024))
+            transport = httpx.HTTPTransport(socket_options=socket_options)
+            timeout = httpx.Timeout(0.5, read=0.05, write=0.05, pool=0.5)
+            with httpx.Client(
+                transport=transport,
+                timeout=timeout,
+                trust_env=False,
+            ) as client:
+                method = client.post if kind == "write-timeout" else client.get
+                with pytest.raises(httpx.TransportError) as raised:
+                    if content is None:
+                        method(f"http://127.0.0.1:{port}/")
+                    else:
+                        method(f"http://127.0.0.1:{port}/", content=content)
+        finally:
+            release.set()
+            server_done.wait(2.0)
+            server.join(2.0)
+
+    assert not server.is_alive()
+    assert server_errors == []
+    return raised.value
+
+
+def _blocked_httpx_error(kind: str) -> httpx.HTTPError:
+    """Build finite public exception graphs while retaining every original node."""
+
+    request = httpx.Request("GET", "https://api.runpod.io/v2/pods")
+    if kind == "http-status":
+        return httpx.HTTPStatusError(
+            "authorization denied",
+            request=request,
+            response=httpx.Response(401, request=request),
+        )
+    public_pairs: dict[str, tuple[type[httpx.HTTPError], type[Exception]]] = {
+        "structural": (httpx.ConnectError, httpcore.ConnectError),
+        "control": (httpx.ConnectError, httpcore.ConnectError),
+        "mixed-group": (httpx.ConnectError, httpcore.ConnectError),
+        "cycle": (httpx.ConnectError, httpcore.ConnectError),
+        "local-protocol": (httpx.LocalProtocolError, httpcore.LocalProtocolError),
+        "unsupported-protocol": (
+            httpx.UnsupportedProtocol,
+            httpcore.UnsupportedProtocol,
+        ),
+        "proxy": (httpx.ProxyError, httpcore.ProxyError),
+    }
+    if kind == "unknown-transport":
+
+        class UnknownTransportError(httpx.TransportError):
+            pass
+
+        outer: httpx.HTTPError = UnknownTransportError(
+            "unknown transport", request=request
+        )
+        outer.__cause__ = httpcore.ConnectError("connection failed")
+        return outer
+    outer_type, core_type = public_pairs[kind]
+    outer = outer_type("transport failed", request=request)
+    core = core_type("transport failed")
+    outer.__cause__ = core
+    if kind == "structural":
+        core.__cause__ = ValueError("invalid transport state")
+    elif kind == "control":
+        core.__cause__ = ExecutionAuthorityError("original authority retired")
+    elif kind == "mixed-group":
+        core.__cause__ = ExceptionGroup(
+            "mixed transport graph",
+            [
+                TimeoutError("native timeout"),
+                ExecutionAuthorityError("original authority retired"),
+            ],
+        )
+    elif kind == "cycle":
+        structural = ValueError("cyclic structural failure")
+        core.__cause__ = structural
+        structural.__cause__ = core
+    return outer
+
+
+def _explicit_graph_ids(error: BaseException) -> tuple[int, ...]:
+    seen: set[int] = set()
+    pending = [error]
+    ordered = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        ordered.append(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return tuple(ordered)
+
+
+def test_native_httpx_httpcore_socket_chain_is_retryable_at_safe_ingress():
+    transport_error = native_httpx_connect_failure()
+    api_error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=type(transport_error).__name__,
+    )
+    api_error.__cause__ = transport_error
+    assert is_retryable_runpod_api_error(api_error)
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise transport_error
+        return httpx.Response(200, json=_page("pods", []))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert client.list_pods() == ()
+    assert len(calls) == 2
+    assert api_error.__cause__ is transport_error
+
+
+@pytest.mark.parametrize(
+    ("kind", "outer_type", "core_type"),
+    [
+        ("read-timeout", httpx.ReadTimeout, httpcore.ReadTimeout),
+        (
+            "malformed-protocol",
+            httpx.RemoteProtocolError,
+            httpcore.RemoteProtocolError,
+        ),
+        (
+            "truncated-protocol",
+            httpx.RemoteProtocolError,
+            httpcore.RemoteProtocolError,
+        ),
+        ("write-timeout", httpx.WriteTimeout, httpcore.WriteTimeout),
+    ],
+)
+def test_native_stream_failure_retains_exact_public_transport_pair(
+    kind, outer_type, core_type
+):
+    transport_error = _native_httpx_stream_failure(kind)
+    assert type(transport_error) is outer_type
+    assert type(transport_error.__cause__) is core_type
+    assert transport_error.__cause__.__cause__ is None
+    assert transport_error.__cause__.__context__ is not None
+
+    api_error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=outer_type.__name__,
+    )
+    api_error.__cause__ = transport_error
+    assert is_retryable_runpod_api_error(api_error)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "structural",
+        "control",
+        "mixed-group",
+        "cycle",
+        "unknown-transport",
+        "local-protocol",
+        "unsupported-protocol",
+        "proxy",
+        "http-status",
+    ],
+)
+def test_transport_graph_blockers_never_grant_retry_authority(kind):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    error = RunPodAPIError(
+        title="Runpod transport failed",
+        detail=type(transport_error).__name__,
+    )
+    error.__cause__ = transport_error
+
+    assert not is_retryable_runpod_api_error(error)
+    assert error.__cause__ is transport_error
+    assert _explicit_graph_ids(transport_error) == original_graph
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "structural",
+        "control",
+        "mixed-group",
+        "cycle",
+        "unknown-transport",
+        "local-protocol",
+        "unsupported-protocol",
+        "proxy",
+        "http-status",
+    ],
+)
+def test_safe_method_ingress_never_retries_a_blocked_transport_graph(kind):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise transport_error
+        return httpx.Response(200, json=_page("pods", []))
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    if kind in {"control", "mixed-group"}:
+        with pytest.raises(type(transport_error)) as caught:
+            client.list_pods()
+        assert caught.value is transport_error
+    else:
+        with pytest.raises(RunPodAPIError) as caught:
+            client.list_pods()
+        assert type(caught.value) is RunPodAPIError
+        assert caught.value.__cause__ is transport_error
+    assert len(calls) == 1
+    assert _explicit_graph_ids(transport_error) == original_graph
+
+
+@pytest.mark.parametrize(
+    ("kind", "method"),
+    [
+        pytest.param("control", "GET", id="safe-get"),
+        pytest.param("mixed-group", "GET", id="safe-get-explicit-group"),
+        pytest.param("control", "POST", id="mutating-post"),
+    ],
+)
+def test_request_transport_preserves_exact_execution_control(
+    kind, method, record_property
+):
+    transport_error = _blocked_httpx_error(kind)
+    original_graph = _explicit_graph_ids(transport_error)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        record_control_injection(record_property, f"request-{kind}-{method.lower()}")
+        raise transport_error
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+        max_safe_retries=1,
+        sleep=lambda _: None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(type(transport_error)) as caught:
+        transport.request_json(method, "/pods", json_body={"name": "x"})
+
+    assert caught.value is transport_error
+    assert len(calls) == 1
+    assert _explicit_graph_ids(transport_error) == original_graph
+
+
+def _successful_response_json_case(operation, calls):
+    payload = _pod(status="RUNNING")
+    status_code = 200 if operation == "get" else 201
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(status_code, json=payload)
+
+    def fail_sleep(_seconds):
+        raise AssertionError("successful response decoding must not retry")
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        max_safe_retries=1,
+        sleep=fail_sleep,
+        http_transport=httpx.MockTransport(handler),
+    )
+    if operation == "get":
+        return client, lambda: client.get_pod("pod-123"), "GET", "/v2/pods/pod-123"
+    return (
+        client,
+        lambda: client.create_pod(
+            PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        ),
+        "POST",
+        "/v2/pods",
+    )
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+def test_successful_response_json_valid_baseline(operation):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    try:
+        resource = invoke()
+
+        assert resource.id == "pod-123"
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+@pytest.mark.parametrize(
+    "error_type", [ValueError, RecursionError], ids=["value", "recursion"]
+)
+@pytest.mark.parametrize("grouped", [False, True], ids=["direct-cause", "group"])
+def test_successful_response_json_preserves_exact_execution_control(
+    monkeypatch,
+    operation,
+    error_type,
+    grouped,
+    record_property,
+):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    carrier, control, explicit = execution_control_carrier(
+        error_type("successful response decoder execution control"),
+        grouped=grouped,
+    )
+    original_graph = _explicit_graph_ids(carrier)
+
+    def controlled_json(response, *args, **kwargs):
+        del args, kwargs
+        assert response.status_code == (200 if operation == "get" else 201)
+        record_control_injection(
+            record_property,
+            f"successful-response-json-{operation}-{error_type.__name__}-"
+            f"{'group' if grouped else 'direct-cause'}",
+        )
+        raise carrier
+
+    monkeypatch.setattr(httpx.Response, "json", controlled_json)
+    try:
+        with pytest.raises(error_type) as caught:
+            invoke()
+
+        assert caught.value is carrier
+        assert type(caught.value) is error_type
+        assert carrier.__cause__ is explicit
+        if grouped:
+            assert explicit.exceptions[0] is control
+            assert len(explicit.exceptions) == 2
+        else:
+            assert explicit is control
+        assert _explicit_graph_ids(carrier) == original_graph
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "paid-create"])
+@pytest.mark.parametrize(
+    "error_type", [ValueError, RecursionError], ids=["value", "recursion"]
+)
+@pytest.mark.parametrize(
+    "context_only", [False, True], ids=["plain", "implicit-context"]
+)
+def test_successful_response_json_retains_ordinary_normalization_contract(
+    monkeypatch,
+    operation,
+    error_type,
+    context_only,
+):
+    calls = []
+    client, invoke, expected_method, expected_path = _successful_response_json_case(
+        operation, calls
+    )
+    ordinary = error_type("ordinary successful response decoder failure")
+    implicit_control = ExecutionAuthorityError("implicit context is not authority")
+    if context_only:
+        ordinary.__context__ = implicit_control
+
+    def fail_json(response, *args, **kwargs):
+        del response, args, kwargs
+        raise ordinary
+
+    monkeypatch.setattr(httpx.Response, "json", fail_json)
+    expected_error = (
+        RunPodAPIError if operation == "get" else RunPodAmbiguousResultError
+    )
+    try:
+        with pytest.raises(expected_error) as caught:
+            invoke()
+
+        assert type(caught.value) is expected_error
+        assert caught.value.__cause__ is ordinary
+        assert ordinary.__context__ is (implicit_control if context_only else None)
+        assert caught.value.status_code == (200 if operation == "get" else 201)
+        assert caught.value.method == expected_method
+        assert caught.value.resource == (
+            "/pods/pod-123" if operation == "get" else "/pods"
+        )
+        assert len(calls) == 1
+        assert calls[0].method == expected_method
+        assert calls[0].url.path == expected_path
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["open-stream", "active", "deadline"],
+)
+def test_sse_preserves_exact_execution_control(monkeypatch, boundary, record_property):
+    transport_error = _blocked_httpx_error("control")
+    original_graph = _explicit_graph_ids(transport_error)
+    closed = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def read(self):
+            return b""
+
+        def iter_lines(self):
+            record_control_injection(record_property, f"sse-{boundary}")
+            raise transport_error
+
+        def close(self):
+            closed.append(True)
+
+    class Stream:
+        def __enter__(self):
+            return Response()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            if boundary == "open-stream":
+                record_control_injection(record_property, f"sse-{boundary}")
+                raise transport_error
+            return Stream()
+
+    class ImmediateTimer:
+        daemon = False
+
+        def __init__(self, _seconds, callback):
+            self.callback = callback
+
+        def start(self):
+            self.callback()
+
+        def cancel(self):
+            pass
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+    )
+    transport._client = Client()
+    if boundary == "deadline":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.clients.threading.Timer", ImmediateTimer
+        )
+
+    with pytest.raises(type(transport_error)) as caught:
+        tuple(
+            transport.iter_sse(
+                "/logs",
+                stream_window_seconds=1 if boundary == "deadline" else None,
+            )
+        )
+
+    assert caught.value is transport_error
+    assert _explicit_graph_ids(transport_error) == original_graph
+    assert closed == ([True] if boundary == "deadline" else [])
+
+
+@pytest.mark.parametrize("boundary", ["open-stream", "active", "deadline"])
+def test_sse_retains_ordinary_normalization_contract(monkeypatch, boundary):
+    transport_error = httpx.ConnectError("ordinary stream failure")
+    closed = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def read(self):
+            return b""
+
+        def iter_lines(self):
+            raise transport_error
+
+        def close(self):
+            closed.append(True)
+
+    class Stream:
+        def __enter__(self):
+            return Response()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            if boundary == "open-stream":
+                raise transport_error
+            return Stream()
+
+    class ImmediateTimer:
+        daemon = False
+
+        def __init__(self, _seconds, callback):
+            self.callback = callback
+
+        def start(self):
+            self.callback()
+
+        def cancel(self):
+            pass
+
+    transport = RunpodTransport(
+        api_key="secret",
+        base_url="https://api.runpod.io/v2",
+        bearer_auth=False,
+    )
+    transport._client = Client()
+    if boundary == "deadline":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.clients.threading.Timer", ImmediateTimer
+        )
+
+    if boundary == "deadline":
+        assert tuple(transport.iter_sse("/logs", stream_window_seconds=1)) == ()
+        assert closed == [True]
+    else:
+        with pytest.raises(RunPodAPIError) as raised:
+            tuple(transport.iter_sse("/logs"))
+        assert raised.value.__cause__ is transport_error
+        assert closed == []
 
 
 def test_safe_get_retries_using_retry_after_and_records_rate_limit():
@@ -436,6 +1221,168 @@ def test_create_timeout_is_ambiguous_and_not_retried():
 
     assert calls == 1
     assert raised.value.detail == "ReadTimeout"
+
+
+@pytest.mark.parametrize("resource_kind", ["pod", "endpoint"])
+def test_paid_create_decoder_control_carrier_preserves_exact_graph(
+    monkeypatch,
+    resource_kind,
+):
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("decoder execution control"),
+        grouped=True,
+    )
+    structural = explicit.exceptions[1]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        payload = _pod() if resource_kind == "pod" else _endpoint()
+        return httpx.Response(201, json=payload)
+
+    def fail_decode(_value):
+        raise carrier
+
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        if resource_kind == "pod":
+            monkeypatch.setattr(PodResource, "from_dict", staticmethod(fail_decode))
+            create = client.create_pod
+            request = PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        else:
+            monkeypatch.setattr(
+                EndpointResource, "from_dict", staticmethod(fail_decode)
+            )
+            create = client.create_endpoint
+            request = _endpoint_request()
+
+        with pytest.raises(RunPodManagerError) as caught:
+            create(request)
+
+        assert caught.value is carrier
+        assert carrier.__cause__ is explicit
+        assert explicit.exceptions == (control, structural)
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("resource_kind", ["pod", "endpoint"])
+def test_paid_create_optional_evidence_control_carrier_preserves_exact_graph(
+    monkeypatch,
+    resource_kind,
+):
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("optional evidence execution control"),
+        grouped=True,
+    )
+    structural = explicit.exceptions[1]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        payload = _pod(env={"SAFE": "value"})
+        if resource_kind == "endpoint":
+            payload = _endpoint(env={"SAFE": "value"})
+        return httpx.Response(201, json=payload)
+
+    def controlled_environment(_value):
+        raise carrier
+
+    monkeypatch.setattr(
+        runpod_models,
+        "environment_values_sha256",
+        controlled_environment,
+    )
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        if resource_kind == "pod":
+            create = client.create_pod
+            request = PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        else:
+            create = client.create_endpoint
+            request = _endpoint_request()
+
+        with pytest.raises(RunPodManagerError) as caught:
+            create(request)
+
+        assert caught.value is carrier
+        assert carrier.__cause__ is explicit
+        assert explicit.exceptions == (control, structural)
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("body", [{}, {"id": "endpoint-ack", "name": None}])
+def test_endpoint_create_without_a_usable_identity_remains_ambiguous(body):
+    calls = []
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(201, json=body)
+        ),
+    )
+
+    with pytest.raises(RunPodAmbiguousResultError, match="usable identity"):
+        client.create_endpoint(_endpoint_request())
+
+    assert len(calls) == 1
+
+
+def test_endpoint_create_retains_identity_and_invalid_optional_evidence():
+    payload = _endpoint(
+        requestUrls=17,
+        env={"PRIVATE": "must-not-leak"},
+    )
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(201, json=payload)
+        ),
+    )
+
+    resource = client.create_endpoint(_endpoint_request())
+
+    assert resource.id == "ep-123"
+    assert resource.request_urls == {}
+    assert resource.field_evidence.state("requestUrls") is ResourceFieldState.INVALID
+    assert resource.raw["env"] == {"PRIVATE": "[REDACTED]"}
+    with pytest.raises(RunPodManagerError, match="requestUrls") as raised:
+        resource.require_valid_fields(context="v2 Endpoint create")
+    assert "must-not-leak" not in str(raised.value)
+
+
+def test_pod_create_retains_identity_and_invalid_optional_evidence():
+    payload = _pod(cost="not-a-number", env={"PRIVATE": "must-not-leak"})
+    client = RunpodControlPlaneClient(
+        api_key="secret",
+        http_transport=httpx.MockTransport(
+            lambda request: httpx.Response(201, json=payload)
+        ),
+    )
+    try:
+        resource = client.create_pod(
+            PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+        )
+
+        assert resource.id == "pod-123"
+        assert resource.cost_per_hr is None
+        assert resource.field_evidence.state("cost") is ResourceFieldState.INVALID
+        assert resource.raw["env"] == {"PRIVATE": "[REDACTED]"}
+        with pytest.raises(RunPodManagerError, match="cost") as raised:
+            resource.require_valid_fields(context="v2 Pod create")
+        assert "must-not-leak" not in str(raised.value)
+    finally:
+        client.close()
 
 
 def test_pod_action_timeout_is_ambiguous_and_not_retried():
@@ -610,15 +1557,7 @@ def test_endpoint_worker_and_billing_request_shapes():
     client = RunpodControlPlaneClient(
         api_key="secret", http_transport=httpx.MockTransport(handler)
     )
-    request = EndpointCreateRequest(
-        name="catalog",
-        image="registry/catalog:sha",
-        gpu_pools=("BLACKWELL_48",),
-        endpoint_type="QUEUE",
-        scaling={"type": "QUEUE_DELAY", "queueDelay": 4},
-        workers_min=0,
-        workers_max=2,
-    )
+    request = _endpoint_request()
     assert client.create_endpoint(request).id == "ep-123"
     assert client.get_endpoint("ep-123").id == "ep-123"
     assert len(client.list_endpoints()) == 1

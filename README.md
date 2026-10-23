@@ -335,9 +335,12 @@ written to provider lease rows or public metadata. On process restart,
 `status()` re-observes the same deterministic Runpod resource and returns a
 fresh host-only route without creating duplicate capacity.
 
-`manage_gpu` remains available for explicit operator start/stop/status/log
-controls, but it no longer attaches, detaches, or reports an LLM route. The
-provider-neutral inference coordinator is the only LLM routing owner.
+`manage_gpu` remains available for explicit operator stop/status/log controls
+over already retained sessions, but ownerless legacy start and stopped-Pod
+resume are retired before any billable provider action. New private inference
+uses the provider-neutral inference-lease coordinator; catalog and training
+capacity use their durable Pod-capacity services. The legacy tool never
+attaches, detaches, or reports an LLM route.
 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
@@ -522,8 +525,13 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.35,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.13.1,<1` — standalone Kestrel config-file loader (runtime)
-- `httpx>=0.27,<1`
+- `kestrel-sovereign>=0.53.41,<1` — canonical joined-effect custody,
+  provider-neutral inference terminal-evidence refresh, and direct-node
+  execution-control classification
+- `httpcore>=1.0.9,<1.1` and `httpx>=0.28.1,<0.29` — reviewed public
+  transport exception pairs for bounded safe-read retry classification;
+  implicit backend context is diagnostic only and mutating requests are never
+  automatically retried
 - `requests>=2.32,<3`
 
 ## Development

@@ -12,6 +12,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
+)
 from serverless_capacity_test_support import (
     MutableClock,
     activated_ambiguous_window,
@@ -171,6 +175,7 @@ class _PlannedControl:
         }
         self.list_calls = 0
         self.get_calls: list[str] = []
+        self.error_callback = None
         # Readback transport failure. Without this the fake could only express
         # "the endpoint is not ours", so the transport branch was untestable.
         self.get_error: RunPodManagerError | None = None
@@ -187,12 +192,16 @@ class _PlannedControl:
     def create_endpoint(self, create_request):
         self.create_requests.append(create_request)
         if self.create_error is not None:
+            if self.error_callback is not None:
+                self.error_callback("create")
             raise self.create_error
         return self.created
 
     def get_endpoint(self, endpoint_id: str):
         self.get_calls.append(endpoint_id)
         if self.get_error is not None:
+            if self.error_callback is not None:
+                self.error_callback("get")
             raise self.get_error
         if self.deleted:
             raise RunPodAPIError(
@@ -212,7 +221,224 @@ class _PlannedControl:
         self.delete_calls.append(endpoint_id)
         self.deleted = True
         if self.delete_error is not None:
+            if self.error_callback is not None:
+                self.error_callback("delete")
             raise self.delete_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "ambiguous-create",
+        "create-manager",
+        "create-readback",
+        "cleanup-ambiguous",
+        "cleanup-manager",
+    ],
+)
+async def test_serverless_provider_preserves_exact_execution_control(
+    boundary, record_property
+):
+    control_client = _PlannedControl()
+    error_type = (
+        RunPodAmbiguousResultError
+        if boundary in {"ambiguous-create", "cleanup-ambiguous"}
+        else RunPodManagerError
+    )
+    if error_type is RunPodAmbiguousResultError:
+        error = error_type(
+            title="unknown",
+            detail=f"{boundary} outcome remains unknown",
+            method="POST" if boundary == "ambiguous-create" else "DELETE",
+            resource="/serverless",
+        )
+    else:
+        error = error_type(f"{boundary} outcome remains unknown")
+    carrier, control, explicit = execution_control_carrier(
+        error,
+        grouped=boundary == "cleanup-ambiguous",
+    )
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control_client,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+    entry_counts = None
+
+    def capture_injection(_phase):
+        nonlocal entry_counts
+        entry_counts = (
+            control_client.list_calls,
+            tuple(control_client.get_calls),
+            tuple(control_client.delete_calls),
+        )
+        record_control_injection(record_property, boundary)
+
+    control_client.error_callback = capture_injection
+
+    if boundary in {"ambiguous-create", "create-manager"}:
+        control_client.create_error = carrier
+        if boundary == "ambiguous-create":
+            control_client.list_pages.append((control_client.created,))
+        operation = lambda: provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+    elif boundary == "create-readback":
+        control_client.get_error = carrier
+        operation = lambda: provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+    else:
+        activation = await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+        control_client.list_pages.append((control_client.created,))
+        control_client.delete_error = carrier
+        operation = lambda: provider.cleanup_planned_endpoint(
+            value,
+            accepted,
+            activation,
+        )
+
+    with pytest.raises(type(carrier)) as raised:
+        await operation()
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    if isinstance(explicit, BaseExceptionGroup):
+        assert explicit.exceptions[0] is control
+    else:
+        assert explicit is control
+    assert entry_counts is not None
+    assert (
+        control_client.list_calls,
+        tuple(control_client.get_calls),
+        tuple(control_client.delete_calls),
+    ) == entry_counts
+    if boundary.startswith("cleanup-"):
+        assert control_client.delete_calls == [activation.endpoint_id]
+
+
+@pytest.mark.asyncio
+async def test_serverless_cleanup_retains_ordinary_rejected_delete_contract():
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+    activation = await provider.activate_planned_endpoint(
+        value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+    ordinary = RunPodManagerError("ordinary definite delete rejection")
+    control.list_pages.append((control.created,))
+    entry_counts = None
+
+    def capture_injection(_phase):
+        nonlocal entry_counts
+        entry_counts = (
+            control.list_calls,
+            tuple(control.get_calls),
+            tuple(control.delete_calls),
+        )
+
+    control.error_callback = capture_injection
+    control.delete_error = ordinary
+
+    with pytest.raises(ServerlessEndpointCleanupError) as raised:
+        await provider.cleanup_planned_endpoint(value, accepted, activation)
+
+    assert raised.value.__cause__ is ordinary
+    assert entry_counts is not None
+    assert (
+        control.list_calls,
+        tuple(control.get_calls),
+        tuple(control.delete_calls),
+    ) == entry_counts
+    assert control.delete_calls == [activation.endpoint_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_kind",
+    ["clean-404", "unknown-404", "structural-404", "authorization"],
+)
+async def test_serverless_cleanup_only_accepts_one_clean_canonical_404(
+    error_kind,
+) -> None:
+    """Exact-ID cleanup must retain the canonical error type and clean graph."""
+
+    class UnknownNotFoundError(RunPodAPIError):
+        pass
+
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+    activation = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+    error_type = UnknownNotFoundError if error_kind == "unknown-404" else RunPodAPIError
+    status_code = 401 if error_kind == "authorization" else 404
+    error = error_type(
+        title="Not found" if status_code == 404 else "Unauthorized",
+        detail="bounded Serverless cleanup response",
+        status_code=status_code,
+    )
+    if error_kind == "structural-404":
+        error.__cause__ = ValueError("invalid endpoint response")
+    control.get_error = error
+
+    if error_kind == "clean-404":
+        assert await provider._cleanup_endpoint_resource(activation) is None
+    else:
+        with pytest.raises(error_type) as caught:
+            await provider._cleanup_endpoint_resource(activation)
+        assert caught.value is error
+    assert control.get_calls[-1] == activation.endpoint_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readback", ["foreign-id", "wrong-type"])
+async def test_serverless_cleanup_requires_exact_typed_endpoint_readback(
+    readback,
+) -> None:
+    control = _PlannedControl()
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    request_value = planned_request()
+    accepted = await provider.quote_planned_endpoint(request_value)
+    activation = await provider.activate_planned_endpoint(
+        request_value,
+        accepted,
+        accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+    )
+    control.readback = (
+        replace(control.readback, id="foreign-endpoint")
+        if readback == "foreign-id"
+        else SimpleNamespace(id=activation.endpoint_id)
+    )
+
+    with pytest.raises(ServerlessEndpointCleanupError, match="did not match"):
+        await provider._cleanup_endpoint_resource(activation)
 
 
 @pytest.mark.asyncio
@@ -259,6 +485,32 @@ async def test_created_endpoint_with_unaccepted_cuda_or_storage_keeps_cleanup_id
         )
     assert raised.value.observed_endpoint_ids == (control.created.id,)
     assert len(control.create_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_ack_retains_exact_id_but_invalid_optional_evidence_never_activates():
+    control = _PlannedControl()
+    control.created = planned_endpoint_resource(env={"PRIVATE": 17})
+    control.readback = control.created
+    provider = RunpodServerlessCapacityProvider(
+        control_client=control,
+        clock=MutableClock(),
+    )
+    value = planned_request()
+    accepted = await provider.quote_planned_endpoint(value)
+
+    with pytest.raises(
+        ServerlessEndpointActivationError, match="invalid policy evidence"
+    ) as raised:
+        await provider.activate_planned_endpoint(
+            value,
+            accepted,
+            accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
+        )
+
+    assert raised.value.observed_endpoint_ids == (control.created.id,)
+    assert control.get_calls == []
+    assert control.delete_calls == []
 
 
 def _ambiguous_create_error() -> RunPodAmbiguousResultError:

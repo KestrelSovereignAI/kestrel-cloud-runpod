@@ -4,7 +4,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +67,7 @@ type runtimeConfig struct {
 	PreloadModel       bool
 	ProvisionRequested *time.Time
 	ContainerStartedAt time.Time
+	TelemetryBinding   string
 }
 
 type startupState struct {
@@ -80,30 +83,58 @@ type startupState struct {
 	strategy               string
 	terminalError          string
 	ollamaProcessRunning   bool
+	runtimeInstanceID      string
+	telemetryRevision      uint64
+	containerStartedMono   time.Time
+	readyMono              time.Time
+	inferenceStarted       uint64
+	inferenceCompleted     uint64
+	inferenceFailed        uint64
+	inferenceCancelled     uint64
+	inferenceInFlight      uint64
+	firstInferenceStarted  *time.Time
+	lastInferenceStarted   *time.Time
+	lastInferenceCompleted *time.Time
+	busyStartedMono        time.Time
+	inferenceBusy          time.Duration
 }
 
 type telemetry struct {
+	SchemaVersion                     int        `json:"schema_version"`
 	RuntimeVersion                    string     `json:"runtime_version"`
 	OllamaVersion                     string     `json:"ollama_version"`
-	ProvisionRequestedAt              *time.Time `json:"provision_requested_at,omitempty"`
+	TelemetryBindingSHA256            string     `json:"telemetry_binding_sha256"`
+	RuntimeInstanceID                 string     `json:"runtime_instance_id"`
+	TelemetryRevision                 uint64     `json:"telemetry_revision"`
+	ProvisionRequestedAt              *time.Time `json:"provision_requested_at"`
 	ContainerStartedAt                time.Time  `json:"container_started_at"`
-	OllamaProcessStartedAt            *time.Time `json:"ollama_process_started_at,omitempty"`
-	OllamaHealthyAt                   *time.Time `json:"ollama_healthy_at,omitempty"`
-	ModelPullStartedAt                *time.Time `json:"model_pull_started_at,omitempty"`
-	ModelPullCompletedAt              *time.Time `json:"model_pull_completed_at,omitempty"`
-	ModelLoadStartedAt                *time.Time `json:"model_load_started_at,omitempty"`
-	ModelReadyAt                      *time.Time `json:"model_ready_at,omitempty"`
-	ReadyAt                           *time.Time `json:"ready_at,omitempty"`
-	PlacementAndImagePullMilliseconds *int64     `json:"placement_and_image_pull_ms,omitempty"`
-	OllamaBootMilliseconds            *int64     `json:"ollama_boot_ms,omitempty"`
-	ModelPullMilliseconds             *int64     `json:"model_pull_ms,omitempty"`
-	ModelLoadMilliseconds             *int64     `json:"model_load_ms,omitempty"`
-	TotalColdStartMilliseconds        *int64     `json:"total_cold_start_ms,omitempty"`
+	OllamaProcessStartedAt            *time.Time `json:"ollama_process_started_at"`
+	OllamaHealthyAt                   *time.Time `json:"ollama_healthy_at"`
+	ModelPullStartedAt                *time.Time `json:"model_pull_started_at"`
+	ModelPullCompletedAt              *time.Time `json:"model_pull_completed_at"`
+	ModelLoadStartedAt                *time.Time `json:"model_load_started_at"`
+	ModelReadyAt                      *time.Time `json:"model_ready_at"`
+	ReadyAt                           *time.Time `json:"ready_at"`
+	PlacementAndImagePullMilliseconds *int64     `json:"placement_and_image_pull_wall_ms"`
+	OllamaBootMilliseconds            *int64     `json:"ollama_boot_ms"`
+	ModelPullMilliseconds             *int64     `json:"model_pull_ms"`
+	ModelLoadMilliseconds             *int64     `json:"model_load_ms"`
+	ContainerToReadyMilliseconds      *int64     `json:"container_to_ready_ms"`
 	CacheHit                          bool       `json:"cache_hit"`
 	StartupStrategy                   string     `json:"startup_strategy"`
 	Ready                             bool       `json:"ready"`
 	OllamaProcessRunning              bool       `json:"ollama_process_running"`
-	TerminalError                     string     `json:"terminal_error,omitempty"`
+	TerminalError                     *string    `json:"terminal_error"`
+	InferenceStarted                  uint64     `json:"inference_started"`
+	InferenceCompleted                uint64     `json:"inference_completed"`
+	InferenceFailed                   uint64     `json:"inference_failed"`
+	InferenceCancelled                uint64     `json:"inference_cancelled"`
+	InferenceInFlight                 uint64     `json:"inference_in_flight"`
+	FirstInferenceStartedAt           *time.Time `json:"first_inference_started_at"`
+	LastInferenceStartedAt            *time.Time `json:"last_inference_started_at"`
+	LastInferenceCompletedAt          *time.Time `json:"last_inference_completed_at"`
+	InferenceBusyMilliseconds         int64      `json:"inference_busy_ms"`
+	InferenceIdleMilliseconds         int64      `json:"inference_idle_ms"`
 }
 
 type runtimeProxy struct {
@@ -111,6 +142,12 @@ type runtimeProxy struct {
 	state  *startupState
 	proxy  *httputil.ReverseProxy
 	now    func() time.Time
+}
+
+type exposedRoutePolicy struct {
+	readOnly            bool
+	requiresModelPolicy bool
+	countsInference     bool
 }
 
 func main() {
@@ -124,8 +161,8 @@ func main() {
 }
 
 func run() error {
-	startedAt := time.Now().UTC()
-	config, err := loadConfig(os.Getenv, startedAt)
+	startedAt := time.Now()
+	config, err := loadConfig(os.Getenv, startedAt.UTC())
 	if err != nil {
 		return err
 	}
@@ -133,7 +170,7 @@ func run() error {
 		return err
 	}
 	scrubSensitiveProcessEnvironment()
-	state := &startupState{strategy: "initializing"}
+	state := newStartupState("initializing", startedAt)
 	handler := newRuntimeProxy(config, state, time.Now)
 	server := &http.Server{
 		Addr:              config.ListenAddress,
@@ -172,7 +209,7 @@ func run() error {
 		terminal = ollamaExitError(err)
 	case err = <-startupExit:
 		if err != nil {
-			state.setTerminalError(safeError(err))
+			state.setTerminalFailure()
 			terminal = fmt.Errorf("runtime initialization failed: %w", err)
 		}
 		if err == nil {
@@ -221,6 +258,10 @@ func loadConfig(getenv func(string) string, startedAt time.Time) (runtimeConfig,
 	required, ok := allowed[requiredName]
 	if !ok {
 		return runtimeConfig{}, errors.New("KESTREL_OLLAMA_REQUIRED_MODEL must exactly match an operator-pinned allowlist entry")
+	}
+	telemetryBinding := getenv("KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256")
+	if !modelDigestRE.MatchString(telemetryBinding) {
+		return runtimeConfig{}, errors.New("KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256 must be 64 lowercase hex characters")
 	}
 	mode := getenv("KESTREL_OLLAMA_MODE")
 	if mode != "dedicated_pod" && mode != "serverless_load_balancer" {
@@ -278,6 +319,7 @@ func loadConfig(getenv func(string) string, startedAt time.Time) (runtimeConfig,
 		PreloadModel:       preload,
 		ProvisionRequested: provisionRequested,
 		ContainerStartedAt: startedAt,
+		TelemetryBinding:   telemetryBinding,
 	}, nil
 }
 
@@ -633,6 +675,7 @@ func ollamaJSON(ctx context.Context, client *http.Client, upstream *url.URL, pat
 }
 
 func newRuntimeProxy(config runtimeConfig, state *startupState, now func() time.Time) http.Handler {
+	state.requireRuntimeInitialized()
 	reverse := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(config.Upstream)
@@ -672,11 +715,12 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 		writeJSON(writer, http.StatusForbidden, map[string]string{"error": "model mutation is disabled"})
 		return
 	}
-	if !allowedRoute(path, request.Method) {
+	policy, allowed := policyForRoute(path, request.Method)
+	if !allowed {
 		writeJSON(writer, http.StatusNotFound, map[string]string{"error": "route is not exposed"})
 		return
 	}
-	if requiresModelPolicy(path, request.Method) {
+	if policy.requiresModelPolicy {
 		model, status, err := inspectModelRequest(writer, request)
 		if err != nil {
 			writeJSON(writer, status, map[string]string{"error": err.Error()})
@@ -686,8 +730,60 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 			writeJSON(writer, http.StatusForbidden, map[string]string{"error": "model is not allowlisted"})
 			return
 		}
+		if !policy.countsInference {
+			runtime.proxy.ServeHTTP(writer, request)
+			return
+		}
+		started := runtime.state.beginInference(runtime.now())
+		tracked := &statusResponseWriter{ResponseWriter: writer}
+		var finishOnce sync.Once
+		finish := func(cancelled, failed bool) {
+			finishOnce.Do(func() {
+				runtime.state.finishInference(
+					started,
+					runtime.now(),
+					cancelled,
+					failed,
+				)
+			})
+		}
+		stopCancellation := context.AfterFunc(request.Context(), func() {
+			finish(true, false)
+		})
+		runtime.proxy.ServeHTTP(tracked, request)
+		stopCancellation()
+		responseStatus := tracked.status
+		if responseStatus == 0 {
+			responseStatus = http.StatusOK
+		}
+		finish(
+			request.Context().Err() != nil,
+			responseStatus < http.StatusOK || responseStatus >= http.StatusMultipleChoices,
+		)
+		return
 	}
 	runtime.proxy.ServeHTTP(writer, request)
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (writer *statusResponseWriter) WriteHeader(status int) {
+	writer.status = status
+	writer.ResponseWriter.WriteHeader(status)
+}
+
+func (writer *statusResponseWriter) Write(value []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	return writer.ResponseWriter.Write(value)
+}
+
+func (writer *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
 }
 
 func (runtime *runtimeProxy) authorized(request *http.Request) bool {
@@ -717,7 +813,7 @@ func (runtime *runtimeProxy) serveHealth(writer http.ResponseWriter, request *ht
 		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 		return
 	}
-	if snapshot.TerminalError != "" || !snapshot.OllamaProcessRunning {
+	if snapshot.TerminalError != nil || !snapshot.OllamaProcessRunning {
 		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "failed"})
 		return
 	}
@@ -752,27 +848,30 @@ func isForbiddenManagementPath(path string) bool {
 	return path == "/api/create" || path == "/api/copy" || path == "/api/delete" || path == "/api/pull" || path == "/api/push" || strings.HasPrefix(path, "/api/blobs")
 }
 
-func allowedRoute(path, method string) bool {
-	readOnly := map[string]bool{"/": true, "/api/tags": true, "/api/ps": true, "/api/version": true, "/v1/models": true}
-	if readOnly[path] {
-		return method == http.MethodGet || method == http.MethodHead
+func policyForRoute(path, method string) (exposedRoutePolicy, bool) {
+	var policy exposedRoutePolicy
+	switch path {
+	case "/", "/api/tags", "/api/ps", "/api/version", "/v1/models":
+		policy = exposedRoutePolicy{readOnly: true}
+	case "/api/generate", "/api/chat", "/api/embed", "/api/embeddings",
+		"/v1/chat/completions", "/v1/completions", "/v1/embeddings":
+		policy = exposedRoutePolicy{requiresModelPolicy: true, countsInference: true}
+	case "/api/show":
+		policy = exposedRoutePolicy{requiresModelPolicy: true}
+	default:
+		if strings.HasPrefix(path, "/v1/models/") {
+			policy = exposedRoutePolicy{readOnly: true}
+		} else {
+			return exposedRoutePolicy{}, false
+		}
 	}
-	if strings.HasPrefix(path, "/v1/models/") {
-		return method == http.MethodGet || method == http.MethodHead
+	if policy == (exposedRoutePolicy{}) {
+		return exposedRoutePolicy{}, false
 	}
-	post := map[string]bool{
-		"/api/generate": true, "/api/chat": true, "/api/embed": true, "/api/embeddings": true,
-		"/api/show": true, "/v1/chat/completions": true,
-		"/v1/completions": true, "/v1/embeddings": true,
+	if policy.readOnly {
+		return policy, method == http.MethodGet || method == http.MethodHead
 	}
-	return post[path] && method == http.MethodPost
-}
-
-func requiresModelPolicy(path, method string) bool {
-	if method != http.MethodPost {
-		return false
-	}
-	return path != "/api/ps" && path != "/api/version"
+	return policy, method == http.MethodPost
 }
 
 func inspectModelRequest(writer http.ResponseWriter, request *http.Request) (string, int, error) {
@@ -831,10 +930,10 @@ func (state *startupState) setProcessRunning(running bool) {
 	state.ollamaProcessRunning = running
 }
 
-func (state *startupState) setTerminalError(message string) {
+func (state *startupState) setTerminalFailure() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.terminalError = message
+	state.terminalError = "runtime_initialization_failed"
 }
 
 func (state *startupState) setStrategy(strategy string, cacheHit bool) {
@@ -878,26 +977,121 @@ func (state *startupState) markReady() {
 	now := time.Now().UTC()
 	state.modelReadyAt = &now
 	state.readyAt = &now
+	state.readyMono = time.Now()
 }
 
 func (state *startupState) snapshot(config runtimeConfig) telemetry {
-	state.mu.RLock()
-	defer state.mu.RUnlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.requireRuntimeInitialized()
+	state.telemetryRevision++
+	terminalError := (*string)(nil)
+	if state.terminalError != "" {
+		value := state.terminalError
+		terminalError = &value
+	}
+	busy := state.inferenceBusy
+	nowMono := time.Now()
+	if state.inferenceInFlight > 0 && !state.busyStartedMono.IsZero() {
+		busy += nowMono.Sub(state.busyStartedMono)
+	}
+	idle := time.Duration(0)
+	if !state.readyMono.IsZero() {
+		elapsed := nowMono.Sub(state.readyMono)
+		if elapsed > busy {
+			idle = elapsed - busy
+		}
+	}
 	result := telemetry{
-		RuntimeVersion: runtimeVersion, OllamaVersion: ollamaVersion,
+		SchemaVersion: 2, RuntimeVersion: runtimeVersion, OllamaVersion: ollamaVersion,
+		TelemetryBindingSHA256: config.TelemetryBinding, RuntimeInstanceID: state.runtimeInstanceID,
+		TelemetryRevision:    state.telemetryRevision,
 		ProvisionRequestedAt: config.ProvisionRequested, ContainerStartedAt: config.ContainerStartedAt,
 		OllamaProcessStartedAt: state.ollamaProcessStartedAt, OllamaHealthyAt: state.ollamaHealthyAt,
 		ModelPullStartedAt: state.modelPullStartedAt, ModelPullCompletedAt: state.modelPullCompletedAt,
 		ModelLoadStartedAt: state.modelLoadStartedAt, ModelReadyAt: state.modelReadyAt, ReadyAt: state.readyAt,
 		CacheHit: state.cacheHit, StartupStrategy: state.strategy, Ready: state.readyAt != nil,
-		OllamaProcessRunning: state.ollamaProcessRunning, TerminalError: state.terminalError,
+		OllamaProcessRunning: state.ollamaProcessRunning, TerminalError: terminalError,
+		InferenceStarted: state.inferenceStarted, InferenceCompleted: state.inferenceCompleted,
+		InferenceFailed: state.inferenceFailed, InferenceCancelled: state.inferenceCancelled,
+		InferenceInFlight: state.inferenceInFlight, FirstInferenceStartedAt: state.firstInferenceStarted,
+		LastInferenceStartedAt: state.lastInferenceStarted, LastInferenceCompletedAt: state.lastInferenceCompleted,
+		InferenceBusyMilliseconds: busy.Milliseconds(), InferenceIdleMilliseconds: idle.Milliseconds(),
 	}
 	result.PlacementAndImagePullMilliseconds = elapsedMilliseconds(config.ProvisionRequested, &config.ContainerStartedAt)
 	result.OllamaBootMilliseconds = elapsedMilliseconds(state.ollamaProcessStartedAt, state.ollamaHealthyAt)
 	result.ModelPullMilliseconds = elapsedMilliseconds(state.modelPullStartedAt, state.modelPullCompletedAt)
 	result.ModelLoadMilliseconds = elapsedMilliseconds(state.modelLoadStartedAt, state.modelReadyAt)
-	result.TotalColdStartMilliseconds = elapsedMilliseconds(config.ProvisionRequested, state.readyAt)
+	if !state.containerStartedMono.IsZero() && !state.readyMono.IsZero() {
+		value := state.readyMono.Sub(state.containerStartedMono).Milliseconds()
+		if value >= 0 {
+			result.ContainerToReadyMilliseconds = &value
+		}
+	}
 	return result
+}
+
+func newStartupState(strategy string, containerStartedAt time.Time) *startupState {
+	if containerStartedAt.IsZero() {
+		panic("runtime startup origin is unavailable")
+	}
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic("runtime entropy unavailable")
+	}
+	return &startupState{
+		strategy:             strategy,
+		runtimeInstanceID:    hex.EncodeToString(value),
+		containerStartedMono: containerStartedAt,
+	}
+}
+
+func (state *startupState) requireRuntimeInitialized() {
+	if state.runtimeInstanceID == "" || state.containerStartedMono.IsZero() {
+		panic("runtime state was not initialized")
+	}
+}
+
+func (state *startupState) beginInference(observedAt time.Time) time.Time {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	startedMono := time.Now()
+	observed := observedAt.UTC()
+	state.inferenceStarted++
+	state.inferenceInFlight++
+	if state.firstInferenceStarted == nil {
+		state.firstInferenceStarted = &observed
+	}
+	state.lastInferenceStarted = &observed
+	if state.inferenceInFlight == 1 {
+		state.busyStartedMono = startedMono
+	}
+	return startedMono
+}
+
+func (state *startupState) finishInference(startedMono time.Time, observedAt time.Time, cancelled, failed bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.inferenceInFlight == 0 {
+		panic("inference telemetry underflow")
+	}
+	state.inferenceInFlight--
+	observed := observedAt.UTC()
+	state.lastInferenceCompleted = &observed
+	if cancelled {
+		state.inferenceCancelled++
+	} else if failed {
+		state.inferenceFailed++
+	} else {
+		state.inferenceCompleted++
+	}
+	if state.inferenceInFlight == 0 {
+		if !state.busyStartedMono.IsZero() {
+			state.inferenceBusy += time.Since(state.busyStartedMono)
+		}
+		state.busyStartedMono = time.Time{}
+	}
+	_ = startedMono
 }
 
 func elapsedMilliseconds(start, end *time.Time) *int64 {

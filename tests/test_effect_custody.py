@@ -4,7 +4,8 @@ import asyncio
 import gc
 import inspect
 import threading
-from importlib.metadata import requires
+import tomllib
+from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
@@ -13,13 +14,21 @@ from kestrel_cloud_runpod import await_owned_effect
 
 
 def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
-    dependencies = [Requirement(value) for value in requires("kestrel-cloud-runpod")]
-    core, = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    with (Path(__file__).resolve().parents[1] / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    dependencies = [Requirement(value) for value in project["dependencies"]]
+    (core,) = [value for value in dependencies if value.name == "kestrel-sovereign"]
     assert "0.53.34" not in core.specifier
-    assert "0.53.35" in core.specifier
-    test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
-    assert test_loop.marker.evaluate({"extra": "test"})
-    assert not test_loop.marker.evaluate({"extra": ""})
+    assert "0.53.36" not in core.specifier
+    assert "0.53.37" not in core.specifier
+    assert "0.53.40" not in core.specifier
+    assert "0.53.41" in core.specifier
+    test_dependencies = [
+        Requirement(value) for value in project["optional-dependencies"]["test"]
+    ]
+    (test_loop,) = [
+        value for value in test_dependencies if value.name == "pytest-asyncio"
+    ]
     assert "1.3.0" not in test_loop.specifier
     assert "1.4.0" in test_loop.specifier
 

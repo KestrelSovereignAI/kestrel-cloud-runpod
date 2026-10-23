@@ -11,12 +11,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
+from .clients import is_exact_runpod_not_found
 from .effect_custody import await_owned_effect
 from .models import (
     CloudType,
     ComputeProduct,
     GPUProfile,
     PlacementDecision,
+    RunPodAcknowledgedResourceError,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -68,16 +70,32 @@ class CreatedTrainingPod:
     raw: Mapping[str, Any] | None = None
 
 
+def _exact_pod_status(
+    payload: Mapping[str, Any],
+    pod_id: str,
+    *,
+    context: str,
+) -> str | None:
+    if not isinstance(payload, Mapping) or payload.get("id") != pod_id:
+        raise RunPodManagerError(
+            f"Runpod v2 {context} response did not match the requested Pod ID"
+        )
+    status = payload.get("status") or payload.get("desiredStatus")
+    if status is not None and not isinstance(status, str):
+        raise RunPodManagerError(f"Runpod v2 {context} response had invalid status")
+    return status
+
+
 class PodCapacityCreatedMismatchError(RunPodManagerError):
-    """A created Pod is known by ID but failed immutable validation."""
+    """A created Pod is known by ID but lacks accepted capacity evidence."""
 
     def __init__(self, provider_pod_id: str) -> None:
         if not provider_pod_id.strip():
             raise ValueError("Created Pod mismatch requires a provider Pod ID")
         self.provider_pod_id = provider_pod_id
         super().__init__(
-            "Runpod v2 created a Pod whose immutable placement did not match "
-            "the accepted capacity request"
+            "Runpod v2 acknowledged a Pod by exact ID, but the response did not "
+            "prove the accepted capacity request"
         )
 
 
@@ -254,9 +272,12 @@ class RunpodPodCapacityProvider:
         }
         if environment is not None:
             metadata["env_overrides"] = dict(environment)
-        result = await await_owned_effect(
-            asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
-        )
+        try:
+            result = await await_owned_effect(
+                asyncio.to_thread(self.provider.start_pod, effective_profile, metadata)
+            )
+        except RunPodAcknowledgedResourceError as exc:
+            raise PodCapacityCreatedMismatchError(exc.resource_id) from exc
         pod_id = result.get("id") or result.get("podId")
         if not isinstance(pod_id, str) or not pod_id:
             raise RunPodAmbiguousResultError(
@@ -341,10 +362,10 @@ class RunpodPodCapacityProvider:
                 asyncio.to_thread(self.provider.stop_pod, pod_id)
             )
         except RunPodAPIError as exc:
-            if exc.status_code == 404:
+            if is_exact_runpod_not_found(exc):
                 return True
             raise
-        status = result.get("status") or result.get("desiredStatus")
+        status = _exact_pod_status(result, pod_id, context="Pod stop")
         if isinstance(status, str) and status.upper() in {
             "EXITED",
             "STOPPED",
@@ -354,11 +375,11 @@ class RunpodPodCapacityProvider:
         try:
             raw = await asyncio.to_thread(self.provider.get_status, pod_id)
         except RunPodAPIError as exc:
-            if exc.status_code == 404:
+            if is_exact_runpod_not_found(exc):
                 return True
             raise
-        observed_status = raw.get("status") or raw.get("desiredStatus")
-        if not isinstance(observed_status, str) or not observed_status:
+        observed_status = _exact_pod_status(raw, pod_id, context="Pod status")
+        if not observed_status:
             raise RunPodManagerError("Runpod v2 Pod status response omitted status")
         return observed_status.upper() in {"EXITED", "STOPPED", "TERMINATED"}
 
@@ -370,19 +391,21 @@ class RunpodPodCapacityProvider:
                 asyncio.to_thread(self.provider.terminate_pod, pod_id)
             )
         except RunPodAPIError as exc:
-            if exc.status_code == 404:
+            if is_exact_runpod_not_found(exc):
                 return True
             raise
-        status = result.get("status") or result.get("desiredStatus")
+        status = _exact_pod_status(result, pod_id, context="Pod termination")
         if isinstance(status, str) and status.upper() == "TERMINATED":
             return True
         try:
             observed = await asyncio.to_thread(self.provider.get_status, pod_id)
         except RunPodAPIError as exc:
-            if exc.status_code == 404:
+            if is_exact_runpod_not_found(exc):
                 return True
             raise
-        observed_status = observed.get("status") or observed.get("desiredStatus")
+        observed_status = _exact_pod_status(
+            observed, pod_id, context="Pod termination status"
+        )
         return isinstance(observed_status, str) and observed_status.upper() in {
             "TERMINATED",
             "EXITED",
