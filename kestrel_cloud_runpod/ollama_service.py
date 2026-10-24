@@ -1159,16 +1159,25 @@ class OllamaLeaseService:
         *,
         name: str,
     ) -> OllamaLease:
-        """Share one admitted original; evict only after its terminal join."""
+        """Publish before opening one effect; evict after its terminal join."""
 
         task = cache.get(key)
         opening = None
         try:
             if task is None:
                 admission = OwnedTaskAdmission()
+                publication_ready = asyncio.Event()
+                publication_failure = None
+
+                async def published_effect():
+                    await publication_ready.wait()
+                    if publication_failure is not None:
+                        raise publication_failure
+                    return await operation()
+
                 try:
                     task = create_owned_task(
-                        operation(),
+                        published_effect(),
                         name=name,
                         retain_originals=True,
                         admission=admission,
@@ -1180,9 +1189,24 @@ class OllamaLeaseService:
                     opening = failure
                     task = admission.task
                     if task is None:
-                        # Core closed the unstarted original on true refusal.
+                        # Core closed the exact unstarted gate coroutine.
+                        # The physical operation factory was never invoked.
                         # There is no Task to replace or retry here.
                         raise
+                    try:
+                        published = cache.get(key) is task
+                    except BaseException as publication:  # noqa: BLE001 - retain failed publication corroboration and original admission
+                        opening = execution_terminal_error(
+                            opening,
+                            publication,
+                            retain_originals=True,
+                            isolate_control_originals=True,
+                        )
+                        published = False
+                    if not published:
+                        publication_failure = opening
+                finally:
+                    publication_ready.set()
             try:
                 result = await await_owned_effect(task)
             except BaseException as outcome:  # noqa: BLE001 - compose actual physical outcome and publication failure

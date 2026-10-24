@@ -1262,21 +1262,33 @@ class PodCapacityLeaseService:
             if member.is_terminal:
                 continue
             try:
-                await self._release_one(
-                    member.cleanup_token, reason=reason, provider_failures=failures
+                try:
+                    await self._release_one(
+                        member.cleanup_token,
+                        reason=reason,
+                        provider_failures=failures,
+                    )
+                except TrainingPodCleanupError as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    failures.append(exc)
+                except RunPodManagerError as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    # The whole step may have lost custody. Stop without another
+                    # database read or sibling effect, retaining the original cause.
+                    raise self._cleanup_error(
+                        reason, member, cleanup_token=cleanup_token
+                    ) from exc
+            except BaseException as abort:
+                if not failures:
+                    raise
+                terminal = execution_terminal_error(
+                    *failures, abort, retain_originals=True
                 )
-            except TrainingPodCleanupError as exc:
-                if is_execution_control_error(exc):
-                    raise
-                failures.append(exc)
-            except RunPodManagerError as exc:
-                if is_execution_control_error(exc):
-                    raise
-                # The whole step may have lost custody. Stop without another
-                # database read or sibling effect, retaining the original cause.
-                raise self._cleanup_error(
-                    reason, member, cleanup_token=cleanup_token
-                ) from exc
+                if terminal is None:
+                    raise AssertionError("Owned family cleanup lost its abort")
+                raise terminal
 
         if failures:
             if any(

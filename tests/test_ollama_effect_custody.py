@@ -1068,6 +1068,183 @@ async def _r27_cached_case(tmp_path, kind):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "publication"),
+    [
+        pytest.param("cleanup", "before", id="cleanup-before"),
+        pytest.param("billing", "before", id="billing-before"),
+        pytest.param("cleanup", "after", id="cleanup-after"),
+        pytest.param("billing", "after", id="billing-after"),
+    ],
+)
+async def test_r28_cache_publication_precedes_physical_effect_for_borrower(
+    tmp_path, kind, publication, record_property
+):
+    """The second public caller races the real first cache-publication fault."""
+    case = await _r27_cached_case(tmp_path, kind)
+    opening = RuntimeError("original R28 cache publication: " + publication)
+    loop = asyncio.get_running_loop()
+    injected, borrowed, boundary = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    counts_lock = threading.Lock()
+    counts = {"started": 0, "completed": 0}
+    real_physical = case.provider.physical_effect
+    entries, first_reads = [], []
+    first = second = None
+
+    def physical():
+        with counts_lock:
+            counts["started"] += 1
+            duplicate = counts["started"] == 2
+        if duplicate:
+            loop.call_soon_threadsafe(boundary.set)
+        real_physical()
+        with counts_lock:
+            counts["completed"] += 1
+
+    case.provider.physical_effect = physical
+
+    class NativeCache(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if asyncio.current_task() is second and not first_reads:
+                first_reads.append(value)
+                borrowed.set()
+            return value
+
+        def __setitem__(self, key, task):
+            entries.append(task)
+            if len(entries) == 1:
+                if publication == "after":
+                    super().__setitem__(key, task)
+                record_property("injection_entry", "cache-" + publication)
+                injected.set()
+                raise opening
+            super().__setitem__(key, task)
+
+    setattr(case.owner, case.cache_attr, NativeCache())
+    first = create_owned_task(case.invoke(), retain_originals=True)
+    try:
+        await asyncio.wait_for(injected.wait(), timeout=5)
+        first.add_done_callback(lambda _task: boundary.set())
+        second = create_owned_task(case.invoke(), retain_originals=True)
+        await asyncio.wait_for(borrowed.wait(), timeout=5)
+        if publication == "before":
+            # Old source: two held provider bodies. Repaired source: the
+            # rejected original is terminal WITHOUT entering its provider.
+            # Never require repaired first-body entry as a reachability oracle.
+            await asyncio.wait_for(boundary.wait(), timeout=5)
+            assert first_reads == [None]
+        else:
+            assert await asyncio.to_thread(case.provider.entered.wait, 5)
+            assert first_reads == [entries[0]]
+            assert len(entries) == 1
+            assert not first.done() and not second.done()
+    finally:
+        primary = sys.exception()
+        owners = [task for task in [first, second, *entries] if task is not None]
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owners, case.provider.finish, primary=primary
+            )
+        except BaseException as cleanup:  # Only the exact expected original is handled without an active primary.
+            if primary is not None:
+                raise execution_terminal_error(
+                    primary,
+                    cleanup,
+                    retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            if cleanup is not opening:
+                raise
+    assert injected.is_set() and borrowed.is_set()
+    assert first.done() and not first.cancelled()
+    assert owned_task_error(first) is opening
+    assert second.done() and not second.cancelled()
+    assert owned_task_error(second) is None
+    assert all(task.done() and not task.cancelled() for task in entries)
+    with counts_lock:
+        actual = dict(counts)
+    record_property("actual_physical_starts", actual["started"])
+    record_property("actual_physical_completions", actual["completed"])
+    assert actual["completed"] == actual["started"]
+    assert actual["started"] == 1, "cache fault admitted duplicate physical effects"
+    durable = case.owner.repository.get(case.lease.lease_id)
+    assert durable.lease_id == case.lease.lease_id
+    assert durable.provider_resource_id == case.lease.provider_resource_id
+    assert durable.provisioning_intent == case.lease.provisioning_intent
+    assert durable.cleanup_receipt is not None
+    if kind == "billing":
+        assert durable.cleanup_receipt == case.lease.cleanup_receipt
+    assert case.key not in getattr(case.owner, case.cache_attr)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cleanup", "billing"])
+async def test_r28_failed_cache_publication_corroboration_keeps_originals(
+    tmp_path, kind, record_property
+):
+    """T2: the new exact-Task corroboration may itself refuse observation."""
+    case = await _r27_cached_case(tmp_path, kind)
+    opening = RuntimeError("original before-store publication failure")
+    lookup = ExecutionCommitOutcomeError("unknown")
+    entries = []
+    lookup_entries = []
+    caller = None
+
+    class NativeCache(dict):
+        def __setitem__(self, key, task):
+            entries.append(task)
+            record_property("injection_entry", "before-store")
+            raise opening
+
+        def get(self, key, default=None):
+            if entries and not lookup_entries:
+                lookup_entries.append(key)
+                record_property("corroboration_entry", "exact-Task-lookup")
+                raise lookup
+            return super().get(key, default)
+
+    setattr(case.owner, case.cache_attr, NativeCache())
+    caller = create_owned_task(case.invoke(), retain_originals=True)
+    try:
+        observation = await wait_owned_tasks_until(
+            [caller], deadline=asyncio.get_running_loop().time() + 5
+        )
+        assert observation.error is None and observation.cancellation is None
+        assert caller.done()
+        originals = tuple(_original_errors(owned_task_error(caller)))
+        assert any(error is opening for error in originals)
+        assert any(error is lookup for error in originals)
+        assert len(entries) == len(lookup_entries) == 1
+        assert entries[0].done() and not entries[0].cancelled()
+        assert not case.provider.entered.is_set()
+        assert not case.provider.completed.is_set()
+    finally:
+        primary = sys.exception()
+        owners = [task for task in [caller, *entries] if task is not None]
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owners, case.provider.finish, primary=primary
+            )
+        except BaseException as cleanup:  # Only the exact asserted two-original graph is handled without primary.
+            if primary is not None:
+                raise
+            originals = tuple(_original_errors(cleanup))
+            if not (
+                any(error is opening for error in originals)
+                and any(error is lookup for error in originals)
+                and all(
+                    error is opening
+                    or error is lookup
+                    or isinstance(error, BaseExceptionGroup)
+                    for error in originals
+                )
+            ):
+                raise
+    assert case.key not in getattr(case.owner, case.cache_attr)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["cleanup", "billing"])
 @pytest.mark.parametrize(
     "fault", ["forget-before", "forget-after", "cache-before", "cache-after"]
@@ -1113,18 +1290,27 @@ async def test_r27_existing_cached_publication_door_joins_original(
     try:
         loop.set_task_factory(factory)
         caller = asyncio.create_task(case.invoke(), name="r27-public-caller")
-        assert await asyncio.to_thread(case.provider.entered.wait, 5), (
-            "actual original body did not enter"
-        )
+        if fault == "cache-before":
+            observation = await wait_owned_tasks_until(
+                [caller], deadline=loop.time() + 5
+            )
+            assert observation.error is None and observation.cancellation is None
+            assert caller.done() and owned_task_error(caller) is opening
+            assert not case.provider.entered.is_set()
+            record_property("unpublished_provider_not_entered", True)
+        else:
+            assert await asyncio.to_thread(case.provider.entered.wait, 5), (
+                "actual original body did not enter"
+            )
+            assert not caller.done(), (
+                "public caller escaped before the same physical tail completed"
+            )
         if fault.startswith("forget-"):
             # T2: the redundant callback was REMOVED, not successfully retried.
             assert entries == []
             record_property("removed_forget_callback_absent", True)
         else:
             assert entries, "the same cache publication boundary was not reached"
-        assert not caller.done(), (
-            "public caller escaped before the same physical tail completed"
-        )
     finally:
         primary = sys.exception()
         loop.set_task_factory(original_factory)
@@ -1148,7 +1334,7 @@ async def test_r27_existing_cached_publication_door_joins_original(
                 )
             assert fault.startswith("cache-")
             assert cleanup is opening
-    assert case.provider.completed.is_set()
+    assert case.provider.completed.is_set() is (fault != "cache-before")
     assert caller.done() and not caller.cancelled()
     if fault.startswith("forget-"):
         assert caller.exception() is None
@@ -1163,9 +1349,12 @@ async def test_r27_existing_cached_publication_door_joins_original(
 async def test_r27_existing_cached_allocation_refusal_closes_original(
     tmp_path, monkeypatch, kind, record_property
 ):
+    from kestrel_cloud_runpod import ollama_service as service_module
+
     case = await _r27_cached_case(tmp_path, kind)
     original_operation = getattr(case.owner, case.operation_attr)
-    originals, admissions = [], []
+    originals, admissions, handed = [], [], []
+    real_creator = service_module.create_owned_task
     opening = RuntimeError("original cache Task allocation refused")
     loop = asyncio.get_running_loop()
     original_factory = loop.get_task_factory()
@@ -1175,24 +1364,30 @@ async def test_r27_existing_cached_allocation_refusal_closes_original(
         originals.append(coroutine)
         return coroutine
 
+    def creator(original, **kwargs):
+        handed.append(original)
+        return real_creator(original, **kwargs)
+
     def refuse(_loop, _coroutine, **_kwargs):
         admissions.append("refused-before-Task")
         record_property("injection_entry", "actual-loop-allocation-refusal")
         raise opening
 
     monkeypatch.setattr(case.owner, case.operation_attr, operation)
+    monkeypatch.setattr(service_module, "create_owned_task", creator)
     try:
         loop.set_task_factory(refuse)
         with pytest.raises(RuntimeError) as caught:
             await case.invoke()
         assert caught.value is opening
-        assert admissions == ["refused-before-Task"] and len(originals) == 1
-        assert inspect.getcoroutinestate(originals[0]) == inspect.CORO_CLOSED
+        assert admissions == ["refused-before-Task"] and len(handed) == 1
+        assert originals == [], "unpublished physical factory was invoked"
+        assert inspect.getcoroutinestate(handed[0]) == inspect.CORO_CLOSED
     finally:
         loop.set_task_factory(original_factory)
         # Baseline safety only: no native Task was accepted. This original
         # unadmitted coroutine is never retried or treated as a physical ACK.
-        for coroutine in originals:
+        for coroutine in handed:
             if inspect.getcoroutinestate(coroutine) != inspect.CORO_CLOSED:
                 record_property("baseline_outer_closed_unadmitted_original", True)
                 coroutine.close()
@@ -1256,17 +1451,24 @@ async def test_r27_core_postaccept_publication_keeps_exact_original(
     tmp_path, monkeypatch, kind, publication, record_property
 ):
     """T2 ONLY: the canonical creator is a newly adopted service path."""
+    from kestrel_cloud_runpod import ollama_service as service_module
+
     case = await _r27_cached_case(tmp_path, kind)
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
     opening = RuntimeError("actual Core callback publication: " + publication)
-    accepted, entries, originals = [], [], []
+    accepted, entries, originals, handed = [], [], [], []
+    real_creator = service_module.create_owned_task
     real_operation = getattr(case.owner, case.operation_attr)
 
     def operation(*args, **kwargs):
         coroutine = real_operation(*args, **kwargs)
         originals.append(coroutine)
         return coroutine
+
+    def creator(original, **kwargs):
+        handed.append(original)
+        return real_creator(original, **kwargs)
 
     class NativePublicationTask(asyncio.Task):
         def add_done_callback(self, callback, *, context=None):
@@ -1286,15 +1488,17 @@ async def test_r27_core_postaccept_publication_keeps_exact_original(
         return task
 
     monkeypatch.setattr(case.owner, case.operation_attr, operation)
+    monkeypatch.setattr(service_module, "create_owned_task", creator)
     try:
         loop.set_task_factory(factory)
         with pytest.raises(RuntimeError) as caught:
             await case.invoke()
         assert caught.value is opening
-        assert len(entries) == len(accepted) == len(originals) == 1
+        assert len(entries) == len(accepted) == len(handed) == 1
+        assert originals == [], "Core-refused gate created a physical coroutine"
         assert accepted[0].done(), "the service lost the actual accepted gated Task"
         assert owned_task_error(accepted[0]) is opening
-        assert inspect.getcoroutinestate(originals[0]) == inspect.CORO_CLOSED
+        assert inspect.getcoroutinestate(handed[0]) == inspect.CORO_CLOSED
         assert not case.provider.entered.is_set()
         assert case.key not in getattr(case.owner, case.cache_attr)
     finally:

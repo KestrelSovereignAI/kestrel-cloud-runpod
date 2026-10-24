@@ -175,6 +175,236 @@ async def test_r27_family_custody_sql_failure_stops_later_effects(tmp_path, door
     assert root.family_release_requested and not root.family_release_complete
 
 
+async def _r28_three_active_family(tmp_path):
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    await _persist_fallback_after_released_root(tmp_path, clock, provider, legacy=True)
+    runtime = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={
+            name: training_profile(name)
+            for name in (
+                "training",
+                "training-h100",
+                "training-flex",
+                "training-spot",
+            )
+        },
+    )
+    root_token = "training:fallback-family-root-0001"
+    for profile_id, pod_id in (
+        ("training-flex", "pod-r28-second-original"),
+        ("training-spot", "pod-r28-third-original"),
+    ):
+        provider.status = "EXITED"
+        await runtime.acquire(
+            training_request(
+                clock,
+                token=fallback_training_cleanup_token(root_token, profile_id),
+                profile_id=profile_id,
+                pod_id=pod_id,
+            )
+        )
+    active = tuple(
+        item for item in runtime._cleanup_family(root_token) if not item.is_terminal
+    )
+    assert len(active) == 3
+    assert len({item.provider_pod_id for item in active}) == 3
+    return runtime, provider, root_token, active
+
+
+def _r28_refuse_stop_attempt(runtime, cleanup_token):
+    with runtime.repository._connect() as connection:
+        connection.execute(
+            "CREATE TABLE r28_abort_target (cleanup_token TEXT PRIMARY KEY)"
+        )
+        connection.execute("INSERT INTO r28_abort_target VALUES (?)", (cleanup_token,))
+        connection.execute(
+            "CREATE TRIGGER r28_later_custody_abort BEFORE UPDATE "
+            "ON pod_capacity_leases WHEN OLD.cleanup_token = "
+            "(SELECT cleanup_token FROM r28_abort_target) "
+            "AND NEW.stop_attempts > OLD.stop_attempts BEGIN "
+            "SELECT RAISE(ABORT, 'r28 later family custody refused'); END"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_graph", ["direct", "group"])
+@pytest.mark.parametrize("later_abort", ["native-sql", "typed-control"])
+async def test_r28_family_abort_retains_prior_control_and_stops_third_sibling(
+    tmp_path, monkeypatch, record_property, prior_graph, later_abort
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    runtime, provider, root_token, active = await _r28_three_active_family(tmp_path)
+    first, second, third = active
+    second_before = runtime.repository.get(second.cleanup_token)
+    third_before = runtime.repository.get(third.cleanup_token)
+    first_carrier, first_control, first_explicit = execution_control_carrier(
+        RunPodManagerError("r28 first provider result remains unknown"),
+        grouped=prior_graph == "group",
+    )
+    stop_entries = []
+    original_stop = provider.stop
+
+    async def controlled_stop(pod_id):
+        stop_entries.append(pod_id)
+        if pod_id == first.provider_pod_id:
+            record_control_injection(
+                record_property, f"r28-first-provider-{prior_graph}"
+            )
+            raise first_carrier
+        return await original_stop(pod_id)
+
+    monkeypatch.setattr(provider, "stop", controlled_stop)
+    original_compare_and_set = runtime.repository.compare_and_set
+    observed_native = None
+    second_at_injection = None
+    later_carrier = None
+    later_explicit = None
+    if later_abort == "native-sql":
+        _r28_refuse_stop_attempt(runtime, second.cleanup_token)
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal observed_native, second_at_injection
+            try:
+                return original_compare_and_set(current, changes=changes)
+            except sqlite3.IntegrityError as error:
+                assert current.cleanup_token == second.cleanup_token
+                second_at_injection = current
+                observed_native = error
+                record_property("r28_later_abort", "native-sql")
+                raise
+
+    else:
+        later_carrier, _later_control, later_explicit = execution_control_carrier(
+            TrainingPodConflictError("r28 later typed custody remains unknown"),
+            grouped=True,
+        )
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal second_at_injection
+            if (
+                current.cleanup_token == second.cleanup_token
+                and "stop_attempts" in changes
+            ):
+                second_at_injection = current
+                record_control_injection(record_property, "r28-later-typed-custody")
+                raise later_carrier
+            return original_compare_and_set(current, changes=changes)
+
+    monkeypatch.setattr(
+        runtime.repository, "compare_and_set", controlled_compare_and_set
+    )
+    caught = None
+    try:
+        await runtime.release(root_token, reason="r28 retained family abort")
+    except (RunPodManagerError, sqlite3.IntegrityError) as error:
+        caught = error
+
+    actual_later = observed_native if later_abort == "native-sql" else later_carrier
+    assert actual_later is not None
+    assert second_at_injection is not None
+    assert second_at_injection.state is TrainingPodState.RELEASING
+    assert second_at_injection.cleanup_state is TrainingPodCleanupState.PENDING
+    assert second_at_injection.backend_base_url is None
+    assert second_at_injection.revision == second_before.revision + 1
+    assert second_at_injection.stop_attempts == second_before.stop_attempts
+    assert stop_entries == [first.provider_pod_id]
+    assert runtime.repository.get(second.cleanup_token) == second_at_injection
+    assert runtime.repository.get(third.cleanup_token) == third_before
+    root = runtime.repository.get(root_token)
+    assert root is not None
+    assert root.family_release_requested and not root.family_release_complete
+    retained_first = runtime.repository.get(first.cleanup_token)
+    assert retained_first is not None and not retained_first.is_terminal
+    assert retained_first.provider_pod_id == first.provider_pod_id
+    assert caught is first_carrier
+    assert is_execution_control_error(caught)
+    assert isinstance(caught.__cause__, BaseExceptionGroup)
+    assert caught.__cause__.exceptions == (first_explicit, actual_later)
+    assert is_execution_control_error(first_carrier)
+    if isinstance(first_explicit, BaseExceptionGroup):
+        assert first_control in first_explicit.exceptions
+    else:
+        assert first_explicit is first_control
+    if later_abort == "native-sql":
+        assert observed_native.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    else:
+        assert later_carrier.__cause__ is later_explicit
+        assert is_execution_control_error(later_carrier)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_kind", ["native-sql", "typed-control"])
+async def test_r28_family_sole_abort_keeps_identity_and_stops_later_siblings(
+    tmp_path, monkeypatch, record_property, abort_kind
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    runtime, provider, root_token, active = await _r28_three_active_family(tmp_path)
+    first, second, third = active
+    second_before = runtime.repository.get(second.cleanup_token)
+    third_before = runtime.repository.get(third.cleanup_token)
+    stop_calls_before = list(provider.stop_calls)
+    original_compare_and_set = runtime.repository.compare_and_set
+    observed_native = None
+    typed_abort = None
+    typed_explicit = None
+    if abort_kind == "native-sql":
+        _r28_refuse_stop_attempt(runtime, first.cleanup_token)
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal observed_native
+            try:
+                return original_compare_and_set(current, changes=changes)
+            except sqlite3.IntegrityError as error:
+                assert current.cleanup_token == first.cleanup_token
+                observed_native = error
+                record_property("r28_sole_abort", "native-sql")
+                raise
+
+    else:
+        typed_abort, _typed_control, typed_explicit = execution_control_carrier(
+            TrainingPodConflictError("r28 sole typed custody remains unknown")
+        )
+
+        def controlled_compare_and_set(current, *, changes):
+            if (
+                current.cleanup_token == first.cleanup_token
+                and "stop_attempts" in changes
+            ):
+                record_control_injection(record_property, "r28-sole-typed-custody")
+                raise typed_abort
+            return original_compare_and_set(current, changes=changes)
+
+    monkeypatch.setattr(
+        runtime.repository, "compare_and_set", controlled_compare_and_set
+    )
+    caught = None
+    try:
+        await runtime.release(root_token, reason="r28 sole family abort")
+    except (RunPodManagerError, sqlite3.IntegrityError) as error:
+        caught = error
+
+    expected = observed_native if abort_kind == "native-sql" else typed_abort
+    assert expected is not None
+    assert caught is expected
+    assert provider.stop_calls == stop_calls_before
+    assert runtime.repository.get(second.cleanup_token) == second_before
+    assert runtime.repository.get(third.cleanup_token) == third_before
+    root = runtime.repository.get(root_token)
+    assert root is not None
+    assert root.family_release_requested and not root.family_release_complete
+    if abort_kind == "native-sql":
+        assert observed_native.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    else:
+        assert typed_abort.__cause__ is typed_explicit
+        assert is_execution_control_error(typed_abort)
+
+
 def _cleanup_carrier(boundary: str):
     return TrainingPodCleanupError(
         boundary,
