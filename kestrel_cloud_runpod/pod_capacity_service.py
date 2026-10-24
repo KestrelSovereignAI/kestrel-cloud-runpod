@@ -738,13 +738,26 @@ class PodCapacityLeaseService:
         lease = self._required(cleanup_token)
         if lease.is_terminal:
             return lease
-        return self._transition_nonterminal(
-            lease,
-            changes={
-                "last_heartbeat_at": self._now(),
-                "last_provider_error": sanitize_training_error(error),
-            },
-        )
+        try:
+            return self._transition_nonterminal(
+                lease,
+                changes={
+                    "last_heartbeat_at": self._now(),
+                    "last_provider_error": sanitize_training_error(error),
+                },
+            )
+        except BaseException as persistence_error:
+            terminal = execution_terminal_error(
+                persistence_error,
+                error,
+                retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if terminal is None:
+                raise AssertionError(
+                    "Training operation-error recording lost its terminal outcome"
+                ) from persistence_error
+            raise terminal
 
     def record_status(self, cleanup_token: str, status: str) -> TrainingPodLease:
         lease = self._required(cleanup_token)

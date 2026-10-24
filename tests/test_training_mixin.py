@@ -1833,3 +1833,443 @@ async def test_r29_f3_training_preserves_operation_and_owned_cleanup_originals(
     assert any(error is primary for error in originals), (
         "ordinary operation primary was lost when original owned cleanup failed"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,persistence_mode",
+    [
+        pytest.param("C01-readiness", "ordinary", id="C01-ordinary-dml"),
+        pytest.param("C02-invalid-object", "ordinary", id="C02-ordinary-dml"),
+        pytest.param("C03-missing-id", "ordinary", id="C03-ordinary-dml"),
+        pytest.param("C04-recovery", "ordinary", id="C04-ordinary-dml"),
+        pytest.param("C05-cancel", "ordinary", id="C05-ordinary-dml"),
+        pytest.param("R01-readiness-connect", "ordinary", id="R01-ordinary-dml"),
+        pytest.param("R02-readiness-timeout", "ordinary", id="R02-ordinary-dml"),
+        pytest.param("C01-readiness", "control", id="C01-control-dml"),
+        pytest.param("C02-invalid-object", "control", id="C02-control-dml"),
+        pytest.param("C03-missing-id", "control", id="C03-control-dml"),
+        pytest.param("C04-recovery", "control", id="C04-control-dml"),
+        pytest.param("C05-cancel", "control", id="C05-control-dml"),
+        pytest.param("R01-readiness-connect", "control", id="R01-control-dml"),
+        pytest.param("R02-readiness-timeout", "control", id="R02-control-dml"),
+    ],
+)
+async def test_training_error_recording_dml_retains_original_and_stops_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    persistence_mode: str,
+    record_property,
+) -> None:
+    """A real failed error-recording UPDATE retains both exact originals."""
+    token = f"training:c06:{boundary}:{persistence_mode}"
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    runtime = manager._get_training_pod_lease_service()
+    session = await manager.start_training_pod("companion-1", cleanup_token=token)
+    if boundary == "C05-cancel":
+        runtime.record_job(token, "job-c06")
+    before = runtime.repository.get(token)
+    assert before is not None
+    stop_calls_before = tuple(provider.stop_calls)
+    workload_calls = []
+    injected_transport_errors = []
+
+    def workload_transport(request: httpx.Request) -> httpx.Response:
+        workload_calls.append((request.method, request.url.path))
+        if request.url.path == "/ready":
+            assert request.method == "GET"
+            if boundary == "R01-readiness-connect":
+                error = httpx.ConnectError(
+                    "ordinary readiness connection failure", request=request
+                )
+                injected_transport_errors.append(error)
+                raise error
+            if boundary == "R02-readiness-timeout":
+                error = httpx.ReadTimeout(
+                    "ordinary readiness timeout", request=request
+                )
+                injected_transport_errors.append(error)
+                raise error
+            assert boundary == "C01-readiness"
+            return httpx.Response(
+                503, json={"detail": "Training in progress: old-job"}
+            )
+        if request.url.path == "/train":
+            assert request.method == "POST"
+            if boundary == "C02-invalid-object":
+                return httpx.Response(200, json=[])
+            if boundary == "C03-missing-id":
+                return httpx.Response(200, json={})
+            assert boundary == "C04-recovery"
+            error = httpx.ConnectError(
+                "ordinary training request failure", request=request
+            )
+            injected_transport_errors.append(error)
+            raise error
+        if request.url.path == "/current-job":
+            assert boundary == "C04-recovery"
+            assert request.method == "GET"
+            return httpx.Response(200, json={"current_job": None})
+        assert boundary == "C05-cancel"
+        assert (request.method, request.url.path) == ("POST", "/cancel/job-c06")
+        error = httpx.ConnectError(
+            "ordinary cancellation request failure", request=request
+        )
+        injected_transport_errors.append(error)
+        raise error
+
+    clients = []
+    original_async_client = httpx.AsyncClient
+
+    class RecordedAsyncClient(original_async_client):
+        async def aclose(self) -> None:
+            self.c06_close_calls += 1
+            self.c06_close_task = asyncio.current_task()
+            await super().aclose()
+
+    def workload_client(**kwargs):
+        client = RecordedAsyncClient(
+            transport=httpx.MockTransport(workload_transport), trust_env=False, **kwargs
+        )
+        client.c06_close_calls = 0
+        client.c06_close_task = None
+        clients.append(client)
+        return client
+
+    with closing(sqlite3.connect(runtime.repository.path)) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_c06_error_recording
+               BEFORE UPDATE OF last_provider_error ON pod_capacity_leases
+               WHEN NEW.last_provider_error IS NOT OLD.last_provider_error
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected operation error recording failure');
+               END"""
+        )
+        connection.commit()
+
+    primaries = []
+    recording_entries = []
+    persistence_errors = []
+    control = explicit = None
+    original_record_error = runtime.record_operation_error
+    original_compare_and_set = runtime.repository.compare_and_set
+
+    def record_error(cleanup_token: str, error: BaseException):
+        entry = runtime.repository.get(cleanup_token)
+        assert entry is not None
+        primaries.append(error)
+        recording_entries.append(entry)
+        return original_record_error(cleanup_token, error)
+
+    def compare_and_set(current, *, changes):
+        nonlocal control, explicit
+        try:
+            return original_compare_and_set(current, changes=changes)
+        except sqlite3.IntegrityError as persistence_error:
+            persistence_errors.append(persistence_error)
+            if persistence_mode == "control":
+                _, control, explicit = execution_control_carrier(persistence_error)
+                record_control_injection(
+                    record_property, f"c06-{boundary}-error-recording-dml"
+                )
+            record_property(
+                "c06_error_recording",
+                json.dumps(
+                    {
+                        "boundary": boundary,
+                        "entry": current.to_public_dict(),
+                        "mode": persistence_mode,
+                        "primary_type": type(primaries[0]).__name__,
+                        "sqlite_errorcode": persistence_error.sqlite_errorcode,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            raise
+
+    monkeypatch.setattr(runtime, "record_operation_error", record_error)
+    monkeypatch.setattr(runtime.repository, "compare_and_set", compare_and_set)
+    monkeypatch.setattr(httpx, "AsyncClient", workload_client)
+    driver = {}
+
+    async def operation():
+        driver["task"] = asyncio.current_task()
+        try:
+            if boundary == "C05-cancel":
+                return await manager.cancel_training_job(session, "job-c06")
+            return await manager.submit_training_job(
+                session,
+                b"avatar",
+                "companion-1",
+                wait_for_model_ready=boundary
+                in {
+                    "C01-readiness",
+                    "R01-readiness-connect",
+                    "R02-readiness-timeout",
+                },
+            )
+        finally:
+            driver["body_exited"] = True
+
+    outcome = await await_owned_operation(operation(), retain_originals=True)
+    after = runtime.repository.get(token)
+    originals = tuple(_original_errors(outcome.error))
+    primary = primaries[0] if len(primaries) == 1 else None
+    entry = recording_entries[0] if len(recording_entries) == 1 else None
+    persistence_error = (
+        persistence_errors[0] if len(persistence_errors) == 1 else None
+    )
+    driver_task = driver.get("task")
+    result_facts = {
+        "after": after.to_public_dict() if after is not None else None,
+        "before": before.to_public_dict(),
+        "boundary": boundary,
+        "clients": [
+            {
+                "close_calls": client.c06_close_calls,
+                "close_task_done": client.c06_close_task is not None
+                and client.c06_close_task.done(),
+                "closed": client.is_closed,
+            }
+            for client in clients
+        ],
+        "driver_body_exited": driver.get("body_exited", False),
+        "driver_task_done": driver_task is not None and driver_task.done(),
+        "entry": entry.to_public_dict() if entry is not None else None,
+        "mode": persistence_mode,
+        "outcome_cancellation": type(outcome.cancellation).__name__
+        if outcome.cancellation is not None
+        else None,
+        "outcome_is_control": is_execution_control_error(outcome.error),
+        "outcome_type": type(outcome.error).__name__,
+        "persistence_error_count": len(persistence_errors),
+        "persistence_error_type": type(persistence_error).__name__,
+        "primary_count": len(primaries),
+        "primary_is_caught_transport": not injected_transport_errors
+        or primary is injected_transport_errors[0],
+        "primary_type": type(primary).__name__,
+        "provider_stop_calls_after": list(provider.stop_calls),
+        "provider_stop_calls_before": list(stop_calls_before),
+        "recording_entry_count": len(recording_entries),
+        "same_control_retained": control is not None
+        and any(error is control for error in originals),
+        "same_dml_retained": persistence_error is not None
+        and any(error is persistence_error for error in originals),
+        "same_explicit_retained": explicit is not None
+        and any(error is explicit for error in originals),
+        "same_primary_retained": primary is not None
+        and any(error is primary for error in originals),
+        "workload_calls": workload_calls,
+    }
+    record_property(
+        "c06_error_recording_result", json.dumps(result_facts, sort_keys=True)
+    )
+
+    assert after is not None
+    assert outcome.cancellation is None
+    assert len(primaries) == len(recording_entries) == len(persistence_errors) == 1
+    assert primary is not None and entry is not None and persistence_error is not None
+    assert persistence_error.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    assert any(error is persistence_error for error in originals)
+    assert after == entry
+    assert tuple(provider.stop_calls) == stop_calls_before
+    assert driver["body_exited"] and driver["task"].done()
+    assert all(
+        client.is_closed
+        and client.c06_close_calls == 1
+        and client.c06_close_task is not None
+        and client.c06_close_task.done()
+        for client in clients
+    )
+    if boundary in {
+        "C01-readiness",
+        "R01-readiness-connect",
+        "R02-readiness-timeout",
+    }:
+        assert entry.revision == before.revision + 1
+    elif boundary == "C05-cancel":
+        assert before.state is TrainingPodState.JOB_SUBMITTED
+        assert entry.state is TrainingPodState.CANCEL_REQUESTED
+        assert entry.revision == before.revision + 1
+    else:
+        assert entry == before
+    assert workload_calls == {
+        "C01-readiness": [("GET", "/ready")],
+        "C02-invalid-object": [("POST", "/train")],
+        "C03-missing-id": [("POST", "/train")],
+        "C04-recovery": [("POST", "/train"), ("GET", "/current-job")],
+        "C05-cancel": [("POST", "/cancel/job-c06")],
+        "R01-readiness-connect": [("GET", "/ready")],
+        "R02-readiness-timeout": [("GET", "/ready")],
+    }[boundary]
+    if persistence_mode == "control":
+        assert control is not None and explicit is not None
+        assert persistence_error.__cause__ is explicit
+        assert all(
+            any(error is original for error in originals)
+            for original in (control, explicit)
+        )
+        assert is_execution_control_error(outcome.error)
+    else:
+        assert not is_execution_control_error(persistence_error)
+        assert not is_execution_control_error(outcome.error)
+    # The pre-repair semantic failures are confined to explicit-primary custody
+    # and the two readiness sites' synthetic replacement of the caught object.
+    assert (not injected_transport_errors or primary is injected_transport_errors[0])
+    assert any(error is primary for error in originals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        pytest.param(httpx.ConnectError, id="R01-connect-recording-success"),
+        pytest.param(httpx.ReadTimeout, id="R02-timeout-recording-success"),
+    ],
+)
+async def test_training_readiness_records_same_caught_error_and_sanitizes_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.HTTPError],
+    record_property,
+) -> None:
+    """Successful error recording retains the caught object and type-only detail."""
+    expected_type = error_type.__name__
+    token = f"training:c06-readiness-success:{expected_type}"
+    marker = f"private-body-marker:https://private.invalid/{expected_type}"
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod("companion-1", cleanup_token=token)
+    runtime = manager._get_training_pod_lease_service()
+    before = runtime.repository.get(token)
+    assert before is not None
+    stop_calls_before = tuple(provider.stop_calls)
+    workload_calls = []
+    injected_errors = []
+    recorded_errors = []
+    recording_entries = []
+    persisted_rows = []
+    clients = []
+
+    def workload_transport(request: httpx.Request) -> httpx.Response:
+        workload_calls.append((request.method, request.url.path))
+        assert (request.method, request.url.path) == ("GET", "/ready")
+        if len(workload_calls) == 1:
+            error = error_type(marker, request=request)
+            injected_errors.append(error)
+            raise error
+        return httpx.Response(
+            200,
+            json={"gpu": "test", "gpu_memory_gb": 24},
+            request=request,
+        )
+
+    original_async_client = httpx.AsyncClient
+
+    class RecordedAsyncClient(original_async_client):
+        async def aclose(self) -> None:
+            self.c06_success_close_calls += 1
+            self.c06_success_close_task = asyncio.current_task()
+            await super().aclose()
+
+    def workload_client(**kwargs):
+        client = RecordedAsyncClient(
+            transport=httpx.MockTransport(workload_transport), trust_env=False, **kwargs
+        )
+        client.c06_success_close_calls = 0
+        client.c06_success_close_task = None
+        clients.append(client)
+        return client
+
+    original_record_error = runtime.record_operation_error
+
+    def record_error(cleanup_token: str, error: BaseException):
+        entry = runtime.repository.get(cleanup_token)
+        assert entry is not None
+        recording_entries.append(entry)
+        recorded_errors.append(error)
+        persisted = original_record_error(cleanup_token, error)
+        persisted_rows.append(persisted)
+        return persisted
+
+    monkeypatch.setattr(runtime, "record_operation_error", record_error)
+    monkeypatch.setattr(httpx, "AsyncClient", workload_client)
+    operation_task = asyncio.create_task(
+        manager._wait_for_training_ready(session, timeout=60, poll_interval=0),
+        name=f"c06-readiness-success-{expected_type}",
+    )
+    await operation_task
+    after = runtime.repository.get(token)
+    assert after is not None
+    injected = injected_errors[0] if len(injected_errors) == 1 else None
+    recorded = recorded_errors[0] if len(recorded_errors) == 1 else None
+    recording_entry = recording_entries[0] if len(recording_entries) == 1 else None
+    persisted = persisted_rows[0] if len(persisted_rows) == 1 else None
+    facts = {
+        "after": after.to_public_dict(),
+        "before": before.to_public_dict(),
+        "client_close_calls": [client.c06_success_close_calls for client in clients],
+        "client_close_tasks_done": [
+            client.c06_success_close_task is not None
+            and client.c06_success_close_task.done()
+            for client in clients
+        ],
+        "client_close_tasks_are_operation_task": [
+            client.c06_success_close_task is operation_task for client in clients
+        ],
+        "client_close_tasks_present": [
+            client.c06_success_close_task is not None for client in clients
+        ],
+        "clients_closed": [client.is_closed for client in clients],
+        "expected_type": expected_type,
+        "injected_count": len(injected_errors),
+        "injected_request_url": str(injected.request.url)
+        if injected is not None and injected.request is not None
+        else None,
+        "operation_task_done": operation_task.done(),
+        "persisted": persisted.to_public_dict() if persisted is not None else None,
+        "provider_stop_calls_after": list(provider.stop_calls),
+        "provider_stop_calls_before": list(stop_calls_before),
+        "recorded_count": len(recorded_errors),
+        "recorded_is_injected": recorded is injected and injected is not None,
+        "recorded_type": type(recorded).__name__,
+        "recording_entry": recording_entry.to_public_dict()
+        if recording_entry is not None
+        else None,
+        "workload_calls": workload_calls,
+    }
+    record_property(
+        "c06_readiness_recording_success", json.dumps(facts, sort_keys=True)
+    )
+
+    assert operation_task.done()
+    assert workload_calls == [("GET", "/ready"), ("GET", "/ready")]
+    assert len(injected_errors) == len(recorded_errors) == 1
+    assert len(recording_entries) == len(persisted_rows) == len(clients) == 1
+    client = clients[0]
+    assert client.is_closed
+    assert client.c06_success_close_calls == 1
+    assert client.c06_success_close_task is not None
+    assert client.c06_success_close_task is not operation_task
+    assert client.c06_success_close_task.done()
+    assert tuple(provider.stop_calls) == stop_calls_before
+    assert before.state is after.state is TrainingPodState.READY
+    assert before.cleanup_state is after.cleanup_state
+    assert before.stop_attempts == after.stop_attempts
+    assert before.cleanup_token == after.cleanup_token == token
+    assert before.provider_pod_id == after.provider_pod_id == session.pod_id
+    assert recording_entry is not None and persisted is not None
+    assert recording_entry.revision == before.revision + 1
+    assert persisted.revision == before.revision + 2
+    assert after.revision == before.revision + 3
+    assert after.last_provider_error == persisted.last_provider_error
+    assert after.last_provider_error is not None
+    assert marker not in after.last_provider_error
+    assert "private-body-marker" not in after.last_provider_error
+    assert str(injected.request.url) not in after.last_provider_error
+    assert recorded is injected
+    assert after.last_provider_error == expected_type

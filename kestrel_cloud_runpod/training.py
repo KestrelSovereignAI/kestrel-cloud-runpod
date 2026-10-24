@@ -281,9 +281,7 @@ class RunPodTrainingMixin:
                 except httpx.ConnectError as exc:
                     if is_execution_control_error(exc):
                         raise
-                    service.record_operation_error(
-                        cleanup_token, httpx.ConnectError("training readiness")
-                    )
+                    service.record_operation_error(cleanup_token, exc)
                     if last_status != "connect_error":
                         logger.info(
                             f"Training pod not yet reachable (attempt {attempts})"
@@ -293,9 +291,7 @@ class RunPodTrainingMixin:
                 except httpx.TimeoutException as exc:
                     if is_execution_control_error(exc):
                         raise
-                    service.record_operation_error(
-                        cleanup_token, httpx.TimeoutException("training readiness")
-                    )
+                    service.record_operation_error(cleanup_token, exc)
                     if last_status != "timeout":
                         logger.warning(
                             f"Training pod /ready timed out (attempt {attempts})"
