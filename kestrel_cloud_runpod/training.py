@@ -14,7 +14,7 @@ import logging
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NoReturn, Optional, overload
 
 from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
@@ -39,7 +39,6 @@ from .models import (
 from .providers import DirectRunPodProvider
 from .training_contracts import (
     TRAINING_PROFILE_IDS,
-    TrainingPodCleanupError,
     TrainingPodCleanupState,
     TrainingPodLease,
     TrainingPodLifecycleError,
@@ -605,12 +604,13 @@ class RunPodTrainingMixin:
             if is_execution_control_error(exc):
                 raise
             service.record_operation_error(cleanup_token, exc)
-            try:
-                await service.release(cleanup_token, reason="model readiness failure")
-            except TrainingPodCleanupError as cleanup_exc:
-                if is_execution_control_error(cleanup_exc):
-                    raise
-                raise cleanup_exc from exc
+            await self._release_after_cancellation(
+                cleanup_token,
+                "model readiness",
+                exc,
+                persist_cancellation=False,
+                reason="model readiness failure",
+            )
             raise
 
         train_url = f"{session.backend_base_url}/train"
@@ -692,14 +692,13 @@ class RunPodTrainingMixin:
                 if is_execution_control_error(exc):
                     raise
                 service.record_operation_error(cleanup_token, exc)
-                try:
-                    await service.release(
-                        cleanup_token, reason="invalid submission response"
-                    )
-                except TrainingPodCleanupError as cleanup_exc:
-                    if is_execution_control_error(cleanup_exc):
-                        raise
-                    raise cleanup_exc from exc
+                await self._release_after_cancellation(
+                    cleanup_token,
+                    "training submission",
+                    exc,
+                    persist_cancellation=False,
+                    reason="invalid submission response",
+                )
                 raise RunPodManagerError(
                     f"Training submission failed ({type(exc).__name__})"
                 ) from exc
@@ -708,12 +707,13 @@ class RunPodTrainingMixin:
         if not isinstance(job_id, str) or not job_id:
             error = RunPodManagerError("Training workload omitted its job ID")
             service.record_operation_error(cleanup_token, error)
-            try:
-                await service.release(cleanup_token, reason="missing training job ID")
-            except TrainingPodCleanupError as cleanup_exc:
-                if is_execution_control_error(cleanup_exc):
-                    raise
-                raise cleanup_exc from error
+            await self._release_after_cancellation(
+                cleanup_token,
+                "training submission",
+                error,
+                persist_cancellation=False,
+                reason="missing training job ID",
+            )
             raise error
 
         service.record_job(cleanup_token, job_id)
@@ -766,12 +766,13 @@ class RunPodTrainingMixin:
             service.record_job(cleanup_token, recovered_job_id)
             return recovered_job_id
         service.record_operation_error(cleanup_token, cause)
-        try:
-            await service.release(cleanup_token, reason="training submission failure")
-        except TrainingPodCleanupError as cleanup_exc:
-            if is_execution_control_error(cleanup_exc):
-                raise
-            raise cleanup_exc from cause
+        await self._release_after_cancellation(
+            cleanup_token,
+            "training submission",
+            cause,
+            persist_cancellation=False,
+            reason="training submission failure",
+        )
         raise RunPodManagerError(
             f"Training submission failed ({type(cause).__name__}); capacity was stopped"
         ) from cause
@@ -856,25 +857,26 @@ class RunPodTrainingMixin:
                         "Training cancellation returned a non-object response"
                     )
                 cancellation = payload
-        except asyncio.CancelledError as cancellation:
-            if is_execution_control_error(cancellation):
+        except asyncio.CancelledError as cancellation_error:
+            if is_execution_control_error(cancellation_error):
                 raise
             await self._release_after_cancellation(
                 cleanup_token,
                 "job cancellation",
-                cancellation,
+                cancellation_error,
                 persist_cancellation=False,
             )
         except (httpx.HTTPError, ValueError, RunPodManagerError) as exc:
             if is_execution_control_error(exc):
                 raise
             service.record_operation_error(cleanup_token, exc)
-            try:
-                await service.release(cleanup_token, reason="job cancellation failure")
-            except TrainingPodCleanupError as cleanup_exc:
-                if is_execution_control_error(cleanup_exc):
-                    raise
-                raise cleanup_exc from exc
+            await self._release_after_cancellation(
+                cleanup_token,
+                "job cancellation",
+                exc,
+                persist_cancellation=False,
+                reason="job cancellation failure",
+            )
             raise RunPodManagerError(
                 f"Training cancellation failed ({type(exc).__name__}); "
                 "capacity was stopped"
@@ -1043,6 +1045,7 @@ class RunPodTrainingMixin:
             )
         return lease
 
+    @overload
     async def _release_after_cancellation(
         self,
         cleanup_token: str,
@@ -1050,30 +1053,60 @@ class RunPodTrainingMixin:
         cancellation: asyncio.CancelledError,
         *,
         persist_cancellation: bool,
+        reason: str | None = None,
+    ) -> NoReturn: ...
+
+    @overload
+    async def _release_after_cancellation(
+        self,
+        cleanup_token: str,
+        operation: str,
+        cancellation: BaseException,
+        *,
+        persist_cancellation: bool,
+        reason: str | None = None,
+    ) -> None: ...
+
+    async def _release_after_cancellation(
+        self,
+        cleanup_token: str,
+        operation: str,
+        cancellation: BaseException,
+        *,
+        persist_cancellation: bool,
+        reason: str | None = None,
     ) -> None:
+        """Join cleanup; healthy ordinary primaries retain caller normalization."""
         service = self._get_training_pod_lease_service()
 
         async def request_and_release() -> TrainingPodLease:
             if persist_cancellation:
                 service.request_cancellation(cleanup_token)
             return await service.release(
-                cleanup_token, reason=f"{operation} cancellation"
+                cleanup_token,
+                reason=reason if reason is not None else f"{operation} cancellation",
             )
 
         cleanup = await await_owned_operation(
             request_and_release(),
             retain_originals=True,
         )
+        if (
+            cleanup.error is None
+            and cleanup.cancellation is None
+            and not isinstance(cancellation, asyncio.CancelledError)
+        ):
+            return
         terminal = execution_terminal_error(
-            cancellation,
             cleanup.error,
+            cancellation,
             cleanup.cancellation,
             retain_originals=True,
             prefer_cancellation=True,
             isolate_control_originals=True,
         )
         if terminal is None:
-            raise AssertionError("Training cancellation lost its terminal outcome")
+            raise AssertionError("Training cleanup lost its terminal outcome")
         raise terminal
 
     async def generate_with_lora(

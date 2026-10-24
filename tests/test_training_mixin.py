@@ -1,7 +1,9 @@
 """Manager integration for durable training capacity and workload recovery."""
 
 import asyncio
+import json
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,14 +12,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from kestrel_sovereign.async_ownership import await_owned_operation
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from pod_capacity_test_support import (
     LateCloseAsyncClient,
     assert_late_http_close_retained,
+    complete_pod_payload,
     execution_control_carrier,
     record_control_injection,
 )
+from test_effect_custody import _original_errors
 from training_test_support import FakeTrainingProvider, MutableClock, training_service
 
+from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.manager import RunPodManager
 from kestrel_cloud_runpod.models import (
     PodStatus,
@@ -32,6 +42,7 @@ from kestrel_cloud_runpod.training_contracts import (
     TrainingPodLifecycleError,
     TrainingPodState,
 )
+from kestrel_cloud_runpod.training_provider import RunpodTrainingPodProvider
 
 
 class FakeWorkloadClient:
@@ -676,6 +687,8 @@ async def test_training_workload_preserves_exact_execution_control(
     boundary: str,
     record_property,
 ):
+    cleanup_boundary = boundary.endswith("-cleanup")
+    recorded_operation_errors: list[BaseException] = []
     provider = FakeTrainingProvider()
     provider.route = "https://pod-training-1-8888.proxy.runpod.net"
     manager = _manager(tmp_path, provider)
@@ -881,13 +894,17 @@ async def test_training_workload_preserves_exact_execution_control(
         else:
             operation = lambda: manager.download_lora(session, "job-control")
 
-        if boundary in {
-            "model-readiness-cleanup",
-            "submit-invalid-cleanup",
-            "missing-job-id-cleanup",
-            "submission-recovery-cleanup",
-            "cancel-cleanup",
-        }:
+        if cleanup_boundary:
+            record_operation_error = runtime.record_operation_error
+
+            def capture_operation_error(cleanup_token: str, error: BaseException):
+                assert cleanup_token == session.training_cleanup_token
+                recorded_operation_errors.append(error)
+                return record_operation_error(cleanup_token, error)
+
+            monkeypatch.setattr(
+                runtime, "record_operation_error", capture_operation_error
+            )
 
             async def controlled_release(*_args, **_kwargs):
                 nonlocal calls_at_injection, durable_at_injection, family_at_injection
@@ -907,10 +924,17 @@ async def test_training_workload_preserves_exact_execution_control(
         durable_before = runtime.repository.get(session.training_cleanup_token)
         assert durable_before is not None
         stop_calls = list(provider.stop_calls)
-    with pytest.raises(type(carrier)) as raised:
-        await operation()
+    if cleanup_boundary:
+        # Accept the old carrier only to expose its missing-primary assertion
+        # on the immutable pre-repair implementation, not as valid behavior.
+        with pytest.raises((ExceptionGroup, type(carrier))) as raised:
+            await operation()
+    else:
+        with pytest.raises(type(carrier)) as raised:
+            await operation()
 
-    assert raised.value is carrier
+    if not cleanup_boundary:
+        assert raised.value is carrier
     assert carrier.__cause__ is explicit
     if isinstance(explicit, BaseExceptionGroup):
         assert explicit.exceptions[0] is control
@@ -974,6 +998,18 @@ async def test_training_workload_preserves_exact_execution_control(
         assert [method for method, _url in calls] == ["POST", "GET"]
     if calls_at_injection is not None:
         assert tuple(calls) == calls_at_injection
+
+    if cleanup_boundary:
+        assert len(recorded_operation_errors) == 1
+        primary = recorded_operation_errors[0]
+        assert primary is not carrier
+        assert not is_execution_control_error(primary)
+        assert type(raised.value) is ExceptionGroup
+        assert len(raised.value.exceptions) == 2
+        assert raised.value.exceptions[0] is carrier
+        assert raised.value.exceptions[1] is primary
+        assert is_execution_control_error(raised.value)
+        assert carrier.__cause__ is explicit
 
 
 @pytest.mark.asyncio
@@ -1491,3 +1527,309 @@ async def test_cancel_stops_pod_and_stop_failure_is_retryable(
     lease = manager.get_training_pod_lease(raised.value.cleanup_token)
     assert lease.provider_pod_id == "pod-training-1"
     assert lease.state is TrainingPodState.RECONCILE_REQUIRED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,cleanup_mode",
+    [
+        pytest.param("C01-readiness", "healthy", id="C01-healthy"),
+        pytest.param("C02-invalid-object", "healthy", id="C02-healthy"),
+        pytest.param("C03-missing-id", "healthy", id="C03-healthy"),
+        pytest.param("C04-recovery", "healthy", id="C04-healthy"),
+        pytest.param("C05-cancel", "healthy", id="C05-healthy"),
+        pytest.param("C01-readiness", "plain-control", id="C01-plain-control"),
+        pytest.param("C01-readiness", "grouped-control", id="C01-grouped-control"),
+        pytest.param("C02-invalid-object", "plain-control", id="C02-plain-control"),
+        pytest.param("C02-invalid-object", "grouped-control", id="C02-grouped-control"),
+        pytest.param("C03-missing-id", "plain-control", id="C03-plain-control"),
+        pytest.param("C03-missing-id", "grouped-control", id="C03-grouped-control"),
+        pytest.param("C04-recovery", "plain-control", id="C04-plain-control"),
+        pytest.param("C04-recovery", "grouped-control", id="C04-grouped-control"),
+        pytest.param("C05-cancel", "plain-control", id="C05-plain-control"),
+        pytest.param("C05-cancel", "grouped-control", id="C05-grouped-control"),
+    ],
+)
+async def test_r29_f3_training_preserves_operation_and_owned_cleanup_originals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    cleanup_mode: str,
+    record_property,
+) -> None:
+    """Actual existing manager/SQLite/HTTPX paths; no replacement release API."""
+    token = f"training:r29-f3:{boundary}:{cleanup_mode}"
+    pod_id = "pod-training-1"
+    events = {"status": "EXITED", "provider_calls": [], "workload_calls": []}
+    stop_entered = threading.Event()
+    stop_exited = threading.Event()
+    clients = []
+    recorded_errors = []
+    driver = {}
+    original_async_client = httpx.AsyncClient
+    cleanup = control = explicit = None
+    if cleanup_mode != "healthy":
+        cleanup, control, explicit = execution_control_carrier(
+            TrainingPodCleanupError(
+                "native transport cleanup remains unknown",
+                cleanup_token=token,
+                pod_id=pod_id,
+                cleanup_state=TrainingPodCleanupState.PENDING,
+                billing_risk=True,
+            ),
+            grouped=cleanup_mode == "grouped-control",
+        )
+
+    def provider_transport(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        events["provider_calls"].append((request.method, request.url.path, body))
+        if request.method == "GET" and request.url.path == f"/v2/pods/{pod_id}":
+            payload = complete_pod_payload(pod_id=pod_id, status=events["status"])
+            payload["runtime"] = {"ports": [{"private": 8888, "type": "http"}]}
+            return httpx.Response(200, json=payload)
+        assert request.method == "POST"
+        assert request.url.path == f"/v2/pods/{pod_id}/action"
+        if body == {"action": "start"}:
+            events["status"] = "RUNNING"
+            return httpx.Response(204)
+        assert body == {"action": "stop"}
+        stop_entered.set()
+        events["cleanup_row"] = runtime.repository.get(token)
+        record_property(
+            "injection_entry",
+            f"{boundary}:{cleanup_mode}:actual-provider-stop-before-outcome",
+        )
+        try:
+            if cleanup is not None:
+                raise cleanup
+            events["status"] = "EXITED"
+            return httpx.Response(204)
+        finally:
+            stop_exited.set()
+
+    def workload_transport(request: httpx.Request) -> httpx.Response:
+        events["workload_calls"].append((request.method, request.url.path))
+        assert request.url.host == f"{pod_id}-8888.proxy.runpod.net"
+        if boundary == "C01-readiness":
+            assert (request.method, request.url.path) == ("GET", "/ready")
+            return httpx.Response(503, json={"detail": "Training in progress: old-job"})
+        if boundary == "C05-cancel":
+            assert (request.method, request.url.path) == ("POST", "/cancel/job-f3")
+            raise httpx.ConnectError(
+                "ordinary cancellation request failure", request=request
+            )
+        if request.url.path == "/train":
+            assert request.method == "POST"
+            if boundary == "C02-invalid-object":
+                return httpx.Response(200, json=[])
+            if boundary == "C03-missing-id":
+                return httpx.Response(200, json={})
+            assert boundary == "C04-recovery"
+            raise httpx.ConnectError(
+                "ordinary training request failure", request=request
+            )
+        assert boundary == "C04-recovery"
+        assert (request.method, request.url.path) == ("GET", "/current-job")
+        return httpx.Response(200, json={"current_job": None})
+
+    class RecordedAsyncClient(original_async_client):
+        async def aclose(self) -> None:
+            self.f3_close_calls += 1
+            self.f3_close_task = asyncio.current_task()
+            await super().aclose()
+
+    def workload_client(**kwargs):
+        client = RecordedAsyncClient(
+            transport=httpx.MockTransport(workload_transport), trust_env=False, **kwargs
+        )
+        client.f3_close_calls = 0
+        client.f3_close_task = None
+        clients.append(client)
+        return client
+
+    native = RunpodControlPlaneClient(
+        api_key="test-not-a-live-credential",
+        http_transport=httpx.MockTransport(provider_transport),
+        max_safe_retries=0,
+    )
+    setup_error = outcome = None
+    try:
+        direct = DirectRunPodProvider(api_key="", client=native)
+        manager = _manager(tmp_path, RunpodTrainingPodProvider(direct))
+        runtime = manager._get_training_pod_lease_service()
+        session = await manager.start_training_pod("companion-1", cleanup_token=token)
+        if boundary == "C05-cancel":
+            # Existing public metadata fixture API, not a new submission grant.
+            runtime.record_job(token, "job-f3")
+        before = runtime.repository.get(token)
+        assert before is not None
+        acquire_calls = tuple(events["provider_calls"])
+        original_record_error = runtime.record_operation_error
+
+        def record_error(cleanup_token, error):
+            recorded_errors.append(error)
+            events["before_error_record"] = runtime.repository.get(cleanup_token)
+            result = original_record_error(cleanup_token, error)
+            events["after_error_record"] = runtime.repository.get(cleanup_token)
+            return result
+
+        monkeypatch.setattr(runtime, "record_operation_error", record_error)
+        monkeypatch.setattr(httpx, "AsyncClient", workload_client)
+
+        async def operation():
+            driver["task"] = asyncio.current_task()
+            try:
+                if boundary == "C05-cancel":
+                    return await manager.cancel_training_job(session, "job-f3")
+                return await manager.submit_training_job(
+                    session,
+                    b"avatar",
+                    "companion-1",
+                    wait_for_model_ready=boundary == "C01-readiness",
+                )
+            finally:
+                driver["body_exited"] = True
+
+        outcome = await await_owned_operation(operation(), retain_originals=True)
+        after = runtime.repository.get(token)
+    except BaseException as error:
+        setup_error = error
+        raise
+    finally:
+        # Physically close the SAME real sync client once, even on fixture failure.
+
+        async def retire_native_client():
+            events["native_close_task"] = asyncio.current_task()
+            await asyncio.to_thread(native.close)
+            events["native_close_returned"] = True
+
+        close = await await_owned_operation(
+            retire_native_client(),
+            retirement_resource=native,
+            retain_originals=True,
+        )
+        retain_outcome = (
+            setup_error is not None
+            or close.error is not None
+            or close.cancellation is not None
+        )
+        terminal = execution_terminal_error(
+            setup_error,
+            outcome.error if retain_outcome and outcome is not None else None,
+            outcome.cancellation if retain_outcome and outcome is not None else None,
+            close.error,
+            close.cancellation,
+            retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
+
+    primary = recorded_errors[0] if recorded_errors else None
+    originals = tuple(_original_errors(outcome.error))
+    facts = {
+        "boundary": boundary,
+        "cleanup_mode": cleanup_mode,
+        "before": before.to_public_dict(),
+        "before_error_record": events["before_error_record"].to_public_dict(),
+        "after_error_record": events["after_error_record"].to_public_dict(),
+        "cleanup_entry": events["cleanup_row"].to_public_dict(),
+        "after": after.to_public_dict(),
+        "provider_acquire_calls": acquire_calls,
+        "provider_cleanup_calls": events["provider_calls"][len(acquire_calls) :],
+        "workload_calls": events["workload_calls"],
+        "primary_type": type(primary).__name__,
+        "primary_message": str(primary),
+        "public_error_type": type(outcome.error).__name__,
+        "primary_is_ordinary": primary is not None
+        and not is_execution_control_error(primary),
+        "same_primary_explicitly_retained": any(
+            error is primary for error in originals
+        ),
+        "same_cleanup_explicitly_retained": cleanup is not None
+        and any(error is cleanup for error in originals),
+        "same_control_explicitly_retained": control is not None
+        and any(error is control for error in originals),
+        "same_explicit_group_or_cause_retained": explicit is not None
+        and any(error is explicit for error in originals),
+        "original_cleanup_cause_unmodified": cleanup is None
+        or cleanup.__cause__ is explicit,
+        "driver_body_exited": driver.get("body_exited", False),
+        "same_driver_task_done": driver.get("task") is not None
+        and driver["task"].done(),
+        "native_stop_call_entered_and_exited": stop_entered.is_set()
+        and stop_exited.is_set(),
+        "native_control_client_closed": native.transport._client.is_closed,
+        "native_close_returned": events.get("native_close_returned", False),
+        "same_native_close_task_done": events["native_close_task"].done(),
+        "async_clients": [
+            {
+                "closed": client.is_closed,
+                "close_calls": client.f3_close_calls,
+                "same_close_task_done": client.f3_close_task is not None
+                and client.f3_close_task.done(),
+            }
+            for client in clients
+        ],
+        "scope": "invented HTTP fixtures/real SQLite and native HTTPX; no cloud or physical training proof",
+    }
+    record_property("r29_f3", json.dumps(facts, sort_keys=True))
+    assert outcome.cancellation is None
+    assert len(recorded_errors) == len(clients) == 1
+    assert primary is not None and not is_execution_control_error(primary)
+    assert driver["body_exited"] and driver["task"].done()
+    assert stop_entered.is_set() and stop_exited.is_set()
+    assert native.transport._client.is_closed
+    assert events["native_close_returned"] and events["native_close_task"].done()
+    assert all(
+        client.is_closed and client.f3_close_calls == 1 and client.f3_close_task.done()
+        for client in clients
+    )
+    assert after.cleanup_token == before.cleanup_token == token
+    assert after.provider_pod_id == before.provider_pod_id == pod_id
+    assert after.hard_deadline == before.hard_deadline
+    assert after.stop_attempts == before.stop_attempts + 1
+    assert (
+        events["workload_calls"]
+        == {
+            "C01-readiness": [("GET", "/ready")],
+            "C02-invalid-object": [("POST", "/train")],
+            "C03-missing-id": [("POST", "/train")],
+            "C04-recovery": [("POST", "/train"), ("GET", "/current-job")],
+            "C05-cancel": [("POST", "/cancel/job-f3")],
+        }[boundary]
+    )
+    if boundary in {"C01-readiness", "C02-invalid-object", "C03-missing-id"}:
+        assert type(primary) is RunPodManagerError
+    else:
+        assert type(primary) is httpx.ConnectError
+    if boundary == "C02-invalid-object":
+        assert (
+            str(primary)
+            == "Training workload returned a non-object submission response"
+        )
+    if boundary == "C03-missing-id":
+        assert str(primary) == "Training workload omitted its job ID"
+    assert events["provider_calls"][len(acquire_calls)] == (
+        "POST",
+        f"/v2/pods/{pod_id}/action",
+        {"action": "stop"},
+    )
+    if cleanup is not None:
+        assert len(events["provider_calls"]) == len(acquire_calls) + 1
+        assert after.state is TrainingPodState.RELEASING
+        assert after.cleanup_state is TrainingPodCleanupState.PENDING
+        assert cleanup.__cause__ is explicit
+        assert all(
+            any(error is original for error in originals)
+            for original in (cleanup, control, explicit)
+        )
+        assert is_execution_control_error(outcome.error)
+    else:
+        assert len(events["provider_calls"]) == len(acquire_calls) + 2
+        assert after.state is TrainingPodState.RELEASED
+        assert after.cleanup_state is TrainingPodCleanupState.COMPLETE
+    # The expected pre-repair semantic failure is only this missing ORIGINAL.
+    assert any(error is primary for error in originals), (
+        "ordinary operation primary was lost when original owned cleanup failed"
+    )

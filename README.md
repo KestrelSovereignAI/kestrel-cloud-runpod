@@ -445,6 +445,19 @@ callers. New catalog hosts construct `PodCapacityLeaseService` with their
 encrypted capability store and call `reconcile()` from a cheap external timer;
 process-local TTLs are never cleanup authority.
 
+Legacy training error preservation: when an ordinary readiness, submission,
+recovery, or cancellation failure is followed by a control-bearing cleanup
+failure, the public call raises the canonical finite exception aggregate. It
+retains the same cleanup carrier and the same operation error (cleanup first),
+without rewriting the cleanup carrier's explicit cause or control evidence.
+Because both originals derive from `Exception`, the aggregate is an
+`ExceptionGroup`; callers must not assume it is the cleanup exception itself.
+Direct control failures and healthy-cleanup ordinary normalization keep their
+existing behavior. At error conversion, retry, persistence, or later-effect
+boundaries, use public Core `is_execution_control_error(error)` with its default
+recursive behavior and re-raise control-bearing evidence unchanged. Neither an
+error aggregate nor cleanup completion grants new work or financial finality.
+
 Install one host-owned synchronous factory that constructs the public service
 with explicit Runpod v2 credentials, the absolute SQLite repository path, GPU
 profiles, the private encrypted `CatalogAttemptCapabilityStore`, and
