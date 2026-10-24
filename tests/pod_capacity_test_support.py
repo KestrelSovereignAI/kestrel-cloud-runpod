@@ -183,6 +183,8 @@ def native_pod_action_harness():
         "action_status": 204,
         "action_payload": None,
         "readback": "running",
+        "readback_payloads": [],
+        "served_readbacks": [],
         "calls": [],
     }
 
@@ -218,6 +220,11 @@ def native_pod_action_harness():
             state["calls"].append((self.command, path, None))
             if path != f"/v2/pods/{state['pod_id']}":
                 self._json_response(404, {"title": "not found"})
+                return
+            if state["readback_payloads"]:
+                payload = state["readback_payloads"].pop(0)
+                state["served_readbacks"].append(payload)
+                self._json_response(200, payload)
                 return
             outcome = state["readback"]
             if outcome == "running":

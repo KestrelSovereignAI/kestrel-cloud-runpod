@@ -221,7 +221,7 @@ class RunpodPodCapacityProvider:
         self, pod_id: str, *, profile: GPUProfile
     ) -> TrainingPodObservation:
         raw = await asyncio.to_thread(self.provider.get_status, pod_id)
-        status = raw.get("status") or raw.get("desiredStatus")
+        status = _exact_pod_status(raw, pod_id, context="Pod status")
         if not isinstance(status, str) or not status:
             raise RunPodManagerError("Runpod v2 Pod status response omitted status")
         return TrainingPodObservation(

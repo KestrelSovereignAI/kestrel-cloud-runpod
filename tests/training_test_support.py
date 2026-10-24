@@ -15,6 +15,7 @@ from kestrel_cloud_runpod.training_contracts import (
 from kestrel_cloud_runpod.training_provider import (
     CreatedTrainingPod,
     TrainingPodObservation,
+    TrainingPodCapacityProvider,
 )
 from kestrel_cloud_runpod.training_repository import SQLiteTrainingPodRepository
 from kestrel_cloud_runpod.training_service import TrainingPodLeaseService
@@ -142,7 +143,7 @@ class FakeTrainingProvider:
 def training_service(
     tmp_path: Path,
     clock: MutableClock,
-    provider: FakeTrainingProvider,
+    provider: FakeTrainingProvider | TrainingPodCapacityProvider,
     *,
     profiles: Mapping[str, GPUProfile] | None = None,
 ) -> TrainingPodLeaseService:
