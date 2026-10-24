@@ -64,10 +64,6 @@ jobs:
     name: Image, SBOM, and vulnerability gate
     needs: proxy-contract
     runs-on: ubuntu-latest
-    env:
-      # Image-layer caches can exceed Ubuntu's RAM-backed /tmp quota. Keep
-      # security-tool scratch in the runner's disk-backed job directory.
-      TMPDIR: ${{ runner.temp }}
     permissions:
       attestations: write # Publish GitHub provenance for the reviewed image digest.
       artifact-metadata: write # Link the immutable GHCR artifact to attestations.
@@ -152,6 +148,9 @@ jobs:
           fi
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          # runner context is available in step.env, not job.env.
+          TMPDIR: ${{ runner.temp }}
         with:
           image: ${{ env.RUNTIME_IMAGE_REF }}
           format: spdx-json
@@ -166,6 +165,8 @@ jobs:
           fi
       - name: Fail on fixed high or critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TMPDIR: ${{ runner.temp }}
         with:
           image-ref: ${{ env.RUNTIME_IMAGE_REF }}
           scanners: vuln

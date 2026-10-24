@@ -212,13 +212,22 @@ def test_image_security_tools_share_runner_owned_scratch() -> None:
     security = workflow["jobs"]["image-security"]
     expected = "${{ runner.temp }}"
 
-    assert security.get("env", {}).get("TMPDIR") == expected
-    # Both Syft and Trivy inherit this same job-scoped directory. A step must
-    # not quietly route one tool back into the runner's quota-limited /tmp.
-    assert all(
-        step.get("env", {}).get("TMPDIR", expected) == expected
+    # GitHub permits runner context in step.env, but rejects it in job.env
+    # before any job can run. Both security tools need an explicit step scope.
+    assert "TMPDIR" not in security.get("env", {})
+    tools = {
+        step["name"]: step
         for step in security["steps"]
-    )
+        if step.get("name") in {
+            "Generate SPDX SBOM",
+            "Fail on fixed high or critical vulnerabilities",
+        }
+    }
+    assert set(tools) == {
+        "Generate SPDX SBOM",
+        "Fail on fixed high or critical vulnerabilities",
+    }
+    assert all(step.get("env", {}).get("TMPDIR") == expected for step in tools.values())
 
 
 def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
