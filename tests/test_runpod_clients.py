@@ -1681,3 +1681,108 @@ def test_v1_and_non_versioned_base_urls_are_rejected():
     for url in ("https://rest.runpod.io/v1", "https://example.test", "not-a-url"):
         with pytest.raises(ValueError, match="/v2|absolute"):
             RunpodControlPlaneClient(api_key="secret", base_url=url)
+
+
+@pytest.mark.parametrize(
+    ("operation", "method", "path"),
+    [
+        ("pod_create", "POST", "/v2/pods"),
+        ("pod_action", "POST", "/v2/pods/pod-123/action"),
+        ("endpoint_create", "POST", "/v2/serverless"),
+        ("endpoint_update", "PATCH", "/v2/serverless/ep-123"),
+    ],
+    ids=["pod-create", "pod-action", "endpoint-create", "endpoint-update"],
+)
+def test_request_too_large_is_known_nonretryable_problem(operation, method, path):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            413,
+            headers={
+                "Content-Type": "application/problem+json",
+                "RateLimit": "limit=100, remaining=99, reset=30",
+                "RateLimit-Policy": "100;w=60",
+            },
+            json={
+                "title": "Request Entity Too Large",
+                "status": 413,
+                "detail": "Request body exceeds the operation limit.",
+            },
+        )
+
+    client = RunpodControlPlaneClient(
+        api_key="secret", http_transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(RunPodAPIError) as raised:
+            if operation == "pod_create":
+                client.create_pod(
+                    PodCreateRequest(name="test", image="image:sha", gpu_id="gpu-id")
+                )
+            elif operation == "pod_action":
+                client.pod_action("pod-123", "stop")
+            elif operation == "endpoint_create":
+                client.create_endpoint(_endpoint_request())
+            else:
+                client.update_endpoint("ep-123", EndpointUpdateRequest(workers_max=1))
+
+        error = raised.value
+        assert type(error) is RunPodAPIError
+        assert error.status_code == 413
+        assert error.title == "Request Entity Too Large"
+        assert error.detail == "Request body exceeds the operation limit."
+        assert error.rate_limit.raw == "limit=100, remaining=99, reset=30"
+        assert error.rate_limit.policy == "100;w=60"
+        assert is_retryable_runpod_api_error(error) is False
+        assert [(item.method, item.url.path) for item in seen] == [(method, path)]
+    finally:
+        client.close()
+
+
+def test_list_pod_nullable_live_fields_do_not_replace_exact_get_readback():
+    seen = []
+    direct = {
+        "host": "203.0.113.1",
+        "port": 22000,
+        "username": "root",
+        "command": "ssh root@203.0.113.1 -p 22000",
+    }
+    runtime = {"uptime": 3600, "ports": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/v2/pods":
+            return httpx.Response(
+                200,
+                json=_page(
+                    "pods",
+                    [_pod(status="RUNNING", runtime=None, ssh={"direct": None})],
+                ),
+            )
+        return httpx.Response(
+            200, json=_pod(status="RUNNING", runtime=runtime, ssh={"direct": direct})
+        )
+
+    client = RunpodControlPlaneClient(
+        api_key="secret", http_transport=httpx.MockTransport(handler)
+    )
+    try:
+        listed = client.list_pods()
+        assert len(listed) == 1
+        assert listed[0].id == "pod-123"
+        assert listed[0].raw["runtime"] is None
+        assert listed[0].raw["ssh"]["direct"] is None
+        exact = client.get_pod(listed[0].id)
+        assert exact.id == listed[0].id
+        assert exact.raw["runtime"] == runtime
+        assert exact.raw["ssh"]["direct"] == direct
+        assert [(item.method, item.url.path) for item in seen] == [
+            ("GET", "/v2/pods"),
+            ("GET", "/v2/pods/pod-123"),
+        ]
+        assert listed[0].raw["runtime"] is None
+        assert listed[0].raw["ssh"]["direct"] is None
+    finally:
+        client.close()
