@@ -1636,3 +1636,152 @@ async def test_new_secondary_ack_progresses_through_exact_cleanup(tmp_path):
     assert completed.cleanup_receipt == terminated.cleanup_receipt
     assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
     assert provider.teardown_calls == calls_before + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ack_before_eviction", [True, False], ids=["cached-done", "evicted-control"]
+)
+@pytest.mark.parametrize(
+    "additional_fails", [False, True], ids=["absence", "retryable-error"]
+)
+async def test_r29_completed_cleanup_cache_covers_late_acknowledgment(
+    tmp_path, monkeypatch, record_property, ack_before_eviction, additional_fails
+):
+    from kestrel_cloud_runpod import ollama_service as service_module
+
+    assert asyncio.get_running_loop().get_task_factory() is None
+    additional_id = "r29-original-post-ack"
+    original_error = OllamaLeaseTeardownError("r29 additional cleanup stays retryable")
+
+    class ExactResourceProvider(FakeOllamaProvider):
+        def __init__(self):
+            super().__init__(serverless_plan())
+            self.resource_ids = []
+
+        async def teardown(self, resource, cleanup_intent):
+            self.resource_ids.append(resource.provider_resource_id)
+            if resource.provider_resource_id == additional_id and additional_fails:
+                raise original_error
+            return await super().teardown(resource, cleanup_intent)
+
+    provider = ExactResourceProvider()
+    clock = MutableClock()
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "r29-cached-cleanup.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    ready = await service.acquire(make_request(clock), plan=serverless_plan())
+    original_intent = ready.provisioning_intent
+    assert original_intent is not None
+    cache_key = (ready.lease_id, original_intent.intent_sha256)
+    first_joined = asyncio.Event()
+    allow_first_return = asyncio.Event()
+    real_join = service_module.await_owned_effect
+    first_task = None
+    original_cached_task = None
+    paused = False
+
+    async def pause_after_real_terminal_join(operation):
+        nonlocal original_cached_task, paused
+        outcome = await real_join(operation)
+        if asyncio.current_task() is first_task and not paused:
+            paused = True
+            assert isinstance(operation, asyncio.Task)
+            assert operation.done()
+            assert service._cleanup_tasks[cache_key] is operation
+            original_cached_task = operation
+            first_joined.set()
+            await allow_first_return.wait()
+        return outcome
+
+    monkeypatch.setattr(
+        service_module, "await_owned_effect", pause_after_real_terminal_join
+    )
+    owned_tasks = []
+    try:
+        first_task = asyncio.create_task(
+            service.release(
+                ready.lease_id, owner_id=ready.owner_id, workload_id=ready.workload_id
+            )
+        )
+        owned_tasks.append(first_task)
+        await asyncio.wait_for(first_joined.wait(), timeout=5)
+        primary_completed = repository.get(ready.lease_id)
+        assert primary_completed is not None
+        assert primary_completed.state is OllamaLeaseState.TERMINATED
+        assert primary_completed.cleanup_receipt is not None
+        assert primary_completed.additional_cleanup_targets == ()
+        assert original_cached_task is not None and original_cached_task.done()
+        if not ack_before_eviction:
+            allow_first_return.set()
+            first_result = await _bounded_owned_task_outcome(first_task)
+            assert first_result == primary_completed
+            assert cache_key not in service._cleanup_tasks
+
+        record_property(
+            "injection_entry",
+            "completed-original-task-retained-in-cache"
+            if ack_before_eviction
+            else "original-task-joined-and-evicted-control",
+        )
+        reopened = repository.attach_provider_acknowledgment(
+            primary_completed,
+            _secondary_resource(primary_completed, additional_id),
+            now=clock(),
+        )
+        assert reopened.state is OllamaLeaseState.RELEASING
+        assert reopened.additional_cleanup_targets[0].cleanup_receipt is None
+        failure = None
+        result = None
+        try:
+            result = await service.release(
+                ready.lease_id, owner_id=ready.owner_id, workload_id=ready.workload_id
+            )
+        except OllamaLeaseTeardownError as error:
+            failure = error
+        durable = SQLiteOllamaLeaseRepository(repository.path).get(ready.lease_id)
+        assert durable is not None
+        facts = {
+            "ack_before_eviction": ack_before_eviction,
+            "additional_fails": additional_fails,
+            "original_physical_task_done_before_ack": original_cached_task.done(),
+            "exact_resource_calls": list(provider.resource_ids),
+            "same_primary_receipt": durable.cleanup_receipt
+            == primary_completed.cleanup_receipt,
+            "additional_receipt": durable.additional_cleanup_targets[0].cleanup_receipt
+            is not None,
+            "durable_state": durable.state.value,
+            "returned_state": None if result is None else result.state.value,
+            "same_original_error": failure is original_error,
+            "cache_empty_after_second_join": cache_key not in service._cleanup_tasks,
+        }
+        record_property(
+            "r29_completed_cleanup_cache", json.dumps(facts, sort_keys=True)
+        )
+        assert provider.resource_ids == [ready.provider_resource_id, additional_id]
+        assert durable.cleanup_receipt == primary_completed.cleanup_receipt
+        assert cache_key not in service._cleanup_tasks
+        if additional_fails:
+            assert failure is original_error
+            assert result is None
+            assert durable.state is OllamaLeaseState.RELEASING
+            assert durable.teardown_state is OllamaTeardownState.RETRYABLE_FAILURE
+            assert durable.additional_cleanup_targets[0].cleanup_receipt is None
+        else:
+            assert failure is None
+            assert result == durable
+            assert durable.state is OllamaLeaseState.TERMINATED
+            assert durable.additional_cleanup_targets[0].cleanup_receipt is not None
+        allow_first_return.set()
+        first_result = await _bounded_owned_task_outcome(first_task)
+        if ack_before_eviction:
+            assert first_result == durable
+    finally:
+        await release_gates_and_boundedly_join_owned_tasks(
+            owned_tasks, allow_first_return, primary=sys.exception()
+        )

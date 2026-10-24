@@ -50,11 +50,19 @@ from kestrel_cloud_runpod.ollama_repository import (
 from kestrel_cloud_runpod.ollama_service import OllamaLeaseService
 
 
-def _service(tmp_path, clock, provider):
+def _service(
+    tmp_path,
+    clock,
+    provider,
+    *,
+    poll_interval_seconds=1,
+    billing_poll_interval_seconds=3600,
+):
     return OllamaLeaseService(
         repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
         provider=provider,
-        poll_interval_seconds=1,
+        poll_interval_seconds=poll_interval_seconds,
+        billing_poll_interval_seconds=billing_poll_interval_seconds,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -2195,6 +2203,121 @@ async def test_touch_releases_a_ready_lease_that_passed_its_cost_cap(tmp_path):
     }
     assert touched.termination_reason == "deadline_or_cost_cap"
     assert capacity.teardown_calls == 1
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["poll_interval_seconds", "billing_poll_interval_seconds"],
+    ids=["poll", "billing"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(1e100, id="timedelta-overflow-float"),
+        pytest.param(10**1000, id="timedelta-overflow-int"),
+        pytest.param(1e-7, id="rounded-zero"),
+        pytest.param(5e-324, id="positive-subnormal"),
+        pytest.param(True, id="boolean"),
+        pytest.param(Decimal("1"), id="non-public-numeric-type"),
+        pytest.param(10**12, id="clock-addition-overflow"),
+    ],
+)
+def test_polling_interval_rejects_unschedulable_configuration_before_admission(
+    tmp_path, field, value, record_property
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    path = tmp_path / "leases.sqlite3"
+    assert not path.exists()
+    record_property("injection_entry", "public-constructor-field")
+    record_property("parameter_field", field)
+    failure = None
+    try:
+        _service(tmp_path, clock, provider, **{field: value})
+    except ValueError as exc:
+        failure = exc
+    # Capture native pre-admission/physical-call facts BEFORE the intended RED
+    # assertion. Wrong API/SQL/type/fixture failures are not this baseline.
+    with closing(sqlite3.connect(path)) as observer, observer:
+        rows = observer.execute("SELECT COUNT(*) FROM ollama_leases").fetchone()[0]
+    record_property("durable_admissions", rows)
+    record_property("provider_provision_calls", provider.provision_calls)
+    record_property("provider_pull_calls", provider.pull_calls)
+    record_property("provider_teardown_calls", provider.teardown_calls)
+    assert rows == 0
+    assert provider.provision_calls == provider.pull_calls == provider.teardown_calls == 0
+    assert type(failure) is ValueError, "constructor accepted an unschedulable interval"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["poll_interval_seconds", "billing_poll_interval_seconds"],
+    ids=["poll", "billing"],
+)
+@pytest.mark.parametrize("value", [0, -1, float("-inf"), False, "1", None, ()])
+def test_polling_interval_preserves_already_rejected_configuration(tmp_path, field, value):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    # These values already fail construction. Do not call a historical TypeError
+    # a newly admitted-effect defect or require an unrelated error-class change.
+    with pytest.raises((ValueError, TypeError)):
+        _service(tmp_path, clock, provider, **{field: value})
+    with closing(sqlite3.connect(tmp_path / "leases.sqlite3")) as observer, observer:
+        assert observer.execute("SELECT COUNT(*) FROM ollama_leases").fetchone()[0] == 0
+    assert provider.provision_calls == provider.pull_calls == provider.teardown_calls == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["poll_interval_seconds", "billing_poll_interval_seconds"],
+    ids=["poll", "billing"],
+)
+@pytest.mark.parametrize("value", [1, 0.25, 1e-6, 0.75e-6, 60, 86400])
+def test_polling_interval_preserves_finite_fields_and_native_schedule(tmp_path, field, value):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider, **{field: value})
+    # Preserve the existing original scalar observable, including sleep's input;
+    # do not silently replace it by a rounded timedelta.total_seconds().
+    assert getattr(service, field) is value
+    delta = timedelta(seconds=value)
+    assert delta > timedelta(0)
+    assert clock() + delta > clock()
+    if field == "poll_interval_seconds":
+        lease, inserted = service.repository.insert_request(make_request(clock), now=clock())
+        assert inserted
+        expected = min(
+            clock() + delta,
+            lease.hard_deadline,
+            lease.readiness_deadline,
+            authorized_cost_deadline(lease),
+        )
+        assert service._next_reconcile_at(lease, now=clock()) == expected
+    assert provider.provision_calls == provider.pull_calls == provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0.25, 1, 3600])
+async def test_finite_billing_interval_keeps_completed_observation_schedule(tmp_path, value):
+    clock = MutableClock()
+    provider = _BillingAdvancingProvider(serverless_plan(), clock=clock, advance_seconds=0)
+    service = _service(tmp_path, clock, provider, billing_poll_interval_seconds=value)
+    ready = await service.acquire(make_request(clock))
+    terminated = await service.release(
+        ready.lease_id, owner_id=ready.owner_id, workload_id=ready.workload_id
+    )
+    observed = await service.reconcile_lease(
+        terminated.lease_id,
+        owner_id=terminated.owner_id,
+        workload_id=terminated.workload_id,
+    )
+    assert observed.lifecycle_billing_state is OllamaLifecycleBillingState.PENDING
+    assert observed.billing_last_checked_at == clock()
+    assert observed.billing_next_check_at == clock() + timedelta(seconds=value)
+    assert service.billing_poll_interval_seconds is value
+    assert provider.provision_calls == provider.teardown_calls == 1
 
 
 @pytest.mark.asyncio

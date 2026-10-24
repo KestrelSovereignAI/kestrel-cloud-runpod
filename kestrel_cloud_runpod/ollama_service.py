@@ -236,6 +236,32 @@ _ALLOWED_TRANSITIONS: Mapping[OllamaLeaseState, frozenset[OllamaLeaseState]] = {
 }
 
 
+def _positive_polling_interval(
+    value: float, *, name: str, now: datetime
+) -> float:
+    """Validate one original scalar against native scheduling representation."""
+
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+        or (isinstance(value, float) and not math.isfinite(value))
+    ):
+        raise ValueError(f"Ollama {name} poll interval must be positive and finite")
+    try:
+        duration = timedelta(seconds=value)
+        if duration <= timedelta(0):
+            raise ValueError(f"Ollama {name} poll interval rounds to zero")
+        _ = now + duration
+    except OverflowError as exc:
+        if is_execution_control_error(exc):
+            raise
+        raise ValueError(
+            f"Ollama {name} poll interval is not a schedulable duration"
+        ) from exc
+    return value
+
+
 class OllamaLeaseService:
     """Coordinate idempotent acquisition, readiness, expiry, and teardown."""
 
@@ -253,10 +279,14 @@ class OllamaLeaseService:
         maximum_billing_observations: int = 128,
         maximum_evidence_bytes: int = 1_048_576,
     ) -> None:
-        if poll_interval_seconds <= 0:
-            raise ValueError("Ollama lease poll interval must be positive")
-        if billing_poll_interval_seconds <= 0:
-            raise ValueError("Ollama billing poll interval must be positive")
+        self._clock = clock
+        now = self._now()
+        poll_interval_seconds = _positive_polling_interval(
+            poll_interval_seconds, name="lease", now=now
+        )
+        billing_poll_interval_seconds = _positive_polling_interval(
+            billing_poll_interval_seconds, name="billing", now=now
+        )
         for name, value in (
             ("reconciliation_batch_size", reconciliation_batch_size),
             ("maximum_telemetry_observations", maximum_telemetry_observations),
@@ -268,7 +298,6 @@ class OllamaLeaseService:
         self.repository = repository
         self.provider = provider
         self.poll_interval_seconds = poll_interval_seconds
-        self._clock = clock
         self._sleep = sleep
         self.billing_poll_interval_seconds = billing_poll_interval_seconds
         self.reconciliation_batch_size = reconciliation_batch_size
@@ -1144,12 +1173,30 @@ class OllamaLeaseService:
                 f"Ollama lease '{lease.lease_id}' has no original cleanup lineage"
             )
         key = (lease.lease_id, intent.intent_sha256)
-        return await self._join_cached_effect(
-            self._cleanup_tasks,
-            key,
-            lambda: self._cleanup_effect(lease, reason=reason),
-            name=f"ollama-cleanup-{lease.lease_id}",
-        )
+        admitted_targets = {
+            target.provider_resource_id for target in lease.additional_cleanup_targets
+        }
+        while True:
+            result = await self._join_cached_effect(
+                self._cleanup_tasks,
+                key,
+                lambda lease=lease: self._cleanup_effect(lease, reason=reason),
+                name=f"ollama-cleanup-{lease.lease_id}",
+            )
+            current = self.repository.latest_cleanup_lineage(result)
+            joined_targets = {
+                target.provider_resource_id
+                for target in result.additional_cleanup_targets
+            }
+            if (
+                current.state is OllamaLeaseState.TERMINATED
+                or admitted_targets <= joined_targets
+            ):
+                return current
+            # A completed cached owner may predate this caller's exact POST
+            # acknowledgment. Join that new target through the same owner;
+            # never return its older aggregate as terminal completion.
+            lease = current
 
     async def _join_cached_effect(
         self,
