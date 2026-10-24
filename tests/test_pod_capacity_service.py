@@ -39,6 +39,7 @@ from kestrel_cloud_runpod.pod_capacity_contracts import (
     PodCapacityCleanupState,
     PodCapacityConflictError,
     PodCapacityLifecycleError,
+    PodCapacityRevisionConflictError,
     PodCapacitySpec,
     PodCapacityState,
     TrainingPodRequest,
@@ -739,7 +740,9 @@ async def test_catalog_capacity_boundary_retains_ordinary_normalization_contract
             nonlocal injected
             if not injected and "artifact_handoff_json" in changes:
                 injected = True
-                raise PodCapacityConflictError("ordinary concurrent acknowledgement")
+                raise PodCapacityRevisionConflictError(
+                    "ordinary concurrent acknowledgement"
+                )
             return compare_and_set(current, changes=changes)
 
         monkeypatch.setattr(runtime.repository, "compare_and_set", conflict_once)
@@ -767,7 +770,7 @@ async def test_catalog_capacity_boundary_retains_ordinary_normalization_contract
 
         def persist_then_conflict(*args, **kwargs):
             transition_with_evidence(*args, **kwargs)
-            raise PodCapacityConflictError("ordinary concurrent billing")
+            raise PodCapacityRevisionConflictError("ordinary concurrent billing")
 
         monkeypatch.setattr(runtime, "_transition_with_evidence", persist_then_conflict)
         result = await runtime._reconcile_billing(current)
@@ -791,7 +794,7 @@ async def test_catalog_capacity_boundary_retains_ordinary_normalization_contract
         nonlocal injected
         if not injected:
             injected = True
-            raise PodCapacityConflictError(f"ordinary {boundary}")
+            raise PodCapacityRevisionConflictError(f"ordinary {boundary}")
         return compare_and_set(current, changes=changes)
 
     monkeypatch.setattr(runtime.repository, "compare_and_set", conflict_once)

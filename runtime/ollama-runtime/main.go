@@ -734,14 +734,14 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 			runtime.proxy.ServeHTTP(writer, request)
 			return
 		}
-		started := runtime.state.beginInference(runtime.now())
+		started := runtime.state.beginInference(runtime.now)
 		tracked := &statusResponseWriter{ResponseWriter: writer}
 		var finishOnce sync.Once
 		finish := func(cancelled, failed bool) {
 			finishOnce.Do(func() {
 				runtime.state.finishInference(
 					started,
-					runtime.now(),
+					runtime.now,
 					cancelled,
 					failed,
 				)
@@ -750,16 +750,22 @@ func (runtime *runtimeProxy) ServeHTTP(writer http.ResponseWriter, request *http
 		stopCancellation := context.AfterFunc(request.Context(), func() {
 			finish(true, false)
 		})
+		defer func() {
+			stopCancellation()
+			if failure := recover(); failure != nil {
+				finish(request.Context().Err() != nil, true)
+				panic(failure)
+			}
+			responseStatus := tracked.status
+			if responseStatus == 0 {
+				responseStatus = http.StatusOK
+			}
+			finish(
+				request.Context().Err() != nil,
+				responseStatus < http.StatusOK || responseStatus >= http.StatusMultipleChoices,
+			)
+		}()
 		runtime.proxy.ServeHTTP(tracked, request)
-		stopCancellation()
-		responseStatus := tracked.status
-		if responseStatus == 0 {
-			responseStatus = http.StatusOK
-		}
-		finish(
-			request.Context().Err() != nil,
-			responseStatus < http.StatusOK || responseStatus >= http.StatusMultipleChoices,
-		)
 		return
 	}
 	runtime.proxy.ServeHTTP(writer, request)
@@ -1052,11 +1058,11 @@ func (state *startupState) requireRuntimeInitialized() {
 	}
 }
 
-func (state *startupState) beginInference(observedAt time.Time) time.Time {
+func (state *startupState) beginInference(now func() time.Time) time.Time {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	startedMono := time.Now()
-	observed := observedAt.UTC()
+	observed := now().UTC()
 	state.inferenceStarted++
 	state.inferenceInFlight++
 	if state.firstInferenceStarted == nil {
@@ -1069,14 +1075,14 @@ func (state *startupState) beginInference(observedAt time.Time) time.Time {
 	return startedMono
 }
 
-func (state *startupState) finishInference(startedMono time.Time, observedAt time.Time, cancelled, failed bool) {
+func (state *startupState) finishInference(startedMono time.Time, now func() time.Time, cancelled, failed bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.inferenceInFlight == 0 {
 		panic("inference telemetry underflow")
 	}
 	state.inferenceInFlight--
-	observed := observedAt.UTC()
+	observed := now().UTC()
 	state.lastInferenceCompleted = &observed
 	if cancelled {
 		state.inferenceCancelled++

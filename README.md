@@ -539,7 +539,7 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.35,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.53.41,<1` — canonical joined-effect custody,
+- `kestrel-sovereign>=0.53.43,<1` — canonical joined-effect custody,
   provider-neutral inference terminal-evidence refresh, and direct-node
   execution-control classification
 - `httpcore>=1.0.9,<1.1` and `httpx>=0.28.1,<0.29` — reviewed public

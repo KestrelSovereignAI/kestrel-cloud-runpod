@@ -12,7 +12,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 
 from .effect_custody import await_owned_effect
 from .models import GPUProfile, RunPodAmbiguousResultError, RunPodManagerError
@@ -38,6 +41,7 @@ from .pod_capacity_contracts import (
     TrainingPodLifecycleError,
     TrainingPodOwnership,
     TrainingPodRequest,
+    TrainingPodRevisionConflictError,
     TrainingPodSource,
     TrainingPodState,
     attempt_environment_sha256,
@@ -1072,7 +1076,7 @@ class PodCapacityLeaseService:
                     lease, changes={"artifact_handoff_json": intent}
                 )
                 break
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 continue
@@ -1253,12 +1257,14 @@ class PodCapacityLeaseService:
             return await self._release_one(cleanup_token, reason=reason)
 
         root = self._mark_family_release_requested(exact)
-        failures: list[TrainingPodCleanupError] = []
+        failures: list[BaseException] = []
         for member in self._cleanup_family(cleanup_token):
             if member.is_terminal:
                 continue
             try:
-                await self._release_one(member.cleanup_token, reason=reason)
+                await self._release_one(
+                    member.cleanup_token, reason=reason, provider_failures=failures
+                )
             except TrainingPodCleanupError as exc:
                 if is_execution_control_error(exc):
                     raise
@@ -1266,30 +1272,41 @@ class PodCapacityLeaseService:
             except RunPodManagerError as exc:
                 if is_execution_control_error(exc):
                     raise
-                current = self._required(member.cleanup_token)
-                failures.append(self._cleanup_error(reason, current))
-                logger.warning(
-                    "Training cleanup family %s could not release attempt %s (%s)",
-                    cleanup_token,
-                    member.cleanup_token,
-                    type(exc).__name__,
-                )
+                # The whole step may have lost custody. Stop without another
+                # database read or sibling effect, retaining the original cause.
+                raise self._cleanup_error(
+                    reason, member, cleanup_token=cleanup_token
+                ) from exc
 
         if failures:
+            if any(
+                not isinstance(error, TrainingPodCleanupError)
+                or is_execution_control_error(error)
+                for error in failures
+            ):
+                terminal = execution_terminal_error(*failures, retain_originals=True)
+                if terminal is None:
+                    raise AssertionError("Owned family cleanup lost its failure")
+                raise terminal
             failure = failures[-1]
+            assert isinstance(failure, TrainingPodCleanupError)
             raise TrainingPodCleanupError(
                 reason,
                 cleanup_token=cleanup_token,
                 pod_id=failure.pod_id,
                 cleanup_state=failure.cleanup_state,
                 billing_risk=True,
-            ) from failure
+            ) from execution_terminal_error(*failures, retain_originals=True)
 
         root = self._mark_family_release_complete(root)
         return root
 
     async def _release_one(
-        self, cleanup_token: str, *, reason: str
+        self,
+        cleanup_token: str,
+        *,
+        reason: str,
+        provider_failures: list[BaseException] | None = None,
     ) -> TrainingPodLease:
         """Stop one exact attempt idempotently, retaining its ID until confirmed."""
 
@@ -1368,7 +1385,7 @@ class PodCapacityLeaseService:
                     lease, changes={"stop_attempts": lease.stop_attempts + 1}
                 )
                 break
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 lease = self._required(cleanup_token)
@@ -1379,10 +1396,25 @@ class PodCapacityLeaseService:
                 confirmed = await self.provider.terminate(self._pod_id(lease))
             else:
                 confirmed = await self.provider.stop(self._pod_id(lease))
-        except RunPodManagerError as exc:
-            if is_execution_control_error(exc):
-                raise
-            lease = self._record_retryable_failure(lease, exc)
+        except BaseException as exc:  # Only this original provider effect may defer.
+            if not isinstance(exc, RunPodManagerError) or is_execution_control_error(
+                exc
+            ):
+                if provider_failures is None:
+                    raise
+                provider_failures.append(exc)
+                return lease
+            try:
+                lease = self._record_retryable_failure(lease, exc)
+            except (
+                BaseException  # noqa: BLE001 - retain custody failure with original provider outcome
+            ) as persistence:  # Lost custody stops all later effects.
+                terminal = execution_terminal_error(
+                    persistence, exc, retain_originals=True
+                )
+                if terminal is None:
+                    raise AssertionError("Provider cleanup lost its custody failure")
+                raise terminal
             if lease.is_terminal:
                 return lease
             raise self._cleanup_error(reason, lease) from exc
@@ -1729,7 +1761,7 @@ class PodCapacityLeaseService:
                         "last_heartbeat_at": self._now(),
                     },
                 )
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 current = self._required(root.cleanup_token)
@@ -1746,7 +1778,7 @@ class PodCapacityLeaseService:
                         "last_heartbeat_at": self._now(),
                     },
                 )
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 current = self._required(root.cleanup_token)
@@ -1761,7 +1793,7 @@ class PodCapacityLeaseService:
         while not current.is_terminal:
             try:
                 return self.repository.compare_and_set(current, changes=changes)
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 current = self._required(lease.cleanup_token)
@@ -1783,7 +1815,7 @@ class PodCapacityLeaseService:
                 lease,
                 changes={"last_provider_error": sanitize_training_error(error)},
             )
-        except TrainingPodConflictError as exc:
+        except TrainingPodRevisionConflictError as exc:
             if is_execution_control_error(exc):
                 raise
             logger.warning(
@@ -1868,7 +1900,7 @@ class PodCapacityLeaseService:
                 lifecycle={"billing_reconciled_at": reconciled_at},
                 billing=receipt,
             )
-        except TrainingPodConflictError as exc:
+        except TrainingPodRevisionConflictError as exc:
             if is_execution_control_error(exc):
                 raise
             current = self._required(lease.cleanup_token)
@@ -1950,7 +1982,7 @@ class PodCapacityLeaseService:
                 persisted["evidence_json"] = updated_evidence
             try:
                 return self.repository.compare_and_set(current, changes=persisted)
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 if not retry_on_conflict:
@@ -2004,7 +2036,7 @@ class PodCapacityLeaseService:
                     lifecycle=lifecycle,
                     retry_on_conflict=False,
                 )
-            except TrainingPodConflictError as exc:
+            except TrainingPodRevisionConflictError as exc:
                 if is_execution_control_error(exc):
                     raise
                 continue
@@ -2277,10 +2309,14 @@ class PodCapacityLeaseService:
         return lease.provider_pod_id
 
     @staticmethod
-    def _cleanup_error(reason: str, lease: TrainingPodLease) -> TrainingPodCleanupError:
+    def _cleanup_error(
+        reason: str, lease: TrainingPodLease, *, cleanup_token: str | None = None
+    ) -> TrainingPodCleanupError:
         return TrainingPodCleanupError(
             reason,
-            cleanup_token=lease.cleanup_token,
+            cleanup_token=(
+                lease.cleanup_token if cleanup_token is None else cleanup_token
+            ),
             pod_id=lease.provider_pod_id,
             cleanup_state=lease.cleanup_state,
             billing_risk=True,

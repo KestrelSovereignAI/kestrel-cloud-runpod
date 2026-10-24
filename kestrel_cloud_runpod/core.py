@@ -579,30 +579,33 @@ class RunPodManagerCore:
         return PodStatus.OFFLINE
 
     async def terminate_session(self, session: RunPodSession) -> None:
-        """Terminate a specific session's pod."""
-        if session and session.pod_id:
-            terminate = getattr(self.provider, "terminate_pod", None)
-            if terminate is None:
-                raise RunPodManagerError(
-                    "Configured provider does not support Pod termination"
-                )
-            await asyncio.to_thread(terminate, session.pod_id)
-            session.status = PodStatus.OFFLINE
-            async with self._lock:
-                if self._session is session:
-                    self._session = None
-            logger.info("Terminated Pod %s", session.pod_id)
+        """Release a retained durable session; refuse ownerless termination."""
+        if not session or not session.pod_id:
+            return
+        async with self._lock:
+            current = self._session
+        session_lease = getattr(self, "_session_lease", None)
+        release = getattr(self, "release_training_pod", None)
+        if (
+            current is not session
+            or session.training_cleanup_token is None
+            or session_lease is None
+            or release is None
+        ):
+            raise RunPodManagerError(
+                "Ownerless Pod termination is retired; release through the durable "
+                "capacity lifecycle"
+            )
+        lease = session_lease(session)
+        await release(lease.cleanup_token, reason="manager terminate_session")
 
     async def terminate_pod(self, pod_id: str) -> None:
-        """Terminate a pod by ID."""
-        terminate = getattr(self.provider, "terminate_pod", None)
-        if terminate is None:
-            raise RunPodManagerError(
-                "Configured provider does not support Pod termination"
-            )
-        await asyncio.to_thread(terminate, pod_id)
+        """Release the current durable session; refuse an ownerless Pod ID."""
         async with self._lock:
-            if self._session and self._session.pod_id == pod_id:
-                self._session.status = PodStatus.OFFLINE
-                self._session = None
-        logger.info("Terminated Pod %s", pod_id)
+            session = self._session
+        if session is None or session.pod_id != pod_id:
+            raise RunPodManagerError(
+                "Ownerless Pod termination is retired; release through the durable "
+                "capacity lifecycle"
+            )
+        await self.terminate_session(session)

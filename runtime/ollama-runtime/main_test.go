@@ -551,6 +551,102 @@ func TestStreamingChunksAndClientCancellationPropagate(t *testing.T) {
 	}
 }
 
+func TestProxyTelemetryCountsUpstreamBodyAbortAsFailure(t *testing.T) {
+	upstreamDone := make(chan struct{})
+	_, upstream := testUpstream(t, func(writer http.ResponseWriter, _ *http.Request) {
+		defer close(upstreamDone)
+		writer.Header().Set("Content-Type", "application/x-ndjson")
+		writer.Header().Set("Content-Length", "1024")
+		writer.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(writer, "{\"chunk\":1}\n"); err != nil {
+			t.Error(err)
+		}
+		writer.(http.Flusher).Flush()
+		// Returning closes a real HTTP body shorter than its declared length.
+	})
+	config := testConfig(upstream)
+	state := newStartupState("test", time.Now())
+	handler := newRuntimeProxy(config, state, time.Now)
+	type abortObservation struct {
+		failure      any
+		contextError error
+		snapshot     telemetry
+	}
+	aborted := make(chan abortObservation, 1)
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		defer close(handlerDone)
+		defer func() {
+			failure := recover()
+			aborted <- abortObservation{failure, request.Context().Err(), state.snapshot(config)}
+			if failure != nil {
+				panic(failure)
+			}
+		}()
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/generate",
+		strings.NewReader(`{"model":"registry.example/team/model:v1","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	body, readError := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || string(body) != "{\"chunk\":1}\n" || readError == nil {
+		t.Fatalf("real truncated HTTP response: status=%d body=%q error=%v", response.StatusCode, body, readError)
+	}
+	var observation abortObservation
+	select {
+	case observation = <-aborted:
+	case <-ctx.Done():
+		t.Fatal("proxy did not report its actual body-copy abort")
+	}
+	for _, done := range []<-chan struct{}{upstreamDone, handlerDone} {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatal("real HTTP handler did not join")
+		}
+	}
+	if observation.failure != http.ErrAbortHandler || observation.contextError != nil {
+		t.Fatalf("not an uncancelled original ErrAbortHandler: panic=%v context=%v", observation.failure, observation.contextError)
+	}
+	// Let the original callback settle even on the old implementation before
+	// reporting its semantic failure. This bounds cleanup, not performance.
+	var snapshot telemetry
+	for {
+		snapshot = state.snapshot(config)
+		if snapshot.InferenceInFlight == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("original telemetry completion did not settle after HTTP abort")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	t.Logf("original abort before server cancellation: started=%d failed=%d cancelled=%d active=%d; joined: completed=%d failed=%d cancelled=%d active=%d",
+		observation.snapshot.InferenceStarted, observation.snapshot.InferenceFailed,
+		observation.snapshot.InferenceCancelled, observation.snapshot.InferenceInFlight,
+		snapshot.InferenceCompleted, snapshot.InferenceFailed, snapshot.InferenceCancelled, snapshot.InferenceInFlight)
+	if snapshot.InferenceStarted != 1 || snapshot.InferenceFailed != 1 ||
+		snapshot.InferenceCancelled != 0 || snapshot.InferenceCompleted != 0 || snapshot.InferenceInFlight != 0 {
+		t.Fatalf("upstream body failure was not retained as failure: %#v", snapshot)
+	}
+}
+
 func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	var generateCalls atomic.Int32

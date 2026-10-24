@@ -1417,6 +1417,10 @@ class TrainingPodConflictError(RunPodManagerError):
     """A cleanup token or Pod is already claimed by another active lease."""
 
 
+class TrainingPodRevisionConflictError(TrainingPodConflictError):
+    """The original CAS revision changed; reread before retrying the transition."""
+
+
 class TrainingPodLifecycleError(RunPodManagerError):
     """An operation failed while durable cleanup state remains observable."""
 
@@ -1979,6 +1983,7 @@ PodCapacityOwnership = TrainingPodOwnership
 PodCapacityState = TrainingPodState
 PodCapacityCleanupState = TrainingPodCleanupState
 PodCapacityConflictError = TrainingPodConflictError
+PodCapacityRevisionConflictError = TrainingPodRevisionConflictError
 PodCapacityLifecycleError = TrainingPodLifecycleError
 PodCapacityCleanupError = TrainingPodCleanupError
 PodCapacityLeaseRequest = TrainingPodRequest

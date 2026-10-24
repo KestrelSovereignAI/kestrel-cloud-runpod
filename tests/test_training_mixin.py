@@ -1,5 +1,8 @@
 """Manager integration for durable training capacity and workload recovery."""
 
+import asyncio
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from pod_capacity_test_support import (
+    LateCloseAsyncClient,
+    assert_late_http_close_retained,
     execution_control_carrier,
     record_control_injection,
 )
@@ -94,6 +99,360 @@ def _manager(tmp_path: Path, provider: FakeTrainingProvider) -> RunPodManager:
     clock = MutableClock()
     manager.set_training_pod_lease_service(training_service(tmp_path, clock, provider))
     return manager
+
+
+async def _training_operation(
+    manager: RunPodManager,
+    session: RunPodSession,
+    boundary: str,
+):
+    runtime = manager._get_training_pod_lease_service()
+    if boundary == "reconcile-status":
+        runtime.record_job(session.training_cleanup_token, "job-r27")
+        lease = runtime.repository.get(session.training_cleanup_token)
+        assert lease is not None
+        return await manager._reconcile_training_workload_status(lease)
+    if boundary == "readiness":
+        return await manager._wait_for_training_ready(
+            session, timeout=1, poll_interval=0
+        )
+    if boundary == "submission":
+        return await manager.submit_training_job(
+            session, b"avatar", "companion-1", wait_for_model_ready=False
+        )
+    if boundary == "current-job":
+        return await manager.get_current_job(session)
+    if boundary == "job-cancellation":
+        return await manager.cancel_training_job(session, "job-r27")
+    if boundary == "clear-current-job":
+        return await manager.clear_current_job(session)
+    if boundary == "status":
+        return await manager.poll_training_status(session, "job-r27")
+    if boundary == "download":
+        return await manager.download_lora(session, "job-r27")
+    if boundary == "generate":
+        return await manager.generate_with_lora(session, "prompt", "lora.safetensors")
+    raise AssertionError(boundary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["model-readiness", "submission", "job-cancellation"]
+)
+async def test_training_cancellation_classifies_control_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    record_property,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=f"training:r27-cancel:{boundary}"
+    )
+    runtime = manager._get_training_pod_lease_service()
+    cancellation, control, explicit = execution_control_carrier(
+        asyncio.CancelledError(f"{boundary} execution control")
+    )
+    entry_rows = []
+    stop_calls = tuple(provider.stop_calls)
+
+    def inject() -> None:
+        row = runtime.repository.get(session.training_cleanup_token)
+        assert row is not None
+        entry_rows.append(row)
+        record_control_injection(record_property, "training-cancel-" + boundary)
+        raise cancellation
+
+    if boundary == "model-readiness":
+
+        async def cancelled_readiness(*_args, **_kwargs):
+            inject()
+
+        manager._wait_for_training_ready = cancelled_readiness
+        operation = lambda: manager.submit_training_job(
+            session, b"avatar", "companion-1"
+        )
+    else:
+
+        class CancelledClient(FakeWorkloadClient):
+            async def post(self, url: str, **_kwargs):
+                if boundary == "submission" and url.endswith("/train"):
+                    inject()
+                if boundary == "job-cancellation" and "/cancel/" in url:
+                    inject()
+                return await super().post(url)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
+        if boundary == "submission":
+            operation = lambda: manager.submit_training_job(
+                session, b"avatar", "companion-1", wait_for_model_ready=False
+            )
+        else:
+            operation = lambda: manager.cancel_training_job(session, "job-r27")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await operation()
+
+    assert raised.value is cancellation
+    assert cancellation.__cause__ is explicit is control
+    assert len(entry_rows) == 1
+    assert runtime.repository.get(session.training_cleanup_token) == entry_rows[0]
+    assert tuple(provider.stop_calls) == stop_calls
+
+
+@pytest.mark.asyncio
+async def test_training_cancellation_retains_original_and_cleanup_failure(
+    tmp_path: Path, record_property
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token="training:r27-cancel-cleanup"
+    )
+    runtime = manager._get_training_pod_lease_service()
+    cancellation = asyncio.CancelledError("ordinary caller withdrawal")
+    cleanup = TrainingPodCleanupError(
+        "cleanup failed",
+        cleanup_token=session.training_cleanup_token,
+        pod_id=session.pod_id,
+        cleanup_state=TrainingPodCleanupState.RETRYABLE_FAILURE,
+        billing_risk=True,
+    )
+    entry_rows = []
+
+    async def cancelled_readiness(*_args, **_kwargs):
+        raise cancellation
+
+    async def failed_release(*_args, **_kwargs):
+        row = runtime.repository.get(session.training_cleanup_token)
+        assert row is not None
+        entry_rows.append(row)
+        record_control_injection(record_property, "training-cancel-cleanup")
+        raise cleanup
+
+    manager._wait_for_training_ready = cancelled_readiness
+    runtime.release = failed_release
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await manager.submit_training_job(session, b"avatar", "companion-1")
+
+    assert raised.value is cancellation
+    assert cancellation.__cause__ is cleanup
+    assert len(entry_rows) == 1
+    assert runtime.repository.get(session.training_cleanup_token) == entry_rows[0]
+    assert provider.stop_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["model-readiness", "submission"])
+async def test_training_cancellation_intent_sql_failure_stops_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    record_property,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    cleanup_token = f"training:r27-intent-sql:{boundary}"
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=cleanup_token
+    )
+    runtime = manager._get_training_pod_lease_service()
+    cancellation = asyncio.CancelledError("ordinary caller withdrawal")
+    original_request = runtime.request_cancellation
+    original_release = runtime.release
+    entry_rows = []
+    persistence_errors = []
+    release_calls = []
+
+    with closing(sqlite3.connect(runtime.repository.path)) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_r27_cancellation_intent
+               BEFORE UPDATE OF state ON pod_capacity_leases
+               WHEN NEW.state = 'cancel_requested'
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected cancellation intent failure');
+               END"""
+        )
+        connection.commit()
+
+    def request_cancellation(token: str):
+        row = runtime.repository.get(token)
+        assert row is not None
+        entry_rows.append(row)
+        record_property(
+            "persistence_injection", "training-cancel-intent-sql-" + boundary
+        )
+        try:
+            return original_request(token)
+        except sqlite3.IntegrityError as error:
+            persistence_errors.append(error)
+            raise
+
+    async def release(*args, **kwargs):
+        release_calls.append((args, kwargs))
+        return await original_release(*args, **kwargs)
+
+    runtime.request_cancellation = request_cancellation
+    runtime.release = release
+
+    if boundary == "model-readiness":
+
+        async def cancelled_readiness(*_args, **_kwargs):
+            raise cancellation
+
+        manager._wait_for_training_ready = cancelled_readiness
+        operation = lambda: manager.submit_training_job(
+            session, b"avatar", "companion-1"
+        )
+    else:
+
+        class CancelledClient(FakeWorkloadClient):
+            async def post(self, url: str, **_kwargs):
+                if url.endswith("/train"):
+                    raise cancellation
+                return await super().post(url)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
+        operation = lambda: manager.submit_training_job(
+            session, b"avatar", "companion-1", wait_for_model_ready=False
+        )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await operation()
+
+    assert raised.value is cancellation
+    assert len(persistence_errors) == len(entry_rows) == 1
+    assert cancellation.__cause__ is persistence_errors[0]
+    assert runtime.repository.get(cleanup_token) == entry_rows[0]
+    assert release_calls == []
+    assert provider.stop_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["model-readiness", "submission", "job-cancellation"]
+)
+async def test_training_ordinary_cancellation_still_releases_owned_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=f"training:r27-ordinary-cancel:{boundary}"
+    )
+    runtime = manager._get_training_pod_lease_service()
+    cancellation = asyncio.CancelledError("ordinary caller withdrawal")
+
+    if boundary == "model-readiness":
+
+        async def cancelled_readiness(*_args, **_kwargs):
+            raise cancellation
+
+        manager._wait_for_training_ready = cancelled_readiness
+        operation = lambda: manager.submit_training_job(
+            session, b"avatar", "companion-1"
+        )
+    else:
+
+        class CancelledClient(FakeWorkloadClient):
+            async def post(self, url: str, **_kwargs):
+                if boundary == "submission" and url.endswith("/train"):
+                    raise cancellation
+                if boundary == "job-cancellation" and "/cancel/" in url:
+                    raise cancellation
+                return await super().post(url)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
+        if boundary == "submission":
+            operation = lambda: manager.submit_training_job(
+                session, b"avatar", "companion-1", wait_for_model_ready=False
+            )
+        else:
+            operation = lambda: manager.cancel_training_job(session, "job-r27")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await operation()
+
+    assert raised.value is cancellation
+    durable = runtime.repository.get(session.training_cleanup_token)
+    assert durable is not None
+    assert durable.state is TrainingPodState.RELEASED
+    assert durable.cleanup_state is TrainingPodCleanupState.COMPLETE
+    assert provider.stop_calls == [session.pod_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "reconcile-status",
+        "readiness",
+        "submission",
+        "current-job",
+        "job-cancellation",
+        "clear-current-job",
+        "status",
+        "download",
+        "generate",
+    ],
+)
+async def test_training_request_control_survives_late_native_client_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    record_property,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=f"training:r27-http:{boundary}"
+    )
+    runtime = manager._get_training_pod_lease_service()
+    carrier, control, explicit = execution_control_carrier(
+        httpx.ConnectError(f"{boundary} request remains unknown")
+    )
+    close_error = OSError(f"{boundary} client close failed")
+    clients: list[LateCloseAsyncClient] = []
+    requests: list[httpx.Request] = []
+    entry_rows = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        clients[-1].fail_close = True
+        row = runtime.repository.get(session.training_cleanup_token)
+        assert row is not None
+        entry_rows.append(row)
+        record_control_injection(record_property, "training-http-close-" + boundary)
+        raise carrier
+
+    def client_factory(**kwargs):
+        client = LateCloseAsyncClient(
+            close_error=close_error,
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(type(carrier)) as raised:
+        await _training_operation(manager, session, boundary)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit is control
+    assert len(requests) == len(clients) == len(entry_rows) == 1
+    assert runtime.repository.get(session.training_cleanup_token) == entry_rows[0]
+    assert_late_http_close_retained(
+        raised.value, client=clients[0], close_error=close_error
+    )
 
 
 @pytest.mark.asyncio
@@ -967,6 +1326,101 @@ async def test_manager_session_tracks_job_result_and_confirmed_stop(
     lease = manager.get_training_pod_lease(session.training_cleanup_token)
     assert lease.state is TrainingPodState.RELEASED
     assert provider.stop_calls == ["pod-training-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["session", "pod-id"])
+async def test_legacy_termination_routes_current_training_session_through_durable_release(
+    tmp_path: Path, entrypoint: str
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token=f"training:r27-terminate:{entrypoint}"
+    )
+
+    if entrypoint == "session":
+        await manager.terminate_session(session)
+    else:
+        await manager.terminate_pod(session.pod_id)
+
+    durable = manager.get_training_pod_lease(session.training_cleanup_token)
+    assert durable.state is TrainingPodState.RELEASED
+    assert durable.cleanup_state is TrainingPodCleanupState.COMPLETE
+    assert manager._session is None
+    assert session.status is PodStatus.OFFLINE
+    assert provider.stop_calls == [session.pod_id]
+    manager.provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_termination_refuses_mutated_session_resource_binding(
+    tmp_path: Path,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token="training:r27-terminate-mutable"
+    )
+    durable = manager.get_training_pod_lease(session.training_cleanup_token)
+    session.pod_id = "foreign-pod"
+
+    with pytest.raises(RunPodManagerError, match="no longer matches"):
+        await manager.terminate_session(session)
+
+    assert manager.get_training_pod_lease(durable.cleanup_token) == durable
+    assert manager._session is session
+    assert provider.stop_calls == []
+    manager.provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_termination_does_not_stop_preexisting_configured_capacity(
+    tmp_path: Path,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.status = "RUNNING"
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token="training:r27-terminate-preexisting"
+    )
+
+    await manager.terminate_session(session)
+
+    durable = manager.get_training_pod_lease(session.training_cleanup_token)
+    assert durable.state is TrainingPodState.RELEASED
+    assert durable.cleanup_state is TrainingPodCleanupState.NOT_OWNED
+    assert manager._session is None
+    assert session.status is PodStatus.OFFLINE
+    assert provider.stop_calls == []
+    manager.provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_termination_retains_session_when_durable_release_is_retryable(
+    tmp_path: Path,
+) -> None:
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    manager = _manager(tmp_path, provider)
+    session = await manager.start_training_pod(
+        "companion-1", cleanup_token="training:r27-terminate-retry"
+    )
+    provider.stop_error = RunPodManagerError("provider unavailable")
+
+    with pytest.raises(TrainingPodCleanupError) as raised:
+        await manager.terminate_session(session)
+
+    durable = manager.get_training_pod_lease(session.training_cleanup_token)
+    assert durable.state is TrainingPodState.RECONCILE_REQUIRED
+    assert durable.cleanup_state is TrainingPodCleanupState.RETRYABLE_FAILURE
+    assert raised.value.cleanup_token == session.training_cleanup_token
+    assert manager._session is session
+    assert session.status is PodStatus.READY
+    assert provider.stop_calls == [session.pod_id]
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -49,6 +50,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaTeardownState,
     ProvisionedOllamaResource,
     normalize_new_ollama_request_money,
+    resource_from_lease,
 )
 from kestrel_cloud_runpod.ollama_repository import (
     _CURRENT_WRITER_CONTRACT_VERSION,
@@ -855,7 +857,9 @@ async def _first_write_version_transition(tmp_path, case):
             await asyncio.wait_for(provider.entered.wait(), timeout=5)
             candidate_row = _raw_lease_row(candidate_repository.path, before.lease_id)
         finally:
-            await release_gates_and_boundedly_join_owned_tasks(task, provider.finish)
+            await release_gates_and_boundedly_join_owned_tasks(
+                task, provider.finish, primary=sys.exception()
+            )
         task.result()
         return repository, before, candidate_row
 
@@ -4180,3 +4184,108 @@ def test_database_environment_expansion_fails_when_missing(monkeypatch):
 
     with pytest.raises(RunPodManagerError, match="MISSING_OLLAMA_ROOT"):
         lease_database_path({"database_path": "${MISSING_OLLAMA_ROOT}/leases.sqlite3"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "has_provisioning", [False, True], ids=["receiptless", "provisioned"]
+)
+@pytest.mark.parametrize(
+    "cleanup_complete", [False, True], ids=["intent-only", "cleanup-receipt"]
+)
+@pytest.mark.parametrize(
+    "foreign", [False, True], ids=["same-resource", "restored-foreign"]
+)
+async def test_primary_cleanup_decoding_binds_retained_resource_even_without_provisioning(
+    tmp_path, has_provisioning, cleanup_complete, foreign
+):
+    clock, repository, provider, pending = await _pending_without_receipt(
+        tmp_path, database_name="primary-resource-binding.sqlite3"
+    )
+    if has_provisioning:
+        receipt = await provider.observe_provisioning(
+            pending.provisioning_intent, resource_from_lease(pending)
+        )
+        pending = repository.record_provisioning_outcome(
+            pending, now=clock(), receipt=receipt
+        )
+    releasing = repository.compare_and_set(
+        pending,
+        changes={
+            "state": OllamaLeaseState.RELEASING,
+            "teardown_state": OllamaTeardownState.PENDING,
+            "route_url": None,
+            "termination_reason": "original test cleanup",
+        },
+    )
+    original = repository.record_cleanup_intent(
+        releasing, now=clock(), termination_reason="original test cleanup"
+    )
+    if cleanup_complete:
+        service = OllamaLeaseService(
+            repository=repository,
+            provider=provider,
+            poll_interval_seconds=1,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+        provider.readback_available = has_provisioning
+        original = await service.release(
+            original.lease_id,
+            owner_id=original.owner_id,
+            workload_id=original.workload_id,
+        )
+        assert (original.provisioning_receipt is not None) is has_provisioning
+        assert original.cleanup_intent.provisioning_receipt_id == (
+            original.provisioning_receipt.receipt_id if has_provisioning else None
+        )
+    assert original.cleanup_intent is not None
+    original.cleanup_intent.validate_resource(resource_from_lease(original))
+    assert repository.get(original.lease_id) == original
+    if not foreign:
+        return
+    forged_intent = replace(
+        original.cleanup_intent, provider_resource_id="foreign-resource-B"
+    )
+    forged_receipt = (
+        replace(
+            original.cleanup_receipt, cleanup_intent_id=forged_intent.cleanup_intent_id
+        )
+        if original.cleanup_receipt is not None
+        else None
+    )
+    before = _raw_lease_row(repository.path, original.lease_id)
+    sql = """UPDATE ollama_leases SET cleanup_intent_json=?, cleanup_receipt_json=?,
+             revision=revision+1, writer_epoch=writer_epoch+1 WHERE lease_id=?"""
+    arguments = (_db_value(forged_intent), _db_value(forged_receipt), original.lease_id)
+    # A permitted current writer does NOT create this aggregate: the native
+    # immutable/cross-resource guard refuses the exact attempted mutation.
+    with closing(sqlite3.connect(repository.path)) as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError, match="invalid Ollama lifecycle evidence mutation"
+        ) as rejected:
+            connection.execute(sql, arguments)
+        assert rejected.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        connection.rollback()
+    assert _raw_lease_row(repository.path, original.lease_id) == before
+    # Model a restored corrupt historical aggregate, then restore the EXACT
+    # original native guard. This is fixture corruption, never live authority.
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='ollama_lifecycle_evidence_update_v7'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v7")
+        connection.execute(sql, arguments)
+        connection.execute(trigger)
+        assert (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='ollama_lifecycle_evidence_update_v7'"
+            ).fetchone()[0]
+            == trigger
+        )
+    assert (
+        _raw_lease_row(repository.path, original.lease_id)["provider_resource_id"]
+        == original.provider_resource_id
+    )
+    with pytest.raises(RunPodManagerError, match="cleanup intent is unbound"):
+        repository.get(original.lease_id)

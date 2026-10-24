@@ -10,7 +10,9 @@ from pod_capacity_test_support import (
     REQUEST_SHA,
     RESULT_SHA,
     TOKEN,
+    LateCloseAsyncClient,
     acknowledgement,
+    assert_late_http_close_retained,
     execution_control_carrier,
     record_control_injection,
 )
@@ -71,6 +73,42 @@ async def test_catalog_transport_retains_ordinary_error_contract(kind) -> None:
 
     assert raised.value.__cause__ is ordinary
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_catalog_transport_retains_request_control_through_late_client_close(
+    monkeypatch: pytest.MonkeyPatch, record_property
+) -> None:
+    carrier, control, explicit = execution_control_carrier(
+        httpx.ConnectError("catalog request outcome remains unknown")
+    )
+    close_error = OSError("catalog client close failed")
+    requests: list[httpx.Request] = []
+    clients: list[LateCloseAsyncClient] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        clients[-1].fail_close = True
+        record_control_injection(record_property, "catalog-request-late-close")
+        raise carrier
+
+    def client_factory(**kwargs):
+        client = LateCloseAsyncClient(close_error=close_error, **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(type(carrier)) as raised:
+        await transport.health(BASE)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit is control
+    assert len(requests) == 1 and len(clients) == 1
+    assert_late_http_close_retained(
+        raised.value, client=clients[0], close_error=close_error
+    )
 
 
 @pytest.mark.asyncio

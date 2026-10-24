@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 
 import pytest
+from kestrel_sovereign.async_ownership import owned_task_error
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
@@ -17,6 +19,7 @@ from ollama_test_support import (
     release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
+from test_effect_custody import _original_errors
 from test_ollama_provider import (
     _claimed_two_target_cleanup,
     _contains_exception_identity,
@@ -599,11 +602,36 @@ async def _two_service_primary_race(tmp_path, *, second_primary_fails, database_
             durable,
         )
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(
-            owned_tasks,
-            coordinator.allow_first_primary,
-            coordinator.allow_second_primary,
-        )
+        primary = sys.exception()
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owned_tasks,
+                coordinator.allow_first_primary,
+                coordinator.allow_second_primary,
+                primary=primary,
+            )
+        except (
+            BaseException
+        ) as terminal:  # original two-service task outcomes are precise
+            if primary is not None:
+                raise
+            originals = tuple(_original_errors(terminal))
+            assert any(error is first_result for error in originals)
+            assert any(
+                error is coordinator.first_secondary_error for error in originals
+            )
+            if second_primary_fails:
+                assert any(error is second_result for error in originals)
+                assert any(
+                    error is coordinator.second_primary_error for error in originals
+                )
+            else:
+                assert owned_task_error(second_task) is None
+            assert not any(
+                isinstance(error, asyncio.CancelledError) for error in originals
+            )
+        else:
+            pytest.fail("original first service failure was discarded")
 
 
 @pytest.mark.asyncio
@@ -854,11 +882,27 @@ async def test_reconciler_continues_after_concurrent_primary_completion(tmp_path
         assert completed.cleanup_receipt is not None
         assert completed.additional_cleanup_targets[0].cleanup_receipt is not None
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(
-            owned_tasks,
-            coordinator.allow_first_primary,
-            coordinator.allow_second_primary,
-        )
+        primary = sys.exception()
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owned_tasks,
+                coordinator.allow_first_primary,
+                coordinator.allow_second_primary,
+                primary=primary,
+            )
+        except (
+            BaseException
+        ) as terminal:  # only the already-observed external failure is expected
+            if primary is not None:
+                raise
+            assert terminal is external_result
+            assert any(
+                error is coordinator.first_secondary_error
+                for error in _original_errors(terminal)
+            )
+            assert owned_task_error(reconcile_task) is None
+        else:
+            pytest.fail("original external service failure was discarded")
 
 
 class _SecondaryRaceCoordinator:
@@ -963,11 +1007,24 @@ async def _two_service_secondary_race(
             durable,
         )
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(
-            owned_tasks,
-            coordinator.allow_first,
-            coordinator.allow_second,
-        )
+        primary = sys.exception()
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                owned_tasks,
+                coordinator.allow_first,
+                coordinator.allow_second,
+                primary=primary,
+            )
+        except (
+            BaseException
+        ) as terminal:  # late secondary error is expected only in the configured branch
+            if primary is not None or not second_fails:
+                raise
+            assert terminal is coordinator.second_error
+            assert owned_task_error(first_task) is None
+            assert owned_task_error(second_task) is coordinator.second_error
+        else:
+            assert not second_fails, "original late secondary failure was discarded"
 
 
 @pytest.mark.asyncio

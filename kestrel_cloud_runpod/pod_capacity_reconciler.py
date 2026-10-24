@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 
 from .models import RunPodManagerError
 from .pod_capacity_contracts import (
@@ -294,8 +297,6 @@ def _exclusive_reconcile_lock(database_path: Path) -> Iterator[None]:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(lock_path, flags, 0o600)
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
     except OSError as exc:
         if is_execution_control_error(exc):
             raise
@@ -303,17 +304,39 @@ def _exclusive_reconcile_lock(database_path: Path) -> Iterator[None]:
             "The Pod capacity reconciliation lock could not be opened"
         ) from exc
     locked = False
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+        except OSError as exc:
+            if is_execution_control_error(exc):
+                raise
+            raise PodCapacityReconcilerConfigurationError(
+                "The Pod capacity reconciliation lock could not be opened"
+            ) from exc
         locked = _lock_descriptor(descriptor)
         if not locked:
             raise PodCapacityReconcilerBusyError(
                 "Another Pod capacity reconciliation pass is active"
             )
         yield
+    except BaseException as exc:  # noqa: BLE001 - Original body remains owned through both closers.
+        primary = exc
     finally:
         if locked:
-            _unlock_descriptor(descriptor)
-        os.close(descriptor)
+            try:
+                _unlock_descriptor(descriptor)
+            except BaseException as exc:  # noqa: BLE001 - Unlock refusal must not skip native close.
+                cleanup_errors.append(exc)
+        try:
+            os.close(descriptor)
+        except BaseException as exc:  # noqa: BLE001 - Retain the original close result, without retry.
+            cleanup_errors.append(exc)
+    terminal = execution_terminal_error(primary, *cleanup_errors, retain_originals=True)
+    if terminal is not None:
+        raise terminal
 
 
 def _lock_descriptor(descriptor: int) -> bool:

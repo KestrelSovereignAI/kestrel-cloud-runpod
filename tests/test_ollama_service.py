@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
@@ -366,7 +367,9 @@ async def test_concurrent_duplicate_acquire_cannot_double_provision(tmp_path):
         assert "no attributable resource" in duplicate.last_provider_error
         assert provider.provision_calls == 1
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(winner, provider.resume)
+        await release_gates_and_boundedly_join_owned_tasks(
+            winner, provider.resume, primary=sys.exception()
+        )
     assert (await winner).state is OllamaLeaseState.READY
 
 
@@ -615,7 +618,9 @@ async def test_concurrent_release_joins_one_same_id_teardown(tmp_path):
         calls_while_first_teardown_is_live = provider.teardown_calls
     finally:
         await release_gates_and_boundedly_join_owned_tasks(
-            owned_tasks, provider.teardown_finish
+            owned_tasks,
+            provider.teardown_finish,
+            primary=sys.exception(),
         )
 
     first_result, second_result = await asyncio.gather(first, second)

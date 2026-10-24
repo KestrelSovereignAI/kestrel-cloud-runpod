@@ -12,6 +12,11 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Self
 
+from kestrel_sovereign.async_ownership import (
+    owned_task_error,
+    pending_owned_retirement_error,
+    wait_owned_tasks_until,
+)
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
@@ -311,12 +316,13 @@ async def release_gates_and_boundedly_join_owned_tasks(
     tasks: asyncio.Task | tuple[asyncio.Task, ...] | list[asyncio.Task],
     *gates,
     timeout: float = 5,
+    primary: BaseException | None = None,
 ) -> None:
     """Release test barriers and prove every owned task reached a terminal state.
 
-    Cancellation is a second bounded observation, not an unbounded join. A
-    cancellation-resistant tail remains an explicit harness failure for the
-    outside process-group watchdog to contain.
+    Retain the caller's active primary plus all original terminal errors and
+    withdrawal. Two original finite observation budgets and one cancellation
+    pass never acknowledge a pending owner or prove process/provider drain.
     """
 
     owned = (tasks,) if isinstance(tasks, asyncio.Task) else tuple(tasks)
@@ -324,24 +330,62 @@ async def release_gates_and_boundedly_join_owned_tasks(
         raise AssertionError("owned Ollama task cleanup requires at least one task")
     if not gates:
         raise AssertionError("owned Ollama task cleanup requires a release gate")
+    failures = [primary]
     for gate in gates:
-        gate.set()
-    done, pending = await asyncio.wait(frozenset(owned), timeout=timeout)
-    for task in done:
-        if not task.cancelled():
-            task.exception()
-    for task in pending:
-        task.cancel("bounded test cleanup after released provider gate")
-    if pending:
-        done, pending = await asyncio.wait(pending, timeout=timeout)
-        for task in done:
-            if not task.cancelled():
-                task.exception()
-    if pending:
-        raise AssertionError(
-            "owned Ollama effect did not finish after gate release and "
-            "bounded cancellation observation"
+        try:
+            gate.set()
+        except BaseException as error:  # noqa: BLE001 - independent gate failure cannot abandon originals
+            failures.append(error)
+    loop = asyncio.get_running_loop()
+    try:
+        observation = await wait_owned_tasks_until(
+            owned,
+            deadline=loop.time() + timeout,
         )
+    except BaseException as error:  # noqa: BLE001 - keep originals after failed observation
+        failures.append(error)
+        pending = {task for task in owned if not task.done()}
+    else:
+        failures.extend((observation.error, observation.cancellation))
+        _done, pending = observation.result
+    for task in pending:
+        try:
+            task.cancel("bounded test cleanup after released provider gate")
+        except BaseException as error:  # noqa: BLE001 - retain failed cancellation delivery and continue finite observation
+            failures.append(error)
+    if pending:
+        try:
+            observation = await wait_owned_tasks_until(
+                pending,
+                deadline=loop.time() + timeout,
+            )
+        except BaseException as error:  # noqa: BLE001 - pending owners remain debt, not success
+            failures.append(error)
+        else:
+            failures.extend((observation.error, observation.cancellation))
+    for task in owned:
+        if task.done():
+            try:
+                failures.append(owned_task_error(task))
+            except BaseException as error:  # noqa: BLE001 - harvest failures cannot hide another original
+                failures.append(error)
+    failures.append(
+        pending_owned_retirement_error(
+            owned,
+            owned,
+            message=(
+                "owned Ollama effect did not finish after gate release and "
+                "bounded cancellation observation"
+            ),
+        )
+    )
+    terminal = execution_terminal_error(
+        *failures,
+        retain_originals=True,
+        isolate_control_originals=True,
+    )
+    if terminal is not None:
+        raise terminal
 
 
 def make_request(clock: MutableClock, **changes) -> OllamaLeaseRequest:

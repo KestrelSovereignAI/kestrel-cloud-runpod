@@ -47,6 +47,7 @@ from .ollama_contracts import (
     iso_datetime,
     normalize_new_ollama_request_money,
     require_aware,
+    resource_from_lease,
     runtime_telemetry_binding_for_intent,
 )
 from .sqlite_store import lease_database_connection
@@ -3439,6 +3440,7 @@ def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
             raise RunPodManagerError("Stored Ollama cleanup has no original intent")
         try:
             lease.cleanup_intent.validate_provisioning(intent, provisioning)
+            lease.cleanup_intent.validate_resource(resource_from_lease(lease))
         except ValueError as exc:
             raise RunPodManagerError("Stored Ollama cleanup intent is unbound") from exc
     if lease.cleanup_receipt is not None:

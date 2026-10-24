@@ -9,7 +9,10 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    owned_native_http_client,
+)
 from pydantic import SecretStr
 
 from .models import RunPodManagerError
@@ -353,11 +356,13 @@ class CatalogPodWorkloadTransport:
         if bearer is not None:
             headers["Authorization"] = f"Bearer {bearer.get_secret_value()}"
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_seconds,
-                transport=self.http_transport,
-                follow_redirects=False,
-                headers=headers,
+            async with owned_native_http_client(
+                httpx.AsyncClient(
+                    timeout=self.timeout_seconds,
+                    transport=self.http_transport,
+                    follow_redirects=False,
+                    headers=headers,
+                )
             ) as client:
                 return await client.request(method, f"{base}{path}", json=json_payload)
         except httpx.TimeoutException as exc:

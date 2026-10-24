@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -199,6 +200,106 @@ func TestProxyTelemetryClassifiesEveryUnsuccessfulInferenceResponse(t *testing.T
 				snapshot.InferenceCompleted != test.wantCompleted ||
 				snapshot.InferenceFailed != test.wantFailed {
 				t.Fatalf("unexpected inference counters for status %d: %#v", test.status, snapshot)
+			}
+		})
+	}
+}
+
+func TestInferenceTimestampsSampleInsideMutationLock(t *testing.T) {
+	// T2 exercises the repaired callable signature. The retained T1 source and
+	// native RED logs separately prove both old-signature behavioral failures;
+	// a signature/compile mismatch is not that counterproof.
+	for _, phase := range []string{"start", "completion"} {
+		t.Run(phase, func(t *testing.T) {
+			state := newStartupState("test", time.Now())
+			config := testConfig(nil)
+			base := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+			owners := [2]time.Time{}
+			if phase == "completion" {
+				for index := range owners {
+					owners[index] = state.beginInference(func() time.Time { return base })
+				}
+			}
+			clockEntered := make(chan struct{})
+			releaseClock := make(chan struct{})
+			secondAttempted := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseFirst := func() { releaseOnce.Do(func() { close(releaseClock) }) }
+			var requests sync.WaitGroup
+			defer func() {
+				releaseFirst()
+				if !waitForTelemetryRequests(&requests, 5*time.Second) {
+					t.Error("original timestamp mutation goroutines did not join")
+				}
+			}()
+			var clockCalls atomic.Int32
+			var outsideLock atomic.Int32
+			clock := func() time.Time {
+				ordinal := clockCalls.Add(1)
+				if state.mu.TryLock() {
+					outsideLock.Add(1)
+					state.mu.Unlock()
+				}
+				if ordinal == 1 {
+					close(clockEntered)
+					<-releaseClock
+				}
+				return base.Add(time.Duration(ordinal) * time.Second)
+			}
+			mutate := func(index int) {
+				if phase == "start" {
+					owners[index] = state.beginInference(clock)
+				} else {
+					state.finishInference(owners[index], clock, false, false)
+				}
+			}
+			requests.Add(1)
+			go func() {
+				defer requests.Done()
+				mutate(0)
+			}()
+			select {
+			case <-clockEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first mutation did not enter its actual clock callback")
+			}
+			requests.Add(1)
+			go func() {
+				defer requests.Done()
+				close(secondAttempted)
+				mutate(1)
+			}()
+			select {
+			case <-secondAttempted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("second mutation did not reach its original helper call")
+			}
+			releaseFirst()
+			if !waitForTelemetryRequests(&requests, 5*time.Second) {
+				t.Fatal("timestamp mutations did not join after clock release")
+			}
+			if clockCalls.Load() != 2 || outsideLock.Load() != 0 {
+				t.Fatalf("clock must sample twice inside real state mutex: calls=%d outside=%d", clockCalls.Load(), outsideLock.Load())
+			}
+			observed := state.snapshot(config)
+			first := base.Add(time.Second)
+			last := base.Add(2 * time.Second)
+			if phase == "start" {
+				if !observed.FirstInferenceStartedAt.Equal(first) || !observed.LastInferenceStartedAt.Equal(last) ||
+					observed.InferenceStarted != 2 || observed.InferenceInFlight != 2 {
+					t.Fatalf("start identity/order changed: %#v", observed)
+				}
+				for _, owner := range owners {
+					state.finishInference(owner, func() time.Time { return last.Add(time.Second) }, false, false)
+				}
+			} else if !observed.FirstInferenceStartedAt.Equal(base) ||
+				!observed.LastInferenceStartedAt.Equal(base) || !observed.LastInferenceCompletedAt.Equal(last) {
+				t.Fatalf("completion failed to retain original starts and latest sample: %#v", observed)
+			}
+			finished := state.snapshot(config)
+			if finished.InferenceStarted != 2 || finished.InferenceCompleted != 2 ||
+				finished.InferenceFailed != 0 || finished.InferenceCancelled != 0 || finished.InferenceInFlight != 0 {
+				t.Fatalf("joined original mutations have unbalanced counters: %#v", finished)
 			}
 		})
 	}

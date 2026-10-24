@@ -930,6 +930,8 @@ class OllamaProvisioningReceipt:
                 raise ValueError(f"Ollama provisioning receipt {name} is invalid")
         require_aware(self.provider_created_at, "provider_created_at")
         require_aware(self.readback_at, "readback_at")
+        if self.provider_created_at > self.readback_at:
+            raise ValueError("Ollama provisioning creation follows completed readback")
         if self.resource_type is OllamaResourceType.POD:
             if (
                 self.pod_realized_placement is None

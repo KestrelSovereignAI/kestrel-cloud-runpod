@@ -3,8 +3,8 @@
 import json
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from datetime import UTC, datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -713,11 +713,12 @@ async def test_manager_termination_clears_session_only_after_v2_confirmation():
     )
     manager._session = session
 
-    await manager.terminate_session(session)
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_session(session)
 
-    mock_provider.terminate_pod.assert_called_once_with("pod-123")
-    assert manager._session is None
-    assert session.status is PodStatus.OFFLINE
+    mock_provider.terminate_pod.assert_not_called()
+    assert manager._session is session
+    assert session.status is PodStatus.READY
 
 
 @pytest.mark.asyncio
@@ -736,11 +737,74 @@ async def test_manager_termination_failure_preserves_reconciliation_handle():
         ttl_seconds=3600,
         started_at=datetime.now(timezone.utc),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        training_cleanup_token="training:terminate-failure-0001",
+    )
+    manager._session = session
+    manager._session_lease = MagicMock(
+        side_effect=RunPodManagerError("durable lease unavailable")
+    )
+    manager.release_training_pod = AsyncMock(
+        side_effect=AssertionError("release must not run without durable binding")
+    )
+
+    with pytest.raises(RunPodManagerError, match="durable lease unavailable"):
+        await manager.terminate_session(session)
+
+    manager._session_lease.assert_called_once_with(session)
+    manager.release_training_pod.assert_not_awaited()
+    assert manager._session is session
+    assert session.status is PodStatus.READY
+    mock_provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pod_id", ["pod-123", "foreign-pod"])
+async def test_manager_terminate_pod_refuses_ownerless_or_unmatched_id(pod_id):
+    mock_provider = MagicMock(spec=DirectRunPodProvider)
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    session = RunPodSession(
+        pod_id="pod-123",
+        profile=manager.profiles["llm"],
+        task_profile="llm",
+        model_name="qwen",
+        pod_type="dedicated",
+        status=PodStatus.READY,
+        ttl_seconds=3600,
+        started_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
     manager._session = session
 
-    with pytest.raises(RunPodManagerError, match="provider unavailable"):
-        await manager.terminate_session(session)
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_pod(pod_id)
 
     assert manager._session is session
     assert session.status is PodStatus.READY
+    mock_provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manager_terminate_session_refuses_detached_durable_session():
+    mock_provider = MagicMock(spec=DirectRunPodProvider)
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    session = RunPodSession(
+        pod_id="pod-123",
+        profile=manager.profiles["llm"],
+        task_profile="training",
+        model_name="trainer",
+        pod_type="dedicated",
+        status=PodStatus.READY,
+        ttl_seconds=3600,
+        started_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        training_cleanup_token="training:detached-terminate-0001",
+    )
+    manager.release_training_pod = AsyncMock()
+
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_session(session)
+
+    manager.release_training_pod.assert_not_awaited()
+    mock_provider.terminate_pod.assert_not_called()

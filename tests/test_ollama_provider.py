@@ -19,6 +19,8 @@ import httpcore
 import httpx
 import pytest
 from jsonschema import Draft202012Validator
+from kestrel_sovereign.async_ownership import owned_task_error
+from kestrel_sovereign.execution_custody import execution_terminal_error
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
@@ -32,14 +34,18 @@ from ollama_test_support import (
     serverless_plan,
 )
 from pod_capacity_test_support import (
+    LateCloseAsyncClient,
+    assert_late_http_close_retained,
     execution_control_carrier,
     native_httpx_connect_failure,
     native_pod_action_harness,
     record_control_injection,
 )
+from test_effect_custody import _original_errors
 
 import kestrel_cloud_runpod.ollama_provider as ollama_provider_module
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
+from kestrel_cloud_runpod.effect_custody import await_owned_effect
 from kestrel_cloud_runpod.models import (
     Availability,
     ComputeProduct,
@@ -331,6 +337,62 @@ def _execution_control_carrier(error):
     control = ExecutionCommitOutcomeError("unknown")
     error.__cause__ = control
     return error, control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["health", "anonymous", "models", "telemetry"])
+async def test_ollama_probe_control_survives_late_native_client_close(
+    monkeypatch: pytest.MonkeyPatch, boundary: str, record_property
+) -> None:
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider = _provider()
+    _, intent, receipt, _ = await _readiness_authority(
+        provider, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+    )
+    carrier, control = _execution_control_carrier(
+        httpx.ConnectError(f"{boundary} request remains unknown")
+    )
+    close_error = OSError(f"{boundary} client close failed")
+    clients: list[LateCloseAsyncClient] = []
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        clients[-1].fail_close = True
+        record_control_injection(record_property, "ollama-http-close-" + boundary)
+        raise carrier
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        client = LateCloseAsyncClient(close_error=close_error, **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    base = "https://ollama.invalid"
+    operation = {
+        "health": lambda: provider._healthy(
+            base + "/ping", bearer_token=_SERVERLESS_TOKEN
+        ),
+        "anonymous": lambda: provider._rejects_anonymous_requests(base),
+        "models": lambda: provider._models(base, bearer_token=_SERVERLESS_TOKEN),
+        "telemetry": lambda: provider._runtime_telemetry(
+            base,
+            bearer_token=_SERVERLESS_TOKEN,
+            intent=intent,
+            provisioning=receipt,
+        ),
+    }[boundary]
+
+    with pytest.raises(type(carrier)) as raised:
+        await operation()
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is control
+    assert len(requests) == len(clients) == 1
+    assert_late_http_close_retained(
+        raised.value, client=clients[0], close_error=close_error
+    )
 
 
 @pytest.mark.asyncio
@@ -725,7 +787,9 @@ async def test_prepared_request_is_single_use_safe_and_mutation_detected(monkeyp
         with pytest.raises(TypeError):
             prepared.provider_request.scaling["requestCount"] = 2
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(provision, resume)
+        await release_gates_and_boundedly_join_owned_tasks(
+            provision, resume, primary=sys.exception()
+        )
     resource = await provision
 
     assert resource.provider_resource_id == "endpoint-1"
@@ -2675,7 +2739,9 @@ async def test_native_late_valid_receipt_survives_receiptless_completed_cleanup(
         assert closed.cleanup_receipt is not None
     finally:
         await release_gates_and_boundedly_join_owned_tasks(
-            acquire, first_readback_finished
+            acquire,
+            first_readback_finished,
+            primary=sys.exception(),
         )
 
     completed = await acquire
@@ -2783,9 +2849,21 @@ async def test_native_late_first_receipt_enrolls_completed_cleanup_for_billing(
             assert closed.cleanup_receipt is not None
         assert closed.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(
-            acquire, first_readback_finished
-        )
+        primary = sys.exception()
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                acquire, first_readback_finished, primary=primary
+            )
+        except BaseException as terminal:  # only configured incomplete cleanup may fail
+            if primary is not None or enrollment_exclusion != "cleanup_incomplete":
+                raise
+            expected = owned_task_error(acquire)
+            assert isinstance(expected, OllamaLeaseTeardownError)
+            assert terminal is expected
+        else:
+            assert enrollment_exclusion != "cleanup_incomplete", (
+                "original retryable cleanup error was discarded"
+            )
 
     if enrollment_exclusion == "cleanup_incomplete":
         with pytest.raises(OllamaLeaseTeardownError):
@@ -4080,9 +4158,19 @@ async def test_native_wrong_name_post_ack_survives_concurrent_release(
                 workload_id=request.workload_id,
             )
     finally:
-        await release_gates_and_boundedly_join_owned_tasks(
-            acquire, client.create_finish
-        )
+        primary = sys.exception()
+        try:
+            await release_gates_and_boundedly_join_owned_tasks(
+                acquire, client.create_finish, primary=primary
+            )
+        except BaseException as terminal:  # exact original acknowledged mismatch
+            if primary is not None:
+                raise
+            expected = owned_task_error(acquire)
+            assert isinstance(expected, OllamaProvisioningMismatchError)
+            assert terminal is expected
+        else:
+            pytest.fail("original acknowledged wrong-name mismatch was discarded")
     with pytest.raises(OllamaProvisioningMismatchError):
         await acquire
 
@@ -4164,7 +4252,9 @@ async def test_native_original_ack_survives_different_candidate_mismatch(
             )
     finally:
         await release_gates_and_boundedly_join_owned_tasks(
-            acquire, client.create_finish
+            acquire,
+            client.create_finish,
+            primary=sys.exception(),
         )
 
     completed = await acquire
@@ -4346,9 +4436,27 @@ async def _run_native_late_original_ack_with_cleanup_failure(
                 pytest.fail("late original acknowledgment was not durably retained")
             final_telemetry_finished.set()
         finally:
-            await release_gates_and_boundedly_join_owned_tasks(
-                owned_tasks, post_finished, final_telemetry_finished
-            )
+            primary = sys.exception()
+            try:
+                await release_gates_and_boundedly_join_owned_tasks(
+                    owned_tasks,
+                    post_finished,
+                    final_telemetry_finished,
+                    primary=primary,
+                )
+            except (
+                BaseException
+            ) as terminal:  # retain both actual source-control task graphs
+                if primary is not None:
+                    raise
+                originals = tuple(_original_errors(terminal))
+                assert is_execution_control_error(terminal)
+                for task in owned_tasks:
+                    expected = owned_task_error(task)
+                    assert expected is not None and is_execution_control_error(expected)
+                    assert any(error is expected for error in originals)
+            else:
+                pytest.fail("actual original source-control outcomes were discarded")
 
         results = await asyncio.gather(acquire, release, return_exceptions=True)
         result_evidence = [
@@ -6192,7 +6300,9 @@ async def test_native_concurrent_release_joins_one_exact_id_delete(
         calls_while_first_delete_is_live = client.delete_calls
     finally:
         await release_gates_and_boundedly_join_owned_tasks(
-            owned_tasks, client.delete_finish
+            owned_tasks,
+            client.delete_finish,
+            primary=sys.exception(),
         )
     first_result, second_result = await asyncio.gather(first, second)
 
@@ -7103,3 +7213,162 @@ def test_attached_network_volume_still_requires_the_component():
         pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
     )
     assert deployment.profile.network_volume_id == "volume-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, OllamaLeaseMode.DEDICATED_POD]
+)
+async def test_native_future_provisioning_birth_is_unavailable_but_ack_cleanup_survives(
+    native_provisioning, tmp_path, monkeypatch, mode
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    clock = MutableClock()
+    provider._clock = clock
+    state["replace_on_get"] = {"createdAt": (clock() + timedelta(days=1)).isoformat()}
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "future-provider-birth.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode, max_authorized_cost=5.0)
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    with pytest.raises(OllamaProvisioningEvidenceError, match="readback"):
+        await service.acquire(request, plan=plan, wait_until_ready=False)
+    retained = repository.get(request.lease_id)
+    assert retained.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert retained.provider_resource_id in {"endpoint-evidence-1", "pod-evidence-1"}
+    assert (
+        retained.provisioning_receipt is None and retained.provisioning_mismatch is None
+    )
+    assert retained.creation_uncertain is True and retained.route_url is None
+    assert not any(
+        method == "DELETE" or path.endswith("/action")
+        for method, path in state["calls"]
+    )
+    closed = await service.release(
+        request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+    )
+    assert closed.state is OllamaLeaseState.TERMINATED
+    assert closed.cleanup_intent.provider_resource_id == retained.provider_resource_id
+    assert closed.cleanup_receipt is not None and closed.provisioning_receipt is None
+    assert closed.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+    assert state["billing_calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, OllamaLeaseMode.DEDICATED_POD]
+)
+async def test_provisioning_readback_clock_follows_actual_delayed_get_return(
+    native_provisioning, monkeypatch, mode
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, _state = native_provisioning
+    clock = MutableClock()
+    provider._clock = clock
+    request = make_request(clock, mode=mode, max_authorized_cost=5.0)
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    prepared = provider.validate_runtime_request(
+        request, plan, provision_requested_at=clock()
+    )
+    resource = await provider.provision(prepared)
+    name = (
+        "get_endpoint"
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else "get_pod"
+    )
+    real_get = getattr(provider.client, name)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def delayed_get(resource_id):
+        observed = real_get(resource_id)
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(5):
+            raise TimeoutError("original GET return was not released")
+        return observed
+
+    monkeypatch.setattr(provider.client, name, delayed_get)
+    owner = asyncio.create_task(
+        provider.observe_provisioning(prepared.intent, resource)
+    )
+    try:
+        async with asyncio.timeout(5):
+            await entered.wait()
+        assert not owner.done()
+        clock.advance(7)
+        release.set()
+        receipt = await await_owned_effect(owner)
+        assert receipt.readback_at == clock()
+        assert receipt.provider_created_at <= receipt.readback_at
+        receipt.validate_intent(prepared.intent)
+    finally:
+        primary = sys.exception()
+        release.set()
+        try:
+            await await_owned_effect(owner)
+        except BaseException as cleanup:  # noqa: BLE001 - retain original primary and owned-tail cleanup
+            raise execution_terminal_error(
+                primary, cleanup, retain_originals=True, isolate_control_originals=True
+            )
+
+
+@pytest.mark.asyncio
+async def test_native_future_birth_never_promotes_ambiguous_discovery_to_authority(
+    native_provisioning, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider, state = native_provisioning
+    state["ambiguous_post"] = True
+    state["inventory_visible"] = False
+    clock = MutableClock()
+    provider._clock = clock
+    repository = SQLiteOllamaLeaseRepository(
+        tmp_path / "future-ambiguous-birth.sqlite3"
+    )
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock, mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, max_authorized_cost=5.0
+    )
+    with pytest.raises(RunPodManagerError):
+        await service.acquire(request, plan=serverless_plan(), wait_until_ready=False)
+    state["inventory_visible"] = True
+    state["replace_on_get"] = {"createdAt": (clock() + timedelta(days=1)).isoformat()}
+    clock.advance(1)
+    unresolved = (await service.reconcile())[0]
+    assert unresolved.state is OllamaLeaseState.RECONCILE_REQUIRED
+    assert (
+        unresolved.provider_resource_id is None
+        and unresolved.provisioning_receipt is None
+    )
+    assert unresolved.ambiguous_create_candidate_id == "endpoint-evidence-1"
+    assert unresolved.creation_uncertain is True and unresolved.route_url is None
+    assert (
+        unresolved.provisioning_mismatch is None
+        and unresolved.ambiguous_candidate_mismatch is None
+    )
+    assert not any(
+        method == "DELETE" or path.endswith("/action")
+        for method, path in state["calls"]
+    )
+    assert state["billing_calls"] == []

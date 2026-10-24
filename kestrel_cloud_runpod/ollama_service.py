@@ -7,13 +7,18 @@ import json
 import logging
 import math
 import sqlite3
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Never
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.async_ownership import OwnedTaskAdmission, create_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 
 from .billing import exact_decimal_integer_scale
 from .effect_custody import await_owned_effect
@@ -1139,21 +1144,69 @@ class OllamaLeaseService:
                 f"Ollama lease '{lease.lease_id}' has no original cleanup lineage"
             )
         key = (lease.lease_id, intent.intent_sha256)
-        task = self._cleanup_tasks.get(key)
-        if task is not None:
-            return await await_owned_effect(task)
-        task = asyncio.create_task(
-            self._cleanup_effect(lease, reason=reason),
+        return await self._join_cached_effect(
+            self._cleanup_tasks,
+            key,
+            lambda: self._cleanup_effect(lease, reason=reason),
             name=f"ollama-cleanup-{lease.lease_id}",
         )
-        self._cleanup_tasks[key] = task
 
-        def forget(completed: asyncio.Task[OllamaLease]) -> None:
-            if self._cleanup_tasks.get(key) is completed:
-                self._cleanup_tasks.pop(key, None)
+    async def _join_cached_effect(
+        self,
+        cache: dict[tuple[str, str], asyncio.Task[OllamaLease]],
+        key: tuple[str, str],
+        operation: Callable[[], Awaitable[OllamaLease]],
+        *,
+        name: str,
+    ) -> OllamaLease:
+        """Share one admitted original; evict only after its terminal join."""
 
-        task.add_done_callback(forget)
-        return await await_owned_effect(task)
+        task = cache.get(key)
+        opening = None
+        try:
+            if task is None:
+                admission = OwnedTaskAdmission()
+                try:
+                    task = create_owned_task(
+                        operation(),
+                        name=name,
+                        retain_originals=True,
+                        admission=admission,
+                    )
+                    cache[key] = task
+                except (
+                    BaseException
+                ) as failure:  # own any accepted original before propagation
+                    opening = failure
+                    task = admission.task
+                    if task is None:
+                        # Core closed the unstarted original on true refusal.
+                        # There is no Task to replace or retry here.
+                        raise
+            try:
+                result = await await_owned_effect(task)
+            except BaseException as outcome:  # noqa: BLE001 - compose actual physical outcome and publication failure
+                raise execution_terminal_error(
+                    opening,
+                    outcome,
+                    retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            if opening is not None:
+                raise opening
+            return result
+        finally:
+            primary = sys.exception()
+            try:
+                if task is not None and task.done() and cache.get(key) is task:
+                    cache.pop(key, None)
+            except BaseException as publication:  # noqa: BLE001 - eviction cannot mask the joined original outcome
+                raise execution_terminal_error(
+                    primary,
+                    publication,
+                    retain_originals=True,
+                    isolate_control_originals=True,
+                )
 
     async def _cleanup_effect(self, lease: OllamaLease, *, reason: str) -> OllamaLease:
         """Own uncertainty resolution and exact-ID teardown as one effect."""
@@ -1648,21 +1701,12 @@ class OllamaLeaseService:
                 f"Ollama lease '{lease.lease_id}' lacks lifecycle billing authority"
             )
         key = (lease.lease_id, cleanup.cleanup_receipt_id)
-        task = self._billing_tasks.get(key)
-        if task is not None:
-            return await await_owned_effect(task)
-        task = asyncio.create_task(
-            self._billing_effect(lease),
+        return await self._join_cached_effect(
+            self._billing_tasks,
+            key,
+            lambda: self._billing_effect(lease),
             name=f"ollama-billing-{lease.lease_id}",
         )
-        self._billing_tasks[key] = task
-
-        def forget(completed: asyncio.Task[OllamaLease]) -> None:
-            if self._billing_tasks.get(key) is completed:
-                self._billing_tasks.pop(key, None)
-
-        task.add_done_callback(forget)
-        return await await_owned_effect(task)
 
     async def _billing_effect(self, lease: OllamaLease) -> OllamaLease:
         intent = lease.provisioning_intent

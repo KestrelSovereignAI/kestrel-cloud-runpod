@@ -13,7 +13,10 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    owned_native_http_client,
+)
 
 from .billing import exact_decimal_integer_scale
 from .clients import (
@@ -511,7 +514,6 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provisioning readback resource does not bind its intent"
             )
-        readback_at = self._clock()
         if intent.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
             observed = await asyncio.to_thread(
                 self.client.get_endpoint, resource.provider_resource_id
@@ -520,6 +522,7 @@ class RunpodOllamaCapacityProvider:
             observed = await asyncio.to_thread(
                 self.client.get_pod, resource.provider_resource_id
             )
+        readback_at = self._clock()
         if observed.id != resource.provider_resource_id:
             _raise_mismatch(
                 observed,
@@ -577,22 +580,31 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider omitted original provisioning evidence"
             )
-        return OllamaProvisioningReceipt(
-            intent_sha256=intent.intent_sha256,
-            lease_id=intent.lease_id,
-            request_fingerprint=intent.request_fingerprint,
-            provision_attempt_id=intent.provision_attempt_id,
-            resource_type=intent.resource_type,
-            provider_resource_id=resource.provider_resource_id,
-            resource_name=intent.resource_name,
-            provider_created_at=observed.created_at,
-            readback_at=readback_at,
-            readback_sha256=_json_sha256(normalized),
-            environment_sha256=observed.environment_sha256,
-            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
-            pod_realized_placement=placement,
-            provider_rate_precision=precision,
-        )
+        try:
+            receipt = OllamaProvisioningReceipt(
+                intent_sha256=intent.intent_sha256,
+                lease_id=intent.lease_id,
+                request_fingerprint=intent.request_fingerprint,
+                provision_attempt_id=intent.provision_attempt_id,
+                resource_type=intent.resource_type,
+                provider_resource_id=resource.provider_resource_id,
+                resource_name=intent.resource_name,
+                provider_created_at=observed.created_at,
+                readback_at=readback_at,
+                readback_sha256=_json_sha256(normalized),
+                environment_sha256=observed.environment_sha256,
+                reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
+                pod_realized_placement=placement,
+                provider_rate_precision=precision,
+            )
+            receipt.validate_intent(intent)
+        except (TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
+            raise OllamaProvisioningEvidenceError(
+                "Ollama provider readback chronology or binding is invalid"
+            ) from exc
+        return receipt
 
     async def discover_provisioning_resource(
         self, intent: OllamaProvisioningIntent
@@ -866,7 +878,9 @@ class RunpodOllamaCapacityProvider:
             raise RunPodManagerError("Ollama runtime telemetry credential is absent")
         fetch_started_at = self._clock()
         try:
-            async with self._http_client(bearer_token=bearer_token) as client:
+            async with owned_native_http_client(
+                self._http_client(bearer_token=bearer_token)
+            ) as client:
                 response = await client.get(f"{base_url.rstrip('/')}/kestrel/telemetry")
                 if response.status_code != 200:
                     raise RunPodManagerError("Ollama runtime telemetry is unavailable")
@@ -908,7 +922,9 @@ class RunpodOllamaCapacityProvider:
 
     async def _healthy(self, url: str, *, bearer_token: str | None) -> bool:
         try:
-            async with self._http_client(bearer_token=bearer_token) as client:
+            async with owned_native_http_client(
+                self._http_client(bearer_token=bearer_token)
+            ) as client:
                 response = await client.get(url)
                 return response.status_code == 200
         except httpx.HTTPError as exc:
@@ -918,7 +934,9 @@ class RunpodOllamaCapacityProvider:
 
     async def _rejects_anonymous_requests(self, base_url: str) -> bool:
         try:
-            async with self._http_client(bearer_token=None) as client:
+            async with owned_native_http_client(
+                self._http_client(bearer_token=None)
+            ) as client:
                 response = await client.get(f"{base_url.rstrip('/')}/api/tags")
                 return response.status_code in {401, 403}
         except httpx.HTTPError as exc:
@@ -930,7 +948,9 @@ class RunpodOllamaCapacityProvider:
         self, base_url: str, *, bearer_token: str | None
     ) -> tuple[str, ...]:
         try:
-            async with self._http_client(bearer_token=bearer_token) as client:
+            async with owned_native_http_client(
+                self._http_client(bearer_token=bearer_token)
+            ) as client:
                 response = await client.get(f"{base_url.rstrip('/')}/api/tags")
                 if response.status_code < 200 or response.status_code >= 300:
                     return ()

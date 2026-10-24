@@ -19,7 +19,10 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 import pytest
-from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    execution_cleanup_debts,
+)
 from ollama_test_support import OwnedLoopbackHTTPServer
 from pydantic import SecretStr
 
@@ -61,6 +64,44 @@ RECEIPT_SHA = "e" * 64
 ACK_SHA = "f" * 64
 PARAMETERS_SHA = "c" * 64
 IMAGE = "ghcr.io/kestrel/catalog-worker@sha256:" + "a" * 64
+
+
+class LateCloseAsyncClient(httpx.AsyncClient):
+    """Real HTTPX client whose actual pool close can fail after one body error."""
+
+    def __init__(self, *args, close_error: BaseException, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.close_error = close_error
+        self.fail_close = False
+        self.close_attempts = 0
+
+    async def aclose(self) -> None:
+        self.close_attempts += 1
+        await super().aclose()
+        if self.fail_close:
+            raise self.close_error
+
+    async def __aexit__(self, *_exc_info) -> None:
+        # Exercise the same public aclose contract from the pre-repair plain
+        # context-manager path and the repaired canonical owner path.
+        await self.aclose()
+
+
+def assert_late_http_close_retained(
+    error: BaseException,
+    *,
+    client: LateCloseAsyncClient,
+    close_error: BaseException,
+) -> None:
+    """Bind a request failure to its exact, joined physical close failure."""
+
+    debts = execution_cleanup_debts(error)
+    assert len(debts) == 1
+    resource, closer = debts[0]
+    assert resource is client
+    assert closer is not None and closer.done() and not closer.cancelled()
+    assert closer.exception() is close_error
+    assert client.close_attempts == 1 and client.is_closed
 
 
 def execution_control_carrier(

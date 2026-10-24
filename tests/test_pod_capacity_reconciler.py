@@ -40,6 +40,132 @@ from kestrel_cloud_runpod.pod_capacity_reconciler import (
 FACTORY_REFERENCE = "catalog_host.runpod:build_capacity_service"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX descriptor counterproof")
+@pytest.mark.parametrize(
+    "door",
+    [
+        "fchmod-ordinary",
+        "fchmod-control",
+        "body-unlock",
+        "body-unlock-close",
+        "success",
+    ],
+)
+def test_r27_lock_retires_exact_real_descriptor_and_preserves_errors(
+    tmp_path, monkeypatch, door, record_property
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    import kestrel_cloud_runpod.pod_capacity_reconciler as module
+
+    real_open, real_close, real_fstat, real_fchmod = (
+        os.open,
+        os.close,
+        os.fstat,
+        os.fchmod,
+    )
+    original_unlock = module._unlock_descriptor
+    original_body, control, explicit = execution_control_carrier(
+        RunPodManagerError("original reconciliation remains unknown")
+    )
+    chmod_error = OSError(errno.EPERM, "original fchmod failure")
+    if door == "fchmod-control":
+        chmod_error.__cause__ = control
+    unlock_error = OSError(errno.EIO, "original unlock failure")
+    close_error = OSError(errno.EIO, "late original physical close failure")
+    descriptors = []
+    identities = []
+    closed = []
+    entries = []
+
+    def opened(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        metadata = real_fstat(descriptor)
+        descriptors.append(descriptor)
+        identities.append((metadata.st_dev, metadata.st_ino))
+        return descriptor
+
+    def require_original(descriptor):
+        assert descriptors == [descriptor]
+        metadata = real_fstat(descriptor)
+        assert (metadata.st_dev, metadata.st_ino) == identities[0]
+
+    def chmod(descriptor, mode):
+        require_original(descriptor)
+        entries.append("fchmod")
+        if door.startswith("fchmod-"):
+            record_property("r27_injection", door)
+            raise chmod_error
+        real_fchmod(descriptor, mode)
+
+    def unlock(descriptor):
+        require_original(descriptor)
+        entries.append("unlock")
+        if door.startswith("body-unlock"):
+            record_property("r27_injection", "unlock")
+            raise unlock_error
+        original_unlock(descriptor)
+
+    def close(descriptor):
+        require_original(descriptor)
+        entries.append("close")
+        real_close(descriptor)
+        closed.append(descriptor)
+        if door == "body-unlock-close":
+            record_property("r27_injection", "after-native-close")
+            raise close_error
+
+    monkeypatch.setattr(
+        module,
+        "os",
+        _module_os_proxy(open=opened, fchmod=chmod, close=close),
+    )
+    monkeypatch.setattr(module, "_unlock_descriptor", unlock)
+    caught = None
+    try:
+        try:
+            with _exclusive_reconcile_lock(tmp_path / "capacity.sqlite3"):
+                entries.append("body")
+                if door.startswith("body-unlock"):
+                    raise original_body
+        except BaseException as error:  # noqa: BLE001 - retain exact original body for real-descriptor cleanup oracle
+            caught = error
+        assert len(descriptors) == 1
+        assert closed == descriptors
+        with pytest.raises(OSError) as retired:
+            real_fstat(descriptors[0])
+        assert retired.value.errno == errno.EBADF
+        if door == "success":
+            assert caught is None
+        elif door == "fchmod-ordinary":
+            assert type(caught) is PodCapacityReconcilerConfigurationError
+            assert caught.__cause__ is chmod_error
+        elif door == "fchmod-control":
+            assert caught is chmod_error
+            assert caught.__cause__ is control
+        else:
+            assert caught is original_body
+            assert is_execution_control_error(caught)
+            assert isinstance(caught.__cause__, BaseExceptionGroup)
+            assert explicit in caught.__cause__.exceptions
+            assert unlock_error in caught.__cause__.exceptions
+            if door == "body-unlock-close":
+                assert close_error in caught.__cause__.exceptions
+    finally:
+        # Safety custody only: preserve the baseline's missing inner retirement.
+        # Never close a foreign/reused descriptor or retry an admitted close.
+        if descriptors:
+            descriptor = descriptors[0]
+            try:
+                metadata = real_fstat(descriptor)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                assert (metadata.st_dev, metadata.st_ino) == identities[0]
+                real_close(descriptor)
+                record_property("r27_outer_reconciliation", "same-original-fd")
+
+
 def _module_os_proxy(**overrides):
     attributes = vars(os).copy()
     attributes.update(overrides)

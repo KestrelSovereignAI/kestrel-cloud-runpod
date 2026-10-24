@@ -752,6 +752,9 @@ async def _three_poll_reverted_lifecycle_billing(tmp_path, billing_server, db_na
     assert durable is not None
 
     assert provider.lifecycle_billing_calls == 3
+    assert restarted._billing_tasks == {}, (
+        "terminal original cache must not suppress a later correction poll"
+    )
     assert [
         observation.provider_capacity_actual_cost_usd
         for observation in third.lifecycle_billing_observations

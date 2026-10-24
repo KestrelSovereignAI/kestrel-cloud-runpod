@@ -6,11 +6,13 @@ from decimal import Clamped, Inexact, Rounded, Subnormal, Underflow, localcontex
 
 import pytest
 from ollama_test_support import (
+    FakeOllamaProvider,
     MutableClock,
     make_decision,
     make_request,
     non_compute_cost_policies,
     non_compute_cost_policy,
+    serverless_plan,
 )
 
 from kestrel_cloud_runpod.models import ComputeProduct, RunPodManagerError
@@ -19,11 +21,13 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseMode,
     OllamaLeaseState,
     OllamaPlacementPlan,
+    OllamaProvisioningReceipt,
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
     authorized_cost_exposure,
     canonical_model_name,
+    iso_datetime,
     maximum_serverless_cold_starts,
     sanitize_provider_error,
     select_ollama_plan,
@@ -728,3 +732,47 @@ def test_accrued_cost_fails_closed_without_a_worker_count():
     )
 
     assert accrued_cost(lease, started + timedelta(seconds=1)) == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["constructor", "wire"])
+@pytest.mark.parametrize(
+    "birth_seconds", [0, 1, 2], ids=["at-intent", "at-readback", "future"]
+)
+async def test_provisioning_receipt_birth_is_bounded_by_completed_readback(
+    boundary, birth_seconds
+):
+    """Synthetic contract shape, not an observed provider resource lifetime."""
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    prepared = provider.validate_runtime_request(
+        make_request(clock), serverless_plan(), provision_requested_at=clock()
+    )
+    resource = await provider.provision(prepared)
+    original = await provider.observe_provisioning(prepared.intent, resource)
+    original.validate_intent(prepared.intent)
+    assert OllamaProvisioningReceipt.from_dict(original.to_dict()) == original
+    created_at = clock() + timedelta(seconds=birth_seconds)
+    readback_at = clock() + timedelta(seconds=1)
+
+    def candidate():
+        if boundary == "constructor":
+            return replace(
+                original, provider_created_at=created_at, readback_at=readback_at
+            )
+        payload = original.to_dict()
+        payload["provider_created_at"] = iso_datetime(created_at)
+        payload["readback_at"] = iso_datetime(readback_at)
+        return OllamaProvisioningReceipt.from_dict(payload)
+
+    if birth_seconds > 1:
+        with pytest.raises(ValueError, match="creation.*readback"):
+            candidate()
+    else:
+        receipt = candidate()
+        receipt.validate_intent(prepared.intent)
+        assert (
+            receipt.provider_created_at == created_at
+            and receipt.readback_at == readback_at
+        )
+        assert OllamaProvisioningReceipt.from_dict(receipt.to_dict()) == receipt
