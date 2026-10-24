@@ -182,9 +182,9 @@ async def test_training_cancellation_classifies_control_before_cleanup(
             inject()
 
         manager._wait_for_training_ready = cancelled_readiness
-        operation = lambda: manager.submit_training_job(
-            session, b"avatar", "companion-1"
-        )
+
+        def operation():
+            return manager.submit_training_job(session, b"avatar", "companion-1")
     else:
 
         class CancelledClient(FakeWorkloadClient):
@@ -197,11 +197,15 @@ async def test_training_cancellation_classifies_control_before_cleanup(
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
         if boundary == "submission":
-            operation = lambda: manager.submit_training_job(
-                session, b"avatar", "companion-1", wait_for_model_ready=False
-            )
+
+            def operation():
+                return manager.submit_training_job(
+                    session, b"avatar", "companion-1", wait_for_model_ready=False
+                )
         else:
-            operation = lambda: manager.cancel_training_job(session, "job-r27")
+
+            def operation():
+                return manager.cancel_training_job(session, "job-r27")
 
     with pytest.raises(asyncio.CancelledError) as raised:
         await operation()
@@ -317,9 +321,9 @@ async def test_training_cancellation_intent_sql_failure_stops_release(
             raise cancellation
 
         manager._wait_for_training_ready = cancelled_readiness
-        operation = lambda: manager.submit_training_job(
-            session, b"avatar", "companion-1"
-        )
+
+        def operation():
+            return manager.submit_training_job(session, b"avatar", "companion-1")
     else:
 
         class CancelledClient(FakeWorkloadClient):
@@ -329,9 +333,11 @@ async def test_training_cancellation_intent_sql_failure_stops_release(
                 return await super().post(url)
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
-        operation = lambda: manager.submit_training_job(
-            session, b"avatar", "companion-1", wait_for_model_ready=False
-        )
+
+        def operation():
+            return manager.submit_training_job(
+                session, b"avatar", "companion-1", wait_for_model_ready=False
+            )
 
     with pytest.raises(asyncio.CancelledError) as raised:
         await operation()
@@ -366,9 +372,9 @@ async def test_training_ordinary_cancellation_still_releases_owned_capacity(
             raise cancellation
 
         manager._wait_for_training_ready = cancelled_readiness
-        operation = lambda: manager.submit_training_job(
-            session, b"avatar", "companion-1"
-        )
+
+        def operation():
+            return manager.submit_training_job(session, b"avatar", "companion-1")
     else:
 
         class CancelledClient(FakeWorkloadClient):
@@ -381,11 +387,15 @@ async def test_training_ordinary_cancellation_still_releases_owned_capacity(
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **_: CancelledClient())
         if boundary == "submission":
-            operation = lambda: manager.submit_training_job(
-                session, b"avatar", "companion-1", wait_for_model_ready=False
-            )
+
+            def operation():
+                return manager.submit_training_job(
+                    session, b"avatar", "companion-1", wait_for_model_ready=False
+                )
         else:
-            operation = lambda: manager.cancel_training_job(session, "job-r27")
+
+            def operation():
+                return manager.cancel_training_job(session, "job-r27")
 
     with pytest.raises(asyncio.CancelledError) as raised:
         await operation()
@@ -739,14 +749,13 @@ async def test_training_workload_preserves_exact_execution_control(
             if (
                 boundary == "reconcile-status"
                 or (boundary.startswith("readiness-") and url.endswith("/ready"))
-                or boundary == "submission-recovery-readback"
-                and url.endswith("/current-job")
-                or boundary == "current-job"
-                and url.endswith("/current-job")
-                or boundary == "status"
-                and "/status/" in url
-                or boundary == "download"
-                and "/download/" in url
+                or (
+                    boundary == "submission-recovery-readback"
+                    and url.endswith("/current-job")
+                )
+                or (boundary == "current-job" and url.endswith("/current-job"))
+                or (boundary == "status" and "/status/" in url)
+                or (boundary == "download" and "/download/" in url)
             ):
                 durable_at_injection = runtime.repository.get(
                     session.training_cleanup_token
@@ -820,9 +829,12 @@ async def test_training_workload_preserves_exact_execution_control(
             raise carrier
 
         manager._acquire_training_session = controlled_acquire
-        operation = lambda: manager.start_training_pod(
-            "companion-1", cleanup_token="training:profile-fallback:0001"
-        )
+
+        def operation():
+            return manager.start_training_pod(
+                "companion-1", cleanup_token="training:profile-fallback:0001"
+            )
+
         durable_before = None
         stop_calls = list(provider.stop_calls)
     elif boundary == "inference-start":
@@ -832,7 +844,10 @@ async def test_training_workload_preserves_exact_execution_control(
             raise carrier
 
         manager.start_session = controlled_start_session
-        operation = lambda: manager.start_inference_pod("companion-1")
+
+        def operation():
+            return manager.start_inference_pod("companion-1")
+
         durable_before = None
         stop_calls = list(provider.stop_calls)
     else:
@@ -844,7 +859,9 @@ async def test_training_workload_preserves_exact_execution_control(
             runtime.record_job(session.training_cleanup_token, "job-control")
             lease = runtime.repository.get(session.training_cleanup_token)
             assert lease is not None
-            operation = lambda: manager._reconcile_training_workload_status(lease)
+
+            def operation():
+                return manager._reconcile_training_workload_status(lease)
         elif boundary.startswith("readiness-"):
             base = datetime(2026, 8, 1, tzinfo=UTC)
             instants = iter((base, base, base + timedelta(seconds=2)))
@@ -857,9 +874,11 @@ async def test_training_workload_preserves_exact_execution_control(
             monkeypatch.setattr(
                 "kestrel_cloud_runpod.training.datetime", AdvancingDateTime
             )
-            operation = lambda: manager._wait_for_training_ready(
-                session, timeout=1, poll_interval=0
-            )
+
+            def operation():
+                return manager._wait_for_training_ready(
+                    session, timeout=1, poll_interval=0
+                )
         elif boundary in {"model-readiness", "model-readiness-cleanup"}:
 
             async def controlled_readiness(*_args, **_kwargs):
@@ -869,30 +888,41 @@ async def test_training_workload_preserves_exact_execution_control(
                 raise carrier
 
             manager._wait_for_training_ready = controlled_readiness
-            operation = lambda: manager.submit_training_job(
-                session, b"avatar", "companion-1"
-            )
+
+            def operation():
+                return manager.submit_training_job(session, b"avatar", "companion-1")
         elif (
-            boundary.startswith("submit-")
-            or boundary.startswith("submission-")
+            boundary.startswith(("submit-", "submission-"))
             or boundary == "missing-job-id-cleanup"
         ):
-            operation = lambda: manager.submit_training_job(
-                session,
-                b"avatar",
-                "companion-1",
-                wait_for_model_ready=False,
-            )
+
+            def operation():
+                return manager.submit_training_job(
+                    session,
+                    b"avatar",
+                    "companion-1",
+                    wait_for_model_ready=False,
+                )
         elif boundary == "current-job":
-            operation = lambda: manager.get_current_job(session)
+
+            def operation():
+                return manager.get_current_job(session)
         elif boundary in {"cancel", "cancel-cleanup"}:
-            operation = lambda: manager.cancel_training_job(session, "job-control")
+
+            def operation():
+                return manager.cancel_training_job(session, "job-control")
         elif boundary == "clear":
-            operation = lambda: manager.clear_current_job(session)
+
+            def operation():
+                return manager.clear_current_job(session)
         elif boundary == "status":
-            operation = lambda: manager.poll_training_status(session, "job-control")
+
+            def operation():
+                return manager.poll_training_status(session, "job-control")
         else:
-            operation = lambda: manager.download_lora(session, "job-control")
+
+            def operation():
+                return manager.download_lora(session, "job-control")
 
         if cleanup_boundary:
             record_operation_error = runtime.record_operation_error
@@ -1076,12 +1106,12 @@ async def test_training_workload_retains_ordinary_normalization_contract(
             if (
                 boundary == "reconcile-status"
                 or boundary.startswith("readiness-")
-                or boundary == "submission-recovery-readback"
-                and url.endswith("/current-job")
-                or boundary == "current-job"
-                and url.endswith("/current-job")
-                or boundary == "download"
-                and "/download/" in url
+                or (
+                    boundary == "submission-recovery-readback"
+                    and url.endswith("/current-job")
+                )
+                or (boundary == "current-job" and url.endswith("/current-job"))
+                or (boundary == "download" and "/download/" in url)
             ):
                 raise ordinary_error
             return _response(url, 200, {"current_job": None})
@@ -1123,7 +1153,9 @@ async def test_training_workload_retains_ordinary_normalization_contract(
         runtime.record_job(session.training_cleanup_token, "job-ordinary")
         lease = runtime.repository.get(session.training_cleanup_token)
         assert lease is not None
-        operation = lambda: manager._reconcile_training_workload_status(lease)
+
+        def operation():
+            return manager._reconcile_training_workload_status(lease)
     elif boundary.startswith("readiness-"):
         base = datetime(2026, 8, 1, tzinfo=UTC)
         instants = iter((base, base, base + timedelta(seconds=2)))
@@ -1134,37 +1166,46 @@ async def test_training_workload_retains_ordinary_normalization_contract(
                 return next(instants)
 
         monkeypatch.setattr("kestrel_cloud_runpod.training.datetime", AdvancingDateTime)
-        operation = lambda: manager._wait_for_training_ready(
-            session, timeout=1, poll_interval=0
-        )
+
+        def operation():
+            return manager._wait_for_training_ready(session, timeout=1, poll_interval=0)
     elif boundary in {"model-readiness", "model-readiness-cleanup"}:
 
         async def ordinary_readiness(*_args, **_kwargs):
             raise ordinary_error
 
         manager._wait_for_training_ready = ordinary_readiness
-        operation = lambda: manager.submit_training_job(
-            session, b"avatar", "companion-1"
-        )
+
+        def operation():
+            return manager.submit_training_job(session, b"avatar", "companion-1")
     elif (
-        boundary.startswith("submit-")
-        or boundary.startswith("submission-")
+        boundary.startswith(("submit-", "submission-"))
         or boundary == "missing-job-id-cleanup"
     ):
-        operation = lambda: manager.submit_training_job(
-            session,
-            b"avatar",
-            "companion-1",
-            wait_for_model_ready=False,
-        )
+
+        def operation():
+            return manager.submit_training_job(
+                session,
+                b"avatar",
+                "companion-1",
+                wait_for_model_ready=False,
+            )
     elif boundary == "current-job":
-        operation = lambda: manager.get_current_job(session)
+
+        def operation():
+            return manager.get_current_job(session)
     elif boundary in {"cancel", "cancel-cleanup"}:
-        operation = lambda: manager.cancel_training_job(session, "job-ordinary")
+
+        def operation():
+            return manager.cancel_training_job(session, "job-ordinary")
     elif boundary == "clear":
-        operation = lambda: manager.clear_current_job(session)
+
+        def operation():
+            return manager.clear_current_job(session)
     else:
-        operation = lambda: manager.download_lora(session, "job-ordinary")
+
+        def operation():
+            return manager.download_lora(session, "job-ordinary")
 
     if boundary.endswith("-cleanup"):
 
@@ -1888,15 +1929,11 @@ async def test_training_error_recording_dml_retains_original_and_stops_cleanup(
                 injected_transport_errors.append(error)
                 raise error
             if boundary == "R02-readiness-timeout":
-                error = httpx.ReadTimeout(
-                    "ordinary readiness timeout", request=request
-                )
+                error = httpx.ReadTimeout("ordinary readiness timeout", request=request)
                 injected_transport_errors.append(error)
                 raise error
             assert boundary == "C01-readiness"
-            return httpx.Response(
-                503, json={"detail": "Training in progress: old-job"}
-            )
+            return httpx.Response(503, json={"detail": "Training in progress: old-job"})
         if request.url.path == "/train":
             assert request.method == "POST"
             if boundary == "C02-invalid-object":
@@ -2019,9 +2056,7 @@ async def test_training_error_recording_dml_retains_original_and_stops_cleanup(
     originals = tuple(_original_errors(outcome.error))
     primary = primaries[0] if len(primaries) == 1 else None
     entry = recording_entries[0] if len(recording_entries) == 1 else None
-    persistence_error = (
-        persistence_errors[0] if len(persistence_errors) == 1 else None
-    )
+    persistence_error = persistence_errors[0] if len(persistence_errors) == 1 else None
     driver_task = driver.get("task")
     result_facts = {
         "after": after.to_public_dict() if after is not None else None,
@@ -2096,15 +2131,18 @@ async def test_training_error_recording_dml_retains_original_and_stops_cleanup(
         assert entry.revision == before.revision + 1
     else:
         assert entry == before
-    assert workload_calls == {
-        "C01-readiness": [("GET", "/ready")],
-        "C02-invalid-object": [("POST", "/train")],
-        "C03-missing-id": [("POST", "/train")],
-        "C04-recovery": [("POST", "/train"), ("GET", "/current-job")],
-        "C05-cancel": [("POST", "/cancel/job-c06")],
-        "R01-readiness-connect": [("GET", "/ready")],
-        "R02-readiness-timeout": [("GET", "/ready")],
-    }[boundary]
+    assert (
+        workload_calls
+        == {
+            "C01-readiness": [("GET", "/ready")],
+            "C02-invalid-object": [("POST", "/train")],
+            "C03-missing-id": [("POST", "/train")],
+            "C04-recovery": [("POST", "/train"), ("GET", "/current-job")],
+            "C05-cancel": [("POST", "/cancel/job-c06")],
+            "R01-readiness-connect": [("GET", "/ready")],
+            "R02-readiness-timeout": [("GET", "/ready")],
+        }[boundary]
+    )
     if persistence_mode == "control":
         assert control is not None and explicit is not None
         assert persistence_error.__cause__ is explicit
@@ -2118,7 +2156,7 @@ async def test_training_error_recording_dml_retains_original_and_stops_cleanup(
         assert not is_execution_control_error(outcome.error)
     # The pre-repair semantic failures are confined to explicit-primary custody
     # and the two readiness sites' synthetic replacement of the caught object.
-    assert (not injected_transport_errors or primary is injected_transport_errors[0])
+    assert not injected_transport_errors or primary is injected_transport_errors[0]
     assert any(error is primary for error in originals)
 
 

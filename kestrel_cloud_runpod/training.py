@@ -13,8 +13,8 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, NoReturn, Optional, overload
+from datetime import UTC, datetime, timedelta
+from typing import Any, NoReturn, overload
 
 from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
@@ -204,7 +204,7 @@ class RunPodTrainingMixin:
         service = self._get_training_pod_lease_service()
 
         ready_url = f"{session.backend_base_url}/ready"
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        deadline = datetime.now(UTC) + timedelta(seconds=timeout)
 
         logger.info(
             "Waiting for training model to load at %s "
@@ -219,7 +219,7 @@ class RunPodTrainingMixin:
         async with owned_native_http_client(
             httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
         ) as client:
-            while datetime.now(timezone.utc) < deadline:
+            while datetime.now(UTC) < deadline:
                 attempts += 1
                 service.heartbeat(cleanup_token)
                 try:
@@ -461,7 +461,7 @@ class RunPodTrainingMixin:
             async with self._lock:
                 if self._session and self._session.is_active:
                     raise RunPodManagerError("A RunPod session is already active")
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             readiness_seconds = profile.readiness_timeout_seconds or POD_READY_TIMEOUT
             readiness_seconds = min(readiness_seconds, ttl_seconds - 1)
             request = TrainingPodRequest(
@@ -516,7 +516,7 @@ class RunPodTrainingMixin:
             self._session = session
         return session
 
-    async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
+    async def start_inference_pod(self, companion_id: str) -> RunPodSession | None:
         """
         Refuse the legacy ownerless LoRA inference admission path.
 
@@ -556,7 +556,7 @@ class RunPodTrainingMixin:
         session: RunPodSession,
         avatar_data: bytes,
         companion_id: str,
-        callback_url: Optional[str] = None,
+        callback_url: str | None = None,
         wait_for_model_ready: bool = True,
     ) -> str:
         """
@@ -773,7 +773,7 @@ class RunPodTrainingMixin:
             f"Training submission failed ({type(cause).__name__}); capacity was stopped"
         ) from cause
 
-    async def get_current_job(self, session: RunPodSession) -> Optional[Dict[str, Any]]:
+    async def get_current_job(self, session: RunPodSession) -> dict[str, Any] | None:
         """
         Check if a training job is currently running on the pod.
 
@@ -816,7 +816,7 @@ class RunPodTrainingMixin:
 
     async def cancel_training_job(
         self, session: RunPodSession, job_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Cancel a training job.
 
@@ -840,7 +840,7 @@ class RunPodTrainingMixin:
 
         url = f"{session.backend_base_url}/cancel/{job_id}"
 
-        cancellation: Dict[str, Any]
+        cancellation: dict[str, Any]
         try:
             async with owned_native_http_client(
                 httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
@@ -880,7 +880,7 @@ class RunPodTrainingMixin:
         await service.release(cleanup_token, reason="job cancelled")
         return cancellation
 
-    async def clear_current_job(self, session: RunPodSession) -> Dict[str, Any]:
+    async def clear_current_job(self, session: RunPodSession) -> dict[str, Any]:
         """
         Force-clear the current job lock on the pod.
 
@@ -926,7 +926,7 @@ class RunPodTrainingMixin:
 
     async def poll_training_status(
         self, session: RunPodSession, job_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Get training job status from pod.
 
@@ -1107,7 +1107,7 @@ class RunPodTrainingMixin:
 
     async def generate_with_lora(
         self, session: RunPodSession, prompt: str, lora_path: str, num_outputs: int = 1
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Generate images using loaded LoRA model.
 
