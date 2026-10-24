@@ -236,3 +236,24 @@ def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() 
     }
 
     assert invalid_counts == {}
+
+
+def test_r29_lease_environment_explicitly_requires_preload(record_property):
+    record_property("injection_entry", "before-managed-preload-environment-build")
+    environment = _environment()
+    preload = environment.get("KESTREL_OLLAMA_PRELOAD_MODEL")
+    record_property(
+        "r29_preload_environment",
+        json.dumps({"value": preload, "type": type(preload).__name__}, sort_keys=True),
+    )
+    assert preload == "true"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "true"])
+def test_r29_profile_cannot_override_lease_owned_preload(value, record_property):
+    record_property("injection_entry", "before-managed-preload-override-build")
+    with pytest.raises(RunPodManagerError, match="cannot override"):
+        _environment(profile_environment={
+            "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
+            "KESTREL_OLLAMA_PRELOAD_MODEL": value,
+        })

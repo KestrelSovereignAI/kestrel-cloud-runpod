@@ -4289,3 +4289,182 @@ async def test_primary_cleanup_decoding_binds_retained_resource_even_without_pro
     )
     with pytest.raises(RunPodManagerError, match="cleanup intent is unbound"):
         repository.get(original.lease_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["cas", "native-sql", "restored"])
+@pytest.mark.parametrize(
+    "has_provisioning", [False, True], ids=["receiptless", "provisioned"]
+)
+async def test_current_owned_terminal_requires_primary_absence(
+    tmp_path, record_property, door, has_provisioning
+):
+    observations = []
+    for intent_only in (False, True):
+        database_name = f"terminal-{door}-{has_provisioning}-{intent_only}.sqlite3"
+        if has_provisioning:
+            clock = MutableClock()
+            repository = SQLiteOllamaLeaseRepository(tmp_path / database_name)
+            provider = FakeOllamaProvider(serverless_plan())
+            service = OllamaLeaseService(
+                repository=repository,
+                provider=provider,
+                poll_interval_seconds=1,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+            original = await service.acquire(
+                make_request(clock), plan=serverless_plan()
+            )
+            assert original.state is OllamaLeaseState.READY
+        else:
+            clock, repository, provider, original = await _pending_without_receipt(
+                tmp_path, database_name=database_name
+            )
+            service = OllamaLeaseService(
+                repository=repository,
+                provider=provider,
+                poll_interval_seconds=1,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+        assert original.provider_resource_id is not None
+        assert original.provisioning_intent is not None
+        assert (original.provisioning_receipt is not None) is has_provisioning
+        assert original.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+        if intent_only:
+            original = repository.compare_and_set(
+                original,
+                changes={
+                    "state": OllamaLeaseState.RELEASING,
+                    "teardown_state": OllamaTeardownState.PENDING,
+                    "route_url": None,
+                    "termination_reason": "r29-primary-absence",
+                },
+            )
+            original = repository.record_cleanup_intent(
+                original, now=clock(), termination_reason="r29-primary-absence"
+            )
+        assert (original.cleanup_intent is not None) is intent_only
+        assert original.cleanup_receipt is None
+        before = _raw_lease_row(repository.path, original.lease_id)
+        calls_before = provider.teardown_calls
+        refusal = None
+        restored_trigger = None
+        mutation = """UPDATE ollama_leases
+                         SET state = 'terminated', teardown_state = 'complete',
+                             route_url = NULL,
+                             revision = revision + 1,
+                             writer_epoch = writer_epoch + 1
+                       WHERE lease_id = ?"""
+        record_property(
+            "injection_entry",
+            "original-owned-before-terminal-mutation:"
+            + door
+            + (":intent-only" if intent_only else ":no-cleanup-intent"),
+        )
+        if door == "restored":
+            with (
+                closing(sqlite3.connect(repository.path)) as connection,
+                connection,
+            ):
+                connection.execute("BEGIN IMMEDIATE")
+                trigger_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'ollama_lifecycle_evidence_update_v7'"
+                ).fetchone()[0]
+                connection.execute("DROP TRIGGER ollama_lifecycle_evidence_update_v7")
+                connection.execute(mutation, (original.lease_id,))
+                connection.execute(trigger_sql)
+                restored_trigger = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'ollama_lifecycle_evidence_update_v7'"
+                ).fetchone()[0]
+            try:
+                repository.get(original.lease_id)
+            except RunPodManagerError as error:
+                refusal = {"type": type(error).__name__, "message": str(error)}
+        else:
+            try:
+                if door == "cas":
+                    repository.compare_and_set(
+                        original,
+                        changes={
+                            "state": OllamaLeaseState.TERMINATED,
+                            "teardown_state": OllamaTeardownState.COMPLETE,
+                            "route_url": None,
+                        },
+                    )
+                else:
+                    with (
+                        closing(sqlite3.connect(repository.path)) as connection,
+                        connection,
+                    ):
+                        connection.execute(mutation, (original.lease_id,))
+            except sqlite3.IntegrityError as error:
+                refusal = {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "sqlite_errorname": error.sqlite_errorname,
+                }
+        after = _raw_lease_row(repository.path, original.lease_id)
+        accepted_consequence = None
+        if refusal is None:
+            retained = repository.get(original.lease_id)
+            assert retained is not None
+            due = repository.list_for_reconciliation(now=clock())
+            returned = await service.release(
+                retained.lease_id,
+                owner_id=retained.owner_id,
+                workload_id=retained.workload_id,
+            )
+            accepted_consequence = {
+                "state": retained.state.value,
+                "teardown": retained.teardown_state.value,
+                "billing": retained.lifecycle_billing_state.value,
+                "cleanup_receipt": retained.cleanup_receipt,
+                "reconciliation_contains_owned_lease": any(
+                    item.lease_id == retained.lease_id for item in due
+                ),
+                "release_returns_unchanged": returned == retained,
+            }
+        observations.append(
+            {
+                "door": door,
+                "member": "intent-only" if intent_only else "no-cleanup-intent",
+                "provisioned": has_provisioning,
+                "before": before,
+                "after": after,
+                "refusal": refusal,
+                "canonical_trigger_restored": (
+                    restored_trigger == trigger_sql if door == "restored" else None
+                ),
+                "teardown_calls_before": calls_before,
+                "teardown_calls_after": provider.teardown_calls,
+                "accepted_consequence": accepted_consequence,
+            }
+        )
+    record_property(
+        "r29_terminal_cleanup", json.dumps(observations, sort_keys=True, default=str)
+    )
+    expected = (
+        {
+            "type": "RunPodManagerError",
+            "message": "Stored Ollama terminal resource lacks primary cleanup evidence",
+        }
+        if door == "restored"
+        else {
+            "type": "IntegrityError",
+            "message": "invalid Ollama lifecycle evidence mutation",
+            "sqlite_errorname": "SQLITE_CONSTRAINT_TRIGGER",
+        }
+    )
+    for observed in observations:
+        assert observed["refusal"] == expected
+        assert observed["teardown_calls_after"] == observed["teardown_calls_before"]
+        if door == "restored":
+            assert observed["canonical_trigger_restored"] is True
+            assert observed["after"]["state"] == "terminated"
+            assert observed["after"]["cleanup_receipt_json"] is None
+        else:
+            assert observed["after"] == observed["before"]

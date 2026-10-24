@@ -500,13 +500,9 @@ class RunpodOllamaCapacityProvider:
         self,
         intent: OllamaProvisioningIntent,
         resource: ProvisionedOllamaResource,
-    ) -> tuple[
-        EndpointResource | PodResource,
-        Mapping[str, Any],
-        PodRealizedPlacement | None,
-        OllamaProviderRatePrecision | None,
-        datetime,
-    ]:
+        *,
+        reconciled_after_ambiguous_create: bool = False,
+    ) -> tuple[EndpointResource | PodResource, OllamaProvisioningReceipt]:
         if (
             resource.resource_type is not intent.resource_type
             or resource.resource_name != intent.resource_name
@@ -560,22 +556,6 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider readback evidence is incomplete or invalid"
             ) from exc
-        return observed, normalized, placement, precision, readback_at
-
-    async def observe_provisioning(
-        self,
-        intent: OllamaProvisioningIntent,
-        resource: ProvisionedOllamaResource,
-        *,
-        reconciled_after_ambiguous_create: bool = False,
-    ) -> OllamaProvisioningReceipt:
-        (
-            observed,
-            normalized,
-            placement,
-            precision,
-            readback_at,
-        ) = await self._read_original_provisioning(intent, resource)
         if observed.created_at is None or observed.environment_sha256 is None:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider omitted original provisioning evidence"
@@ -604,6 +584,20 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama provider readback chronology or binding is invalid"
             ) from exc
+        return observed, receipt
+
+    async def observe_provisioning(
+        self,
+        intent: OllamaProvisioningIntent,
+        resource: ProvisionedOllamaResource,
+        *,
+        reconciled_after_ambiguous_create: bool = False,
+    ) -> OllamaProvisioningReceipt:
+        _observed, receipt = await self._read_original_provisioning(
+            intent,
+            resource,
+            reconciled_after_ambiguous_create=reconciled_after_ambiguous_create,
+        )
         return receipt
 
     async def discover_provisioning_resource(
@@ -651,13 +645,16 @@ class RunpodOllamaCapacityProvider:
             raise OllamaProvisioningEvidenceError(
                 "Ollama readiness resource does not bind its provisioning receipt"
             )
-        (
-            observed,
-            _normalized,
-            _placement,
-            _precision,
-            _readback_at,
-        ) = await self._read_original_provisioning(intent, resource)
+        observed, fresh = await self._read_original_provisioning(intent, resource)
+        if not provisioning.same_provider_authority(fresh):
+            _raise_mismatch(
+                observed,
+                intent,
+                provider_resource_id=resource.provider_resource_id,
+                observed_at=fresh.readback_at,
+                reason=OllamaProvisioningMismatchReason.RESOURCE_IDENTITY,
+                detail="Ollama readiness readback changed original provisioning authority",
+            )
         if resource.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
             if not isinstance(observed, EndpointResource):
                 raise OllamaProvisioningEvidenceError(
@@ -1305,28 +1302,36 @@ def _validate_endpoint_provisioning(
             "allowedCudaVersions",
             "excludedTypes",
         ):
-            if key not in expected_gpu:
-                if key in gpu_value and gpu_value[key] not in (None, (), []):
-                    assessment.mismatch(
-                        OllamaProvisioningMismatchReason.ENDPOINT_POLICY,
-                        "Ollama Endpoint placement policy does not match intent",
-                    )
-                continue
             if key not in gpu_value:
-                assessment.missing("policy", f"gpu.{key}")
+                if key in expected_gpu:
+                    assessment.missing("policy", f"gpu.{key}")
                 continue
             try:
                 actual: object
                 accepted: object
                 if key in {"pools", "allowedCudaVersions", "excludedTypes"}:
                     actual = _string_tuple(gpu_value[key], f"Endpoint.gpu.{key}")
-                    accepted = _string_tuple(expected_gpu.get(key), f"intent.gpu.{key}")
                 elif key == "count":
                     actual = _required_int(gpu_value[key], "Endpoint.gpu.count")
-                    accepted = _required_int(expected_gpu.get(key), "intent.gpu.count")
                 else:
-                    actual = gpu_value[key]
-                    accepted = expected_gpu.get(key)
+                    actual = _typed_runtime_value(
+                        key, gpu_value[key], context="Endpoint.gpu"
+                    )
+                if key not in expected_gpu:
+                    if actual not in (None, ()):
+                        assessment.mismatch(
+                            OllamaProvisioningMismatchReason.ENDPOINT_POLICY,
+                            "Ollama Endpoint placement policy does not match intent",
+                        )
+                    continue
+                if key in {"pools", "allowedCudaVersions", "excludedTypes"}:
+                    accepted = _string_tuple(expected_gpu[key], f"intent.gpu.{key}")
+                elif key == "count":
+                    accepted = _required_int(expected_gpu[key], "intent.gpu.count")
+                else:
+                    accepted = _typed_runtime_value(
+                        key, expected_gpu[key], context="intent.gpu"
+                    )
             except OllamaProvisioningEvidenceError as exc:
                 if is_execution_control_error(exc):
                     raise
@@ -1659,7 +1664,7 @@ def _typed_runtime_value(key: str, value: object, *, context: str) -> object:
         return _required_int(value, f"{context}.{key}")
     if key == "ports":
         return _string_tuple(value, f"{context}.ports")
-    if key in {"registry", "flashboot"}:
+    if key in {"registry", "flashboot", "minCudaVersion"}:
         if value is None:
             return None
         if not isinstance(value, str):

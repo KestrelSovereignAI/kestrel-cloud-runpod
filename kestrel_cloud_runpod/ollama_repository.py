@@ -616,7 +616,12 @@ def _writer_trigger_script() -> str:
         CREATE TRIGGER ollama_lifecycle_evidence_update_v7
         BEFORE UPDATE ON ollama_leases
         WHEN
-          (NEW.cleanup_intent_json IS NOT NULL AND (
+          (NEW.state = 'terminated'
+             AND NEW.provisioning_evidence_state IS NOT 'historical_unknown'
+             AND NEW.provider_resource_id IS NOT NULL
+             AND (NEW.cleanup_intent_json IS NULL
+                  OR NEW.cleanup_receipt_json IS NULL))
+          OR (NEW.cleanup_intent_json IS NOT NULL AND (
                 NEW.provisioning_evidence_state NOT IN ('intent_recorded', 'complete')
              OR NEW.provisioning_intent_json IS NULL
              OR NEW.provider_resource_id IS NULL
@@ -3415,6 +3420,16 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
 def _validate_stored_lifecycle_evidence(lease: OllamaLease) -> None:
     intent = lease.provisioning_intent
     provisioning = lease.provisioning_receipt
+    if (
+        lease.state is OllamaLeaseState.TERMINATED
+        and lease.provisioning_evidence_state
+        is not OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+        and lease.provider_resource_id is not None
+        and (lease.cleanup_intent is None or lease.cleanup_receipt is None)
+    ):
+        raise RunPodManagerError(
+            "Stored Ollama terminal resource lacks primary cleanup evidence"
+        )
     if intent is None and (
         lease.runtime_telemetry_binding_sha256 is not None
         or lease.cleanup_intent is not None

@@ -41,6 +41,15 @@ After startup every readiness probe revalidates Ollama, the exact digest, and
 the model's completion/tool support. A mismatch, missing capability, expired
 workload capability, or upstream failure returns `503`.
 
+Python 0.16 managed leases require preload: the provider owns
+`KESTREL_OLLAMA_PRELOAD_MODEL` and sets it to `true`. Profile overrides are
+rejected before provisioning, including an explicit `true` override. This is
+a managed-lease policy; the standalone runtime's configuration parser is
+unchanged. Startup completion requires bound
+boot, model-load and total-readiness measurements, plus a complete pull phase
+unless the snapshot records an exact cache hit. Partial telemetry cannot
+publish a managed route.
+
 The provider sets `KESTREL_OLLAMA_MODEL_STORAGE_PATH` to `/models` for ephemeral
 container storage, `/workspace/ollama` for a Pod volume, or
 `/runpod-volume/ollama` for a Serverless network volume, matching Runpod's

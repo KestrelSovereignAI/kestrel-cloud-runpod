@@ -2472,3 +2472,244 @@ async def test_touch_releases_a_lease_that_passes_its_cost_cap_while_observing(
     }
     assert touched.termination_reason == "deadline_or_cost_cap"
     assert capacity.teardown_calls == 1
+
+
+# These synthetic metadata shapes do not measure physical model startup.
+
+_R29_STARTUP_OMISSIONS = [
+    pytest.param(
+        dict(ollama_process_started_at=None, ollama_healthy_at=None,
+             ollama_boot_ms=None, model_load_started_at=None,
+             model_ready_at=None, model_load_ms=None, container_to_ready_ms=None),
+        id="all-boot-load-total",
+    ),
+    pytest.param(dict(ollama_process_started_at=None, ollama_healthy_at=None,
+                      ollama_boot_ms=None), id="boot"),
+    pytest.param(dict(ollama_process_started_at=None, ollama_boot_ms=None),
+                 id="boot-start"),
+    pytest.param(dict(ollama_healthy_at=None, ollama_boot_ms=None), id="boot-end"),
+    pytest.param(dict(model_load_started_at=None, model_ready_at=None,
+                      model_load_ms=None), id="load"),
+    pytest.param(dict(model_load_started_at=None, model_load_ms=None),
+                 id="load-start"),
+    pytest.param(dict(model_ready_at=None, model_load_ms=None), id="load-end"),
+    pytest.param(dict(container_to_ready_ms=None), id="total"),
+    pytest.param(dict(cache_hit=False, startup_strategy="pulled"),
+                 id="noncache-pull"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["constructor", "wire"])
+@pytest.mark.parametrize("changes", _R29_STARTUP_OMISSIONS)
+async def test_r29_incomplete_startup_remains_valid_partial_shape(
+    tmp_path, boundary, changes, record_property
+):
+    clock = MutableClock()
+    provider = _ChangedStartupTelemetryProvider(lambda _intent: changes)
+    service = _service(tmp_path, clock, provider)
+    lease = await service.acquire(make_request(clock), wait_until_ready=False)
+    assert lease.runtime_telemetry_observations == ()
+    assert lease.provisioning_intent is not None
+    assert lease.provisioning_receipt is not None
+    # The SAME FakeProvider supplies actual canonical binding/receipt/hash.
+    from kestrel_cloud_runpod.ollama_contracts import resource_from_lease
+
+    observed = await provider.observe(
+        resource_from_lease(lease), lease.provisioning_intent,
+        lease.provisioning_receipt,
+    )
+    telemetry = observed.runtime_telemetry
+    assert telemetry is not None
+    if boundary == "wire":
+        telemetry = type(telemetry).from_dict(telemetry.to_dict())
+    assert all(getattr(telemetry.snapshot, key) == value
+               for key, value in changes.items())
+    record_property("injection_entry", "first-bound-snapshot-" + boundary)
+    assert telemetry.is_complete_startup_for(lease.provisioning_intent) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", _R29_STARTUP_OMISSIONS)
+async def test_r29_first_incomplete_snapshot_cannot_publish_ready_route(
+    tmp_path, changes, record_property
+):
+    clock = MutableClock()
+    provider = _ChangedStartupTelemetryProvider(lambda _intent: changes)
+    service = _service(tmp_path, clock, provider)
+    waiting = await service.acquire(make_request(clock), wait_until_ready=False)
+    assert waiting.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert waiting.runtime_telemetry_observations == ()
+    assert waiting.public_route_url is None
+    record_property("injection_entry", "before-first-runtime-observation")
+    checked = await service._check_readiness_once(waiting)
+    durable = service.repository.get(waiting.lease_id)
+    assert durable is not None
+    assert len(durable.runtime_telemetry_observations) == 1
+    retained = durable.runtime_telemetry_observations[0]
+    assert all(getattr(retained.snapshot, key) == value
+               for key, value in changes.items())
+    record_property("retained_snapshot", retained.snapshot_sha256)
+    record_property("returned_state", checked.state.value)
+    record_property("durable_telemetry_state", durable.runtime_telemetry_state.value)
+    record_property("route_published", str(checked.public_route_url is not None))
+    assert checked.state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert checked.public_route_url is None
+    assert durable.public_route_url is None
+    assert durable.runtime_telemetry_state is OllamaRuntimeTelemetryState.PARTIAL
+    assert provider.provision_calls == 1
+    assert provider.pull_calls == provider.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_hit", [True, False], ids=["cache-hit", "pulled"])
+async def test_r29_complete_startup_first_observation_controls(tmp_path, cache_hit):
+    clock = MutableClock()
+    def changes(intent):
+        if cache_hit:
+            return {}
+        return dict(cache_hit=False, startup_strategy="pulled",
+                    model_pull_started_at=intent.provision_requested_at,
+                    model_pull_completed_at=intent.provision_requested_at,
+                    model_pull_ms=0)
+    provider = _ChangedStartupTelemetryProvider(changes)
+    service = _service(tmp_path, clock, provider)
+    waiting = await service.acquire(make_request(clock), wait_until_ready=False)
+    assert waiting.runtime_telemetry_observations == ()
+    ready = await service._check_readiness_once(waiting)
+    durable = service.repository.get(waiting.lease_id)
+    assert durable is not None
+    assert ready.state is OllamaLeaseState.READY
+    assert ready.public_route_url == provider.route_url
+    assert durable.runtime_telemetry_state is OllamaRuntimeTelemetryState.STARTUP_COMPLETE
+    telemetry = durable.runtime_telemetry_observations[0]
+    assert telemetry.is_complete_startup_for(waiting.provisioning_intent)
+    assert type(telemetry).from_dict(telemetry.to_dict()).is_complete_startup_for(
+        waiting.provisioning_intent
+    )
+    assert (telemetry.snapshot.model_pull_ms is None) is cache_hit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["constructor", "wire"])
+@pytest.mark.parametrize("inversion", ["container-boot", "healthy-load", "pull-load"])
+async def test_r29_cross_phase_startup_order_is_not_complete(
+    tmp_path, boundary, inversion, record_property
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    lease = await service.acquire(make_request(clock), wait_until_ready=False)
+    from kestrel_cloud_runpod.ollama_contracts import resource_from_lease
+
+    observed = await provider.observe(
+        resource_from_lease(lease), lease.provisioning_intent,
+        lease.provisioning_receipt,
+    )
+    snapshot = observed.runtime_telemetry.snapshot
+    start = snapshot.container_started_at
+    if inversion == "container-boot":
+        changes = dict(ollama_process_started_at=start - timedelta(seconds=1),
+                       ollama_healthy_at=start - timedelta(seconds=1))
+    elif inversion == "healthy-load":
+        changes = dict(ollama_healthy_at=start + timedelta(seconds=1),
+                       ollama_boot_ms=1000, model_load_started_at=start,
+                       model_ready_at=start + timedelta(seconds=2),
+                       model_load_ms=2000, ready_at=start + timedelta(seconds=2),
+                       container_to_ready_ms=2000)
+    else:
+        changes = dict(cache_hit=False, startup_strategy="pulled",
+                       model_pull_started_at=start,
+                       model_pull_completed_at=start + timedelta(seconds=2),
+                       model_pull_ms=2000, model_load_started_at=start,
+                       model_ready_at=start + timedelta(seconds=3),
+                       model_load_ms=3000, ready_at=start + timedelta(seconds=3),
+                       container_to_ready_ms=3000)
+    record_property("injection_entry", "individually-valid-phase-order-" + inversion)
+    with pytest.raises(ValueError, match="startup order"):
+        if boundary == "constructor":
+            replace(snapshot, **changes)
+        else:
+            payload = snapshot.to_dict()
+            payload.update({key: value.isoformat() if hasattr(value, "isoformat") else value
+                            for key, value in changes.items()})
+            type(snapshot).from_dict(payload)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_hit",
+    [
+        pytest.param(1, id="int-one"),
+        pytest.param(0, id="int-zero"),
+        pytest.param("true", id="string-true"),
+        pytest.param("false", id="string-false"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty-list"),
+        pytest.param([True], id="nonempty-list"),
+        pytest.param({}, id="empty-object"),
+    ],
+)
+async def test_r29_malformed_cache_boolean_never_completes_startup(
+    tmp_path, cache_hit, record_property
+):
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    service = _service(tmp_path, clock, provider)
+    lease = await service.acquire(make_request(clock), wait_until_ready=False)
+    assert lease.runtime_telemetry_observations == ()
+    assert lease.provisioning_intent is not None
+    assert lease.provisioning_receipt is not None
+    from kestrel_cloud_runpod.ollama_contracts import resource_from_lease
+
+    original = await provider.observe(
+        resource_from_lease(lease),
+        lease.provisioning_intent,
+        lease.provisioning_receipt,
+    )
+    assert original.runtime_telemetry is not None
+    record_property("injection_entry", "bound-original-before-malformed-cache")
+    members = []
+    for pull_present in (False, True):
+        changes = {
+            "cache_hit": cache_hit,
+            "startup_strategy": "pulled",
+            "model_pull_started_at": (
+                lease.provisioning_intent.provision_requested_at
+                if pull_present else None
+            ),
+            "model_pull_completed_at": (
+                lease.provisioning_intent.provision_requested_at
+                if pull_present else None
+            ),
+            "model_pull_ms": 0 if pull_present else None,
+        }
+        changed = _replace_runtime_snapshot(original, **changes)
+        telemetry = changed.runtime_telemetry
+        assert telemetry is not None
+        assert telemetry.snapshot.cache_hit is cache_hit
+        wire_error = None
+        try:
+            type(telemetry).from_dict(telemetry.to_dict())
+        except TypeError as error:
+            wire_error = {"type": type(error).__name__, "message": str(error)}
+        complete = telemetry.is_complete_startup_for(lease.provisioning_intent)
+        members.append(
+            {
+                "pull_present": pull_present,
+                "cache_type": type(cache_hit).__name__,
+                "cache_value": cache_hit,
+                "snapshot": telemetry.snapshot.to_dict(),
+                "snapshot_sha256": telemetry.snapshot_sha256,
+                "wire_error": wire_error,
+                "complete_type": type(complete).__name__,
+                "complete": complete,
+            }
+        )
+    record_property("r29_cache_boolean_members", json.dumps(members, sort_keys=True))
+    for member in members:
+        assert member["wire_error"] == {
+            "type": "TypeError",
+            "message": "Ollama cache_hit must be a boolean",
+        }
+        assert member["complete_type"] == "bool"
+        assert member["complete"] is False

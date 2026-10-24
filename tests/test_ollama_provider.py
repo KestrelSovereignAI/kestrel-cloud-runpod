@@ -66,6 +66,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
+    OllamaLeaseReadinessError,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
     OllamaLifecycleBillingState,
@@ -7372,3 +7373,393 @@ async def test_native_future_birth_never_promotes_ambiguous_discovery_to_authori
         for method, path in state["calls"]
     )
     assert state["billing_calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [OllamaLeaseMode.DEDICATED_POD,
+                                 OllamaLeaseMode.SERVERLESS_LOAD_BALANCER])
+async def test_r29_lazy_profile_refused_before_public_provisioning(
+    tmp_path, monkeypatch, mode, record_property
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    profile = _profile()
+    profile = replace(profile, env={**profile.env,
+                                   "KESTREL_OLLAMA_PRELOAD_MODEL": "false"})
+    client = _ControlClient()
+    provider = _provider(client=client, deployment=replace(_deployment(), profile=profile))
+    clock = MutableClock()
+    service = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        poll_interval_seconds=1,
+        provider=provider, clock=clock, sleep=clock.sleep,
+    )
+    caught = None
+    record_property("injection_entry", "accepted-profile-before-runtime-preflight")
+    try:
+        await service.acquire(make_request(clock, mode=mode, max_authorized_cost=5.0),
+                              wait_until_ready=False)
+    except RunPodManagerError as error:
+        caught = error
+    durable = service.repository.get("lease-001")
+    assert durable is not None
+    record_property("pod_create_entered", str(client.pod_request is not None))
+    record_property("endpoint_create_entered", str(client.endpoint_request is not None))
+    record_property("state", durable.state.value)
+    assert caught is not None
+    assert "cannot override" in str(caught)
+    assert client.pod_request is None and client.endpoint_request is None
+    assert durable.state is OllamaLeaseState.FAILED
+    assert durable.provision_attempts == 0
+    assert durable.provisioning_intent is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service_path", ["waiting", "ready"])
+@pytest.mark.parametrize("case", ["future-birth", "changed-birth", "stable-birth"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, id="endpoint"),
+        pytest.param(OllamaLeaseMode.DEDICATED_POD, id="pod"),
+    ],
+)
+async def test_r29_readiness_preserves_original_creation_authority(
+    native_provisioning, tmp_path, monkeypatch, record_property, mode, case, service_path
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "r29-creation.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(clock, mode=mode, max_authorized_cost=5.0)
+    plan = (
+        serverless_plan()
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
+        else pod_plan(rate=0.5)
+    )
+    waiting = await service.acquire(request, plan=plan, wait_until_ready=False)
+    intent, receipt = waiting.provisioning_intent, waiting.provisioning_receipt
+    assert intent is not None and receipt is not None
+    if mode is OllamaLeaseMode.DEDICATED_POD:
+        state["readback"]["runtime"] = {
+            "ports": [{"privatePort": 11434, "type": "http"}]
+        }
+    if service_path == "ready":
+        ready = await service.reconcile_lease(
+            request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+        )
+        assert ready.state is OllamaLeaseState.READY
+    with closing(sqlite3.connect(repository.path)) as connection:
+        original_raw = connection.execute(
+            "SELECT provisioning_receipt_json FROM ollama_leases WHERE lease_id = ?",
+            (request.lease_id,),
+        ).fetchone()[0]
+    clock.advance(2)
+    birth = (
+        clock() + timedelta(days=1)
+        if case == "future-birth"
+        else receipt.provider_created_at + timedelta(seconds=1)
+        if case == "changed-birth"
+        else receipt.provider_created_at
+    )
+    assert receipt.provider_created_at <= receipt.readback_at < clock()
+    if case == "changed-birth":
+        assert intent.provision_requested_at <= birth <= clock()
+    record_property(
+        "injection_entry",
+        "original-" + service_path + "-before-createdAt-readback-mutation",
+    )
+    state["replace_on_get"] = {"createdAt": birth.isoformat()}
+    state["workload_calls"].clear()
+    resource = ProvisionedOllamaResource(
+        intent.resource_type, receipt.provider_resource_id, intent.resource_name
+    )
+    direct_error = None
+    direct_observation = None
+    try:
+        direct_observation = await provider.observe(resource, intent, receipt)
+    except OllamaProvisioningMismatchError as error:
+        direct_error = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "reason": error.evidence.reason.value,
+        }
+    except OllamaProvisioningEvidenceError as error:
+        direct_error = {"type": type(error).__name__, "message": str(error)}
+    direct_calls = list(state["workload_calls"])
+    state["workload_calls"].clear()
+    provider_before = list(state["calls"])
+    public_error = None
+    public = None
+    try:
+        public = await (
+            service.reconcile_lease(
+                request.lease_id,
+                owner_id=request.owner_id,
+                workload_id=request.workload_id,
+            )
+            if service_path == "waiting"
+            else service.get(
+                request.lease_id,
+                owner_id=request.owner_id,
+                workload_id=request.workload_id,
+            )
+        )
+    except OllamaLeaseReadinessError as error:
+        public_error = {"type": type(error).__name__, "message": str(error)}
+    retained = repository.get(request.lease_id)
+    assert retained is not None
+    public_calls = list(state["workload_calls"])
+    provider_delta = state["calls"][len(provider_before):]
+    recovery = None
+    if case == "future-birth" and retained.state is not OllamaLeaseState.TERMINATED:
+        state["replace_on_get"] = {}
+        recovered = await service.reconcile_lease(
+            request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+        )
+        recovery = {
+            "state": recovered.state.value,
+            "route": recovered.route_url,
+            "receipt": recovered.provisioning_receipt.to_dict(),
+        }
+    with closing(sqlite3.connect(repository.path)) as connection:
+        final_raw = connection.execute(
+            "SELECT provisioning_receipt_json FROM ollama_leases WHERE lease_id = ?",
+            (request.lease_id,),
+        ).fetchone()[0]
+    facts = {
+        "mode": mode.value,
+        "case": case,
+        "service_path": service_path,
+        "original_receipt": receipt.to_dict(),
+        "original_raw": original_raw,
+        "fresh_birth": birth.isoformat(),
+        "fresh_readback_clock": clock().isoformat(),
+        "direct_error": direct_error,
+        "direct_ready": (
+            direct_observation.provider_ready if direct_observation is not None else None
+        ),
+        "direct_calls": direct_calls,
+        "public_error": public_error,
+        "public_state": public.state.value if public is not None else None,
+        "public_route": public.route_url if public is not None else None,
+        "retained_state": retained.state.value,
+        "retained_billing": retained.lifecycle_billing_state.value,
+        "retained_evidence": retained.provisioning_evidence_state.value,
+        "retained_receipt": retained.provisioning_receipt.to_dict(),
+        "retained_mismatch": (
+            retained.provisioning_mismatch.reason.value
+            if retained.provisioning_mismatch is not None
+            else None
+        ),
+        "public_calls": public_calls,
+        "provider_delta": provider_delta,
+        "recovery": recovery,
+        "final_raw": final_raw,
+    }
+    record_property("r29_creation_authority", json.dumps(facts, sort_keys=True, default=str))
+    assert final_raw == original_raw
+    if case == "future-birth":
+        assert direct_error == {
+            "type": "OllamaProvisioningEvidenceError",
+            "message": "Ollama provider readback chronology or binding is invalid",
+        }
+        assert direct_calls == public_calls == []
+        assert retained.provisioning_mismatch is None
+        assert retained.state is not OllamaLeaseState.TERMINATED
+        assert public is None or public.route_url is None
+        assert not any(
+            method == "DELETE" or path.endswith("/action")
+            for method, path in provider_delta
+        )
+        assert recovery is not None and recovery["state"] == "ready"
+        assert recovery["route"] and recovery["receipt"] == receipt.to_dict()
+    elif case == "changed-birth":
+        assert direct_error == {
+            "type": "OllamaProvisioningMismatchError",
+            "message": "Ollama readiness readback changed original provisioning authority",
+            "reason": "resource_identity",
+        }
+        assert direct_calls == public_calls == []
+        assert retained.state is OllamaLeaseState.TERMINATED
+        assert facts["retained_mismatch"] == "resource_identity"
+        assert public is not None and public.route_url is None
+        assert retained.cleanup_intent is not None and retained.cleanup_receipt is not None
+    else:
+        assert direct_error is None and direct_observation.provider_ready
+        assert direct_calls and public_calls
+        assert public_error is None
+        assert public is not None and public.state is OllamaLeaseState.READY
+        assert public.route_url
+        assert retained.provisioning_mismatch is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,key,value,expected",
+    [
+        pytest.param("cuda-int", "minCudaVersion", 17, "unavailable", id="cuda-int"),
+        pytest.param("cuda-list", "minCudaVersion", ["12.4"], "unavailable", id="cuda-list"),
+        pytest.param("allowed-scalar", "allowedCudaVersions", 17, "unavailable", id="allowed-scalar"),
+        pytest.param("allowed-member", "allowedCudaVersions", [17], "unavailable", id="allowed-member"),
+        pytest.param("excluded-scalar", "excludedTypes", 17, "unavailable", id="excluded-scalar"),
+        pytest.param("excluded-member", "excludedTypes", [17], "unavailable", id="excluded-member"),
+        pytest.param("neutral", "minCudaVersion", None, "healthy", id="neutral"),
+        pytest.param("valid-floor", "minCudaVersion", "12.4", "mismatch", id="valid-floor"),
+        pytest.param("valid-exclusion", "excludedTypes", ["foreign-gpu"], "mismatch", id="valid-exclusion"),
+        pytest.param("independent-drift", "minCudaVersion", 17, "mismatch", id="independent-drift"),
+    ],
+)
+async def test_r29_malformed_optional_gpu_evidence_cannot_authorize_cleanup(
+    native_provisioning, tmp_path, monkeypatch, record_property, case, key, value, expected
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    fixture_provider, state = native_provisioning
+    clock = MutableClock()
+    provider = _native_readiness_provider(fixture_provider, state, clock)
+    repository = SQLiteOllamaLeaseRepository(tmp_path / "r29-gpu-evidence.sqlite3")
+    service = OllamaLeaseService(
+        repository=repository,
+        provider=provider,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    request = make_request(
+        clock, mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, max_authorized_cost=5.0
+    )
+    waiting = await service.acquire(
+        request, plan=serverless_plan(), wait_until_ready=False
+    )
+    ready = await service.reconcile_lease(
+        request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+    )
+    assert ready.state is OllamaLeaseState.READY
+    intent, receipt = ready.provisioning_intent, ready.provisioning_receipt
+    assert intent is not None and receipt is not None
+    assert "minCudaVersion" not in json.loads(intent.provider_request_json)["gpu"]
+    original_gpu = dict(state["readback"]["gpu"])
+    changed_gpu = {**original_gpu, key: value}
+    record_property(
+        "injection_entry", "original-ready-before-gpu-policy-mutation"
+    )
+    state["replace_on_get"] = {"gpu": changed_gpu}
+    if case == "independent-drift":
+        state["replace_on_get"]["workers"] = {
+            **state["readback"]["workers"], "min": 4, "max": 4
+        }
+    with closing(sqlite3.connect(repository.path)) as connection:
+        original_raw = connection.execute(
+            "SELECT provisioning_receipt_json FROM ollama_leases WHERE lease_id = ?",
+            (request.lease_id,),
+        ).fetchone()[0]
+    resource = ProvisionedOllamaResource(
+        intent.resource_type, receipt.provider_resource_id, intent.resource_name
+    )
+    direct_error = None
+    direct_receipt = None
+    try:
+        direct_receipt = await provider.observe_provisioning(intent, resource)
+    except OllamaProvisioningMismatchError as error:
+        direct_error = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "reason": error.evidence.reason.value,
+        }
+    except OllamaProvisioningEvidenceError as error:
+        direct_error = {"type": type(error).__name__, "message": str(error)}
+    state["workload_calls"].clear()
+    provider_before = list(state["calls"])
+    public_error = None
+    public = None
+    try:
+        public = await service.get(
+            request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+        )
+    except OllamaLeaseReadinessError as error:
+        public_error = {"type": type(error).__name__, "message": str(error)}
+    retained = repository.get(request.lease_id)
+    assert retained is not None
+    public_calls = list(state["workload_calls"])
+    provider_delta = state["calls"][len(provider_before):]
+    recovery = None
+    if expected == "unavailable" and retained.state is not OllamaLeaseState.TERMINATED:
+        state["replace_on_get"] = {}
+        recovered = await service.get(
+            request.lease_id, owner_id=request.owner_id, workload_id=request.workload_id
+        )
+        recovery = {
+            "state": recovered.state.value,
+            "route": recovered.route_url,
+            "receipt": recovered.provisioning_receipt.to_dict(),
+        }
+    with closing(sqlite3.connect(repository.path)) as connection:
+        final_raw = connection.execute(
+            "SELECT provisioning_receipt_json FROM ollama_leases WHERE lease_id = ?",
+            (request.lease_id,),
+        ).fetchone()[0]
+    facts = {
+        "case": case, "key": key, "value": value, "expected": expected,
+        "original_gpu": original_gpu, "fresh_gpu": changed_gpu,
+        "original_receipt": receipt.to_dict(), "original_raw": original_raw,
+        "direct_error": direct_error,
+        "direct_receipt": direct_receipt.to_dict() if direct_receipt is not None else None,
+        "public_error": public_error,
+        "public_state": public.state.value if public is not None else None,
+        "public_route": public.route_url if public is not None else None,
+        "retained_state": retained.state.value,
+        "retained_billing": retained.lifecycle_billing_state.value,
+        "retained_evidence": retained.provisioning_evidence_state.value,
+        "retained_receipt": retained.provisioning_receipt.to_dict(),
+        "retained_mismatch": (
+            retained.provisioning_mismatch.reason.value
+            if retained.provisioning_mismatch is not None else None
+        ),
+        "cleanup_receipt": (
+            retained.cleanup_receipt.to_dict() if retained.cleanup_receipt is not None else None
+        ),
+        "public_calls": public_calls, "provider_delta": provider_delta,
+        "recovery": recovery, "final_raw": final_raw,
+    }
+    record_property("r29_optional_gpu", json.dumps(facts, sort_keys=True, default=str))
+    assert final_raw == original_raw
+    if expected == "unavailable":
+        assert direct_error == {
+            "type": "OllamaProvisioningEvidenceError",
+            "message": "Ollama Endpoint omitted original policy evidence: gpu."
+            + key + " (invalid)",
+        }
+        assert public_error is not None and public_error["type"] == "OllamaLeaseReadinessError"
+        assert public_calls == []
+        assert retained.state is OllamaLeaseState.READY
+        assert retained.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+        assert retained.provisioning_mismatch is None and retained.cleanup_receipt is None
+        assert not any(
+            method == "DELETE" or path.endswith("/action")
+            for method, path in provider_delta
+        )
+        assert recovery is not None and recovery["state"] == "ready"
+        assert recovery["route"] and recovery["receipt"] == receipt.to_dict()
+    elif expected == "mismatch":
+        assert direct_error == {
+            "type": "OllamaProvisioningMismatchError",
+            "message": "Ollama Endpoint placement policy does not match intent",
+            "reason": "endpoint_policy",
+        }
+        assert public_calls == []
+        assert retained.state is OllamaLeaseState.TERMINATED
+        assert facts["retained_mismatch"] == "endpoint_policy"
+        assert retained.cleanup_receipt is not None
+    else:
+        assert direct_error is None and direct_receipt is not None
+        assert public_error is None
+        assert public is not None and public.state is OllamaLeaseState.READY
+        assert public.route_url and public_calls
+        assert retained.provisioning_mismatch is None

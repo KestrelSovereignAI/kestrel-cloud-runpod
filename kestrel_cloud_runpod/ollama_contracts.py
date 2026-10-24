@@ -1506,11 +1506,11 @@ def _validate_telemetry_phase(
     started_at: datetime | None,
     completed_at: datetime | None,
     duration_ms: int | None,
-) -> None:
+) -> bool:
     if started_at is None or completed_at is None:
         if duration_ms is not None:
             raise ValueError(f"Ollama telemetry {name} duration is unbound")
-        return
+        return False
     if completed_at < started_at:
         raise ValueError(f"Ollama telemetry {name} order is invalid")
     derived_ms = (completed_at - started_at) // timedelta(milliseconds=1)
@@ -1521,6 +1521,7 @@ def _validate_telemetry_phase(
     # quantization interval; larger discrepancies remain invalid.
     if duration_ms not in {derived_ms, max(0, derived_ms - 1)}:
         raise ValueError(f"Ollama telemetry {name} duration is inconsistent")
+    return True
 
 
 @dataclass(frozen=True)
@@ -1656,6 +1657,20 @@ class OllamaRuntimeTelemetrySnapshot:
             self.model_ready_at,
             self.model_load_ms,
         )
+        previous = self.container_started_at
+        for timestamp in (
+            self.ollama_process_started_at,
+            self.ollama_healthy_at,
+            self.model_pull_started_at,
+            self.model_pull_completed_at,
+            self.model_load_started_at,
+            self.model_ready_at,
+            self.ready_at,
+        ):
+            if timestamp is not None:
+                if timestamp < previous:
+                    raise ValueError("Ollama telemetry startup order is invalid")
+                previous = timestamp
         if self.ready_at is not None and any(
             timestamp is not None and timestamp > self.ready_at
             for timestamp in (self.ollama_healthy_at, self.model_ready_at)
@@ -1862,6 +1877,31 @@ class OllamaRuntimeTelemetryObservation:
             and snapshot.ollama_process_running is True
             and snapshot.ready_at is not None
             and snapshot.terminal_error is None
+            and snapshot.container_to_ready_ms is not None
+            and _validate_telemetry_phase(
+                "Ollama boot",
+                snapshot.ollama_process_started_at,
+                snapshot.ollama_healthy_at,
+                snapshot.ollama_boot_ms,
+            )
+            and _validate_telemetry_phase(
+                "model load",
+                snapshot.model_load_started_at,
+                snapshot.model_ready_at,
+                snapshot.model_load_ms,
+            )
+            and (
+                snapshot.cache_hit is True
+                or (
+                    snapshot.cache_hit is False
+                    and _validate_telemetry_phase(
+                        "model pull",
+                        snapshot.model_pull_started_at,
+                        snapshot.model_pull_completed_at,
+                        snapshot.model_pull_ms,
+                    )
+                )
+            )
         )
 
     def to_dict(self) -> dict[str, Any]:
