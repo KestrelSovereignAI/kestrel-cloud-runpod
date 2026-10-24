@@ -15,11 +15,16 @@ from kestrel_cloud_runpod import await_owned_effect
 def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     dependencies = [Requirement(value) for value in requires("kestrel-cloud-runpod")]
     (core,) = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    (sdk,) = [
+        value for value in dependencies if value.name == "kestrel-sovereign-sdk"
+    ]
+    assert {str(value) for value in sdk.specifier} == {">=0.43.0", "<1"}
     assert "0.53.34" not in core.specifier
     # SDK0.43's trust-bundle profile first resolves with published Core0.54.4.
     assert "0.53.35" not in core.specifier
     assert "0.54.3" not in core.specifier
     assert "0.54.4" in core.specifier
+    assert {str(value) for value in core.specifier} == {">=0.54.4", "<1"}
     test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
     assert test_loop.marker.evaluate({"extra": "test"})
     assert not test_loop.marker.evaluate({"extra": ""})

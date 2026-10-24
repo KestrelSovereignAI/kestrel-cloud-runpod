@@ -86,10 +86,11 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   poll. Historical rows keep unknown cleanup and cost provenance; only a
   strictly current request proven never to have reached provider admission may
   record no provider effect.
-- Require Core 0.53.43 for provider-neutral refresh of cached terminal inference
-  evidence, the canonical joined-effect owner, and direct-node execution-control
-  classification used by this adapter, including the public owned-operation
-  facade used to retain cancellation and cleanup outcomes.
+- Require published Core 0.54.4, compatible with SDK 0.43's trust bundle, for
+  provider-neutral refresh of cached terminal
+  inference evidence, the canonical joined-effect owner, and direct-node
+  execution-control classification used by this adapter, including the public
+  owned-operation facade used to retain cancellation and cleanup outcomes.
 
 ## [0.15.1] - 2026-10-20
 
