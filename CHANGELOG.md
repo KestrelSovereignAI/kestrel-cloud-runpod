@@ -6,6 +6,15 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Match the pinned CPU Pod response object and complete empty create intent;
+  schema-validate readiness fixtures, preserve missing facts as unknown and bind
+  the original start window to planning. Enforce Decimal tuple bounds independent
+  of ambient precision, including retained catalog facts and integral RAM.
+- Preserve original transport outcomes through joined TLS retirement. Close-only
+  failures after write remain unknown; route/TLS diagnostics stay private. Test
+  an actual owned peer withholding close_notify and document the dedicated CA
+  required before presenting the client certificate.
+
 - Refuse zero catalog compute prices with a domain error and keep zero realized
   Pod rates unknown, including RUNNING placeholders. Bound noncompute policy
   precision, magnitude and UTC timestamp range before any catalog request.

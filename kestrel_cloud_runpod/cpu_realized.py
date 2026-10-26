@@ -6,10 +6,10 @@ These checks never create, adopt, connect, delete or infer physical release.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from collections.abc import Mapping
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
 
@@ -82,7 +82,9 @@ def inspect_cpu_readiness(
         plan.request.expires_at,
         plan.planned_at + timedelta(seconds=plan.request.ready_timeout_seconds),
     )
-    if not plan.planned_at <= at < deadline:
+    if at < plan.planned_at:
+        raise CpuPodReadinessUnknown(expected_pod_id)
+    if at >= deadline:
         raise CpuPodMismatch(expected_pod_id)
     expected = {
         "name": "kestrel-cpu-" + plan.request.digest()[:32],
@@ -99,32 +101,56 @@ def inspect_cpu_readiness(
             observed != value or (name == "disk" and type(observed) is not int)
         ):
             raise CpuPodMismatch(expected_pod_id)
-    cpu = raw.get("cpu")
-    networking = raw.get("globalNetworking")
-    if raw.get("gpu") not in (None, {}) or (networking is not False and networking is not None):
+    # Known changes to the empty create intent are contradictions. Missing
+    # required readback fields stay unknown, including during provisioning.
+    empty = {
+        "ports": [], "env": {}, "mounts": {}, "args": "", "registry": None,
+        "locked": False, "template": None,
+    }
+    unknown = any(raw.get(name) is None for name in expected)
+    for name, value in empty.items():
+        if name not in raw:
+            unknown = True
+        elif raw[name] != value or type(raw[name]) is not type(value):
+            raise CpuPodMismatch(expected_pod_id)
+    for name in ("cmd", "entrypoint"):
+        if name in raw and (type(raw[name]) is not list or raw[name] != []):
+            raise CpuPodMismatch(expected_pod_id)
+    # These optional fields are omitted, never null, on schema-valid CPU Pods.
+    if "gpu" in raw or "cluster" in raw:
         raise CpuPodMismatch(expected_pod_id)
-    if cpu is not None:
-        if not isinstance(cpu, Mapping):
-            raise CpuPodMismatch(expected_pod_id)
-        if (
-            cpu.get("id") != plan.profile.cpu_id
-            or type(cpu.get("vcpuCount")) is not int
-            or cpu.get("vcpuCount") != plan.profile.vcpu_count
-            or type(cpu.get("memory")) is not int
-            or Decimal(cpu["memory"]) != plan.catalog.ram_gb
-        ):
-            raise CpuPodMismatch(expected_pod_id)
+    networking = raw.get("globalNetworking")
+    if networking is None:
+        unknown = True
+    elif not isinstance(networking, Mapping):
+        raise CpuPodMismatch(expected_pod_id)
+    elif "ip" in networking or "internalDns" in networking:
+        raise CpuPodMismatch(expected_pod_id)
+    elif "enabled" not in networking:
+        unknown = True
+    elif networking["enabled"] is not False:
+        raise CpuPodMismatch(expected_pod_id)
+    cpu = raw.get("cpu")
+    if cpu is None:
+        unknown = True
+    elif not isinstance(cpu, Mapping):
+        raise CpuPodMismatch(expected_pod_id)
+    else:
+        for name, value in {
+            "id": plan.profile.cpu_id, "vcpuCount": plan.profile.vcpu_count,
+            "memory": int(plan.catalog.ram_gb),
+        }.items():
+            if name not in cpu or cpu[name] is None:
+                unknown = True
+            elif cpu[name] != value or type(cpu[name]) is not type(value):
+                raise CpuPodMismatch(expected_pod_id)
     status = raw.get("status")
+    if status is not None and status not in ("RUNNING", "PROVISIONING", "STARTING"):
+        raise CpuPodMismatch(expected_pod_id)
+    if unknown or status is None:
+        raise CpuPodReadinessUnknown(expected_pod_id)
     if status in {"PROVISIONING", "STARTING"}:
         return CpuPodObservation(expected_pod_id, plan.request.digest(), at, "pending")
-    if status != "RUNNING":
-        raise CpuPodMismatch(expected_pod_id)
-    if (
-        any(raw.get(name) is None for name in expected)
-        or cpu is None
-        or raw.get("globalNetworking") is not False
-    ):
-        raise CpuPodReadinessUnknown(expected_pod_id)
     cost = raw.get("cost")
     if type(cost) not in (int, float):
         raise CpuPodReadinessUnknown(expected_pod_id)
@@ -135,7 +161,7 @@ def inspect_cpu_readiness(
         raise CpuPodMismatch(expected_pod_id)
     try:
         started = datetime.fromisoformat(raw["startedAt"])
-        if started.utcoffset() is None or not plan.request.requested_at <= started <= at:
+        if started.utcoffset() is None or not plan.planned_at <= started <= at:
             raise ValueError
     except (KeyError, ValueError, TypeError):
         raise CpuPodReadinessUnknown(expected_pod_id) from None

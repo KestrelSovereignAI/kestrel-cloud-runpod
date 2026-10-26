@@ -40,7 +40,11 @@ finite disk/transfer/cleanup hourly and fixed estimates with original provenance
 exact provider/profile/disk/datacenter/full-profile-digest binding, explicit
 covered components and a window covering request lifetime plus cleanup grace. Neither
 value defaults to zero. Both amounts permit at most 12 fractional places and
-24 whole digits; policy timestamps must convert within the UTC calendar range.
+24 whole digits, checked on the original Decimal tuple without ambient-context
+normalization or rounding (including retained model copies). Nested catalog
+amounts have the same bounded Decimal requirement and allocated RAM must be
+integral, as required by the pinned Pod response. Non-finite catalog prices fail
+before ordered comparison. Policy timestamps must convert within the UTC calendar range.
 Invalid policy values fail typed validation before catalog access. These are
 operator estimates, not provider billing caps
 or verified paid observations. Unknown components must not be represented as

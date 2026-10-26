@@ -34,15 +34,26 @@ class PinnedWorkerTarget:
     expires_at: datetime
 
     def __post_init__(self):
-        try:
-            ipaddress.ip_address(self.address)  # No ambient DNS or rebinding.
-        except (ValueError, TypeError):
-            raise ValueError("private worker requires a numeric endpoint") from None
+        valid_address = False
+        if type(self.address) is str and "%" not in self.address:
+            try:
+                ipaddress.ip_address(self.address)  # No ambient DNS or rebinding.
+                valid_address = True
+            except ValueError:
+                pass
+        # Raise outside the parsing handler: even __context__ contains no route.
+        if not valid_address:
+            raise ValueError("private worker requires a numeric endpoint")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ValueError("invalid private worker port")
-        if not re.fullmatch(r"[a-f0-9]{64}", self.certificate_sha256):
+        if type(self.certificate_sha256) is not str or not re.fullmatch(
+            r"[a-f0-9]{64}", self.certificate_sha256
+        ):
             raise ValueError("exact pretrusted worker certificate pin required")
-        if not self.server_name or self.expires_at.utcoffset() is None:
+        if (
+            type(self.server_name) is not str or not self.server_name
+            or not isinstance(self.expires_at, datetime) or self.expires_at.utcoffset() is None
+        ):
             raise ValueError("private worker name and aware expiry required")
 
 
@@ -114,6 +125,10 @@ class PinnedWorkerTLS:
             check()
             writer = None
             sent = False
+            failure = None
+            close_failure = None
+            native_io = True
+            failure_is_native = False
             try:
                 async with asyncio.timeout(timeout_seconds):
                     reader, writer = await asyncio.open_connection(
@@ -125,6 +140,7 @@ class PinnedWorkerTLS:
                         ssl_shutdown_timeout=min(1.0, float(timeout_seconds)),
                         limit=self.MAX_RESPONSE + 1,
                     )
+                    native_io = False
                     peer = writer.get_extra_info("ssl_object")
                     if peer is None or peer.version() != "TLSv1.3":
                         raise ResourceUnsupported("private worker TLS version is not admitted")
@@ -135,31 +151,55 @@ class PinnedWorkerTLS:
                         raise ResourceUnsupported("private worker certificate does not match")
                     # No await between the ORIGINAL check and the final write.
                     check()
+                    native_io = True
                     writer.write(request)
                     sent = True
                     await writer.drain()
                     response = await reader.readline()
                     if not response.endswith(b"\n") or len(response) > self.MAX_RESPONSE:
                         raise ResourceOutcomeUnknown("worker response framing is uncertain")
-            except Exception as error:
-                if sent:
-                    raise ResourceOutcomeUnknown(
-                        "private worker exchange requires original-ID reconciliation"
-                    ) from error
-                raise
+            except BaseException as error:
+                failure = error
+                failure_is_native = native_io
             finally:
                 if writer is not None:
-                    writer.close()
+                    try:
+                        writer.close()
+                    except Exception as error:
+                        close_failure = error
                     try:
                         await await_owned_effect(writer.wait_closed())
-                    except (ConnectionError, ssl.SSLError):
-                        pass  # Close may fail after the peer/transport is already gone.
+                    except BaseException as error:
+                        if close_failure is None:
+                            close_failure = error
+            # Classify only after physical retirement. Close errors cannot mask
+            # an existing admission/framing/cancellation outcome. Raw native TLS
+            # exceptions can contain private routes; do not attach them as causes
+            # or contexts to the content-free public transport classification.
+            if failure is None:
+                failure = close_failure
+                failure_is_native = True
+            if failure is not None:
+                if not isinstance(failure, Exception):
+                    raise failure
+                if sent:
+                    if isinstance(failure, ResourceOutcomeUnknown):
+                        raise failure
+                    raise ResourceOutcomeUnknown(
+                        "private worker exchange requires original-ID reconciliation"
+                    )
+                if failure_is_native and isinstance(failure, OSError):
+                    raise ResourceUnsupported("private worker connection failed")
+                raise failure
             # Joining physical socket retirement may await after response read.
             # Retain the original delivery check through that last await too.
+            denied = False
             try:
                 check()
-            except Exception as error:
+            except Exception:
+                denied = True
+            if denied:
                 raise ResourceOutcomeUnknown(
                     "private worker delivery requires original-ID reconciliation"
-                ) from error
+                )
             return response

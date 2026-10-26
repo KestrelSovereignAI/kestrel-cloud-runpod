@@ -3,9 +3,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from dataclasses import replace
+from hashlib import sha256
 import ssl
+import socket
+import threading
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -48,6 +50,7 @@ async def tls_peer(tmp_path):
         .sign(key, None)
     )
     ca_path = tmp_path / "ca.pem"
+    issued_files = [ca_path]
     ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
 
     def leaf(label, server):
@@ -72,6 +75,7 @@ async def tls_peer(tmp_path):
         )
         cert_path = tmp_path / (label + ".pem")
         key_path = tmp_path / (label + ".key")
+        issued_files.extend((cert_path, key_path))
         cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         key_path.write_bytes(
             private.private_bytes(
@@ -158,6 +162,9 @@ async def tls_peer(tmp_path):
         for task in tuple(tasks):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for path in issued_files:
+            path.unlink()
+        assert not any(path.exists() for path in issued_files)
 
 
 async def test_real_pinned_mutual_tls_carries_one_frame_under_original_admission(tls_peer):
@@ -354,3 +361,167 @@ def test_invalid_private_route_is_not_echoed_in_validation_diagnostics():
             "private-route-secret.invalid", 443, "worker", "a" * 64, datetime.now(UTC)
         )
     assert "private-route-secret" not in str(error.value)
+    assert error.value.__context__ is None and error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("address", [1, True, b"\x7f\x00\x00\x01", "fe80::1%private-zone"])
+def test_numeric_endpoint_requires_literal_text_without_scope_or_retained_parse_error(address):
+    with pytest.raises(ValueError, match="numeric endpoint") as error:
+        PinnedWorkerTarget(address, 443, "worker", "a" * 64, datetime.now(UTC))
+    assert error.value.__context__ is None and error.value.__cause__ is None
+
+
+async def test_native_connect_failure_has_no_private_route_in_exception_chain(tls_peer):
+    target, context, _, _, _ = tls_peer
+    # Bind our own socket without listening: this exact owned endpoint refuses.
+    with socket.socket() as owned:
+        owned.bind(("127.0.0.1", 0))
+        target = replace(target, port=owned.getsockname()[1])
+        with pytest.raises(ResourceUnsupported, match="connection failed") as error:
+            await PinnedWorkerTLS(target, context()).exchange(
+                b"private\n", admission=admission({"current": True})
+            )
+    assert "127.0.0.1" not in str(error.value) and str(target.port) not in str(error.value)
+    assert error.value.__context__ is None and error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("close_error", [TimeoutError("private-shutdown"), OSError("private-route")])
+@pytest.mark.parametrize("outcome", ["response", "wrong-pin", "unframed"])
+async def test_close_error_cannot_replace_original_classification(tls_peer, monkeypatch, close_error, outcome):
+    target, context, _, _, _ = tls_peer
+    original_open = asyncio.open_connection
+
+    async def close_error_open(*args, **kwargs):
+        reader, writer = await original_open(*args, **kwargs)
+        original_wait = writer.wait_closed
+
+        async def wait_closed():
+            await original_wait()  # Actual native socket is retired first.
+            raise close_error
+
+        writer.wait_closed = wait_closed
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", close_error_open)
+    if outcome == "wrong-pin":
+        target = replace(target, certificate_sha256="0" * 64)
+    expected = ResourceUnsupported if outcome == "wrong-pin" else ResourceOutcomeUnknown
+    message = "certificate does not match" if outcome == "wrong-pin" else (
+        "framing is uncertain" if outcome == "unframed" else "original-ID reconciliation"
+    )
+    with pytest.raises(expected, match=message) as error:
+        await PinnedWorkerTLS(target, context()).exchange(
+            b"lost\n" if outcome == "unframed" else b"original\n",
+            admission=admission({"current": True}),
+        )
+    assert error.value.__context__ is None and error.value.__cause__ is None
+    assert "private-shutdown" not in str(error.value) and "private-route" not in str(error.value)
+
+
+async def test_native_peer_withholding_close_notify_keeps_postwrite_unknown_and_reaps_socket(
+    tls_peer, monkeypatch
+):
+    target, context, _, _, _ = tls_peer
+    release = threading.Event()
+    received = []
+    failures = []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(3)
+    original_port = listener.getsockname()[1]
+    retired = []
+    close_failures = []
+    original_open = asyncio.open_connection
+
+    async def observe_native_close(*args, **kwargs):
+        reader, writer = await original_open(*args, **kwargs)
+        original_wait = writer.wait_closed
+
+        async def wait_closed():
+            try:
+                await original_wait()
+            except Exception as error:
+                # Observe the real CPython close result; inject no error.
+                close_failures.append((type(error), str(error)))
+                raise
+
+        writer.wait_closed = wait_closed
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", observe_native_close)
+
+    def serve():
+        try:
+            with listener.accept()[0] as connection:
+                connection.settimeout(3)
+                with context(False).wrap_socket(connection, server_side=True) as tls:
+                    retired.append(tls)
+                    frame = b""
+                    while not frame.endswith(b"\n"):
+                        frame += tls.recv(1024)
+                    received.append(frame)
+                    tls.sendall(b"original-receipt\n")
+                    # SSLSocket performs no background read. Unlike an asyncio
+                    # server it cannot auto-answer close_notify while withheld.
+                    if not release.wait(4):
+                        raise AssertionError("owned peer exceeded fixed lifetime")
+        except BaseException as error:
+            failures.append(error)
+
+    child = threading.Thread(target=serve, name="owned-close-notify-peer")
+    child.start()
+    try:
+        with pytest.raises(ResourceOutcomeUnknown, match="original-ID reconciliation") as error:
+            await PinnedWorkerTLS(replace(target, port=original_port), context()).exchange(
+                b"original-action-id\n", admission=admission({"current": True}), timeout_seconds=0.3
+            )
+        assert received == [b"original-action-id\n"] and child.is_alive()
+        assert close_failures == [(TimeoutError, "SSL shutdown timed out")]
+        assert error.value.__context__ is None and error.value.__cause__ is None
+    finally:
+        release.set()
+        listener.close()
+        await asyncio.to_thread(child.join, 4)
+        assert not child.is_alive() and listener.fileno() == -1
+        assert len(retired) == 1 and retired[0].fileno() == -1
+        assert not failures
+
+
+
+async def test_repeated_cancellation_keeps_native_close_join_owned(tls_peer, monkeypatch):
+    target, context, received, _, _ = tls_peer
+    original_open = asyncio.open_connection
+    closing, resume, joined = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def delayed_close(*args, **kwargs):
+        reader, writer = await original_open(*args, **kwargs)
+        original_wait = writer.wait_closed
+
+        async def wait_closed():
+            await original_wait()
+            closing.set()
+            await resume.wait()
+            joined.set()
+
+        writer.wait_closed = wait_closed
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", delayed_close)
+    task = asyncio.create_task(PinnedWorkerTLS(target, context()).exchange(
+        b"original\n", admission=admission({"current": True})
+    ))
+    try:
+        await asyncio.wait_for(closing.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not joined.is_set()
+        resume.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert joined.is_set() and received == [b"original\n"]
+    finally:
+        resume.set()
+        await asyncio.gather(task, return_exceptions=True)

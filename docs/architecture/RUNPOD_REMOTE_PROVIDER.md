@@ -11,7 +11,13 @@ store, wallet, action queue or inference integration is added.
 `cpu_realized.inspect_cpu_readiness` consumes the production v2 Pod parser's
 observation for the EXACT original Pod ID retained by the host. It checks the
 accepted plan's request-scoped name, digest-pinned image string, CPU flavor/count,
-RAM, disk, secure cloud and realized data center. Data-center create preferences
+integral RAM, disk, secure cloud and realized data center. The readback uses
+`Pod.globalNetworking`'s pinned response object (`enabled: false`, no `ip` or
+`internalDns`), not the request boolean. It requires the exact empty ports,
+environment, mounts and args, no registry/template, unlocked state and no GPU or
+cluster membership. Optional deconstructed command fields must also be empty.
+A missing required fact stays unknown even while provisioning; a known changed
+fact is a contradiction. Data-center create preferences
 are not enforcement. Only RUNNING has an authoritative compute rate: it must be
 known, finite and no greater than the accepted COMPUTE rate, not the larger
 all-in rate. Pending zero placeholders do not become free capacity. Initial
@@ -19,19 +25,30 @@ readiness has one fixed deadline; retries cannot renew it. Known contradiction
 or elapsed readiness preserves the original Pod ID and requires exact teardown.
 Unknown observations remain unknown, not absent/released. A repeated name is a
 candidate only: duplicates are ambiguous, and no candidate never proves an
-in-flight create cannot finish. `startedAt` is an incarnation hint, not an
-attestation. These pure checks are factual correlation, never caller authority.
+in-flight create cannot finish. `startedAt` must fall between original planning and observation; it is an
+incarnation hint, not an attestation. A caller clock before planning is unknown,
+not evidence of a contradictory Pod. These pure checks are factual correlation, never caller authority.
 
 `remote_worker_tls.PinnedWorkerTLS` sends one bounded opaque newline frame per
 native TLS connection. It requires TLS1.3, certificate chain/hostname verification,
 an exact pretrusted peer certificate pin, an explicit numeric endpoint and fixed
-expiry. The host owns client certificate loading and the CA; no TOFU or ambient
-DNS lookup is used. The ORIGINAL async policy admission remains retained through
+expiry. The host owns client certificate loading and a dedicated, provisioned CA;
+no TOFU or ambient DNS lookup is used. Mutual TLS presents the client certificate
+during the handshake, before the application can verify the peer certificate
+pin. Therefore the original host must provision a dedicated trust root for the
+exact worker destination and load only the intended request-scoped client
+identity. A broadly trusted public or cross-tenant CA is not sufficient for
+client-identity confidentiality; the later certificate pin does not retroactively
+protect that handshake. No CA or identity is discovered from the endpoint. The ORIGINAL async policy admission remains retained through
 connect, handshake, final write and response. Its synchronous checker runs after
 handshake immediately before the final write with no intervening await. After
 write, transport loss/denied delivery requires original-ID reconciliation; there
-are no automatic retries. Cancellation retains the original host's unknown
-custody and closes/joins the socket. Control and data calls share no client queue.
+are no automatic retries. A close-notify timeout or other close-only error after write is also unknown.
+Socket retirement cannot replace an already classified admission/framing error.
+Native route/TLS exception messages and their attached contexts/causes are not
+returned by the transport; errors expose only content-free classification.
+Cancellation retains the original host's unknown custody and physically joins
+the socket retirement even under repeated cancellation. Control and data calls share no client queue.
 Server priority dispatch and physical input retirement still require the real
 worker. The byte channel does not authenticate SDK scope/session/epoch by itself:
 the reviewed worker/driver must enforce those original bindings, current epoch,
@@ -40,8 +57,10 @@ credentials and original receipts through every actual effect and transfer.
 Tests use the production v2 GET parser over MockTransport plus actual native TLS
 sockets with a locally owned CA and exact client/server certificates. They test
 post-handshake revocation before bytes, post-write revocation, receipt loss,
-certificate/hostname/owner denial, fixed expiry, bounded frames and independent
-concurrent transport. They do not run Chromium, cloud isolation, an AMD64 image,
+certificate/hostname/owner denial, fixed expiry, bounded frames, independent
+concurrent transport and an owned native peer that withholds close_notify.
+Nominal running and pending Pod fixtures validate against the pinned response
+schema before intentional missing/contradictory-fact tests modify them. They do not run Chromium, cloud isolation, an AMD64 image,
 a remote worker or real Runpod provisioning, and are not worker conformance.
 
 ## Canonical acquisition custody gap
