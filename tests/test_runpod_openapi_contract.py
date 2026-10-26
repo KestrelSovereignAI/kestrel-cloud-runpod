@@ -25,6 +25,7 @@ SCHEMA_PATH = ROOT / "vendor" / "runpod-v2-openapi.yaml"
 LOCK_PATH = ROOT / "vendor" / "runpod-v2-openapi.lock.json"
 
 REQUIRED_OPERATIONS = {
+    ("/v2/catalog/cpus", "get"): "listCpuTypes",
     ("/v2/catalog/gpus", "get"): "listGpuTypes",
     ("/v2/catalog/gpus/{id}", "get"): "getGpuType",
     ("/v2/pods", "get"): "listPods",

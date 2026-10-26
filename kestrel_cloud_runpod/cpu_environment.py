@@ -1,6 +1,6 @@
 """Read-only CPU acquisition prerequisites, not an admitted visual provider.
 
-The canonical host still owns grants, accepted quotes, request/lease custody,
+The admitting host must own grants, accepted quotes, request/lease custody,
 unknown-create reconciliation and teardown. No method in this module creates a
 Pod or asserts that a CPU allocation provides a secure browser transport.
 """
@@ -13,13 +13,15 @@ from decimal import Decimal
 import hashlib
 import json
 from types import MappingProxyType
-from typing import Protocol, Self
+from typing import Callable, Literal, Protocol, Self
 
 from pydantic import AwareDatetime, model_validator
 
 from kestrel_sdk.computer_use import EnvironmentRequest
-from kestrel_sdk.computer_use.models import PinnedImage
-from kestrel_sdk.resources import Identifier, PositiveInt, ResourceContract, ResourceUnsupported, USD
+from kestrel_sdk.computer_use.models import ImageDigest, PinnedImage
+from kestrel_sdk.resources import (
+    Identifier, PositiveInt, ResourceContract, ResourceUnsupported, USD,
+)
 from .billing import billing_identity_amount, exact_decimal_sum
 from .cpu_catalog import CpuCatalogSnapshot, CpuPodCatalogMatch
 from .models import ComputeProduct, CpuPodCreateRequest
@@ -30,8 +32,27 @@ def _aware(at: datetime) -> None:
         raise ValueError("CPU planning requires a trusted aware current time")
 
 
+def _utc_iso(at: datetime) -> str:
+    _aware(at)
+    try:
+        return at.astimezone(UTC).isoformat()
+    except OverflowError:
+        raise ValueError("CPU timestamp is outside the supported UTC range") from None
+
+
+def _digest(kind: str, payload: dict) -> str:
+    envelope = {"kind": kind, "version": 1, "payload": payload}
+    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_catalog_age(value: timedelta) -> None:
+    if not isinstance(value, timedelta) or not timedelta(0) < value <= timedelta(minutes=1):
+        raise ValueError("CPU catalog freshness must be positive and at most one minute")
+
+
 class CpuEnvironmentProfile(ResourceContract):
-    """Trusted exact placement/image; no arbitrary ports, mounts, env or args."""
+    """Exact requested shape/image; datacenter placement remains a preference."""
 
     provider_id: Identifier
     profile_id: Identifier
@@ -57,15 +78,23 @@ class CpuEnvironmentProfile(ResourceContract):
         if request.location != "remote" or request.surface != "browser":
             raise ResourceUnsupported("CPU planning requires an explicit remote browser request")
         if not request.required_capabilities <= {
-                "screenshot", "click", "type", "key", "scroll", "wait", "navigate", "takeover"}:
-            raise ResourceUnsupported("CPU planning has no file/exec/clipboard/DOM transport conformance")
+                "screenshot", "click", "type", "key", "scroll", "wait", "navigate",
+                "takeover"}:
+            raise ResourceUnsupported(
+                "CPU planning has no file/exec/clipboard/DOM/accessibility conformance"
+            )
         if not request.requested_at <= at < request.expires_at:
             raise ResourceUnsupported("CPU request is outside its fixed lifetime")
         if request.expires_at - request.requested_at > timedelta(seconds=self.max_lifetime_seconds):
             raise ResourceUnsupported("CPU request exceeds the configured lifetime")
+        if at >= request.expires_at - timedelta(seconds=request.ready_timeout_seconds):
+            raise ResourceUnsupported("CPU request has insufficient remaining readiness time")
 
-    def pod_request(self, request: EnvironmentRequest) -> CpuPodCreateRequest:
-        """Exact wire intent, with a deterministic name; never paid authority."""
+    def digest(self) -> str:
+        return _digest("runpod.cpu-environment-profile", self.model_dump(mode="json"))
+
+    def _pod_request(self, request: EnvironmentRequest) -> CpuPodCreateRequest:
+        """Internal construction after plan admission; never paid authority."""
         return CpuPodCreateRequest(
             name="kestrel-cpu-" + request.digest()[:32], image=self.image,
             cpu_id=self.cpu_id, vcpu_count=self.vcpu_count,
@@ -84,6 +113,12 @@ No network volumes/persistent storage are supported by this planner.
 """
 
     policy_id: Identifier
+    provider_id: Identifier
+    profile_id: Identifier
+    profile_sha256: ImageDigest
+    disk_gb: PositiveInt
+    data_center_id: Identifier
+    covered_components: frozenset[Literal["container_disk", "transfer", "cleanup"]]
     observed_at: AwareDatetime
     expires_at: AwareDatetime
     disk_transfer_cleanup_hourly_usd: USD
@@ -93,10 +128,29 @@ No network volumes/persistent storage are supported by this planner.
     def coverage_window(self) -> Self:
         if self.expires_at <= self.observed_at:
             raise ValueError("CPU cost policy expiry must follow observation")
+        if self.covered_components != {"container_disk", "transfer", "cleanup"}:
+            raise ValueError("CPU cost policy must explicitly cover disk, transfer and cleanup")
         return self
 
-    def require_coverage(self, request: EnvironmentRequest, profile: CpuEnvironmentProfile, *, at: datetime) -> None:
+    def digest(self) -> str:
+        payload = self.model_dump(mode="json")
+        payload["covered_components"] = sorted(self.covered_components)
+        for name in ("disk_transfer_cleanup_hourly_usd", "disk_transfer_cleanup_fixed_usd"):
+            payload[name] = billing_identity_amount(getattr(self, name))
+        for name in ("observed_at", "expires_at"):
+            payload[name] = _utc_iso(getattr(self, name))
+        return _digest("runpod.cpu-noncompute-policy", payload)
+
+    def require_coverage(
+        self, request: EnvironmentRequest, profile: CpuEnvironmentProfile, *, at: datetime,
+    ) -> None:
         _aware(at)
+        if (self.provider_id, self.profile_id, self.profile_sha256,
+                self.disk_gb, self.data_center_id) != (
+                profile.provider_id, profile.profile_id, profile.digest(),
+                profile.disk_gb, profile.data_center_id) or self.covered_components != {
+                    "container_disk", "transfer", "cleanup"}:
+            raise ResourceUnsupported("CPU noncompute policy prices another profile/disk/region")
         if not self.observed_at <= at < self.expires_at:
             raise ResourceUnsupported("CPU noncompute cost policy is not current")
         if self.expires_at - request.expires_at < timedelta(seconds=profile.cleanup_grace_seconds):
@@ -127,51 +181,57 @@ class CpuEnvironmentAcquisitionPlan:
     catalog: CpuPodCatalogMatch
     planned_at: datetime
     expires_at: datetime
+    catalog_max_age: timedelta = timedelta(seconds=30)
 
     def __post_init__(self):
         _aware(self.planned_at)
         _aware(self.expires_at)
         _aware(self.catalog.observed_at)
+        _require_catalog_age(self.catalog_max_age)
+        self.profile.require_request(self.request, at=self.planned_at)
+        self.noncompute.require_coverage(self.request, self.profile, at=self.planned_at)
         if (self.catalog.cpu_id, self.catalog.vcpu_count, self.catalog.data_center_ids) != (
                 self.profile.cpu_id, self.profile.vcpu_count, (self.profile.data_center_id,)):
             raise ValueError("CPU catalog match differs from the exact profile")
         if (not self.catalog.ram_gb.is_finite() or self.catalog.ram_gb <= 0
-                or not self.catalog.compute_cost_per_hr.is_finite() or self.catalog.compute_cost_per_hr < 0):
+                or not self.catalog.compute_cost_per_hr.is_finite()
+                or self.catalog.compute_cost_per_hr < 0):
             raise ValueError("CPU planning requires finite known resource/price facts")
         if not self.catalog.observed_at <= self.planned_at < self.expires_at <= min(
                 self.request.expires_at, self.noncompute.expires_at,
-                self.catalog.observed_at + timedelta(minutes=1)):
+                self.catalog.observed_at + self.catalog_max_age,
+                self.request.expires_at - timedelta(seconds=self.request.ready_timeout_seconds)):
             raise ValueError("CPU plan lifetime exceeds current catalog/request/policy facts")
 
     @property
     def all_in_hourly_usd(self) -> Decimal:
-        return exact_decimal_sum((self.catalog.compute_cost_per_hr, self.noncompute.disk_transfer_cleanup_hourly_usd))
+        return exact_decimal_sum((self.catalog.compute_cost_per_hr,
+                                  self.noncompute.disk_transfer_cleanup_hourly_usd))
 
     @property
     def estimated_total_usd(self) -> Decimal:
         # Price the entire admitted lifetime, including elapsed provisioning,
         # and a configured cleanup grace. A late create never widens TTL.
-        duration = self.request.expires_at - self.request.requested_at + timedelta(seconds=self.profile.cleanup_grace_seconds)
+        duration = (self.request.expires_at - self.request.requested_at
+                    + timedelta(seconds=self.profile.cleanup_grace_seconds))
         return exact_decimal_sum((_duration_cost(self.all_in_hourly_usd, duration),
                                   self.noncompute.disk_transfer_cleanup_fixed_usd))
 
     def digest(self) -> str:
         payload = dict(
-            request_sha256=self.request.digest(), profile=self.profile.model_dump(mode="json"),
-            noncompute=self.noncompute.model_dump(mode="json"),
+            request_sha256=self.request.digest(), profile_sha256=self.profile.digest(),
+            noncompute_sha256=self.noncompute.digest(),
             cpu_id=self.catalog.cpu_id, vcpu_count=self.catalog.vcpu_count,
             data_center_ids=self.catalog.data_center_ids,
             ram_gb=billing_identity_amount(self.catalog.ram_gb),
             compute_hourly_usd=billing_identity_amount(self.catalog.compute_cost_per_hr),
             all_in_hourly_usd=billing_identity_amount(self.all_in_hourly_usd),
             estimated_total_usd=billing_identity_amount(self.estimated_total_usd),
-            planned_at=self.planned_at.astimezone(UTC).isoformat(),
-            expires_at=self.expires_at.astimezone(UTC).isoformat(),
-            catalog_observed_at=self.catalog.observed_at.astimezone(UTC).isoformat(),
+            planned_at=_utc_iso(self.planned_at), expires_at=_utc_iso(self.expires_at),
+            catalog_observed_at=_utc_iso(self.catalog.observed_at),
+            catalog_max_age_us=self.catalog_max_age // timedelta(microseconds=1),
         )
-        for name in ("observed_at", "expires_at"):
-            payload["noncompute"][name] = getattr(self.noncompute, name).astimezone(UTC).isoformat()
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return _digest("runpod.cpu-environment-plan", payload)
 
     def pod_request(
         self, request: EnvironmentRequest, profile: CpuEnvironmentProfile,
@@ -183,43 +243,59 @@ class CpuEnvironmentAcquisitionPlan:
         hold current grants/privacy, and reconcile any unknown create by the
         original request. This plan owns no mutation or second custody store.
         """
-        if request != self.request or profile != self.profile or noncompute != self.noncompute:
-            raise ResourceUnsupported("CPU plan differs from the original request/profile/cost policy")
-        profile.require_request(request, at=at)
-        noncompute.require_coverage(request, profile, at=at)
+        if (request.digest() != self.request.digest()
+                or profile.digest() != self.profile.digest()
+                or noncompute.digest() != self.noncompute.digest()):
+            raise ResourceUnsupported(
+                "CPU plan differs from the original request/profile/cost policy"
+            )
+        self.profile.require_request(self.request, at=at)
+        self.noncompute.require_coverage(self.request, self.profile, at=at)
         if not self.planned_at <= at < self.expires_at:
             raise ResourceUnsupported("CPU acquisition plan expired or is from the future")
-        if (self.all_in_hourly_usd > request.max_hourly_cost_usd
-                or self.estimated_total_usd > request.max_total_cost_usd):
+        if (self.all_in_hourly_usd > self.request.max_hourly_cost_usd
+                or self.estimated_total_usd > self.request.max_total_cost_usd):
             raise ResourceUnsupported("CPU all-in estimate exceeds the original cost ceilings")
-        return profile.pod_request(request)
+        return self.profile._pod_request(self.request)
 
 
 class CpuEnvironmentPlanner:
     """Uses the production v2 catalog client without exposing a create method."""
 
-    def __init__(self, client: CpuCatalogReader, *, catalog_max_age: timedelta = timedelta(seconds=30)):
-        if not isinstance(catalog_max_age, timedelta) or not timedelta(0) < catalog_max_age <= timedelta(minutes=1):
-            raise ValueError("CPU catalog freshness must be positive and at most one minute")
+    def __init__(
+        self, client: CpuCatalogReader, *, catalog_max_age: timedelta = timedelta(seconds=30),
+    ):
+        _require_catalog_age(catalog_max_age)
         self.client, self.catalog_max_age = client, catalog_max_age
 
     def plan(
         self, request: EnvironmentRequest, profile: CpuEnvironmentProfile,
-        noncompute: CpuNonComputeCostPolicy, *, clock=lambda: datetime.now(UTC),
+        noncompute: CpuNonComputeCostPolicy, *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> CpuEnvironmentAcquisitionPlan:
         # Production list_cpus records observation before its real HTTP request;
         # the second clock sample includes provider latency in freshness checks.
         initial = clock()
         profile.require_request(request, at=initial)
         noncompute.require_coverage(request, profile, at=initial)
-        snapshot = self.client.list_cpus(product=ComputeProduct.POD, vcpu_count=profile.vcpu_count)
+        snapshot = self.client.list_cpus(
+            product=ComputeProduct.POD, vcpu_count=profile.vcpu_count,
+        )
         now = clock()
         profile.require_request(request, at=now)
         noncompute.require_coverage(request, profile, at=now)
-        match = snapshot.match_pod(profile.pod_request(request), now=now, max_age=self.catalog_max_age)
+        if not initial <= snapshot.observed_at <= now:
+            raise ResourceUnsupported("CPU catalog clock does not cover the current API request")
+        if now >= snapshot.observed_at + self.catalog_max_age:
+            raise ResourceUnsupported("CPU catalog freshness expired during planning")
+        match = snapshot.match_pod(
+            profile._pod_request(request), now=now, max_age=self.catalog_max_age,
+        )
         plan = CpuEnvironmentAcquisitionPlan(
             request, profile, noncompute, match, now,
-            min(request.expires_at, noncompute.expires_at, snapshot.observed_at + self.catalog_max_age),
+            min(request.expires_at - timedelta(seconds=request.ready_timeout_seconds),
+                noncompute.expires_at, snapshot.observed_at + self.catalog_max_age),
+            self.catalog_max_age,
         )
         plan.pod_request(request, profile, noncompute, at=now)
         return plan

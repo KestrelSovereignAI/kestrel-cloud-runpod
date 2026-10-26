@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
+import json
 import tomllib
 
 import httpx
@@ -17,6 +18,7 @@ from kestrel_sdk.resources import ResourceScope, ResourceUnsupported
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.cpu_environment import (
     CpuEnvironmentPlanner, CpuEnvironmentProfile, CpuNonComputeCostPolicy,
+    _duration_cost,
 )
 from kestrel_cloud_runpod.models import RunPodManagerError
 from scripts.check_runpod_openapi import load_openapi
@@ -33,9 +35,14 @@ def profile(**changes):
     ) | changes))
 
 
-def policy(**changes):
+def policy(*, priced_profile=None, **changes):
+    priced = priced_profile or profile()
     return CpuNonComputeCostPolicy(**(dict(
         policy_id="explicit-estimate-v1", observed_at=NOW - timedelta(minutes=1),
+        provider_id=priced.provider_id, profile_id=priced.profile_id,
+        profile_sha256=priced.digest(), disk_gb=priced.disk_gb,
+        data_center_id=priced.data_center_id,
+        covered_components=frozenset({"container_disk", "transfer", "cleanup"}),
         expires_at=NOW + timedelta(hours=2),
         disk_transfer_cleanup_hourly_usd=Decimal("0.02"),
         disk_transfer_cleanup_fixed_usd=Decimal("0.01"),
@@ -54,21 +61,25 @@ def request(**changes):
 
 
 def cpu(**changes):
-    return dict(
-        id="cpu5c", name="Compute", group="Gen5", vcpu={"min": 2, "max": 32},
-        ramGbPerVcpu=2.5, price={"securePerVcpu": 0.04}, availability="HIGH",
-        dataCenters=[{"id": "US-TX-3", "availability": "MEDIUM"}],
-    ) | changes
+    fixture = Path(__file__).parent / "fixtures/cpu_environment_catalog_v2.json"
+    return json.loads(fixture.read_text())["cpus"][0] | changes
 
 
 def make_plan(*, original=None, configured=None, costs=None, raw=None, clock=lambda: NOW):
+    calls = []
+
     def handler(http_request):
+        calls.append(http_request)
         assert http_request.method == "GET" and http_request.url.path == "/v2/catalog/cpus"
         assert dict(http_request.url.params) == {"include": "AVAILABILITY", "product": "POD", "vcpuCount": "4"}
         return httpx.Response(200, json={"cpus": [cpu() if raw is None else raw]})
 
     with closing(RunpodControlPlaneClient(api_key="synthetic", http_transport=httpx.MockTransport(handler))) as client:
-        return CpuEnvironmentPlanner(client).plan(original or request(), configured or profile(), costs or policy(), clock=clock)
+        plan = CpuEnvironmentPlanner(client).plan(
+            original or request(), configured or profile(), costs or policy(), clock=clock,
+        )
+        assert len(calls) == 1
+        return plan
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +111,14 @@ def test_real_client_only_reads_catalog_and_emits_exact_cpu_intent_matching_pinn
     document = load_openapi((Path(__file__).resolve().parents[1] / "vendor/runpod-v2-openapi.yaml").read_text())
     Draft202012Validator({"$ref": "#/components/schemas/CreatePodRequest", "components": document["components"]}).validate(wire)
     assert make_plan().digest() == plan.digest()
+
+
+def test_cpu_catalog_fixture_matches_the_actual_pinned_response_schema():
+    root = Path(__file__).resolve().parents[1]
+    document = load_openapi((root / "vendor/runpod-v2-openapi.yaml").read_text())
+    Draft202012Validator({
+        "$ref": "#/components/schemas/ListCpuTypesResponse", "components": document["components"],
+    }).validate({"cpus": [cpu()]})
 
 
 @pytest.mark.parametrize("changes", [
@@ -143,7 +162,7 @@ def test_unknown_price_stock_region_or_shape_is_not_a_plan(raw):
 
 def test_catalog_latency_counts_against_freshness_and_request_lifetime():
     times = iter([NOW, NOW + timedelta(seconds=31)])
-    with pytest.raises(RunPodManagerError, match="stale"):
+    with pytest.raises(ResourceUnsupported, match="freshness"):
         make_plan(clock=lambda: next(times))
 
 
@@ -165,9 +184,10 @@ def test_plan_cannot_be_used_after_expiry_or_with_changed_original_bindings():
 
 def test_plan_digest_binds_cpu_economics_placement_owner_and_policy_provenance():
     original = make_plan()
+    larger = profile(disk_gb=21)
     for changed in (
         replace(original, request=request(request_id="other")),
-        replace(original, profile=profile(disk_gb=21)),
+        replace(original, profile=larger, noncompute=policy(priced_profile=larger)),
         replace(original, noncompute=policy(policy_id="other")),
         replace(original, catalog=replace(original.catalog, ram_gb=Decimal("11"))),
         replace(original, catalog=replace(original.catalog, compute_cost_per_hr=Decimal("0.17"))),
@@ -227,4 +247,99 @@ def test_no_fake_provider_registration_or_cpu_custody_store():
         "kestrel_sovereign.environment_providers", "kestrel_sovereign.computer_drivers"))
     assert not hasattr(CpuEnvironmentPlanner, "acquire")
     assert not hasattr(CpuEnvironmentPlanner, "release")
+    assert not hasattr(CpuEnvironmentProfile, "pod_request")
     assert "kestrel-sovereign-sdk>=0.43.0,<1" in pyproject["project"]["dependencies"]
+
+
+def test_request_identity_uses_exact_sdk_digest_even_for_equal_decimal_values():
+    original = make_plan()
+    changed = request(max_hourly_cost_usd=Decimal("0.2"), max_total_cost_usd=Decimal("0.110"))
+    assert changed == original.request and changed.digest() != original.request.digest()
+    with pytest.raises(ResourceUnsupported, match="original"):
+        original.pod_request(changed, profile(), policy(), at=NOW)
+    assert original.pod_request(request(), profile(), policy(), at=NOW).name == (
+        "kestrel-cpu-" + original.request.digest()[:32]
+    )
+
+
+def test_final_intent_emitter_receives_the_stored_original_objects(monkeypatch):
+    plan = make_plan()
+    received = []
+    emitter = CpuEnvironmentProfile._pod_request
+
+    def capture(instance, original):
+        received.append((instance, original))
+        return emitter(instance, original)
+
+    monkeypatch.setattr(CpuEnvironmentProfile, "_pod_request", capture)
+    clone = EnvironmentRequest.model_validate_json(request().model_dump_json())
+    assert clone is not plan.request and clone.digest() == plan.request.digest()
+    plan.pod_request(clone, profile(), policy(), at=NOW)
+    assert len(received) == 1
+    assert received[0][0] is plan.profile and received[0][1] is plan.request
+
+
+@pytest.mark.parametrize("changes", [
+    {"provider_id": "other"}, {"profile_id": "other"}, {"profile_sha256": "b" * 64},
+    {"disk_gb": 2000}, {"data_center_id": "EU-RO-1"},
+])
+def test_noncompute_policy_prices_exactly_the_bound_profile(changes):
+    with pytest.raises(ResourceUnsupported, match="another profile"):
+        make_plan(costs=policy(**changes))
+    with pytest.raises(ResourceUnsupported, match="another profile"):
+        make_plan(configured=profile(disk_gb=2000))
+
+
+def test_cost_policy_requires_all_components_and_prices_numeric_identity_canonically():
+    with pytest.raises(ValidationError, match="explicitly cover"):
+        policy(covered_components=frozenset({"container_disk", "transfer"}))
+    copied = policy().model_copy(update={"covered_components": frozenset({"container_disk"})})
+    with pytest.raises(ResourceUnsupported, match="another profile"):
+        make_plan(costs=copied)
+    equivalent = policy(disk_transfer_cleanup_hourly_usd=Decimal("0.020"),
+                        disk_transfer_cleanup_fixed_usd=Decimal("0.01000"))
+    assert policy().digest() == equivalent.digest()
+    original = make_plan()
+    assert replace(original, noncompute=equivalent).digest() == original.digest()
+    assert original.pod_request(request(), profile(), equivalent, at=NOW) == (
+        original.pod_request(request(), profile(), policy(), at=NOW)
+    )
+
+
+def test_fractional_cost_rounds_up_and_exact_cost_ceiling_equality_is_accepted():
+    assert _duration_cost(Decimal("0.01"), timedelta(microseconds=1)) == Decimal("3E-12")
+    original = request(max_hourly_cost_usd=Decimal("0.18"), max_total_cost_usd=Decimal("0.103"))
+    plan = make_plan(original=original)
+    assert plan.pod_request(original, profile(), policy(), at=NOW).disk_gb == 20
+
+
+def test_half_open_catalog_expiry_has_a_domain_error_at_the_exact_boundary():
+    times = iter([NOW, NOW + timedelta(seconds=30)])
+    with pytest.raises(ResourceUnsupported, match="freshness"):
+        make_plan(clock=lambda: next(times))
+
+
+@pytest.mark.parametrize("initial", [NOW + timedelta(seconds=1), NOW - timedelta(seconds=1)])
+def test_catalog_observation_must_belong_to_the_same_api_call_clock_window(initial):
+    times = iter([initial, initial])
+    with pytest.raises(ResourceUnsupported, match="clock"):
+        make_plan(original=request(requested_at=NOW - timedelta(minutes=1)),
+                  clock=lambda: next(times))
+
+
+def test_plan_expiry_reserves_full_readiness_time_and_never_widens_request_ttl():
+    short = request(expires_at=NOW + timedelta(seconds=61))
+    plan = make_plan(original=short)
+    assert plan.expires_at == NOW + timedelta(seconds=1)
+    with pytest.raises(ResourceUnsupported, match="readiness"):
+        plan.pod_request(short, profile(), policy(), at=NOW + timedelta(seconds=1))
+    times = iter([NOW, NOW + timedelta(seconds=1)])
+    with pytest.raises(ResourceUnsupported, match="readiness"):
+        make_plan(original=short, clock=lambda: next(times))
+
+
+def test_takeover_is_only_a_logical_controller_fence_not_manual_transport_support():
+    plan = make_plan(original=request(required_capabilities=frozenset({"screenshot", "takeover"})))
+    assert plan.request.required_capabilities == {"screenshot", "takeover"}
+    with pytest.raises(ResourceUnsupported, match="accessibility"):
+        make_plan(original=request(required_capabilities=frozenset({"screenshot", "accessibility"})))

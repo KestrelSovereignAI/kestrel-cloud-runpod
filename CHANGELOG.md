@@ -11,6 +11,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   provenance. Include lifetime/cleanup estimates under both cost ceilings and
   emit a short-lived exact CPU Pod intent without registering a visual provider
   or adding capacity custody. No paid create or browser transport is implied.
+- Bind intent names to the exact original SDK request digest, and bind
+  noncompute policies to the complete requested profile and cost components.
+  Canonical policy/profile digests distinguish domain/version and normalize
+  numerical policy amounts. Reserve readiness time and check a single catalog
+  clock window. Document placement preferences and required realized Pod
+  region/shape/billed-rate verification plus teardown before admission.
 
 ### Changed
 
