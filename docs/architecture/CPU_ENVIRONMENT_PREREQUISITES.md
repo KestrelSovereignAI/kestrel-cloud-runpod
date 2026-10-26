@@ -21,8 +21,11 @@ that request does not advertise manual pixels/input or the optional human channe
 It reads `/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=N` through
 `RunpodControlPlaneClient`, preserving request-start time. Provider latency
 counts toward a short freshness limit. The observed timestamp must lie between
-the same call's initial and final trusted clock samples. Exact freshness expiry
-fails with a domain error. Unknown price, stock, requested data center
+the same call's initial and final trusted clock samples. An injected planner
+clock must use the same authoritative wall-clock domain as the production
+catalog client's system UTC clock; an arbitrary synthetic epoch is not a
+supported production clock. Naive snapshot timestamps are refused explicitly.
+Exact freshness expiry fails with a domain error. Unknown price, stock, requested data center
 or shape fails. This uses the API's
 [CPU catalog](https://docs.runpod.io/api-reference-v2/catalog/list-cpu-types)
 and existing typed
@@ -60,8 +63,10 @@ original readiness timeout; a late plan cannot extend the original request TTL.
 
 Core #3703 candidate source owns the intended canonical visual request/quote/
 lease/connection/action store. Published Core 0.55.0 does not yet contain that
-new SDK visual runtime/provider registration; its legacy computer-use feature
-is a separately authorized host-access surface. A compatible reviewed Core
+new SDK visual runtime/provider registration. This planning package requires
+published Core >=0.54.4, the first version resolving SDK0.43 and its TLS bundle.
+That dependency compatibility does not satisfy visual runtime readiness.
+Core's legacy computer-use feature is a separately authorized host-access surface. A compatible reviewed Core
 release and registered runtime remain prerequisites, not published readiness.
 A complete adapter must persist the exact accepted all-in quote and original
 create intent there before calling the existing paid v2 create boundary. A
@@ -76,9 +81,14 @@ not enforcement. After create, retain original Pod ID/custody and inspect the
 realized `dataCenterId`, CPU type/count, image/cloud/disk and Pod `cost` before
 connecting, sending private content/credentials or claiming readiness. Require
 the actual data center to equal the original authorized region, actual shape
-to match the admitted profile and finite known billed `cost` to be no greater
-than the planned compute rate. Pending observations may be polled only within
-the original readiness deadline without private content or credentials. A verified
+to match the admitted profile. Read the authoritative billed `cost` from a
+`RUNNING` Pod. Require the billed rate to be finite, known and no greater than
+`plan.catalog.compute_cost_per_hr`, the planned compute-only rate; do not compare
+it with `plan.all_in_hourly_usd`. Missing rates, and a `0.0` placeholder while
+PROVISIONING/STARTING/EXITED/TERMINATED, are unknown rather than free or
+ready resources. Non-RUNNING observations do not establish an admitted billed
+rate even if they contain a numeric value. Pending observations may be polled
+only within the original readiness deadline without private content or credentials. A verified
 mismatch, or still-unknown facts at that deadline, refuses admission and triggers
 teardown of the ORIGINAL owned Pod through canonical cleanup custody.
 Teardown errors remain unknown and retain that ID until actual release is proven.

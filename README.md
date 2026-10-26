@@ -6,6 +6,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Installation
 
+Requires Core >=0.54.4 and SDK >=0.43; older Core SDK pins are incompatible.
+
 ```bash
 uv pip install kestrel-cloud-runpod
 ```

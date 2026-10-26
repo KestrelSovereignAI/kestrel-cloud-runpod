@@ -20,7 +20,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Changed
 
-- Require published SDK 0.43 or newer for canonical visual resource contracts.
+- Require published SDK 0.43 or newer for canonical visual resource contracts
+  and Core 0.54.4 or newer, the first published Core resolving that SDK and its
+  TLS trust bundle.
+- Revalidate original typed CPU planning inputs before catalog access and plan
+  construction; unchecked copies cannot bypass cost, grace or request bounds.
+  Reject timezone-naive catalog snapshots with an explicit domain error.
 
 ## [0.16.0] - 2026-10-20
 
