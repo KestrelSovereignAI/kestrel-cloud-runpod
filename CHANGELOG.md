@@ -6,6 +6,11 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Added
 
+- Add exact original CPU Pod readiness observations and a bounded pretrusted
+  TLS byte channel with retained current-call checks. Native TLS and synthetic
+  control-plane tests are independent prerequisites, not a registered remote
+  provider, browser/workspace driver or cloud conformance claim.
+
 - Read-only CPU environment acquisition planning uses the existing v2 catalog,
   exact SDK request/profile/placement bindings and explicit noncompute cost
   provenance. Include lifetime/cleanup estimates under both cost ceilings and
