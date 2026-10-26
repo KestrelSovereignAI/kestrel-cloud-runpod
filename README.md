@@ -6,6 +6,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Installation
 
+Requires Core >=0.54.4 and SDK >=0.43; older Core SDK pins are incompatible.
+
 ```bash
 uv pip install kestrel-cloud-runpod
 ```
@@ -58,6 +60,18 @@ may change after observation, and network-volume attachment compatibility needs
 separate validation. The environment provider must still acquire fresh all-in
 pricing, authorization and durable cleanup custody before provisioning.
 No CPU provisioning tool is registered by this package yet.
+
+`cpu_environment.CpuEnvironmentPlanner` now builds an exact short-lived CPU
+acquisition intent from those production catalog facts, the original SDK
+`EnvironmentRequest`, a digest-pinned requested profile and explicitly bound finite
+disk/transfer/cleanup cost estimates. It checks both original cost ceilings and
+revalidates the same inputs before emitting a typed CPU Pod request. It does
+not provision, own a separate lease store or advertise a secure visual provider.
+The API's data-center field is a placement preference: actual region, CPU shape
+and billed Pod rate must be verified before readiness, with original-custody
+teardown on a mismatch. Published Core 0.55.0 does not supply that new visual runtime.
+See [CPU environment prerequisites](docs/architecture/CPU_ENVIRONMENT_PREREQUISITES.md)
+for the remaining browser transport, original-custody and teardown gates.
 
 ## Configuration
 

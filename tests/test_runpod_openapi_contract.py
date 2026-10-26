@@ -25,6 +25,7 @@ SCHEMA_PATH = ROOT / "vendor" / "runpod-v2-openapi.yaml"
 LOCK_PATH = ROOT / "vendor" / "runpod-v2-openapi.lock.json"
 
 REQUIRED_OPERATIONS = {
+    ("/v2/catalog/cpus", "get"): "listCpuTypes",
     ("/v2/catalog/gpus", "get"): "listGpuTypes",
     ("/v2/catalog/gpus/{id}", "get"): "getGpuType",
     ("/v2/pods", "get"): "listPods",
@@ -86,6 +87,22 @@ def test_consumed_request_and_response_shapes_match_pin():
 
         return collect(schemas[name])
 
+    assert set(schemas["CpuType"]["required"]) == {
+        "id", "name", "group", "vcpu", "ramGbPerVcpu", "price",
+    }
+    cpu = schemas["CpuType"]["properties"]
+    assert set(cpu["vcpu"]["required"]) == {"min", "max"}
+    assert cpu["ramGbPerVcpu"]["type"] == "number"
+    assert set(cpu["price"]["required"]) == {"securePerVcpu", "serverlessPerVcpu"}
+    assert all(cpu["price"]["properties"][name]["type"] == "number"
+               for name in ("securePerVcpu", "serverlessPerVcpu"))
+    assert schemas["ListCpuTypesResponse"]["required"] == ["cpus"]
+    operation = _schema()["paths"]["/v2/catalog/cpus"]["get"]
+    assert [item["$ref"] for item in operation["parameters"]] == [
+        "#/components/parameters/CatalogIncludeParam",
+        "#/components/parameters/CpuProductFilter",
+        "#/components/parameters/CpuVCPUCountFilter",
+    ]
     assert set(schemas["GpuType"]["required"]) >= {
         "id",
         "pool",
