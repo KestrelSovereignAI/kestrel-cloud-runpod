@@ -15,7 +15,7 @@ import json
 from types import MappingProxyType
 from typing import Callable, Literal, Protocol, Self
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from kestrel_sdk.computer_use import EnvironmentRequest
 from kestrel_sdk.computer_use.models import ImageDigest, PinnedImage
@@ -53,6 +53,21 @@ def _digest(kind: str, payload: dict) -> str:
 def _require_catalog_age(value: timedelta) -> None:
     if not isinstance(value, timedelta) or not timedelta(0) < value <= timedelta(minutes=1):
         raise ValueError("CPU catalog freshness must be positive and at most one minute")
+
+
+def _require_bounded_decimal(value: Decimal, *, positive: bool = False) -> None:
+    """Bound original tuple facts without normalize/ambient-context rounding."""
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError("CPU amount must be a finite Decimal")
+    _, digits, exponent = value.as_tuple()
+    if (
+        value < 0
+        or (positive and value == 0)
+        or len(digits) > 36
+        or exponent < -12
+        or len(digits) + exponent > 24
+    ):
+        raise ValueError("CPU amount exceeds nonnegative 36-digit/12-place/24-whole bounds")
 
 
 class CpuEnvironmentProfile(ResourceContract):
@@ -142,8 +157,18 @@ class CpuNonComputeCostPolicy(ResourceContract):
     disk_transfer_cleanup_hourly_usd: USD
     disk_transfer_cleanup_fixed_usd: USD
 
+    @field_validator(
+        "disk_transfer_cleanup_hourly_usd", "disk_transfer_cleanup_fixed_usd", mode="after"
+    )
+    @classmethod
+    def bounded_amount(cls, value):
+        _require_bounded_decimal(value)
+        return value
+
     @model_validator(mode="after")
     def coverage_window(self) -> Self:
+        _utc_iso(self.observed_at)
+        _utc_iso(self.expires_at)
         if self.expires_at <= self.observed_at:
             raise ValueError("CPU cost policy expiry must follow observation")
         if self.covered_components != {"container_disk", "transfer", "cleanup"}:
@@ -223,6 +248,8 @@ class CpuEnvironmentAcquisitionPlan:
         )
         _aware(self.planned_at)
         _aware(self.expires_at)
+        if not isinstance(self.catalog, CpuPodCatalogMatch):
+            raise ValueError("CPU planning requires exact typed catalog facts")
         _aware(self.catalog.observed_at)
         _require_catalog_age(self.catalog_max_age)
         self.profile.require_request(self.request, at=self.planned_at)
@@ -233,13 +260,12 @@ class CpuEnvironmentAcquisitionPlan:
             (self.profile.data_center_id,),
         ):
             raise ValueError("CPU catalog match differs from the exact profile")
-        if (
-            not self.catalog.ram_gb.is_finite()
-            or self.catalog.ram_gb <= 0
-            or not self.catalog.compute_cost_per_hr.is_finite()
-            or self.catalog.compute_cost_per_hr <= 0
-        ):
-            raise ValueError("CPU planning requires positive finite known resource/price facts")
+        _require_bounded_decimal(self.catalog.ram_gb, positive=True)
+        _require_bounded_decimal(self.catalog.compute_cost_per_hr, positive=True)
+        if self.catalog.ram_gb != self.catalog.ram_gb.to_integral_value():
+            raise ValueError("CPU planning requires integral API allocated RAM")
+        if type(self.catalog.vcpu_count) is not int:
+            raise ValueError("CPU planning requires integral API vCPU count")
         if (
             not self.catalog.observed_at
             <= self.planned_at
@@ -378,6 +404,12 @@ class CpuEnvironmentPlanner:
             now=now,
             max_age=self.catalog_max_age,
         )
+        if (
+            not isinstance(match.compute_cost_per_hr, Decimal)
+            or not match.compute_cost_per_hr.is_finite()
+            or match.compute_cost_per_hr <= 0
+        ):
+            raise ResourceUnsupported("CPU catalog requires a positive compute price")
         plan = CpuEnvironmentAcquisitionPlan(
             request,
             profile,

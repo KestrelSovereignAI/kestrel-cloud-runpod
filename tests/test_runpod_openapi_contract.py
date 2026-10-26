@@ -111,6 +111,30 @@ def test_consumed_request_and_response_shapes_match_pin():
         "maxCount",
     }
     assert schemas["ListGpuTypesResponse"]["required"] == ["gpus"]
+    assert required("Pod") >= {
+        "id", "name", "status", "image", "args", "disk", "mounts", "ports", "env",
+        "registry", "cloud", "dataCenterId", "cost", "locked", "startedAt", "globalNetworking",
+    }
+    pod = schemas["Pod"]["allOf"][1]["properties"]
+    assert pod["globalNetworking"] == {"$ref": "#/components/schemas/PodGlobalNetworking"}
+    assert schemas["PodGlobalNetworking"]["required"] == ["enabled"]
+    assert schemas["PodGlobalNetworking"]["type"] == "object"
+    assert schemas["PodGlobalNetworking"]["properties"]["enabled"]["type"] == "boolean"
+    assert {"ip", "internalDns"} <= schemas["PodGlobalNetworking"]["properties"].keys()
+    assert pod["cpu"]["allOf"] == [{"$ref": "#/components/schemas/CpuConfig"}]
+    assert required("CpuConfig") == {"id", "vcpuCount", "memory"}
+    assert schemas["CpuConfig"]["allOf"][1]["properties"]["memory"]["type"] == "integer"
+    base = schemas["BaseContainerConfig"]["properties"]
+    assert base["args"]["type"] == "string"
+    assert base["ports"]["type"] == "array" and base["ports"]["items"]["type"] == "string"
+    assert base["env"]["type"] == "object"
+    assert base["env"]["additionalProperties"] == {"type": "string"}
+    assert schemas["ContainerConfig"]["allOf"][1]["properties"]["registry"]["type"] == ["string", "null"]
+    assert pod["locked"]["type"] == "boolean"
+    assert "cluster" not in required("Pod") and "gpu" not in required("Pod")
+    assert pod["cluster"]["allOf"] == [{"$ref": "#/components/schemas/PodCluster"}]
+    assert pod["mounts"] == {"$ref": "#/components/schemas/Mounts"}
+    assert schemas["Mounts"]["unevaluatedProperties"] is False
     assert required("ListPodsResponse") == {"pods", "pagination"}
     assert required("ListEndpointsResponse") == {"endpoints", "pagination"}
     assert required("ListNetworkVolumesResponse") == {"networkVolumes", "pagination"}

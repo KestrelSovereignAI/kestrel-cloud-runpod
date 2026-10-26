@@ -614,7 +614,7 @@ def test_default_production_clock_matches_the_unpatched_client(monkeypatch):
 def test_zero_catalog_compute_rate_cannot_create_a_free_acquisition_intent(price):
     raw = cpu()
     raw["price"] = dict(raw["price"], securePerVcpu=price)
-    with pytest.raises(ValueError, match="positive finite"):
+    with pytest.raises(ResourceUnsupported, match="positive compute price"):
         make_plan(raw=raw)
 
 
@@ -627,3 +627,116 @@ def test_extreme_profile_duration_is_a_typed_validation_error_before_catalog(fie
     with pytest.raises(ValidationError):
         make_plan(configured=forged, calls=calls)
     assert not calls
+
+
+@pytest.mark.parametrize("field", ["observed_at", "expires_at"])
+def test_policy_rejects_utc_range_overflow_before_any_catalog_call(field):
+    extreme = (
+        datetime(1, 1, 1, 1, tzinfo=timezone(timedelta(hours=14)))
+        if field == "observed_at"
+        else datetime(9999, 12, 31, 23, tzinfo=timezone(timedelta(hours=-5)))
+    )
+    with pytest.raises(ValidationError, match="supported UTC range"):
+        policy(**{field: extreme})
+    costs = policy().model_copy(update={field: extreme})
+    calls = []
+    with pytest.raises(ValidationError, match="supported UTC range"):
+        make_plan(costs=costs, calls=calls)
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "field", ["disk_transfer_cleanup_hourly_usd", "disk_transfer_cleanup_fixed_usd"]
+)
+@pytest.mark.parametrize("amount", [Decimal("1E-1000000"), Decimal("1E1000000")])
+def test_policy_rejects_extreme_precision_and_magnitude_before_catalog(field, amount):
+    with pytest.raises(ValidationError):
+        policy(**{field: amount})
+    costs = policy().model_copy(update={field: amount})
+    calls = []
+    with pytest.raises(ValidationError):
+        make_plan(costs=costs, calls=calls)
+    assert not calls
+
+
+def test_plan_digest_binds_planning_and_catalog_clocks_and_freshness_limit():
+    times = iter([NOW, NOW + timedelta(seconds=1)])
+    original = make_plan(clock=lambda: next(times))
+    variants = (
+        replace(original, planned_at=NOW + timedelta(seconds=2)),
+        replace(original, catalog=replace(original.catalog, observed_at=NOW + timedelta(microseconds=1))),
+        replace(original, catalog_max_age=timedelta(seconds=31)),
+    )
+    for changed in variants:
+        assert changed.digest() != original.digest()
+
+
+@pytest.mark.parametrize("precision", [2, 28, 100])
+@pytest.mark.parametrize("amount", [
+    Decimal("0.0100000000000000000000000000001"),
+    Decimal("123456789012345678901234.0000000000001"),
+    Decimal("0.0123456789012345"),
+    Decimal("0.01" + "0" * 32000 + "1"),
+])
+@pytest.mark.parametrize("field", ["disk_transfer_cleanup_hourly_usd", "disk_transfer_cleanup_fixed_usd"])
+def test_policy_tuple_precision_is_context_independent_before_catalog(precision, amount, field):
+    with localcontext() as context:
+        context.prec = precision
+        with pytest.raises(ValidationError):
+            policy(**{field: amount})
+        copied = policy().model_copy(update={field: amount})
+        calls = []
+        with pytest.raises(ValidationError):
+            make_plan(costs=copied, calls=calls)
+        assert not calls
+
+
+@pytest.mark.parametrize("field", ["ram_gb", "compute_cost_per_hr"])
+@pytest.mark.parametrize("amount", [
+    0.16, "0.16", Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"),
+    Decimal("0.01" + "0" * 80000 + "1"), Decimal("1E1000000"),
+])
+def test_forged_nested_catalog_types_and_tuple_bounds_fail_before_arithmetic(field, amount):
+    original = make_plan()
+    with localcontext() as context:
+        context.prec = 2
+        with pytest.raises(ValueError):
+            replace(original, catalog=replace(original.catalog, **{field: amount}))
+
+
+def test_nonintegral_catalog_ram_cannot_plan_unrealizable_api_memory():
+    with pytest.raises(ValueError, match="integral API allocated RAM"):
+        make_plan(raw=cpu(ramGbPerVcpu=2.51))
+
+
+@pytest.mark.parametrize("price", [Decimal("NaN"), Decimal("sNaN")])
+def test_catalog_reader_nonfinite_rate_has_domain_error_before_comparison(price):
+    original = make_plan()
+
+    class Snapshot:
+        observed_at = NOW
+
+        def match_pod(self, *args, **kwargs):
+            return replace(original.catalog, compute_cost_per_hr=price)
+
+    class Reader:
+        def list_cpus(self, **kwargs):
+            return Snapshot()
+
+    with pytest.raises(ResourceUnsupported, match="positive compute price"):
+        CpuEnvironmentPlanner(Reader()).plan(request(), profile(), policy(), clock=lambda: NOW)
+
+
+def test_exact_maximum_tuple_bounds_and_smallest_fraction_are_accepted_at_low_precision():
+    with localcontext() as context:
+        context.prec = 2
+        for amount in (Decimal("999999999999999999999999.999999999999"), Decimal("1E-12")):
+            assert policy(disk_transfer_cleanup_hourly_usd=amount).disk_transfer_cleanup_hourly_usd == amount
+
+
+
+def test_bounded_policy_json_roundtrip_preserves_exact_original_value():
+    original = policy(disk_transfer_cleanup_hourly_usd=Decimal("0.02000"))
+    restored = CpuNonComputeCostPolicy.model_validate_json(original.model_dump_json())
+    assert restored.disk_transfer_cleanup_hourly_usd.as_tuple() == original.disk_transfer_cleanup_hourly_usd.as_tuple()
+    assert restored.digest() == original.digest()
