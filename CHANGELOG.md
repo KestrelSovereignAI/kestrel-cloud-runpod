@@ -2,6 +2,20 @@
 
 All notable changes to `kestrel-cloud-runpod` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Read-only CPU environment acquisition planning uses the existing v2 catalog,
+  exact SDK request/profile/placement bindings and explicit noncompute cost
+  provenance. Include lifetime/cleanup estimates under both cost ceilings and
+  emit a short-lived exact CPU Pod intent without registering a visual provider
+  or adding capacity custody. No paid create or browser transport is implied.
+
+### Changed
+
+- Require published SDK 0.43 or newer for canonical visual resource contracts.
+
 ## [0.16.0] - 2026-10-20
 
 ### Added

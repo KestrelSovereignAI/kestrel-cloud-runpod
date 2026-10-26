@@ -59,6 +59,15 @@ separate validation. The environment provider must still acquire fresh all-in
 pricing, authorization and durable cleanup custody before provisioning.
 No CPU provisioning tool is registered by this package yet.
 
+`cpu_environment.CpuEnvironmentPlanner` now builds an exact short-lived CPU
+acquisition intent from those production catalog facts, the original SDK
+`EnvironmentRequest`, a digest-pinned placement profile and explicit finite
+disk/transfer/cleanup cost estimates. It checks both original cost ceilings and
+revalidates the same inputs before emitting a typed CPU Pod request. It does
+not provision, own a separate lease store or advertise a secure visual provider.
+See [CPU environment prerequisites](docs/architecture/CPU_ENVIRONMENT_PREREQUISITES.md)
+for the remaining browser transport, original-custody and teardown gates.
+
 ## Configuration
 
 | Variable | Description |
