@@ -15,7 +15,7 @@ import json
 from types import MappingProxyType
 from typing import Callable, Literal, Protocol, Self
 
-from pydantic import AwareDatetime, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from kestrel_sdk.computer_use import EnvironmentRequest
 from kestrel_sdk.computer_use.models import ImageDigest, PinnedImage
@@ -65,8 +65,8 @@ class CpuEnvironmentProfile(ResourceContract):
     vcpu_count: PositiveInt
     data_center_id: Identifier
     disk_gb: PositiveInt
-    max_lifetime_seconds: PositiveInt
-    cleanup_grace_seconds: PositiveInt
+    max_lifetime_seconds: PositiveInt = Field(le=7 * 86400)
+    cleanup_grace_seconds: PositiveInt = Field(le=86400)
 
     @model_validator(mode="after")
     def cpu_shape(self) -> Self:
@@ -237,9 +237,9 @@ class CpuEnvironmentAcquisitionPlan:
             not self.catalog.ram_gb.is_finite()
             or self.catalog.ram_gb <= 0
             or not self.catalog.compute_cost_per_hr.is_finite()
-            or self.catalog.compute_cost_per_hr < 0
+            or self.catalog.compute_cost_per_hr <= 0
         ):
-            raise ValueError("CPU planning requires finite known resource/price facts")
+            raise ValueError("CPU planning requires positive finite known resource/price facts")
         if (
             not self.catalog.observed_at
             <= self.planned_at

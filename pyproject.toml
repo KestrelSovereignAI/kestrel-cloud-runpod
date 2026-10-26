@@ -34,8 +34,8 @@ classifiers = [
 dependencies = [
     "kestrel-sovereign-sdk>=0.43.0,<1",
     # Canonical joined-operation and native terminal-evidence composition.
-    # 0.54.4 is the first published Core resolving SDK 0.43 and its TLS bundle.
     # Do not duplicate Core's ownership algorithm in the cloud adapter.
+    # 0.54.4 is the first published Core resolving SDK 0.43 and its TLS bundle.
     "kestrel-sovereign>=0.54.4,<1",
     # Direct runtime dep of signed_invocations (Ed25519 receipt signing and
     # verification).  Declared explicitly rather than leaned on transitively:

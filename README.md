@@ -69,7 +69,7 @@ revalidates the same inputs before emitting a typed CPU Pod request. It does
 not provision, own a separate lease store or advertise a secure visual provider.
 The API's data-center field is a placement preference: actual region, CPU shape
 and billed Pod rate must be verified before readiness, with original-custody
-teardown on a mismatch. Published Core 0.55 does not supply that new visual runtime.
+teardown on a mismatch. Published Core 0.55.0 does not supply that new visual runtime.
 See [CPU environment prerequisites](docs/architecture/CPU_ENVIRONMENT_PREREQUISITES.md)
 for the remaining browser transport, original-custody and teardown gates.
 

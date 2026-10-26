@@ -11,6 +11,8 @@ The GPU/Ollama offering and its capacity custody are independent and unchanged.
 
 The planner requires an exact trusted requested CPU profile: digest-pinned image,
 CPU flavor/power-of-two count, one explicit preferred data center, disk and lifetime.
+Profile lifetime is at most seven days and cleanup grace at most one day;
+extreme durations fail typed validation before arithmetic or catalog access.
 The original `EnvironmentRequest` must explicitly target that provider/profile,
 image, region and remote browser destination. Files/exec/clipboard/DOM,
 accessibility and native desktop are unsupported prerequisites rather than inferred capabilities.
@@ -25,8 +27,9 @@ the same call's initial and final trusted clock samples. An injected planner
 clock must use the same authoritative wall-clock domain as the production
 catalog client's system UTC clock; an arbitrary synthetic epoch is not a
 supported production clock. Naive snapshot timestamps are refused explicitly.
-Exact freshness expiry fails with a domain error. Unknown price, stock, requested data center
-or shape fails. This uses the API's
+Exact freshness expiry fails with a domain error. Unknown or zero compute price,
+stock, requested data center or shape fails. A zero catalog compute rate is not
+admitted as free capacity. This uses the API's
 [CPU catalog](https://docs.runpod.io/api-reference-v2/catalog/list-cpu-types)
 and existing typed
 [CPU Pod create shape](https://docs.runpod.io/api-reference-v2/pods/create-a-pod),
@@ -64,10 +67,11 @@ original readiness timeout; a late plan cannot extend the original request TTL.
 Core #3703 candidate source owns the intended canonical visual request/quote/
 lease/connection/action store. Published Core 0.55.0 does not yet contain that
 new SDK visual runtime/provider registration. This planning package requires
-published Core >=0.54.4, the first version resolving SDK0.43 and its TLS bundle.
+published Core >=0.54.4, the first version resolving SDK 0.43 and its TLS bundle.
 That dependency compatibility does not satisfy visual runtime readiness.
-Core's legacy computer-use feature is a separately authorized host-access surface. A compatible reviewed Core
-release and registered runtime remain prerequisites, not published readiness.
+Core's legacy computer-use feature is a separately authorized host-access
+surface. A compatible reviewed Core release and registered runtime remain
+prerequisites, not published readiness.
 A complete adapter must persist the exact accepted all-in quote and original
 create intent there before calling the existing paid v2 create boundary. A
 timeout/malformed accepted response retains original unknown custody. Reconcile
@@ -85,7 +89,7 @@ to match the admitted profile. Read the authoritative billed `cost` from a
 `RUNNING` Pod. Require the billed rate to be finite, known and no greater than
 `plan.catalog.compute_cost_per_hr`, the planned compute-only rate; do not compare
 it with `plan.all_in_hourly_usd`. Missing rates, and a `0.0` placeholder while
-PROVISIONING/STARTING/EXITED/TERMINATED, are unknown rather than free or
+PROVISIONING/STARTING/EXITED/TERMINATED/ERROR, are unknown rather than free or
 ready resources. Non-RUNNING observations do not establish an admitted billed
 rate even if they contain a numeric value. Pending observations may be polled
 only within the original readiness deadline without private content or credentials. A verified

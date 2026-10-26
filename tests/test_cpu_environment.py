@@ -216,8 +216,10 @@ def test_exact_profile_destination_and_known_contract_prerequisites_are_required
     ],
 )
 def test_noncompute_policy_must_be_current_and_cover_cleanup(changes):
+    calls = []
     with pytest.raises(ResourceUnsupported):
-        make_plan(costs=policy(**changes))
+        make_plan(costs=policy(**changes), calls=calls)
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -434,10 +436,13 @@ def test_final_intent_emitter_receives_the_stored_original_objects(monkeypatch):
     ],
 )
 def test_noncompute_policy_prices_exactly_the_bound_profile(changes):
+    calls = []
     with pytest.raises(ResourceUnsupported, match="another profile"):
-        make_plan(costs=policy(**changes))
+        make_plan(costs=policy(**changes), calls=calls)
+    assert not calls
     with pytest.raises(ResourceUnsupported, match="another profile"):
-        make_plan(configured=profile(disk_gb=2000))
+        make_plan(configured=profile(disk_gb=2000), calls=calls)
+    assert not calls
 
 
 def test_cost_policy_requires_all_components_and_prices_numeric_identity_canonically():
@@ -579,3 +584,46 @@ def test_actual_production_cpu_query_values_validate_against_the_pinned_paramete
         Draft202012Validator(
             {**parameter["schema"], "components": document["components"]}
         ).validate(value)
+
+
+def test_default_production_clock_matches_the_unpatched_client(monkeypatch):
+    from kestrel_cloud_runpod import clients
+
+    monkeypatch.setattr(clients, "datetime", datetime)
+    now = datetime.now(UTC)
+    original = request(requested_at=now, expires_at=now + timedelta(minutes=30))
+    costs = policy(observed_at=now, expires_at=now + timedelta(hours=2))
+    calls = []
+
+    def handler(http_request):
+        calls.append(http_request)
+        assert http_request.method == "GET"
+        assert http_request.url.path == "/v2/catalog/cpus"
+        return httpx.Response(200, json={"cpus": [cpu()]})
+
+    with closing(
+        RunpodControlPlaneClient(api_key="synthetic", http_transport=httpx.MockTransport(handler))
+    ) as client:
+        plan = CpuEnvironmentPlanner(client).plan(original, profile(), costs)
+    assert len(calls) == 1
+    assert now <= plan.catalog.observed_at <= plan.planned_at < datetime.now(UTC)
+    assert plan.pod_request(original, profile(), costs, at=datetime.now(UTC)).disk_gb == 20
+
+
+@pytest.mark.parametrize("price", [0, -0.0])
+def test_zero_catalog_compute_rate_cannot_create_a_free_acquisition_intent(price):
+    raw = cpu()
+    raw["price"] = dict(raw["price"], securePerVcpu=price)
+    with pytest.raises(ValueError, match="positive finite"):
+        make_plan(raw=raw)
+
+
+@pytest.mark.parametrize("field", ["max_lifetime_seconds", "cleanup_grace_seconds"])
+def test_extreme_profile_duration_is_a_typed_validation_error_before_catalog(field):
+    with pytest.raises(ValidationError):
+        profile(**{field: 10**15})
+    forged = profile().model_copy(update={field: 10**15})
+    calls = []
+    with pytest.raises(ValidationError):
+        make_plan(configured=forged, calls=calls)
+    assert not calls
