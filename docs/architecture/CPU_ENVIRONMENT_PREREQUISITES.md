@@ -39,7 +39,10 @@ The catalog is compute-only. An explicit `CpuNonComputeCostPolicy` supplies
 finite disk/transfer/cleanup hourly and fixed estimates with original provenance,
 exact provider/profile/disk/datacenter/full-profile-digest binding, explicit
 covered components and a window covering request lifetime plus cleanup grace. Neither
-value defaults to zero. These are operator estimates, not provider billing caps
+value defaults to zero. Both amounts permit at most 12 fractional places and
+24 whole digits; policy timestamps must convert within the UTC calendar range.
+Invalid policy values fail typed validation before catalog access. These are
+operator estimates, not provider billing caps
 or verified paid observations. Unknown components must not be represented as
 zero. The plan prices the entire original lifetime plus cleanup grace, includes
 fixed reserves and refuses either original ceiling being exceeded. Duration
@@ -86,9 +89,10 @@ realized `dataCenterId`, CPU type/count, image/cloud/disk and Pod `cost` before
 connecting, sending private content/credentials or claiming readiness. Require
 the actual data center to equal the original authorized region, actual shape
 to match the admitted profile. Read the authoritative billed `cost` from a
-`RUNNING` Pod. Require the billed rate to be finite, known and no greater than
+`RUNNING` Pod. Require the billed rate to be positive, finite, known and no greater than
 `plan.catalog.compute_cost_per_hr`, the planned compute-only rate; do not compare
-it with `plan.all_in_hourly_usd`. Missing rates, and a `0.0` placeholder while
+it with `plan.all_in_hourly_usd`. Missing or zero rates never establish readiness,
+including on a `RUNNING` Pod. A `0.0` placeholder while
 PROVISIONING/STARTING/EXITED/TERMINATED/ERROR, are unknown rather than free or
 ready resources. Non-RUNNING observations do not establish an admitted billed
 rate even if they contain a numeric value. Pending observations may be polled

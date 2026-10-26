@@ -139,11 +139,13 @@ class CpuNonComputeCostPolicy(ResourceContract):
     covered_components: frozenset[Literal["container_disk", "transfer", "cleanup"]]
     observed_at: AwareDatetime
     expires_at: AwareDatetime
-    disk_transfer_cleanup_hourly_usd: USD
-    disk_transfer_cleanup_fixed_usd: USD
+    disk_transfer_cleanup_hourly_usd: USD = Field(max_digits=36, decimal_places=12)
+    disk_transfer_cleanup_fixed_usd: USD = Field(max_digits=36, decimal_places=12)
 
     @model_validator(mode="after")
     def coverage_window(self) -> Self:
+        _utc_iso(self.observed_at)
+        _utc_iso(self.expires_at)
         if self.expires_at <= self.observed_at:
             raise ValueError("CPU cost policy expiry must follow observation")
         if self.covered_components != {"container_disk", "transfer", "cleanup"}:
@@ -378,6 +380,8 @@ class CpuEnvironmentPlanner:
             now=now,
             max_age=self.catalog_max_age,
         )
+        if match.compute_cost_per_hr <= 0:
+            raise ResourceUnsupported("CPU catalog requires a positive compute price")
         plan = CpuEnvironmentAcquisitionPlan(
             request,
             profile,

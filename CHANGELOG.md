@@ -4,6 +4,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Refuse zero catalog compute prices with a domain error and keep zero realized
+  Pod rates unknown, including RUNNING placeholders. Bound noncompute policy
+  precision, magnitude and UTC timestamp range before any catalog request.
+
 ### Added
 
 - Add exact original CPU Pod readiness observations and a bounded pretrusted

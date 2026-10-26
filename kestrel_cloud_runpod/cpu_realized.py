@@ -129,7 +129,7 @@ def inspect_cpu_readiness(
     if type(cost) not in (int, float):
         raise CpuPodReadinessUnknown(expected_pod_id)
     rate = Decimal(str(cost))
-    if not rate.is_finite() or rate < 0:
+    if not rate.is_finite() or rate <= 0:
         raise CpuPodReadinessUnknown(expected_pod_id)
     if rate > plan.catalog.compute_cost_per_hr:
         raise CpuPodMismatch(expected_pod_id)

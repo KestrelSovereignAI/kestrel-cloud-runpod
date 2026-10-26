@@ -107,6 +107,8 @@ def test_realized_mismatch_preserves_original_id_and_requires_teardown(change):
         {"dataCenterId": None},
         {"cpu": None},
         {"cost": None},
+        {"cost": 0},
+        {"cost": -0.0},
         {"startedAt": None},
         {"startedAt": "2026-10-26T12:00:01"},
         {"startedAt": (NOW - timedelta(seconds=1)).isoformat()},
