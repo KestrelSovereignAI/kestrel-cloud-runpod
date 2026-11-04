@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from pod_capacity_test_support import (
+    complete_pod_payload,
     execution_control_carrier,
+    native_pod_action_harness,
     record_control_injection,
 )
 
@@ -465,6 +467,75 @@ async def test_manager_get_logs_uses_provider_v2_log_stream():
 
     mock_provider.get_logs.assert_called_with("pod-123", 50)
     assert logs == "log line 1\nlog line 2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_evidence", ["missing", "null"])
+async def test_native_partial_status_read_preserves_original_live_session(
+    status_evidence,
+):
+    with native_pod_action_harness() as (state, direct, _adapter):
+        with patch.object(RunPodManager, "_build_provider", return_value=direct):
+            manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+        original = RunPodSession(
+            pod_id=state["pod_id"],
+            task_profile="llm",
+            model_name="test-model",
+            status=PodStatus.READY,
+            started_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            profile=manager.profiles["llm"],
+            ttl_seconds=3600,
+            pod_type="dedicated",
+        )
+        manager._session = original
+        initial = await manager.get_status()
+        assert initial["active"] is True
+        retained_runtime = deepcopy(original.runtime)
+        partial = complete_pod_payload(pod_id=state["pod_id"], status="RUNNING")
+        if status_evidence == "missing":
+            del partial["status"]
+        else:
+            partial["status"] = None
+        # A legacy-looking field is not substitute v2 status evidence.
+        partial["desiredStatus"] = "STOPPED"
+        state["readback_payloads"] = [partial]
+
+        with pytest.raises(RunPodManagerError, match="v2 Pod status.*status"):
+            await manager.get_status()
+
+        assert manager._session is original
+        assert original.status is PodStatus.READY
+        assert original.runtime == retained_runtime
+        assert (await manager.get_status(refresh=False))["active"] is True
+        state["readback"] = "terminal"
+        terminal = await manager.get_status()
+        assert terminal["status"] == PodStatus.OFFLINE.value
+        assert terminal["active"] is False
+        assert manager._session is original
+        assert state["calls"] == [
+            ("GET", f"/v2/pods/{state['pod_id']}", None)
+        ] * 3
+
+
+@pytest.mark.parametrize("status_evidence", ["missing", "null"])
+def test_partial_create_acknowledgment_retains_resource_identity(status_evidence):
+    client = _FakeControlClient()
+
+    def partial_create(request):
+        client.create_request = request
+        payload = {"id": "pod-partial-create", "name": request.name}
+        if status_evidence == "null":
+            payload["status"] = None
+        return PodResource.from_dict(payload)
+
+    client.create_pod = partial_create
+    provider = DirectRunPodProvider(api_key="", client=client)
+    result = provider.start_pod(_profile(), {"name": "kestrel-image"})
+    assert result["id"] == "pod-partial-create"
+    assert result["name"] == "kestrel-image"
+    assert result.get("status") is None
+    assert client.create_request is not None
 
 
 def test_legacy_profile_fields_fail_with_migration_guidance():

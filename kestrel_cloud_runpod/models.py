@@ -985,8 +985,12 @@ class PodResource:
             field_evidence=ResourceFieldEvidence(tuple(missing), tuple(invalid)),
         )
 
-    def require_valid_fields(self, *, context: str) -> "PodResource":
-        self.field_evidence.require_valid(context=context)
+    def require_valid_fields(
+        self, *, context: str, required_fields: Sequence[str] = ()
+    ) -> "PodResource":
+        self.field_evidence.require_valid(
+            context=context, required_fields=required_fields
+        )
         return self
 
 

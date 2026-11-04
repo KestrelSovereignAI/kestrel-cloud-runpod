@@ -177,7 +177,7 @@ class DirectRunPodProvider(GPUProvider):
 
     def get_status(self, pod_id: str) -> Dict[str, Any]:
         pod = self.client.get_pod(pod_id)
-        pod.require_valid_fields(context="v2 Pod status")
+        pod.require_valid_fields(context="v2 Pod status", required_fields=("status",))
         return dict(pod.raw)
 
     def stop_pod(self, pod_id: str) -> Dict[str, Any]:
