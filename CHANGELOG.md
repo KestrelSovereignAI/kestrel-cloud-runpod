@@ -6,6 +6,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Rebuild both private Ollama runtime `1.1.2` binaries with digest-pinned Go
+  `1.26.10` for CVE-2026-111943; preserve the unchanged high/critical image
+  vulnerability gate and disable automatic toolchain upgrades in both builders.
+
 - Match the pinned CPU Pod response object and complete empty create intent;
   schema-validate readiness fixtures, preserve missing facts as unknown and bind
   the original start window to planning. Enforce Decimal tuple bounds independent

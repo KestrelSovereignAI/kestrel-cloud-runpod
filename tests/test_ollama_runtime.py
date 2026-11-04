@@ -165,14 +165,20 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
         "golang.org/x/text@v0.42.0",
     ):
         assert fixed_module in dockerfile
-    assert "golang:1.26.9-alpine3.23@sha256:" in dockerfile
-    assert "golang:1.26.9-bookworm@sha256:" in dockerfile
-    assert "ENV GOTOOLCHAIN=local" in dockerfile
+    assert (
+        "golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43"
+        in dockerfile
+    )
+    assert (
+        "golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb"
+        in dockerfile
+    )
+    assert dockerfile.count("ENV GOTOOLCHAIN=local") == 2
     assert "go version -m /out/ollama" in dockerfile
     assert '"github.com/klauspost/compress" {print $3}' in dockerfile
     assert "= v1.20.2" in dockerfile
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
-    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.9\n")
+    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.10\n")
     assert "USER 0:0" in dockerfile
     assert (
         "prepareRuntimeFilesystem(config.ModelStoragePath)"
@@ -218,7 +224,8 @@ def test_image_security_tools_share_runner_owned_scratch() -> None:
     tools = {
         step["name"]: step
         for step in security["steps"]
-        if step.get("name") in {
+        if step.get("name")
+        in {
             "Generate SPDX SBOM",
             "Fail on fixed high or critical vulnerabilities",
         }
@@ -262,7 +269,9 @@ def test_r29_lease_environment_explicitly_requires_preload(record_property):
 def test_r29_profile_cannot_override_lease_owned_preload(value, record_property):
     record_property("injection_entry", "before-managed-preload-override-build")
     with pytest.raises(RunPodManagerError, match="cannot override"):
-        _environment(profile_environment={
-            "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
-            "KESTREL_OLLAMA_PRELOAD_MODEL": value,
-        })
+        _environment(
+            profile_environment={
+                "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
+                "KESTREL_OLLAMA_PRELOAD_MODEL": value,
+            }
+        )
