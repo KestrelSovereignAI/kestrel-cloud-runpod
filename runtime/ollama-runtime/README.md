@@ -80,7 +80,7 @@ does not reproduce that original binding is not authoritative for the lease.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.2`; it does not change the
+The runtime is independently versioned as `1.1.3`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds
@@ -92,6 +92,9 @@ The official binary is overwritten in the final filesystem, and both installed
 OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
 The build refuses toolchain auto-upgrades; the unchanged security gate must
 pass for the actual image, including its operating-system packages.
+Version `1.1.2` is already published from the security-only mainline. The
+managed startup/telemetry changes require this new version and a newly scanned
+immutable image digest; an older version's image is not evidence for this code.
 The linked compression module is also checked explicitly at build time:
 `github.com/klauspost/compress` is pinned to `1.20.2`, fixing the upstream
 [S2 dictionary overflow](https://github.com/klauspost/compress/security/advisories/GHSA-259r-337f-4rfw)

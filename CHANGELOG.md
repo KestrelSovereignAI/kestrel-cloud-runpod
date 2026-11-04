@@ -52,6 +52,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Changed
 
+- Give the managed startup/telemetry runtime successor version `1.1.3`, keeping
+  the published security-only `1.1.2` identity intact. A fresh built/scanned
+  immutable digest is required; the Python package version is unchanged.
+
 - Require published SDK 0.43 or newer for canonical visual resource contracts
   and Core 0.54.4 or newer, the first published Core resolving that SDK and its
   TLS trust bundle.

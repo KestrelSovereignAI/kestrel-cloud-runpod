@@ -35,7 +35,7 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime
-  RUNTIME_VERSION: 1.1.2
+  RUNTIME_VERSION: 1.1.3
 
 jobs:
   proxy-contract:
@@ -149,7 +149,7 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         env:
-          # runner context is available in step.env, not job.env.
+          # Large extraction uses runner scratch; runner context requires step.env.
           TMPDIR: ${{ runner.temp }}
         with:
           image: ${{ env.RUNTIME_IMAGE_REF }}

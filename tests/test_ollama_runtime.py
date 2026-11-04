@@ -275,3 +275,8 @@ def test_r29_profile_cannot_override_lease_owned_preload(value, record_property)
                 "KESTREL_OLLAMA_PRELOAD_MODEL": value,
             }
         )
+
+
+def test_changed_runtime_cannot_reuse_the_published_112_image_identity() -> None:
+    """Main already published 1.1.2 without this branch's runtime telemetry."""
+    assert tuple(map(int, OLLAMA_RUNTIME_VERSION.split("."))) > (1, 1, 2)
