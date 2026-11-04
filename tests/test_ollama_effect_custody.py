@@ -28,7 +28,7 @@ from ollama_test_support import (
     release_gates_and_boundedly_join_owned_tasks,
     serverless_plan,
 )
-from test_effect_custody import _original_errors
+from test_effect_custody import _assert_factory_admission_failure, _original_errors
 from test_ollama_repository import _terminated_pod_billing_evidence
 
 from kestrel_cloud_runpod.models import (
@@ -1346,7 +1346,7 @@ async def test_r27_existing_cached_publication_door_joins_original(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["cleanup", "billing"])
-async def test_r27_existing_cached_allocation_refusal_closes_original(
+async def test_r27_existing_cached_factory_failure_keeps_source_and_closes_original(
     tmp_path, monkeypatch, kind, record_property
 ):
     from kestrel_cloud_runpod import ollama_service as service_module
@@ -1369,8 +1369,8 @@ async def test_r27_existing_cached_allocation_refusal_closes_original(
         return real_creator(original, **kwargs)
 
     def refuse(_loop, _coroutine, **_kwargs):
-        admissions.append("refused-before-Task")
-        record_property("injection_entry", "actual-loop-allocation-refusal")
+        admissions.append("factory-raised-before-Task")
+        record_property("injection_entry", "actual-loop-factory-failure")
         raise opening
 
     monkeypatch.setattr(case.owner, case.operation_attr, operation)
@@ -1379,14 +1379,14 @@ async def test_r27_existing_cached_allocation_refusal_closes_original(
         loop.set_task_factory(refuse)
         with pytest.raises(RuntimeError) as caught:
             await case.invoke()
-        assert caught.value is opening
-        assert admissions == ["refused-before-Task"] and len(handed) == 1
+        _assert_factory_admission_failure(caught.value, opening)
+        assert admissions == ["factory-raised-before-Task"] and len(handed) == 1
         assert originals == [], "unpublished physical factory was invoked"
         assert inspect.getcoroutinestate(handed[0]) == inspect.CORO_CLOSED
     finally:
         loop.set_task_factory(original_factory)
-        # Baseline safety only: no native Task was accepted. This original
-        # unadmitted coroutine is never retried or treated as a physical ACK.
+        # This test factory never allocated a Task; its exception alone does
+        # not prove that fact to Core. Never retry or treat it as a physical ACK.
         for coroutine in handed:
             if inspect.getcoroutinestate(coroutine) != inspect.CORO_CLOSED:
                 record_property("baseline_outer_closed_unadmitted_original", True)
