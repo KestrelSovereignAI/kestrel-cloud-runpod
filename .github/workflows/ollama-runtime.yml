@@ -35,7 +35,7 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime
-  RUNTIME_VERSION: 1.1.1
+  RUNTIME_VERSION: 1.1.2
 
 jobs:
   proxy-contract:
@@ -143,6 +143,9 @@ jobs:
           fi
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          # Large image extraction belongs on runner scratch, not /tmp quota.
+          TMPDIR: ${{ runner.temp }}
         with:
           image: ${{ env.RUNTIME_IMAGE_REF }}
           format: spdx-json
@@ -157,6 +160,8 @@ jobs:
           fi
       - name: Fail on fixed high or critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TMPDIR: ${{ runner.temp }}
         with:
           image-ref: ${{ env.RUNTIME_IMAGE_REF }}
           scanners: vuln
