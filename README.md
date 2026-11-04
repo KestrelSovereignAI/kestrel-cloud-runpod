@@ -554,6 +554,18 @@ An authenticated smoke test is opt-in, read-only, and lists the GPU catalog only
 RUNPOD_API_KEY=... uv run pytest --run-cloud tests/test_runpod_smoke.py
 ```
 
+### Public package releases
+
+Publication accepts only a `vX.Y.Z` release tag, including manual dispatch
+(`refs/tags/vX.Y.Z` is also accepted). The workflow validates the tag against
+package metadata, resolves it once to a commit, and passes that same immutable
+SHA to every reusable CI checkout and the artifact build. Moving a tag after
+resolution cannot change the tested/built revision. Ordinary non-release CI
+keeps its event checkout, including the synthetic PR merge.
+
+The existing protected `pypi` environment and trusted publisher are unchanged.
+This public package's workflow never publishes private Frinz/catalog/contracts.
+
 ## License
 
 Apache-2.0

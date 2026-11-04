@@ -6,6 +6,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Bind manual and tag-triggered publication CI and builds to one resolved
+  release commit. Reject non-release refs and tag/package-version mismatches
+  before CI, and retain the unconditional build-side version check.
+
 - Match the pinned CPU Pod response object and complete empty create intent;
   schema-validate readiness fixtures, preserve missing facts as unknown and bind
   the original start window to planning. Enforce Decimal tuple bounds independent
