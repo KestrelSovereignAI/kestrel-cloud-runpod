@@ -63,11 +63,14 @@ measures the `/ping` `204` to `200` cold-start interval.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.1`; it does not change the
+The runtime is independently versioned as `1.1.2`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds
-that exact source commit with Go `1.26.9` and explicit fixed module versions.
+that exact source commit with Go `1.26.10` and explicit fixed module versions.
+Both binaries must be rebuilt: the previous Go `1.26.9` build is affected by
+[GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809),
+which adds distrust of compromised intermediate certificates in `crypto/x509`.
 The official binary is overwritten in the final filesystem, and both installed
 OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
 The build refuses toolchain auto-upgrades; the unchanged security gate must

@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.18.0@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 
-FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS proxy-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43 AS proxy-builder
+ENV GOTOOLCHAIN=local
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.1.1
+ARG RUNTIME_VERSION=1.1.2
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -12,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" go build \
     -ldflags="-s -w -buildid= -X main.runtimeVersion=${RUNTIME_VERSION} -X main.ollamaVersion=${OLLAMA_VERSION}" \
     -o /out/kestrel-ollama-runtime ./
 
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS ollama-builder
+FROM golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS ollama-builder
 ENV GOTOOLCHAIN=local
 ARG OLLAMA_COMMIT=eec8e0b9458b8a01be0c216a9cc53eefde24ef50
 ADD --checksum=sha256:8c5030739b89aaa7eada7332c707cb3c6be27d9ec901b501a539fa57c576faae \
@@ -39,7 +40,7 @@ RUN go get \
     && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "github.com/klauspost/compress" {print $3}')" = v1.20.2
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.1.1
+ARG RUNTIME_VERSION=1.1.2
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \
