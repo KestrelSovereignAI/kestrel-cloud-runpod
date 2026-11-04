@@ -260,7 +260,7 @@ def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
 
     assert RUNPOD_V2_OPENAPI_SOURCE_URL == "https://api.runpod.io/v2/openapi.yaml"
     assert RUNPOD_V2_OPENAPI_SHA256 == (
-        "202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415"
+        "7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd"
     )
     assert payload["type"] == "QUEUE"
     assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}
@@ -706,3 +706,42 @@ def test_serverless_worker_cost_bills_every_gpu_in_the_worker() -> None:
     for bad in (0, -1, True):
         with pytest.raises((ValueError, TypeError)):
             serverless_worker_cost_usd(Decimal("0.44"), bad, one_hour)
+
+
+def test_openapi_provenance_refresh_does_not_restamp_durable_authority(monkeypatch):
+    from kestrel_cloud_runpod import serverless_capacity_contracts as contracts
+
+    def payloads():
+        original_request, original_quote, original_activation, _ = (
+            legacy_planned_authority()
+        )
+        return {
+            "plan": planned_endpoint().to_dict(),
+            "quote": quote().to_dict(),
+            "original_plan": original_request.endpoint.to_dict(),
+            "original_quote": original_quote.to_dict(),
+            "original_activation": original_activation.to_dict(),
+            "cleanup_intent": _cleanup_intent().to_dict(),
+            "original_cleanup": ServerlessEndpointCleanupReceipt.from_dict(
+                _cleanup_receipt_payload()
+            ).to_dict(),
+            "cleanup_v2": ServerlessEndpointCleanupReceipt.from_dict(
+                _cleanup_receipt_payload(version=2, basis="delete_acknowledged")
+            ).to_dict(),
+            "billing": _receipt().to_dict(),
+        }
+
+    monkeypatch.setattr(
+        contracts,
+        "RUNPOD_V2_OPENAPI_SHA256",
+        "202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415",
+    )
+    original = payloads()
+    monkeypatch.setattr(
+        contracts,
+        "RUNPOD_V2_OPENAPI_SHA256",
+        "7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd",
+    )
+    refreshed = payloads()
+    assert refreshed == original
+    assert json_sha256(refreshed) == json_sha256(original)

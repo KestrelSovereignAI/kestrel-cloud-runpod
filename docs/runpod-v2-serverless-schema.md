@@ -4,8 +4,8 @@ The production management contract for this package is the OpenAPI document
 served by the Runpod v2 API itself:
 
 - Source: `https://api.runpod.io/v2/openapi.yaml`
-- Observed SHA-256: `202db6255f134dda8d1881913a0a52c63a53cf3e8909ca167628075017c4c415`
-- Observed: 2026-10-17
+- Observed SHA-256: `7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd`
+- Observed: 2026-11-04 (two independent, byte-identical public downloads)
 
 That schema requires `type: QUEUE`, puts `idleTimeout` under `workers`, and
 uses `scaling: {type: QUEUE_DELAY, queueDelay: ...}`. In August 2026, the
@@ -22,6 +22,35 @@ Before changing request models, compare the
 API-served schema first, update the pinned digest and contract tests together,
 and review every create/readback field. Do not infer the production wire shape
 from the rendered example or GitHub copy alone.
+
+The November 4 refresh includes audit logs, organization roles/groups, cost
+centers, resource tags/filters, and Serverless time-series metrics. These are
+vendored provider documentation, not newly implemented client operations or
+permission to mutate accounts. All existing consumed operation IDs remain.
+
+Compatibility boundaries checked for our current Pod, Serverless, CPU/GPU
+catalog, inventory, worker/log and billing calls:
+
+- HTTP 413 can describe either an oversized request or response. It is a
+  definitive RFC 9457 error, never a successful/ambiguous creation receipt or
+  automatic mutation retry. A late inventory-page 413 refuses the entire
+  inventory; it is not an empty list or proof of cleanup. General mutation
+  bodies are limited to 1 MiB; Pod creation keeps its separate 100 KiB limit,
+  including expanded requests. Authentication and rate limits precede these
+  checks. The client preserves the actual rate-limit headers, not example quotas.
+- Pod inventory can return null `runtime` and `ssh.direct` even for a running
+  Pod. Fetch the exact Pod ID for live details. A direct SSH mapping can survive
+  on a stopped Pod and is not readiness. `Pod.cost` is an hourly compute rate,
+  including in `EXITED`, not a current charge or final billing receipt.
+- The schema adds GPU-count/host-resource bounds, optional host CPU/RAM facts,
+  and expands Pod mounts to four network volumes with separate patch semantics.
+  This refresh does not enable new mount kinds, change existing constrained
+  request builders or accepted resource plans, or infer missing stock/price.
+
+The shared exported digest identifies these reviewed schema bytes. It is not
+part of durable endpoint plans, quotes, activations, cleanup receipts or billing
+authority. Updating it must not restamp their original payloads or hashes,
+renew work, change cancellation/replay authority or provide new spend approval.
 
 ## Durable endpoint cleanup (0.14)
 

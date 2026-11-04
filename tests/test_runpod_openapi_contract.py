@@ -88,14 +88,21 @@ def test_consumed_request_and_response_shapes_match_pin():
         return collect(schemas[name])
 
     assert set(schemas["CpuType"]["required"]) == {
-        "id", "name", "group", "vcpu", "ramGbPerVcpu", "price",
+        "id",
+        "name",
+        "group",
+        "vcpu",
+        "ramGbPerVcpu",
+        "price",
     }
     cpu = schemas["CpuType"]["properties"]
     assert set(cpu["vcpu"]["required"]) == {"min", "max"}
     assert cpu["ramGbPerVcpu"]["type"] == "number"
     assert set(cpu["price"]["required"]) == {"securePerVcpu", "serverlessPerVcpu"}
-    assert all(cpu["price"]["properties"][name]["type"] == "number"
-               for name in ("securePerVcpu", "serverlessPerVcpu"))
+    assert all(
+        cpu["price"]["properties"][name]["type"] == "number"
+        for name in ("securePerVcpu", "serverlessPerVcpu")
+    )
     assert schemas["ListCpuTypesResponse"]["required"] == ["cpus"]
     operation = _schema()["paths"]["/v2/catalog/cpus"]["get"]
     assert [item["$ref"] for item in operation["parameters"]] == [
@@ -112,11 +119,27 @@ def test_consumed_request_and_response_shapes_match_pin():
     }
     assert schemas["ListGpuTypesResponse"]["required"] == ["gpus"]
     assert required("Pod") >= {
-        "id", "name", "status", "image", "args", "disk", "mounts", "ports", "env",
-        "registry", "cloud", "dataCenterId", "cost", "locked", "startedAt", "globalNetworking",
+        "id",
+        "name",
+        "status",
+        "image",
+        "args",
+        "disk",
+        "mounts",
+        "ports",
+        "env",
+        "registry",
+        "cloud",
+        "dataCenterId",
+        "cost",
+        "locked",
+        "startedAt",
+        "globalNetworking",
     }
     pod = schemas["Pod"]["allOf"][1]["properties"]
-    assert pod["globalNetworking"] == {"$ref": "#/components/schemas/PodGlobalNetworking"}
+    assert pod["globalNetworking"] == {
+        "$ref": "#/components/schemas/PodGlobalNetworking"
+    }
     assert schemas["PodGlobalNetworking"]["required"] == ["enabled"]
     assert schemas["PodGlobalNetworking"]["type"] == "object"
     assert schemas["PodGlobalNetworking"]["properties"]["enabled"]["type"] == "boolean"
@@ -126,10 +149,15 @@ def test_consumed_request_and_response_shapes_match_pin():
     assert schemas["CpuConfig"]["allOf"][1]["properties"]["memory"]["type"] == "integer"
     base = schemas["BaseContainerConfig"]["properties"]
     assert base["args"]["type"] == "string"
-    assert base["ports"]["type"] == "array" and base["ports"]["items"]["type"] == "string"
+    assert (
+        base["ports"]["type"] == "array" and base["ports"]["items"]["type"] == "string"
+    )
     assert base["env"]["type"] == "object"
     assert base["env"]["additionalProperties"] == {"type": "string"}
-    assert schemas["ContainerConfig"]["allOf"][1]["properties"]["registry"]["type"] == ["string", "null"]
+    assert schemas["ContainerConfig"]["allOf"][1]["properties"]["registry"]["type"] == [
+        "string",
+        "null",
+    ]
     assert pod["locked"]["type"] == "boolean"
     assert "cluster" not in required("Pod") and "gpu" not in required("Pod")
     assert pod["cluster"]["allOf"] == [{"$ref": "#/components/schemas/PodCluster"}]
@@ -208,6 +236,37 @@ def test_runtime_base_url_matches_the_ga_schema_server():
     document = _schema()
     assert document["servers"][0]["url"] == "https://api.runpod.io"
     assert CONTROL_PLANE_BASE_URL == document["servers"][0]["url"] + "/v2"
+
+
+def test_consumed_operations_describe_request_and_response_size_failures():
+    document = _schema()
+    for path in ("/v2/pods", "/v2/serverless", "/v2/network-volumes"):
+        assert document["paths"][path]["get"]["responses"]["413"] == {
+            "$ref": "#/components/responses/ResponseTooLargeError"
+        }
+    for path, method in (
+        ("/v2/pods/{id}/action", "post"),
+        ("/v2/serverless", "post"),
+        ("/v2/serverless/{id}", "patch"),
+    ):
+        assert document["paths"][path][method]["responses"]["413"] == {
+            "$ref": "#/components/responses/RequestTooLargeError"
+        }
+    for name in ("RequestTooLargeError", "ResponseTooLargeError"):
+        response = document["components"]["responses"][name]
+        assert set(response["headers"]) == {"RateLimit", "RateLimit-Policy"}
+        assert response["content"]["application/problem+json"]["schema"] == {
+            "$ref": "#/components/schemas/ErrorResponse"
+        }
+
+
+def test_current_pin_records_provider_limits_and_patch_mount_shape():
+    schemas = _schema()["components"]["schemas"]
+    assert schemas["BaseGpuConfig"]["properties"]["count"]["maximum"] == 1024
+    assert schemas["Mounts"]["allOf"][1]["properties"]["network"]["maxItems"] == 4
+    assert schemas["UpdatePodRequest"]["allOf"][1]["properties"]["mounts"] == {
+        "$ref": "#/components/schemas/UpdatePodMounts"
+    }
 
 
 def test_semantic_diff_reports_breaking_and_additive_changes():
