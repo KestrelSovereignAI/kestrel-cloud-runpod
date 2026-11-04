@@ -11,7 +11,7 @@ from .models import RunPodManagerError
 from .ollama_contracts import OllamaLeaseMode
 
 OLLAMA_RUNTIME_CONTRACT = "ollama-runtime/v1"
-OLLAMA_RUNTIME_VERSION = "1.1.1"
+OLLAMA_RUNTIME_VERSION = "1.1.2"
 OLLAMA_RUNTIME_IMAGE_REPOSITORY = (
     "ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime"
 )
@@ -28,8 +28,10 @@ _RESERVED_ENV = frozenset(
         "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT",
         "KESTREL_OLLAMA_MODE",
         "KESTREL_OLLAMA_MODEL_STORAGE_PATH",
+        "KESTREL_OLLAMA_PRELOAD_MODEL",
         "KESTREL_OLLAMA_PROVISION_REQUESTED_AT",
         "KESTREL_OLLAMA_REQUIRED_MODEL",
+        "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256",
         "OLLAMA_HOST",
         "OLLAMA_MODELS",
         "OLLAMA_MODELS_PULL",
@@ -65,6 +67,7 @@ def build_ollama_runtime_environment(
     mode: OllamaLeaseMode,
     model_storage_path: str,
     provision_requested_at: datetime,
+    telemetry_binding_sha256: str,
 ) -> dict[str, str]:
     """Create the sole Pod/LB runtime environment from trusted policy inputs."""
 
@@ -88,6 +91,10 @@ def build_ollama_runtime_environment(
         )
     expires_at = _aware_utc(bearer_token_expires_at, "bearer expiry")
     requested_at = _aware_utc(provision_requested_at, "provision timestamp")
+    if re.fullmatch(r"[0-9a-f]{64}", telemetry_binding_sha256) is None:
+        raise RunPodManagerError(
+            "Ollama runtime telemetry binding must be a lowercase SHA-256 digest"
+        )
     if expires_at <= requested_at:
         raise RunPodManagerError("Ollama workload bearer expires before provisioning")
     allowed_raw = profile_environment.get("KESTREL_OLLAMA_ALLOWED_MODELS")
@@ -109,8 +116,10 @@ def build_ollama_runtime_environment(
             "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT": _rfc3339(expires_at),
             "KESTREL_OLLAMA_MODE": mode.value,
             "KESTREL_OLLAMA_MODEL_STORAGE_PATH": storage_path,
+            "KESTREL_OLLAMA_PRELOAD_MODEL": "true",
             "KESTREL_OLLAMA_PROVISION_REQUESTED_AT": _rfc3339(requested_at),
             "KESTREL_OLLAMA_REQUIRED_MODEL": requested_model,
+            "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256": (telemetry_binding_sha256),
             "PORT": str(OLLAMA_RUNTIME_PORT),
             "PORT_HEALTH": str(OLLAMA_RUNTIME_PORT),
         }

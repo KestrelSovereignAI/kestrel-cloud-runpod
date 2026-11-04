@@ -1,15 +1,18 @@
 """Cost selection and public-route contracts for Ollama leases."""
 
-from datetime import timedelta
 from dataclasses import replace
+from datetime import timedelta
+from decimal import Clamped, Inexact, Rounded, Subnormal, Underflow, localcontext
 
 import pytest
 from ollama_test_support import (
+    FakeOllamaProvider,
     MutableClock,
     make_decision,
     make_request,
     non_compute_cost_policies,
     non_compute_cost_policy,
+    serverless_plan,
 )
 
 from kestrel_cloud_runpod.models import ComputeProduct, RunPodManagerError
@@ -17,13 +20,14 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLease,
     OllamaLeaseMode,
     OllamaLeaseState,
+    OllamaPlacementPlan,
+    OllamaProvisioningReceipt,
     OllamaResourceType,
     OllamaTeardownState,
     accrued_cost,
     authorized_cost_exposure,
-    OllamaPlacementPlan,
-    OllamaResourceType,
     canonical_model_name,
+    iso_datetime,
     maximum_serverless_cold_starts,
     sanitize_provider_error,
     select_ollama_plan,
@@ -292,6 +296,49 @@ def test_all_in_ceiling_exact_boundary_and_tiny_overage(extra_overhead, affordab
             select_ollama_plan(**arguments)
 
 
+def test_tiny_component_sum_never_rounds_away_under_hostile_decimal_context():
+    clock = MutableClock()
+    request = make_request(
+        clock,
+        mode=OllamaLeaseMode.DEDICATED_POD,
+        expected_session_seconds=1,
+        expected_active_seconds=1,
+        hard_deadline=clock() + timedelta(seconds=1),
+        max_authorized_cost=0.00001,
+    )
+    policies = non_compute_cost_policies(estimated=0.00001, maximum=0.00001)
+    arguments = {
+        "request": request,
+        "decisions": {
+            ComputeProduct.POD: make_decision(
+                ComputeProduct.POD,
+                rate=0.036,
+                gpu_id="pod",
+                pool=None,
+            )
+        },
+        "non_compute_cost_policies": policies,
+        "planned_at": clock(),
+        "serverless_max_workers": 1,
+    }
+
+    with localcontext() as context:
+        context.prec = 2
+        context.Emin = -1
+        for signal in (Underflow, Subnormal, Inexact, Rounded, Clamped):
+            context.traps[signal] = False
+        with pytest.raises(RunPodManagerError, match="authorized cost"):
+            select_ollama_plan(**arguments)
+        plan = select_ollama_plan(
+            **{
+                **arguments,
+                "request": replace(request, max_authorized_cost=0.00002),
+            }
+        )
+
+    assert plan.cost_ceiling == 0.00002
+
+
 @pytest.mark.parametrize(
     "mode, product",
     [
@@ -494,13 +541,13 @@ def test_accrued_cost_bills_every_gpu_in_the_placement():
     """
     clock = MutableClock()
     started = clock()
-    base = dict(
-        offered_rate_per_hr=1.0,
-        provisioning_started_at=started,
-        hard_deadline=started + timedelta(hours=4),
-        maximum_concurrent_workers=1,
-        accrued_estimated_cost=0.0,
-    )
+    base = {
+        "offered_rate_per_hr": 1.0,
+        "provisioning_started_at": started,
+        "hard_deadline": started + timedelta(hours=4),
+        "maximum_concurrent_workers": 1,
+        "accrued_estimated_cost": 0.0,
+    }
     single = replace(_accrual_lease(), **base, placement_gpu_count=1)
     quad = replace(_accrual_lease(), **base, placement_gpu_count=4)
     now = started + timedelta(hours=1)
@@ -604,13 +651,13 @@ def test_accrued_cost_bills_every_serverless_worker():
     """
     clock = MutableClock()
     started = clock()
-    base = dict(
-        offered_rate_per_hr=1.0,
-        provisioning_started_at=started,
-        hard_deadline=started + timedelta(hours=4),
-        accrued_estimated_cost=0.0,
-        placement_gpu_count=1,
-    )
+    base = {
+        "offered_rate_per_hr": 1.0,
+        "provisioning_started_at": started,
+        "hard_deadline": started + timedelta(hours=4),
+        "accrued_estimated_cost": 0.0,
+        "placement_gpu_count": 1,
+    }
     one = replace(_accrual_lease(), **base, maximum_concurrent_workers=1)
     five = replace(_accrual_lease(), **base, maximum_concurrent_workers=5)
     now = started + timedelta(hours=1)
@@ -685,3 +732,47 @@ def test_accrued_cost_fails_closed_without_a_worker_count():
     )
 
     assert accrued_cost(lease, started + timedelta(seconds=1)) == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["constructor", "wire"])
+@pytest.mark.parametrize(
+    "birth_seconds", [0, 1, 2], ids=["at-intent", "at-readback", "future"]
+)
+async def test_provisioning_receipt_birth_is_bounded_by_completed_readback(
+    boundary, birth_seconds
+):
+    """Synthetic contract shape, not an observed provider resource lifetime."""
+    clock = MutableClock()
+    provider = FakeOllamaProvider(serverless_plan())
+    prepared = provider.validate_runtime_request(
+        make_request(clock), serverless_plan(), provision_requested_at=clock()
+    )
+    resource = await provider.provision(prepared)
+    original = await provider.observe_provisioning(prepared.intent, resource)
+    original.validate_intent(prepared.intent)
+    assert OllamaProvisioningReceipt.from_dict(original.to_dict()) == original
+    created_at = clock() + timedelta(seconds=birth_seconds)
+    readback_at = clock() + timedelta(seconds=1)
+
+    def candidate():
+        if boundary == "constructor":
+            return replace(
+                original, provider_created_at=created_at, readback_at=readback_at
+            )
+        payload = original.to_dict()
+        payload["provider_created_at"] = iso_datetime(created_at)
+        payload["readback_at"] = iso_datetime(readback_at)
+        return OllamaProvisioningReceipt.from_dict(payload)
+
+    if birth_seconds > 1:
+        with pytest.raises(ValueError, match="creation.*readback"):
+            candidate()
+    else:
+        receipt = candidate()
+        receipt.validate_intent(prepared.intent)
+        assert (
+            receipt.provider_created_at == created_at
+            and receipt.readback_at == readback_at
+        )
+        assert OllamaProvisioningReceipt.from_dict(receipt.to_dict()) == receipt

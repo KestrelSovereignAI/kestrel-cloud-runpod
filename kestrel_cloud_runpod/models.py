@@ -1,11 +1,18 @@
 """Typed contracts for the Runpod v2 control and data planes."""
 
+import hashlib
+import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 CONTROL_PLANE_BASE_URL = "https://api.runpod.io/v2"
 SERVERLESS_DATA_PLANE_BASE_URL = "https://api.runpod.ai/v2"
@@ -20,6 +27,103 @@ class RunPodManagerError(Exception):
     """Base exception for Runpod manager and provider failures."""
 
 
+class RunPodLegacyAdmissionRetiredError(RunPodManagerError):
+    """Legacy session admission has no durable original-effect owner."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Legacy Runpod session admission is retired; use the inference-lease "
+            "provider or durable Pod-capacity service"
+        )
+
+
+class RunPodMountPolicyMismatchError(RunPodManagerError):
+    """A complete endpoint readback confirms storage outside policy."""
+
+
+class ResourceFieldState(str, Enum):
+    """Whether one optional provider-readback field is usable as evidence."""
+
+    PRESENT = "present"
+    MISSING = "missing"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class ResourceFieldEvidence:
+    """Secret-safe field-local validity for a partially usable v2 response."""
+
+    missing_fields: tuple[str, ...] = ()
+    invalid_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        missing = tuple(sorted(set(self.missing_fields)))
+        invalid = tuple(sorted(set(self.invalid_fields)))
+        if any(
+            not isinstance(item, str) or not item for item in (*missing, *invalid)
+        ) or set(missing).intersection(invalid):
+            raise ValueError("Runpod resource field evidence is invalid")
+        object.__setattr__(self, "missing_fields", missing)
+        object.__setattr__(self, "invalid_fields", invalid)
+
+    def state(self, field_path: str) -> ResourceFieldState:
+        if field_path in self.invalid_fields:
+            return ResourceFieldState.INVALID
+        if field_path in self.missing_fields:
+            return ResourceFieldState.MISSING
+        return ResourceFieldState.PRESENT
+
+    def require_valid(
+        self, *, context: str, required_fields: Sequence[str] = ()
+    ) -> None:
+        unavailable = sorted(
+            {
+                *self.invalid_fields,
+                *(field for field in required_fields if field in self.missing_fields),
+            }
+        )
+        if unavailable:
+            raise RunPodManagerError(
+                f"Invalid {context} response fields: " + ", ".join(unavailable)
+            )
+
+
+def environment_values_sha256(environment: Mapping[str, str]) -> str:
+    """Bind exact environment values without imposing a product's key policy."""
+
+    if not isinstance(environment, Mapping) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        raise TypeError("Runpod environment must be a string mapping")
+    encoded = json.dumps(
+        dict(sorted(environment.items())), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _freeze_json_value(value: Any) -> Any:
+    """Own and recursively freeze one JSON-compatible request value."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
+
+
+def _mutable_json_value(value: Any) -> Any:
+    """Return a fresh JSON shape from an immutable request snapshot."""
+
+    if isinstance(value, Mapping):
+        return {key: _mutable_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json_value(item) for item in value]
+    return value
+
+
 def normalize_cuda_floor(value: Optional[str]) -> Optional[str]:
     """Represent a configured CUDA floor in the API's major.minor format."""
 
@@ -31,32 +135,180 @@ def normalize_cuda_floor(value: Optional[str]) -> Optional[str]:
     return f"{int(major)}.{int(minor or '0')}"
 
 
+@dataclass(frozen=True)
+class EndpointMountAssessment:
+    """Complete resource mount evidence, before outcome precedence is chosen."""
+
+    missing_kinds: tuple[str, ...]
+    invalid_kinds: tuple[str, ...]
+    mismatched_kinds: tuple[str, ...]
+
+
+def _mount_sequence(
+    value: object, *, required_keys: frozenset[str]
+) -> tuple[tuple[tuple[object, ...], ...], bool, bool]:
+    """Return typed members, invalid evidence and whether evidence is complete."""
+
+    if not isinstance(value, list):
+        return (), True, False
+    valid: list[tuple[object, ...]] = []
+    invalid = False
+    for mount in value:
+        if not isinstance(mount, Mapping) or set(mount) != required_keys:
+            invalid = True
+            continue
+        fields: list[object] = []
+        for key in sorted(required_keys):
+            field = mount.get(key)
+            if not isinstance(field, str) or not field:
+                invalid = True
+                break
+            fields.append(field)
+        else:
+            valid.append(tuple(fields))
+    return tuple(valid), invalid, not invalid
+
+
+def _persistent_mount(
+    value: object,
+) -> tuple[tuple[object, ...] | None, bool, bool]:
+    if not isinstance(value, Mapping) or set(value) != {"path", "size"}:
+        return None, True, False
+    path = value.get("path")
+    size = value.get("size")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+    ):
+        return None, True, False
+    return (path, size), False, True
+
+
+def _has_confirmed_foreign_mount_member(actual: object, accepted: object) -> bool:
+    """Return whether partial sequence evidence proves an unaccepted member."""
+
+    if not isinstance(actual, tuple) or not isinstance(accepted, tuple):
+        return False
+    remaining = list(accepted)
+    for member in actual:
+        try:
+            remaining.remove(member)
+        except ValueError:
+            return True
+    return False
+
+
+def _assess_mounts(
+    raw: Mapping[str, Any],
+    *,
+    expected: Mapping[str, object],
+    parsers: Mapping[str, Callable[[object], tuple[object, bool, bool]]],
+    required_kinds: frozenset[str],
+) -> EndpointMountAssessment:
+    """Assess every mount kind without inferring absence from malformed siblings."""
+
+    if "mounts" not in raw or raw.get("mounts") is None:
+        return EndpointMountAssessment(tuple(sorted(required_kinds)), (), ())
+    mounts = raw.get("mounts")
+    if not isinstance(mounts, Mapping):
+        return EndpointMountAssessment((), tuple(sorted(parsers)), ())
+    missing: list[str] = []
+    invalid: list[str] = []
+    mismatched: list[str] = []
+    if set(mounts).difference(parsers):
+        mismatched.append("unsupported")
+    for kind, parser in parsers.items():
+        if kind not in mounts:
+            if kind in required_kinds:
+                missing.append(kind)
+            elif kind in expected:
+                mismatched.append(kind)
+            continue
+        actual, actual_invalid, complete = parser(mounts[kind])
+        if actual_invalid:
+            invalid.append(kind)
+        if kind not in expected:
+            if complete or _has_confirmed_foreign_mount_member(actual, ()):
+                mismatched.append(kind)
+            continue
+        accepted, accepted_invalid, accepted_complete = parser(expected[kind])
+        if accepted_invalid or not accepted_complete:
+            raise ValueError("Accepted mount policy is invalid")
+        if (complete and actual != accepted) or (
+            actual_invalid and _has_confirmed_foreign_mount_member(actual, accepted)
+        ):
+            mismatched.append(kind)
+    return EndpointMountAssessment(tuple(missing), tuple(invalid), tuple(mismatched))
+
+
+def assess_endpoint_mounts(
+    raw: Mapping[str, Any], expected_network_volume_ids: Sequence[str]
+) -> EndpointMountAssessment:
+    """Assess network and global policy independently without short-circuiting."""
+
+    return _assess_mounts(
+        raw,
+        expected={
+            "network": [
+                {"volumeId": volume_id} for volume_id in expected_network_volume_ids
+            ],
+            "global": [],
+        },
+        parsers={
+            "network": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"volumeId"})
+            ),
+            "global": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"volumeId"})
+            ),
+        },
+        required_kinds=frozenset({"network", "global"}),
+    )
+
+
+def assess_pod_mounts(
+    raw: Mapping[str, Any], expected_mounts: Mapping[str, Any] | None
+) -> EndpointMountAssessment:
+    """Assess Pod network and persistent mounts as independent typed evidence."""
+
+    if "mounts" not in raw or raw.get("mounts") is None:
+        return EndpointMountAssessment(("mounts",), (), ())
+    if not isinstance(raw.get("mounts"), Mapping):
+        return EndpointMountAssessment((), ("mounts",), ())
+    return _assess_mounts(
+        raw,
+        expected=expected_mounts or {},
+        parsers={
+            "network": lambda value: _mount_sequence(
+                value, required_keys=frozenset({"path", "volumeId"})
+            ),
+            "persistent": _persistent_mount,
+        },
+        required_kinds=frozenset(),
+    )
+
+
 def validate_endpoint_mounts(
     raw: Mapping[str, Any], expected_network_volume_ids: Sequence[str]
 ) -> None:
     """Verify all endpoint storage kinds against the accepted storage policy."""
 
-    mounts = _mapping(raw, "mounts", "Endpoint")
-    if set(mounts) != {"network", "global"}:
-        raise RunPodManagerError("Endpoint mounts contain missing or unsupported kinds")
-    network, global_mounts = mounts["network"], mounts["global"]
-    if not isinstance(network, list) or not isinstance(global_mounts, list):
-        raise RunPodManagerError(
-            "Endpoint mounts must contain network and global lists"
+    assessment = assess_endpoint_mounts(raw, expected_network_volume_ids)
+    if assessment.mismatched_kinds:
+        if assessment.mismatched_kinds == ("global",):
+            raise RunPodMountPolicyMismatchError(
+                "Endpoint global mounts are outside the accepted policy"
+            )
+        raise RunPodMountPolicyMismatchError(
+            "Endpoint mounts contain storage outside the accepted policy"
         )
-    if global_mounts:
-        raise RunPodManagerError(
-            "Endpoint global mounts are outside the accepted policy"
-        )
-    network_ids = []
-    for mount in network:
-        if not isinstance(mount, Mapping) or set(mount) != {"volumeId"}:
-            raise RunPodManagerError("Endpoint network mount has an invalid shape")
-        network_ids.append(_string(mount, "volumeId", "Endpoint network mount"))
-    if tuple(network_ids) != tuple(expected_network_volume_ids):
-        raise RunPodManagerError(
-            "Endpoint network mounts do not match the accepted policy"
-        )
+    if assessment.invalid_kinds:
+        raise RunPodManagerError("Endpoint mounts contain invalid policy evidence")
+    if assessment.missing_kinds:
+        raise RunPodManagerError("Endpoint mounts omit required policy evidence")
 
 
 @dataclass(frozen=True)
@@ -100,6 +352,27 @@ class RunPodAmbiguousResultError(RunPodAPIError):
     """A mutating request may have succeeded and must be reconciled first."""
 
     reconcile_required = True
+
+
+class RunPodAcknowledgedResourceError(RunPodAmbiguousResultError):
+    """A mutation returned an exact resource with invalid sibling evidence."""
+
+    def __init__(self, *, resource_id: str, resource_name: str) -> None:
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("Acknowledged resource ID must be nonempty")
+        if not isinstance(resource_name, str) or not resource_name:
+            raise ValueError("Acknowledged resource name must be nonempty")
+        self.resource_id = resource_id
+        self.resource_name = resource_name
+        super().__init__(
+            title="Runpod v2 create evidence is invalid",
+            detail=(
+                "The Pod create was acknowledged by exact ID, but its optional "
+                "response evidence was invalid"
+            ),
+            method="POST",
+            resource="/pods",
+        )
 
 
 class CloudType(str, Enum):
@@ -306,6 +579,11 @@ class _PodContainerRequest:
             raise ValueError("Pod name and image are required")
         if type(self.disk_gb) is not int or self.disk_gb < 1:
             raise ValueError("Pod disk_gb must be a positive integer")
+        object.__setattr__(self, "ports", tuple(self.ports))
+        object.__setattr__(self, "data_center_ids", tuple(self.data_center_ids))
+        object.__setattr__(self, "env", _freeze_json_value(self.env))
+        if self.mounts is not None:
+            object.__setattr__(self, "mounts", _freeze_json_value(self.mounts))
 
     def _container_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -314,7 +592,7 @@ class _PodContainerRequest:
             "cloud": self.cloud.value,
             "disk": self.disk_gb,
             "ports": list(self.ports),
-            "env": dict(self.env),
+            "env": _mutable_json_value(self.env),
             "globalNetworking": self.global_networking,
         }
         if self.args is not None:
@@ -324,7 +602,7 @@ class _PodContainerRequest:
         if self.data_center_ids:
             payload["dataCenterIds"] = list(self.data_center_ids)
         if self.mounts is not None:
-            payload["mounts"] = dict(self.mounts)
+            payload["mounts"] = _mutable_json_value(self.mounts)
         return payload
 
 
@@ -345,7 +623,6 @@ class PodCreateRequest(_PodContainerRequest):
         normalize_cuda_floor(self.min_cuda_version)
 
     def to_payload(self) -> Dict[str, Any]:
-        self.__post_init__()
         payload = self._container_payload()
         payload["gpu"] = {"id": self.gpu_id, "count": self.gpu_count}
         if self.min_cuda_version is not None:
@@ -368,7 +645,6 @@ class CpuPodCreateRequest(_PodContainerRequest):
     vcpu_count: int
 
     def __post_init__(self) -> None:
-        super().__post_init__()
         if not isinstance(self.cpu_id, str) or not self.cpu_id:
             raise ValueError("Pod cpu_id is required")
         count = self.vcpu_count
@@ -380,7 +656,7 @@ class CpuPodCreateRequest(_PodContainerRequest):
             if not isinstance(self.mounts, Mapping) or set(self.mounts) - {"network"}:
                 raise ValueError("CPU Pods support only an explicit network mount")
             network = self.mounts.get("network", [])
-            if not isinstance(network, list) or len(network) > 1:
+            if not isinstance(network, (list, tuple)) or len(network) > 1:
                 raise ValueError("CPU Pods support at most one network mount")
             for mount in network:
                 if (
@@ -392,10 +668,9 @@ class CpuPodCreateRequest(_PodContainerRequest):
                     )
                 ):
                     raise ValueError("CPU Pod network mount requires volumeId and path")
+        super().__post_init__()
 
     def to_payload(self) -> Dict[str, Any]:
-        # Caller-owned mount mappings may have changed since construction.
-        self.__post_init__()
         payload = self._container_payload()
         payload["cpu"] = {"id": self.cpu_id, "vcpuCount": self.vcpu_count}
         return payload
@@ -416,7 +691,7 @@ class EndpointCreateRequest:
     idle_timeout_seconds: Optional[int] = 10
     disk_gb: int = 20
     ports: tuple[str, ...] = ()
-    env: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict, repr=False)
     args: Optional[str] = None
     registry_id: Optional[str] = None
     data_center_ids: tuple[str, ...] = ()
@@ -457,6 +732,12 @@ class EndpointCreateRequest:
         normalize_cuda_floor(self.min_cuda_version)
         if not isinstance(self.resource_schema_version, EndpointResourceVersion):
             raise ValueError("Endpoint resource_schema_version is invalid")
+        object.__setattr__(self, "gpu_pools", tuple(self.gpu_pools))
+        object.__setattr__(self, "ports", tuple(self.ports))
+        object.__setattr__(self, "data_center_ids", tuple(self.data_center_ids))
+        object.__setattr__(self, "network_volume_ids", tuple(self.network_volume_ids))
+        object.__setattr__(self, "scaling", _freeze_json_value(self.scaling))
+        object.__setattr__(self, "env", _freeze_json_value(self.env))
 
     def to_payload(self) -> Dict[str, Any]:
         workers: Dict[str, int] = {"min": self.workers_min, "max": self.workers_max}
@@ -468,10 +749,10 @@ class EndpointCreateRequest:
             "type": self.endpoint_type,
             "gpu": {"pools": list(self.gpu_pools), "count": self.gpu_count},
             "workers": workers,
-            "scaling": dict(self.scaling),
+            "scaling": _mutable_json_value(self.scaling),
             "disk": self.disk_gb,
             "ports": list(self.ports),
-            "env": dict(self.env),
+            "env": _mutable_json_value(self.env),
             "dataCenterIds": list(self.data_center_ids),
             "networkVolumes": list(self.network_volume_ids),
             "timeout": self.execution_timeout_ms,
@@ -557,36 +838,156 @@ class EndpointUpdateRequest:
         return payload
 
 
+def _optional_evidence_value(
+    source: Mapping[str, Any],
+    key: str,
+    field_path: str,
+    parser: Any,
+    missing: list[str],
+    invalid: list[str],
+) -> Any:
+    """Parse one optional field without suppressing usable sibling evidence."""
+
+    if key not in source or source[key] is None:
+        missing.append(field_path)
+        return None
+    try:
+        return parser(source[key])
+    except (RunPodManagerError, TypeError, ValueError, OverflowError) as error:
+        if is_execution_control_error(error):
+            raise
+        invalid.append(field_path)
+        return None
+
+
 @dataclass(frozen=True)
 class PodResource:
     id: str
     name: str
-    status: str
+    status: str | None
     gpu_id: Optional[str]
     gpu_count: int
-    cost_per_hr: Optional[float]
+    cost_per_hr: Decimal | None
     raw: Mapping[str, Any]
+    cloud: CloudType | None = None
+    data_center_id: str | None = None
+    cuda_version: str | None = None
+    image: str | None = None
+    environment_sha256: str | None = None
+    created_at: datetime | None = None
+    field_evidence: ResourceFieldEvidence = field(default_factory=ResourceFieldEvidence)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "PodResource":
-        gpu = value.get("gpu") or {}
-        if not isinstance(gpu, Mapping):
-            raise RunPodManagerError("Invalid v2 Pod.gpu response")
-        try:
-            cost = _optional_number(value.get("cost"), "Pod.cost")
-        except OverflowError:
-            raise RunPodManagerError("Invalid Pod.cost response") from None
-        if cost is not None and (not math.isfinite(cost) or cost < 0):
-            raise RunPodManagerError("Invalid Pod.cost response")
+        missing: list[str] = []
+        invalid: list[str] = []
+        gpu_value = value.get("gpu")
+        if gpu_value is None:
+            missing.append("gpu")
+            gpu: Mapping[str, Any] = {}
+        elif not isinstance(gpu_value, Mapping):
+            invalid.append("gpu")
+            gpu = {}
+        else:
+            gpu = gpu_value
+
+        gpu_id = _optional_evidence_value(
+            gpu,
+            "id",
+            "gpu.id",
+            lambda item: _optional_string(item, "Pod.gpu.id"),
+            missing,
+            invalid,
+        )
+        gpu_count = _optional_evidence_value(
+            gpu,
+            "count",
+            "gpu.count",
+            lambda item: _optional_integer(item, "Pod.gpu.count"),
+            missing,
+            invalid,
+        )
+        cost = _optional_evidence_value(
+            value,
+            "cost",
+            "cost",
+            lambda item: _optional_decimal(item, "Pod.cost"),
+            missing,
+            invalid,
+        )
+        raw_cloud = value.get("cloud")
+        if raw_cloud is None:
+            missing.append("cloud")
+            cloud = None
+        else:
+            try:
+                cloud = CloudType(raw_cloud)
+            except (TypeError, ValueError):
+                invalid.append("cloud")
+                cloud = None
+        environment_sha256 = _optional_evidence_value(
+            value,
+            "env",
+            "env",
+            environment_values_sha256,
+            missing,
+            invalid,
+        )
         return cls(
             id=_string(value, "id", "Pod"),
             name=_string(value, "name", "Pod"),
-            status=_string(value, "status", "Pod"),
-            gpu_id=_optional_string(gpu.get("id"), "Pod.gpu.id"),
-            gpu_count=_optional_integer(gpu.get("count"), "Pod.gpu.count") or 0,
+            status=_optional_evidence_value(
+                value,
+                "status",
+                "status",
+                lambda item: _nonempty_response_string(item, "Pod.status"),
+                missing,
+                invalid,
+            ),
+            gpu_id=gpu_id,
+            gpu_count=gpu_count or 0,
             cost_per_hr=cost,
             raw=sanitize_resource_payload(value),
+            cloud=cloud,
+            data_center_id=_optional_evidence_value(
+                value,
+                "dataCenterId",
+                "dataCenterId",
+                lambda item: _optional_string(item, "Pod.dataCenterId"),
+                missing,
+                invalid,
+            ),
+            cuda_version=_optional_evidence_value(
+                value,
+                "cudaVersion",
+                "cudaVersion",
+                lambda item: _optional_string(item, "Pod.cudaVersion"),
+                missing,
+                invalid,
+            ),
+            image=_optional_evidence_value(
+                value,
+                "image",
+                "image",
+                lambda item: _optional_string(item, "Pod.image"),
+                missing,
+                invalid,
+            ),
+            environment_sha256=environment_sha256,
+            created_at=_optional_evidence_value(
+                value,
+                "createdAt",
+                "createdAt",
+                lambda item: _optional_response_datetime(item, "Pod.createdAt"),
+                missing,
+                invalid,
+            ),
+            field_evidence=ResourceFieldEvidence(tuple(missing), tuple(invalid)),
         )
+
+    def require_valid_fields(self, *, context: str) -> "PodResource":
+        self.field_evidence.require_valid(context=context)
+        return self
 
 
 @dataclass(frozen=True)
@@ -596,21 +997,67 @@ class EndpointResource:
     endpoint_type: Optional[str]
     request_urls: Mapping[str, str]
     raw: Mapping[str, Any]
+    image: str | None = None
+    environment_sha256: str | None = None
+    created_at: datetime | None = None
+    field_evidence: ResourceFieldEvidence = field(default_factory=ResourceFieldEvidence)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "EndpointResource":
-        urls = value.get("requestUrls") or {}
-        if not isinstance(urls, Mapping) or not all(
-            isinstance(key, str) and isinstance(item, str) for key, item in urls.items()
-        ):
-            raise RunPodManagerError("Invalid v2 Endpoint.requestUrls response")
+        missing: list[str] = []
+        invalid: list[str] = []
+        urls = _optional_evidence_value(
+            value,
+            "requestUrls",
+            "requestUrls",
+            lambda item: _string_mapping(item, "Endpoint.requestUrls"),
+            missing,
+            invalid,
+        )
+        environment_sha256 = _optional_evidence_value(
+            value,
+            "env",
+            "env",
+            environment_values_sha256,
+            missing,
+            invalid,
+        )
         return cls(
             id=_string(value, "id", "Endpoint"),
             name=_string(value, "name", "Endpoint"),
-            endpoint_type=_optional_string(value.get("type"), "Endpoint.type"),
-            request_urls=dict(urls),
+            endpoint_type=_optional_evidence_value(
+                value,
+                "type",
+                "type",
+                lambda item: _optional_string(item, "Endpoint.type"),
+                missing,
+                invalid,
+            ),
+            request_urls=dict(urls or {}),
             raw=sanitize_resource_payload(value),
+            image=_optional_evidence_value(
+                value,
+                "image",
+                "image",
+                lambda item: _optional_string(item, "Endpoint.image"),
+                missing,
+                invalid,
+            ),
+            environment_sha256=environment_sha256,
+            created_at=_optional_evidence_value(
+                value,
+                "createdAt",
+                "createdAt",
+                lambda item: _optional_response_datetime(item, "Endpoint.createdAt"),
+                missing,
+                invalid,
+            ),
+            field_evidence=ResourceFieldEvidence(tuple(missing), tuple(invalid)),
         )
+
+    def require_valid_fields(self, *, context: str) -> "EndpointResource":
+        self.field_evidence.require_valid(context=context)
+        return self
 
 
 @dataclass(frozen=True)
@@ -753,6 +1200,20 @@ def _optional_string(value: Any, context: str) -> Optional[str]:
     return value
 
 
+def _nonempty_response_string(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RunPodManagerError(f"Invalid {context} response")
+    return value
+
+
+def _string_mapping(value: Any, context: str) -> Dict[str, str]:
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise RunPodManagerError(f"Invalid {context} response")
+    return dict(value)
+
+
 def _integer(value: Mapping[str, Any], key: str, context: str) -> int:
     item = value.get(key)
     if not isinstance(item, int) or isinstance(item, bool):
@@ -781,6 +1242,42 @@ def _optional_number(value: Any, context: str) -> Optional[float]:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise RunPodManagerError(f"Invalid {context} response")
     return float(value)
+
+
+def _optional_decimal(value: Any, context: str) -> Decimal | None:
+    """Preserve the JSON parser's numeric value; not the original wire lexeme."""
+
+    if value is None:
+        return None
+    if not isinstance(value, (int, float, Decimal)) or isinstance(value, bool):
+        raise RunPodManagerError(f"Invalid {context} response")
+    try:
+        parsed = Decimal(str(value))
+        binary = float(value)
+    except (InvalidOperation, ValueError, OverflowError) as exc:
+        raise RunPodManagerError(f"Invalid {context} response") from exc
+    if (
+        not parsed.is_finite()
+        or parsed < 0
+        or not math.isfinite(binary)
+        or (parsed != 0 and binary == 0)
+    ):
+        raise RunPodManagerError(f"Invalid {context} response")
+    return parsed
+
+
+def _optional_response_datetime(value: Any, context: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RunPodManagerError(f"Invalid {context} response")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise RunPodManagerError(f"Invalid {context} response") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RunPodManagerError(f"Invalid {context} response")
+    return parsed.astimezone(UTC)
 
 
 def _boolean(value: Mapping[str, Any], key: str, context: str) -> bool:

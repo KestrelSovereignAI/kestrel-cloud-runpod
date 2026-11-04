@@ -80,6 +80,12 @@ def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch):
         "ollama_leases": {
             "database_path": str(tmp_path / "leases.sqlite3"),
             "poll_interval_seconds": 5,
+            "billing_poll_interval_seconds": 3600,
+            "billing_batch_hours": 24,
+            "reconciliation_batch_size": 100,
+            "maximum_telemetry_observations": 256,
+            "maximum_billing_observations": 128,
+            "maximum_evidence_bytes": 1_048_576,
             "serverless_workers_max": 1,
             "serverless_request_count": 1,
             "serverless_execution_timeout_ms": 300_000,

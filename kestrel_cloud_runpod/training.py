@@ -13,8 +13,8 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any, NoReturn, overload
 
 from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
@@ -22,17 +22,23 @@ from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_UPLOAD,
     POD_READY_TIMEOUT,
 )
+from kestrel_sovereign.async_ownership import await_owned_operation
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+    owned_native_http_client,
+)
 
 from .models import (
     GPUProfile,
     RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
 )
 from .providers import DirectRunPodProvider
 from .training_contracts import (
     TRAINING_PROFILE_IDS,
-    TrainingPodCleanupError,
     TrainingPodCleanupState,
     TrainingPodLease,
     TrainingPodLifecycleError,
@@ -146,11 +152,15 @@ class RunPodTrainingMixin:
             return None
         url = f"{lease.backend_base_url}/status/{lease.provider_job_id}"
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+            async with owned_native_http_client(
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+            ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
                 payload: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise RunPodManagerError(
                 f"Training reconciliation status failed ({type(exc).__name__})"
             ) from exc
@@ -194,7 +204,7 @@ class RunPodTrainingMixin:
         service = self._get_training_pod_lease_service()
 
         ready_url = f"{session.backend_base_url}/ready"
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        deadline = datetime.now(UTC) + timedelta(seconds=timeout)
 
         logger.info(
             "Waiting for training model to load at %s "
@@ -206,8 +216,10 @@ class RunPodTrainingMixin:
         last_status = None
         last_detail = None
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
-            while datetime.now(timezone.utc) < deadline:
+        async with owned_native_http_client(
+            httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+        ) as client:
+            while datetime.now(UTC) < deadline:
                 attempts += 1
                 service.heartbeat(cleanup_token)
                 try:
@@ -225,7 +237,9 @@ class RunPodTrainingMixin:
                         try:
                             data = response.json()
                             detail = data.get("detail", "loading")
-                        except Exception:
+                        except Exception as exc:
+                            if is_execution_control_error(exc):
+                                raise
                             detail = response.text[:100]
 
                         # Check if another training is already running
@@ -264,20 +278,20 @@ class RunPodTrainingMixin:
                             f"Unexpected /ready response: {response.status_code}"
                         )
 
-                except httpx.ConnectError:
-                    service.record_operation_error(
-                        cleanup_token, httpx.ConnectError("training readiness")
-                    )
+                except httpx.ConnectError as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    service.record_operation_error(cleanup_token, exc)
                     if last_status != "connect_error":
                         logger.info(
                             f"Training pod not yet reachable (attempt {attempts})"
                         )
                         last_status = "connect_error"
 
-                except httpx.TimeoutException:
-                    service.record_operation_error(
-                        cleanup_token, httpx.TimeoutException("training readiness")
-                    )
+                except httpx.TimeoutException as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    service.record_operation_error(cleanup_token, exc)
                     if last_status != "timeout":
                         logger.warning(
                             f"Training pod /ready timed out (attempt {attempts})"
@@ -410,6 +424,8 @@ class RunPodTrainingMixin:
                     root_cleanup_token=root_cleanup_token,
                 )
             except TrainingPodLifecycleError as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Profile {profile_name} failed: {e}")
                 last_error = e
                 if e.billing_risk or e.cleanup_state not in {
@@ -445,7 +461,7 @@ class RunPodTrainingMixin:
             async with self._lock:
                 if self._session and self._session.is_active:
                     raise RunPodManagerError("A RunPod session is already active")
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             readiness_seconds = profile.readiness_timeout_seconds or POD_READY_TIMEOUT
             readiness_seconds = min(readiness_seconds, ttl_seconds - 1)
             request = TrainingPodRequest(
@@ -500,11 +516,9 @@ class RunPodTrainingMixin:
             self._session = session
         return session
 
-    async def start_inference_pod(self, companion_id: str) -> Optional[RunPodSession]:
+    async def start_inference_pod(self, companion_id: str) -> RunPodSession | None:
         """
-        Start a pod for LoRA-based image generation.
-
-        Reuses an eligible stopped Pod before creating a new one.
+        Refuse the legacy ownerless LoRA inference admission path.
 
         Args:
             companion_id: Companion for tracking
@@ -513,16 +527,8 @@ class RunPodTrainingMixin:
             RunPodSession if started successfully, None otherwise
         """
         try:
-            profile = self._select_profile("image")
             ttl_seconds = 600  # 10 min for inference
 
-            # Try to resume a stopped inference pod first (much faster)
-            stopped_pod = await self.find_stopped_pod("lora_inference", "image")
-            if stopped_pod:
-                logger.info("Starting existing stopped inference Pod through Runpod v2")
-                return await self.resume_stopped_pod(stopped_pod, profile, ttl_seconds)
-
-            # No stopped pod found, create new one
             await self.start_session(
                 task_profile="image",
                 model_name="flux-with-lora",
@@ -537,9 +543,11 @@ class RunPodTrainingMixin:
             async with self._lock:
                 return self._session
 
-        except RunPodAmbiguousResultError:
+        except (RunPodAmbiguousResultError, RunPodLegacyAdmissionRetiredError):
             raise
         except RunPodManagerError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to start inference pod for {companion_id}: {e}")
             return None
 
@@ -548,7 +556,7 @@ class RunPodTrainingMixin:
         session: RunPodSession,
         avatar_data: bytes,
         companion_id: str,
-        callback_url: Optional[str] = None,
+        callback_url: str | None = None,
         wait_for_model_ready: bool = True,
     ) -> str:
         """
@@ -579,22 +587,34 @@ class RunPodTrainingMixin:
             # /health can be healthy while the large trainer model is loading.
             if wait_for_model_ready:
                 await self._wait_for_training_ready(session)
-        except asyncio.CancelledError:
-            service.request_cancellation(cleanup_token)
-            await self._release_after_cancellation(cleanup_token, "model readiness")
-            raise
+        except asyncio.CancelledError as cancellation:
+            if is_execution_control_error(cancellation):
+                raise
+            await self._release_after_cancellation(
+                cleanup_token,
+                "model readiness",
+                cancellation,
+                persist_cancellation=True,
+            )
         except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
-            try:
-                await service.release(cleanup_token, reason="model readiness failure")
-            except TrainingPodCleanupError as cleanup_exc:
-                raise cleanup_exc from exc
+            await self._release_after_cancellation(
+                cleanup_token,
+                "model readiness",
+                exc,
+                persist_cancellation=False,
+                reason="model readiness failure",
+            )
             raise
 
         train_url = f"{session.backend_base_url}/train"
         logger.info(f"Submitting training job to {train_url}")
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_UPLOAD) as client:
+        async with owned_native_http_client(
+            httpx.AsyncClient(timeout=HTTP_TIMEOUT_UPLOAD)
+        ) as client:
             try:
                 # Use avatar bytes directly from sovereign storage
                 logger.info(
@@ -625,13 +645,18 @@ class RunPodTrainingMixin:
                     raise RunPodManagerError(
                         "Training workload returned a non-object submission response"
                     )
-            except asyncio.CancelledError:
-                service.request_cancellation(cleanup_token)
+            except asyncio.CancelledError as cancellation:
+                if is_execution_control_error(cancellation):
+                    raise
                 await self._release_after_cancellation(
-                    cleanup_token, "training submission"
+                    cleanup_token,
+                    "training submission",
+                    cancellation,
+                    persist_cancellation=True,
                 )
-                raise
             except httpx.ConnectError as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -640,6 +665,8 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except httpx.HTTPStatusError as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -648,6 +675,8 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except httpx.TimeoutException as e:
+                if is_execution_control_error(e):
+                    raise
                 return await self._recover_or_cleanup_submission(
                     client=client,
                     session=session,
@@ -656,13 +685,16 @@ class RunPodTrainingMixin:
                     cause=e,
                 )
             except (ValueError, RunPodManagerError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 service.record_operation_error(cleanup_token, exc)
-                try:
-                    await service.release(
-                        cleanup_token, reason="invalid submission response"
-                    )
-                except TrainingPodCleanupError as cleanup_exc:
-                    raise cleanup_exc from exc
+                await self._release_after_cancellation(
+                    cleanup_token,
+                    "training submission",
+                    exc,
+                    persist_cancellation=False,
+                    reason="invalid submission response",
+                )
                 raise RunPodManagerError(
                     f"Training submission failed ({type(exc).__name__})"
                 ) from exc
@@ -671,10 +703,13 @@ class RunPodTrainingMixin:
         if not isinstance(job_id, str) or not job_id:
             error = RunPodManagerError("Training workload omitted its job ID")
             service.record_operation_error(cleanup_token, error)
-            try:
-                await service.release(cleanup_token, reason="missing training job ID")
-            except TrainingPodCleanupError as cleanup_exc:
-                raise cleanup_exc from error
+            await self._release_after_cancellation(
+                cleanup_token,
+                "training submission",
+                error,
+                persist_cancellation=False,
+                reason="missing training job ID",
+            )
             raise error
 
         service.record_job(cleanup_token, job_id)
@@ -719,21 +754,26 @@ class RunPodTrainingMixin:
                         }
                     ):
                         recovered_job_id = raw_id
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             recovered_job_id = None
         if recovered_job_id:
             service.record_job(cleanup_token, recovered_job_id)
             return recovered_job_id
         service.record_operation_error(cleanup_token, cause)
-        try:
-            await service.release(cleanup_token, reason="training submission failure")
-        except TrainingPodCleanupError as cleanup_exc:
-            raise cleanup_exc from cause
+        await self._release_after_cancellation(
+            cleanup_token,
+            "training submission",
+            cause,
+            persist_cancellation=False,
+            reason="training submission failure",
+        )
         raise RunPodManagerError(
             f"Training submission failed ({type(cause).__name__}); capacity was stopped"
         ) from cause
 
-    async def get_current_job(self, session: RunPodSession) -> Optional[Dict[str, Any]]:
+    async def get_current_job(self, session: RunPodSession) -> dict[str, Any] | None:
         """
         Check if a training job is currently running on the pod.
 
@@ -753,7 +793,9 @@ class RunPodTrainingMixin:
 
         url = f"{session.backend_base_url}/current-job"
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+        async with owned_native_http_client(
+            httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+        ) as client:
             try:
                 response = await client.get(url)
                 if response.status_code == 404:
@@ -765,6 +807,8 @@ class RunPodTrainingMixin:
                     return data
                 return None
             except (httpx.HTTPError, ValueError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 service.record_operation_error(cleanup_token, exc)
                 raise RunPodManagerError(
                     f"Training current-job observation failed ({type(exc).__name__})"
@@ -772,7 +816,7 @@ class RunPodTrainingMixin:
 
     async def cancel_training_job(
         self, session: RunPodSession, job_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Cancel a training job.
 
@@ -796,9 +840,11 @@ class RunPodTrainingMixin:
 
         url = f"{session.backend_base_url}/cancel/{job_id}"
 
-        cancellation: Dict[str, Any]
+        cancellation: dict[str, Any]
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+            async with owned_native_http_client(
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+            ) as client:
                 response = await client.post(url)
                 response.raise_for_status()
                 payload: object = response.json()
@@ -807,15 +853,26 @@ class RunPodTrainingMixin:
                         "Training cancellation returned a non-object response"
                     )
                 cancellation = payload
-        except asyncio.CancelledError:
-            await self._release_after_cancellation(cleanup_token, "job cancellation")
-            raise
+        except asyncio.CancelledError as cancellation_error:
+            if is_execution_control_error(cancellation_error):
+                raise
+            await self._release_after_cancellation(
+                cleanup_token,
+                "job cancellation",
+                cancellation_error,
+                persist_cancellation=False,
+            )
         except (httpx.HTTPError, ValueError, RunPodManagerError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
-            try:
-                await service.release(cleanup_token, reason="job cancellation failure")
-            except TrainingPodCleanupError as cleanup_exc:
-                raise cleanup_exc from exc
+            await self._release_after_cancellation(
+                cleanup_token,
+                "job cancellation",
+                exc,
+                persist_cancellation=False,
+                reason="job cancellation failure",
+            )
             raise RunPodManagerError(
                 f"Training cancellation failed ({type(exc).__name__}); "
                 "capacity was stopped"
@@ -823,7 +880,7 @@ class RunPodTrainingMixin:
         await service.release(cleanup_token, reason="job cancelled")
         return cancellation
 
-    async def clear_current_job(self, session: RunPodSession) -> Dict[str, Any]:
+    async def clear_current_job(self, session: RunPodSession) -> dict[str, Any]:
         """
         Force-clear the current job lock on the pod.
 
@@ -847,11 +904,15 @@ class RunPodTrainingMixin:
         url = f"{session.backend_base_url}/clear-current-job"
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+            async with owned_native_http_client(
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+            ) as client:
                 response = await client.post(url)
                 response.raise_for_status()
                 result: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training lock clear failed ({type(exc).__name__})"
@@ -865,7 +926,7 @@ class RunPodTrainingMixin:
 
     async def poll_training_status(
         self, session: RunPodSession, job_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Get training job status from pod.
 
@@ -887,11 +948,15 @@ class RunPodTrainingMixin:
         status_url = f"{session.backend_base_url}/status/{job_id}"
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
+            async with owned_native_http_client(
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT)
+            ) as client:
                 response = await client.get(status_url)
                 response.raise_for_status()
                 result: object = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training status observation failed ({type(exc).__name__}); "
@@ -932,11 +997,15 @@ class RunPodTrainingMixin:
         logger.info(f"Downloading LoRA from {download_url}")
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DOWNLOAD) as client:
+            async with owned_native_http_client(
+                httpx.AsyncClient(timeout=HTTP_TIMEOUT_DOWNLOAD)
+            ) as client:
                 response = await client.get(download_url)
                 response.raise_for_status()
                 content = response.content
         except httpx.HTTPError as exc:
+            if is_execution_control_error(exc):
+                raise
             service.record_operation_error(cleanup_token, exc)
             raise RunPodManagerError(
                 f"Training result download failed ({type(exc).__name__}); "
@@ -955,21 +1024,90 @@ class RunPodTrainingMixin:
             )
         return token
 
+    def _session_lease(self, session: RunPodSession) -> TrainingPodLease:
+        """Bind a mutable legacy session to its exact durable lease."""
+
+        cleanup_token = self._training_token(session)
+        lease = self.get_training_pod_lease(cleanup_token)
+        if (
+            session.task_profile != "training"
+            or lease.is_terminal
+            or lease.provider_pod_id != session.pod_id
+            or lease.profile_id != session.profile.id
+            or lease.companion_id != session.companion_id
+        ):
+            raise RunPodManagerError(
+                "Training session no longer matches its durable capacity lease"
+            )
+        return lease
+
+    @overload
     async def _release_after_cancellation(
-        self, cleanup_token: str, operation: str
+        self,
+        cleanup_token: str,
+        operation: str,
+        cancellation: asyncio.CancelledError,
+        *,
+        persist_cancellation: bool,
+        reason: str | None = None,
+    ) -> NoReturn: ...
+
+    @overload
+    async def _release_after_cancellation(
+        self,
+        cleanup_token: str,
+        operation: str,
+        cancellation: BaseException,
+        *,
+        persist_cancellation: bool,
+        reason: str | None = None,
+    ) -> None: ...
+
+    async def _release_after_cancellation(
+        self,
+        cleanup_token: str,
+        operation: str,
+        cancellation: BaseException,
+        *,
+        persist_cancellation: bool,
+        reason: str | None = None,
     ) -> None:
+        """Join cleanup; healthy ordinary primaries retain caller normalization."""
         service = self._get_training_pod_lease_service()
-        cleanup = asyncio.create_task(
-            service.release(cleanup_token, reason=f"{operation} cancellation")
+
+        async def request_and_release() -> TrainingPodLease:
+            if persist_cancellation:
+                service.request_cancellation(cleanup_token)
+            return await service.release(
+                cleanup_token,
+                reason=reason if reason is not None else f"{operation} cancellation",
+            )
+
+        cleanup = await await_owned_operation(
+            request_and_release(),
+            retain_originals=True,
         )
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await cleanup
+        if (
+            cleanup.error is None
+            and cleanup.cancellation is None
+            and not isinstance(cancellation, asyncio.CancelledError)
+        ):
+            return
+        terminal = execution_terminal_error(
+            cleanup.error,
+            cancellation,
+            cleanup.cancellation,
+            retain_originals=True,
+            prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
+        if terminal is None:
+            raise AssertionError("Training cleanup lost its terminal outcome")
+        raise terminal
 
     async def generate_with_lora(
         self, session: RunPodSession, prompt: str, lora_path: str, num_outputs: int = 1
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Generate images using loaded LoRA model.
 
@@ -991,7 +1129,9 @@ class RunPodTrainingMixin:
         generate_url = f"{session.backend_base_url}/generate"
         logger.info(f"Generating with LoRA at {generate_url}")
 
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_UPLOAD) as client:
+        async with owned_native_http_client(
+            httpx.AsyncClient(timeout=HTTP_TIMEOUT_UPLOAD)
+        ) as client:
             response = await client.post(
                 generate_url,
                 json={

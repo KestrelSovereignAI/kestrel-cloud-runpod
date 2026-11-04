@@ -708,7 +708,9 @@ def test_serverless_worker_cost_bills_every_gpu_in_the_worker() -> None:
             serverless_worker_cost_usd(Decimal("0.44"), bad, one_hour)
 
 
-def test_openapi_provenance_refresh_does_not_restamp_durable_authority(monkeypatch):
+def test_openapi_provenance_refresh_does_not_restamp_durable_authority(
+    monkeypatch, record_property
+):
     from kestrel_cloud_runpod import serverless_capacity_contracts as contracts
 
     def payloads():
@@ -743,5 +745,7 @@ def test_openapi_provenance_refresh_does_not_restamp_durable_authority(monkeypat
         "7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd",
     )
     refreshed = payloads()
+    record_property("openapi_original_authority", json.dumps(original, sort_keys=True))
+    record_property("openapi_refreshed_authority", json.dumps(refreshed, sort_keys=True))
     assert refreshed == original
     assert json_sha256(refreshed) == json_sha256(original)

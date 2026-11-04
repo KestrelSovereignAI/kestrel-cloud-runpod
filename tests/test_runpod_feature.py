@@ -1,11 +1,115 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
-
-from kestrel_cloud_runpod.feature import RunPodFeature
-from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_sdk.llm import BackendType
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
+)
+
+from kestrel_cloud_runpod.feature import RunPodFeature
+from kestrel_cloud_runpod.models import (
+    RunPodLegacyAdmissionRetiredError,
+    RunPodManagerError,
+)
+
+
+@pytest.mark.asyncio
+async def test_legacy_feature_refuses_direct_admission_before_acknowledged_post():
+    """Legacy admission has no durable place to retain an exact POST ACK."""
+
+    import asyncio
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
+    from kestrel_cloud_runpod.manager import RunPodManager
+    from kestrel_cloud_runpod.providers import DirectRunPodProvider
+
+    calls: list[tuple[str, str]] = []
+    created: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/v2/catalog/gpus":
+            return httpx.Response(
+                200,
+                json={
+                    "gpus": [
+                        {
+                            "id": "live-gpu",
+                            "name": "Live GPU",
+                            "pool": None,
+                            "manufacturer": "NVIDIA",
+                            "memory": 24,
+                            "secure": True,
+                            "community": False,
+                            "price": {"secure": 0.5, "community": 0.0},
+                            "maxCount": {"secure": 1, "community": 0},
+                            "availability": "HIGH",
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v2/pods":
+            body = json.loads(request.content)
+            resource_id = f"known-pod-{len(created) + 1}"
+            created.append(resource_id)
+            return httpx.Response(
+                201,
+                json={
+                    "id": resource_id,
+                    "name": body["name"],
+                    "status": "PROVISIONING",
+                    "gpu": body["gpu"],
+                    "cost": True,
+                },
+            )
+        raise AssertionError((request.method, request.url.path))
+
+    client = RunpodControlPlaneClient(
+        api_key="synthetic-control-only",
+        http_transport=httpx.MockTransport(handler),
+        max_safe_retries=0,
+    )
+    provider = DirectRunPodProvider(api_key="", client=client)
+    config = {
+        "manager": {"cloud_type": "SECURE"},
+        "profiles": {
+            "llm": {
+                "name": "Test",
+                "image_name": "synthetic/image:sha",
+                "min_vram_gb": 24,
+                "max_cost_per_hr": 1.0,
+                "default_model": "model",
+            }
+        },
+    }
+    try:
+        with patch.object(RunPodManager, "_build_provider", return_value=provider):
+            manager = RunPodManager(config=config)
+        feature = RunPodFeature.__new__(RunPodFeature)
+        feature.manager = manager
+        feature._start_lock = asyncio.Lock()
+
+        first = await feature._start(
+            model_name="", task_profile="llm", ttl_seconds="", pod_type=""
+        )
+        second = await feature._start(
+            model_name="", task_profile="llm", ttl_seconds="", pod_type=""
+        )
+
+        assert first.status is ToolResultStatus.ERROR
+        assert second.status is ToolResultStatus.ERROR
+        assert created == [], "legacy admission performed a Pod POST without custody"
+        assert all(method != "POST" for method, _path in calls)
+        assert manager._session is None
+    finally:
+        client.close()
 
 
 class FakeRunPodManager:
@@ -53,6 +157,214 @@ class FakeRunPodManager:
             "status": "terminating",
             "remaining_ttl_seconds": 0,
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "initialize",
+        "start-preflight",
+        "start-retired",
+        "start",
+        "start-cleanup",
+        "image-preflight",
+        "image-retired",
+        "image-start",
+        "image-start-cleanup",
+        "image-missing-endpoint-cleanup",
+        "image-request",
+        "image-final-cleanup",
+        "stop-preflight",
+        "stop",
+        "status",
+        "logs",
+    ],
+)
+async def test_feature_preserves_exact_execution_control(
+    monkeypatch, boundary, record_property
+):
+    import asyncio
+
+    error = (
+        RunPodLegacyAdmissionRetiredError()
+        if boundary in {"start-retired", "image-retired"}
+        else RunPodManagerError(f"feature {boundary} remains unknown")
+    )
+    carrier, control, explicit = execution_control_carrier(
+        error,
+        grouped=boundary == "stop",
+    )
+
+    def inject() -> None:
+        record_control_injection(record_property, boundary)
+
+    class ControlledManager(FakeRunPodManager):
+        async def get_status(self, **_kwargs):
+            if boundary in {
+                "start-preflight",
+                "image-preflight",
+                "stop-preflight",
+                "status",
+            }:
+                inject()
+                raise carrier
+            status = await super().get_status()
+            if boundary in {"start-cleanup", "image-start-cleanup"}:
+                return {**status, "active": False}
+            return status
+
+        async def stop_session(self):
+            if boundary in {
+                "stop",
+                "start-cleanup",
+                "image-start-cleanup",
+                "image-missing-endpoint-cleanup",
+                "image-final-cleanup",
+            }:
+                self.stop_calls += 1
+                inject()
+                raise carrier
+            return await super().stop_session()
+
+        async def start_session(self, **kwargs):
+            if boundary in {"start-retired", "image-retired"}:
+                inject()
+                raise carrier
+            if boundary in {
+                "start",
+                "image-start",
+            }:
+                inject()
+                raise carrier
+            if boundary in {"start-cleanup", "image-start-cleanup"}:
+                raise RunPodManagerError("ordinary failed start")
+            result = await super().start_session(**kwargs)
+            if boundary == "image-missing-endpoint-cleanup":
+                result.pop("image_endpoint", None)
+            return result
+
+        async def get_logs(self, **_kwargs):
+            if boundary == "logs":
+                inject()
+                raise carrier
+            return ""
+
+    feature = RunPodFeature.__new__(RunPodFeature)
+    manager = ControlledManager()
+    feature.manager = manager
+    feature._start_lock = asyncio.Lock()
+    post_entries = []
+
+    def controlled_post(url, payload):
+        post_entries.append((url, payload))
+        if boundary == "image-request":
+            inject()
+            raise carrier
+        return {"images": ["image-1"]}
+
+    monkeypatch.setattr(feature, "_post_json", controlled_post)
+
+    with pytest.raises(type(carrier)) as raised:
+        if boundary == "initialize":
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.feature.RunPodManager",
+                lambda: (inject(), (_ for _ in ()).throw(carrier))[1],
+            )
+            await feature.initialize()
+        elif boundary.startswith("start"):
+            await feature._start(
+                model_name="",
+                task_profile="llm",
+                ttl_seconds="",
+                pod_type="",
+            )
+        elif boundary.startswith("image"):
+            await feature.generate_image_on_runpod("portrait")
+        elif boundary in {"stop-preflight", "stop"}:
+            await feature._stop()
+        elif boundary == "status":
+            await feature._status()
+        else:
+            await feature._logs(lines=10)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    if isinstance(explicit, BaseExceptionGroup):
+        assert explicit.exceptions[0] is control
+    else:
+        assert explicit is control
+    assert len(post_entries) == (
+        1 if boundary in {"image-request", "image-final-cleanup"} else 0
+    )
+    assert len(manager.start_calls) == (
+        1
+        if boundary
+        in {
+            "image-missing-endpoint-cleanup",
+            "image-request",
+            "image-final-cleanup",
+        }
+        else 0
+    )
+    assert manager.stop_calls == (
+        1
+        if boundary
+        in {
+            "stop",
+            "start-cleanup",
+            "image-start-cleanup",
+            "image-missing-endpoint-cleanup",
+            "image-final-cleanup",
+        }
+        else 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    ["image-retired", "start-preflight", "stop-preflight"],
+)
+async def test_feature_retains_ordinary_normalization_contract(boundary):
+    class OrdinaryManager(FakeRunPodManager):
+        async def get_status(self, **kwargs):
+            if boundary.endswith("preflight"):
+                raise RuntimeError("ordinary status unavailable")
+            return await super().get_status(**kwargs)
+
+        async def start_session(self, **kwargs):
+            if boundary == "image-retired":
+                raise RunPodLegacyAdmissionRetiredError()
+            return await super().start_session(**kwargs)
+
+    feature = RunPodFeature.__new__(RunPodFeature)
+    manager = OrdinaryManager()
+    feature.manager = manager
+    feature._start_lock = asyncio.Lock()
+
+    if boundary == "image-retired":
+        result = await feature.generate_image_on_runpod("portrait")
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["error_type"] == "RunPodLegacyAdmissionRetiredError"
+        assert result.data["migration_required"] == (
+            "inference_lease_or_durable_pod_capacity_service"
+        )
+        assert manager.stop_calls == 0
+    elif boundary == "start-preflight":
+        result = await feature._start(
+            model_name="",
+            task_profile="llm",
+            ttl_seconds="",
+            pod_type="",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert len(manager.start_calls) == 1
+        assert manager.stop_calls == 0
+    else:
+        result = await feature._stop()
+        assert result.status is ToolResultStatus.OK
+        assert manager.stop_calls == 1
 
 
 class DummyLLMService:
@@ -1038,7 +1350,6 @@ async def test_failed_start_surfaces_teardown_error_in_data(monkeypatch):
     provider.stop_pod, so a failed stop_pod leaves the manager with
     no handle for retry. The orphan is invisible to the user.
     Surface teardown_error + warning in the ToolResult.failed data."""
-    import asyncio as _asyncio
 
     class _DoubleFailManager(FakeRunPodManager):
         async def get_status(self, **_):
@@ -1084,7 +1395,6 @@ async def test_stop_serializes_with_in_flight_start(monkeypatch):
     import asyncio as _asyncio
 
     start_release = _asyncio.Event()
-    stop_observed_lock_held = _asyncio.Event()
 
     class _SlowStartManager(FakeRunPodManager):
         async def start_session(self, **kwargs):

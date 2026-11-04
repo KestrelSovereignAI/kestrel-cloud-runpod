@@ -41,6 +41,15 @@ After startup every readiness probe revalidates Ollama, the exact digest, and
 the model's completion/tool support. A mismatch, missing capability, expired
 workload capability, or upstream failure returns `503`.
 
+Python 0.16 managed leases require preload: the provider owns
+`KESTREL_OLLAMA_PRELOAD_MODEL` and sets it to `true`. Profile overrides are
+rejected before provisioning, including an explicit `true` override. This is
+a managed-lease policy; the standalone runtime's configuration parser is
+unchanged. Startup completion requires bound
+boot, model-load and total-readiness measurements, plus a complete pull phase
+unless the snapshot records an exact cache hit. Partial telemetry cannot
+publish a managed route.
+
 The provider sets `KESTREL_OLLAMA_MODEL_STORAGE_PATH` to `/models` for ephemeral
 container storage, `/workspace/ollama` for a Pod volume, or
 `/runpod-volume/ollama` for a Serverless network volume, matching Runpod's
@@ -61,13 +70,24 @@ cannot observe those provider phases separately. The live gate correlates it
 with Runpod worker/Pod timestamps to isolate image-pull time. Runpod LB also
 measures the `/ping` `204` to `200` cold-start interval.
 
+`KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256` is mandatory workload input. The
+Python capacity provider derives it once from the accepted immutable
+provisioning intent with the canonical `runtime_telemetry_binding_for_intent`
+contract and includes it in the exact create payload. Operators must not
+derive it from current configuration, substitute an arbitrary digest, or
+default it when the original binding is unavailable. Runtime telemetry that
+does not reproduce that original binding is not authoritative for the lease.
+
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.1`; it does not change the
+The runtime is independently versioned as `1.1.2`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds
-that exact source commit with Go `1.26.9` and explicit fixed module versions.
+that exact source commit with Go `1.26.10` and explicit fixed module versions.
+Both binaries must be rebuilt: the previous Go `1.26.9` build is affected by
+[GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809),
+which adds distrust of compromised intermediate certificates in `crypto/x509`.
 The official binary is overwritten in the final filesystem, and both installed
 OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
 The build refuses toolchain auto-upgrades; the unchanged security gate must

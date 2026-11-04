@@ -14,12 +14,17 @@ from kestrel_cloud_runpod import await_owned_effect
 
 def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     dependencies = [Requirement(value) for value in requires("kestrel-cloud-runpod")]
-    core, = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    (core,) = [value for value in dependencies if value.name == "kestrel-sovereign"]
+    (sdk,) = [
+        value for value in dependencies if value.name == "kestrel-sovereign-sdk"
+    ]
+    assert {str(value) for value in sdk.specifier} == {">=0.43.0", "<1"}
     assert "0.53.34" not in core.specifier
     # SDK0.43's trust-bundle profile first resolves with published Core0.54.4.
     assert "0.53.35" not in core.specifier
     assert "0.54.3" not in core.specifier
     assert "0.54.4" in core.specifier
+    assert {str(value) for value in core.specifier} == {">=0.54.4", "<1"}
     test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
     assert test_loop.marker.evaluate({"extra": "test"})
     assert not test_loop.marker.evaluate({"extra": ""})
@@ -38,6 +43,28 @@ def _original_errors(error):
         pending.append(original.__cause__)
         if isinstance(original, BaseExceptionGroup):
             pending.extend(original.exceptions)
+
+
+def _assert_factory_admission_failure(error, original):
+    """Keep the exact source and any canonical opaque-factory uncertainty."""
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+    assert original.__cause__ is None
+    assert original.__context__ is None
+    debts = execution_cleanup_debts(error)
+    if error is original:
+        # Older supported Core reports the exact source directly.
+        assert debts == ()
+        return
+    assert type(error) is RuntimeError
+    assert error.__cause__ is original
+    assert len(debts) == 1
+    admission, task = debts[0]
+    assert type(admission) is OwnedTaskAdmission
+    assert admission.task is None
+    assert admission._acceptance_unknown is True
+    assert task is None
 
 
 @pytest.mark.asyncio
@@ -111,8 +138,10 @@ async def test_effect_self_cancellation_does_not_loop_forever():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["ordinary", "denied", "unknown", "grouped_control"])
-async def test_late_effect_failure_retains_original_cancellation_and_native_evidence(kind):
-    from kestrel_sovereign._async_ownership import await_owned_task
+async def test_late_effect_failure_retains_original_cancellation_and_native_evidence(
+    kind,
+):
+    from kestrel_sovereign.async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import (
         ExecutionAuthorityError,
         ExecutionCommitOutcomeError,
@@ -126,7 +155,9 @@ async def test_late_effect_failure_retains_original_cancellation_and_native_evid
         "ordinary": sql_error,
         "denied": ExecutionAuthorityError("original native session lost"),
         "unknown": native,
-        "grouped_control": BaseExceptionGroup("original SQL and native", [sql_error, native]),
+        "grouped_control": BaseExceptionGroup(
+            "original SQL and native", [sql_error, native]
+        ),
     }
     original = failures[kind]
     entered, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -158,11 +189,15 @@ async def test_late_effect_failure_retains_original_cancellation_and_native_evid
     ), "late failure must not discard original observer cancellation"
     if kind != "ordinary":
         assert is_execution_control_error(outcome.error)
-        assert original.__cause__ is None, "finite observation must not mutate shared native source"
+        assert original.__cause__ is None, (
+            "finite observation must not mutate shared native source"
+        )
     if kind in {"unknown", "grouped_control"}:
         assert execution_commit_outcome(outcome.error) == "unknown"
     if kind == "ordinary":
-        assert outcome.error is original  # Preserve documented effect-failure precedence.
+        assert (
+            outcome.error is original
+        )  # Preserve documented effect-failure precedence.
 
 
 @pytest.mark.asyncio
@@ -219,10 +254,9 @@ async def test_existing_awaitable_contract_is_not_narrowed_to_coroutines(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["coroutine", "closeable_awaitable"])
-async def test_opaque_factory_failure_retains_original_and_closes_unstarted_effect(kind):
-    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
-    from kestrel_sovereign.execution_custody import execution_cleanup_debts
-
+async def test_opaque_factory_failure_retains_original_and_closes_unstarted_effect(
+    kind,
+):
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
     original = RuntimeError("original loop refused owned task admission")
@@ -250,37 +284,32 @@ async def test_opaque_factory_failure_retains_original_and_closes_unstarted_effe
         loop.set_task_factory(refuse)
         with pytest.raises(RuntimeError) as caught:
             await await_owned_effect(effect)
-        assert any(error is original for error in _original_errors(caught.value))
         # A custom factory's exception cannot prove that it allocated no Task.
         # Newer Core retains that uncertainty in its canonical admission cell,
         # with the EXACT original error as cause, rather than certifying absence.
         # Older supported Core returns the source directly. Neither may replace
         # the source, mutate its graph, run the payload, or invent a joined Task.
-        if caught.value is not original:
-            assert caught.value.__cause__ is original
-            debts = execution_cleanup_debts(caught.value)
-            assert len(debts) == 1
-            admission, task = debts[0]
-            assert type(admission) is OwnedTaskAdmission
-            assert admission.task is None
-            assert admission._acceptance_unknown is True
-            assert task is None
-        assert original.__cause__ is None
-        assert original.__context__ is None
+        _assert_factory_admission_failure(caught.value, original)
     finally:
         loop.set_task_factory(previous_factory)
         release.set()
         if kind == "coroutine":
             assert inspect.getcoroutinestate(effect) == inspect.CORO_CLOSED
     assert body == []
-    assert closed == (["original unstarted close"] if kind == "closeable_awaitable" else [])
+    assert closed == (
+        ["original unstarted close"] if kind == "closeable_awaitable" else []
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["existing_task", "existing_future", "future_like", "readonly_future"])
+@pytest.mark.parametrize(
+    "kind", ["existing_task", "existing_future", "future_like", "readonly_future"]
+)
 @pytest.mark.parametrize("failure", [False, True])
-async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admission_is_refused(kind, failure):
-    from kestrel_sovereign._async_ownership import await_owned_task
+async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admission_is_refused(
+    kind, failure
+):
+    from kestrel_sovereign.async_ownership import await_owned_task
 
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
@@ -306,7 +335,9 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     class ReadOnlyFuture(asyncio.Future):
         def __setattr__(self, name, value):
             if name.startswith("_kestrel_"):
-                raise AttributeError("foreign Future does not admit private Core metadata")
+                raise AttributeError(
+                    "foreign Future does not admit private Core metadata"
+                )
             return super().__setattr__(name, value)
 
     async def accepted():
@@ -335,12 +366,17 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
         loop.set_task_factory(refuse)
         for _ in range(3):
             await asyncio.sleep(0)
-            assert not owner.done(), "an accepted original cannot lose its join to wrapper refusal"
+            assert not owner.done(), (
+                "an accepted original cannot lose its join to wrapper refusal"
+            )
             owner.cancel("original existing-effect caller cancellation")
     finally:
         loop.set_task_factory(previous_factory)
         release.set()
-        if kind in {"existing_future", "future_like", "readonly_future"} and not effect.done():
+        if (
+            kind in {"existing_future", "future_like", "readonly_future"}
+            and not effect.done()
+        ):
             if failure:
                 effect.set_exception(original)
             else:
@@ -358,4 +394,7 @@ async def test_existing_admitted_awaitable_is_joined_even_when_new_task_admissio
     else:
         assert effect_outcome.result == "original accepted receipt"
         assert isinstance(outcome.error, asyncio.CancelledError)
-    assert any(isinstance(error, asyncio.CancelledError) for error in _original_errors(outcome.error))
+    assert any(
+        isinstance(error, asyncio.CancelledError)
+        for error in _original_errors(outcome.error)
+    )

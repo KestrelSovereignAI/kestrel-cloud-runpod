@@ -2364,6 +2364,39 @@ class ServerlessEndpointHourCost:
         )
 
 
+def validate_serverless_endpoint_hour_coverage(
+    endpoint_hour_costs: tuple[ServerlessEndpointHourCost, ...],
+    *,
+    endpoint_id: str,
+    started_at: datetime,
+    coverage_until: datetime,
+    observed_at: datetime,
+) -> None:
+    """Validate ordered, complete endpoint-hour evidence for one lifecycle."""
+
+    start, end = serverless_billing_hour_bounds(started_at, coverage_until)
+    require_aware(observed_at, "observed_at")
+    if observed_at < end:
+        raise ValueError("Serverless endpoint billing window is still open")
+    if not isinstance(endpoint_hour_costs, tuple) or not endpoint_hour_costs:
+        raise ValueError("Serverless endpoint billing requires endpoint-hour costs")
+    cursor = start
+    observed_ids: set[str] = set()
+    for item in endpoint_hour_costs:
+        if not isinstance(item, ServerlessEndpointHourCost):
+            raise TypeError("Serverless endpoint-hour cost type is invalid")
+        if (
+            item.endpoint_id != endpoint_id
+            or item.utc_hour_start != cursor
+            or item.provider_observation_id in observed_ids
+        ):
+            raise ValueError("Serverless endpoint billing hours are inconsistent")
+        observed_ids.add(item.provider_observation_id)
+        cursor = item.utc_hour_end
+    if cursor != end:
+        raise ValueError("Serverless endpoint billing does not cover its lifecycle")
+
+
 @dataclass(frozen=True)
 class ServerlessRetiredEndpointBillingReceipt:
     """Observed full-lifecycle costs, not an invoice-finality or job receipt.
@@ -2398,29 +2431,13 @@ class ServerlessRetiredEndpointBillingReceipt:
         if self.cleanup.workers_zero_observed_at < self.activation.readback_at:
             raise ValueError("Serverless cleanup precedes activation readback")
         require_aware(self.reconciled_at, "reconciled_at")
-        start, end = self.billing_window
-        if self.reconciled_at < end:
-            raise ValueError("Retired Serverless billing window is still open")
-        if (
-            not isinstance(self.endpoint_hour_costs, tuple)
-            or not self.endpoint_hour_costs
-        ):
-            raise ValueError("Retired Serverless billing requires endpoint-hour costs")
-        cursor = start
-        observed_ids: set[str] = set()
-        for item in self.endpoint_hour_costs:
-            if not isinstance(item, ServerlessEndpointHourCost):
-                raise TypeError("Retired Serverless endpoint-hour cost type is invalid")
-            if (
-                item.endpoint_id != self.activation.endpoint_id
-                or item.utc_hour_start != cursor
-                or item.provider_observation_id in observed_ids
-            ):
-                raise ValueError("Retired Serverless billing hours are inconsistent")
-            observed_ids.add(item.provider_observation_id)
-            cursor = item.utc_hour_end
-        if cursor != end:
-            raise ValueError("Retired Serverless billing does not cover its lifecycle")
+        validate_serverless_endpoint_hour_coverage(
+            self.endpoint_hour_costs,
+            endpoint_id=self.activation.endpoint_id,
+            started_at=self.activation.create_started_at,
+            coverage_until=self.cleanup.verified_absent_at,
+            observed_at=self.reconciled_at,
+        )
 
     @property
     def billing_window(self) -> tuple[datetime, datetime]:
@@ -3289,4 +3306,5 @@ __all__ = [
     "serverless_billing_hour_starts",
     "serverless_endpoint_hour_cost_totals",
     "serverless_worker_cost_usd",
+    "validate_serverless_endpoint_hour_coverage",
 ]

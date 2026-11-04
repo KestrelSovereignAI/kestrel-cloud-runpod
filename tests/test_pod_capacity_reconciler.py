@@ -1,9 +1,13 @@
 """Installed, locked, content-free Pod-capacity reconciler command tests."""
 
 import asyncio
+import errno
 import json
+import os
+import sys
 from importlib.metadata import distribution
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 from pod_capacity_test_support import (
@@ -12,6 +16,8 @@ from pod_capacity_test_support import (
     FakeCapacityProvider,
     FakeWorkloadTransport,
     MutableClock,
+    execution_control_carrier,
+    record_control_injection,
     request,
     service,
 )
@@ -23,12 +29,147 @@ from kestrel_cloud_runpod.pod_capacity_reconciler import (
     EXIT_OK,
     EXIT_RETRYABLE,
     EXIT_RUNTIME_ERROR,
+    PodCapacityReconcilerBusyError,
+    PodCapacityReconcilerConfigurationError,
     _exclusive_reconcile_lock,
+    load_service_factory,
     reconcile_once,
     run_cli,
 )
 
 FACTORY_REFERENCE = "catalog_host.runpod:build_capacity_service"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX descriptor counterproof")
+@pytest.mark.parametrize(
+    "door",
+    [
+        "fchmod-ordinary",
+        "fchmod-control",
+        "body-unlock",
+        "body-unlock-close",
+        "success",
+    ],
+)
+def test_r27_lock_retires_exact_real_descriptor_and_preserves_errors(
+    tmp_path, monkeypatch, door, record_property
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    import kestrel_cloud_runpod.pod_capacity_reconciler as module
+
+    real_open, real_close, real_fstat, real_fchmod = (
+        os.open,
+        os.close,
+        os.fstat,
+        os.fchmod,
+    )
+    original_unlock = module._unlock_descriptor
+    original_body, control, explicit = execution_control_carrier(
+        RunPodManagerError("original reconciliation remains unknown")
+    )
+    chmod_error = OSError(errno.EPERM, "original fchmod failure")
+    if door == "fchmod-control":
+        chmod_error.__cause__ = control
+    unlock_error = OSError(errno.EIO, "original unlock failure")
+    close_error = OSError(errno.EIO, "late original physical close failure")
+    descriptors = []
+    identities = []
+    closed = []
+    entries = []
+
+    def opened(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        metadata = real_fstat(descriptor)
+        descriptors.append(descriptor)
+        identities.append((metadata.st_dev, metadata.st_ino))
+        return descriptor
+
+    def require_original(descriptor):
+        assert descriptors == [descriptor]
+        metadata = real_fstat(descriptor)
+        assert (metadata.st_dev, metadata.st_ino) == identities[0]
+
+    def chmod(descriptor, mode):
+        require_original(descriptor)
+        entries.append("fchmod")
+        if door.startswith("fchmod-"):
+            record_property("r27_injection", door)
+            raise chmod_error
+        real_fchmod(descriptor, mode)
+
+    def unlock(descriptor):
+        require_original(descriptor)
+        entries.append("unlock")
+        if door.startswith("body-unlock"):
+            record_property("r27_injection", "unlock")
+            raise unlock_error
+        original_unlock(descriptor)
+
+    def close(descriptor):
+        require_original(descriptor)
+        entries.append("close")
+        real_close(descriptor)
+        closed.append(descriptor)
+        if door == "body-unlock-close":
+            record_property("r27_injection", "after-native-close")
+            raise close_error
+
+    monkeypatch.setattr(
+        module,
+        "os",
+        _module_os_proxy(open=opened, fchmod=chmod, close=close),
+    )
+    monkeypatch.setattr(module, "_unlock_descriptor", unlock)
+    caught = None
+    try:
+        try:
+            with _exclusive_reconcile_lock(tmp_path / "capacity.sqlite3"):
+                entries.append("body")
+                if door.startswith("body-unlock"):
+                    raise original_body
+        except BaseException as error:  # noqa: BLE001 - retain exact original body for real-descriptor cleanup oracle
+            caught = error
+        assert len(descriptors) == 1
+        assert closed == descriptors
+        with pytest.raises(OSError) as retired:
+            real_fstat(descriptors[0])
+        assert retired.value.errno == errno.EBADF
+        if door == "success":
+            assert caught is None
+        elif door == "fchmod-ordinary":
+            assert type(caught) is PodCapacityReconcilerConfigurationError
+            assert caught.__cause__ is chmod_error
+        elif door == "fchmod-control":
+            assert caught is chmod_error
+            assert caught.__cause__ is control
+        else:
+            assert caught is original_body
+            assert is_execution_control_error(caught)
+            assert isinstance(caught.__cause__, BaseExceptionGroup)
+            assert explicit in caught.__cause__.exceptions
+            assert unlock_error in caught.__cause__.exceptions
+            if door == "body-unlock-close":
+                assert close_error in caught.__cause__.exceptions
+    finally:
+        # Safety custody only: preserve the baseline's missing inner retirement.
+        # Never close a foreign/reused descriptor or retry an admitted close.
+        if descriptors:
+            descriptor = descriptors[0]
+            try:
+                metadata = real_fstat(descriptor)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                assert (metadata.st_dev, metadata.st_ino) == identities[0]
+                real_close(descriptor)
+                record_property("r27_outer_reconciliation", "same-original-fd")
+
+
+def _module_os_proxy(**overrides):
+    attributes = vars(os).copy()
+    attributes.update(overrides)
+    return SimpleNamespace(**attributes)
 
 
 def test_distribution_installs_capacity_reconciler_entry_point() -> None:
@@ -234,3 +375,228 @@ def test_cli_runtime_error_is_typed_without_exposing_message(tmp_path) -> None:
         "status": "error",
     }
     assert leaked_secret not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "module-import",
+        "attribute",
+        "factory",
+        "runtime-timeout",
+        "runtime-manager",
+        "runtime-os",
+        "outer-busy",
+        "outer-configuration",
+        "lock-open",
+        "lock-posix",
+        "lock-windows",
+    ],
+)
+def test_reconciler_does_not_convert_execution_control_to_runtime_exit(
+    tmp_path, monkeypatch, boundary, record_property
+):
+    host_os_name = os.name
+    runtime, provider = _runtime(tmp_path)
+    error_type = {
+        "module-import": ImportError,
+        "attribute": AttributeError,
+        "runtime-timeout": TimeoutError,
+        "runtime-os": OSError,
+        "lock-open": OSError,
+        "lock-posix": OSError,
+        "lock-windows": OSError,
+        "outer-busy": PodCapacityReconcilerBusyError,
+        "outer-configuration": PodCapacityReconcilerConfigurationError,
+    }.get(boundary, RunPodManagerError)
+    carrier, control, explicit = execution_control_carrier(
+        error_type(f"reconciler {boundary} outcome remains unknown"),
+        grouped=True,
+    )
+
+    def inject() -> None:
+        record_control_injection(record_property, f"reconciler-{boundary}")
+
+    async def controlled_reconcile():
+        inject()
+        raise carrier
+
+    output = StringIO()
+
+    with pytest.raises(type(carrier)) as raised:
+        if boundary == "module-import":
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+                lambda _name: (inject(), (_ for _ in ()).throw(carrier))[1],
+            )
+            load_service_factory(FACTORY_REFERENCE)
+        elif boundary == "attribute":
+
+            class ControlledModule:
+                def __getattribute__(self, _name):
+                    inject()
+                    raise carrier
+
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+                lambda _name: ControlledModule(),
+            )
+            load_service_factory(FACTORY_REFERENCE)
+        elif boundary.startswith("lock-"):
+            if boundary == "lock-open":
+                monkeypatch.setattr(
+                    "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                    _module_os_proxy(
+                        open=lambda *_args, **_kwargs: (
+                            inject(),
+                            (_ for _ in ()).throw(carrier),
+                        )[1]
+                    ),
+                )
+            elif boundary == "lock-posix":
+                monkeypatch.setattr(
+                    "fcntl.flock",
+                    lambda *_args, **_kwargs: (
+                        inject(),
+                        (_ for _ in ()).throw(carrier),
+                    )[1],
+                )
+            else:
+                monkeypatch.setattr(
+                    "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                    _module_os_proxy(name="nt"),
+                )
+                monkeypatch.setitem(
+                    sys.modules,
+                    "msvcrt",
+                    SimpleNamespace(
+                        LK_NBLCK=1,
+                        locking=lambda *_args, **_kwargs: (
+                            inject(),
+                            (_ for _ in ()).throw(carrier),
+                        )[1],
+                    ),
+                )
+            with _exclusive_reconcile_lock(tmp_path / "capacity.sqlite3"):
+                raise AssertionError("controlled lock failure was suppressed")
+        else:
+            if boundary.startswith("runtime-"):
+                runtime.reconcile = controlled_reconcile
+
+            def factory():
+                if boundary in {"factory", "outer-busy", "outer-configuration"}:
+                    inject()
+                    raise carrier
+                return runtime
+
+            factory_loader = lambda _reference: (
+                (inject(), (_ for _ in ()).throw(carrier))[1]
+                if boundary in {"outer-busy", "outer-configuration"}
+                else factory
+            )
+            run_cli(
+                ["--service-factory", FACTORY_REFERENCE],
+                stdout=output,
+                factory_loader=factory_loader,
+            )
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    assert isinstance(explicit, BaseExceptionGroup)
+    assert explicit.exceptions[0] is control
+    assert output.getvalue() == ""
+    assert provider.create_calls == []
+    assert os.name == host_os_name
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "module-import",
+        "attribute",
+        "runtime-os",
+        "lock-open",
+        "lock-posix",
+        "lock-windows",
+    ],
+)
+def test_reconciler_retains_ordinary_normalization_contract(
+    tmp_path, monkeypatch, boundary
+):
+    host_os_name = os.name
+    runtime, provider = _runtime(tmp_path)
+    output = StringIO()
+
+    if boundary == "module-import":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+            lambda _name: (_ for _ in ()).throw(ImportError("missing module")),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            load_service_factory(FACTORY_REFERENCE)
+    elif boundary == "attribute":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.importlib.import_module",
+            lambda _name: SimpleNamespace(),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            load_service_factory(FACTORY_REFERENCE)
+    elif boundary == "runtime-os":
+
+        async def failed_reconcile():
+            raise OSError("ordinary runtime failure")
+
+        runtime.reconcile = failed_reconcile
+        assert (
+            run_cli(
+                ["--service-factory", FACTORY_REFERENCE],
+                stdout=output,
+                factory_loader=lambda _reference: lambda: runtime,
+            )
+            == EXIT_RUNTIME_ERROR
+        )
+        assert json.loads(output.getvalue()) == {
+            "status": "error",
+            "error_type": "OSError",
+        }
+    elif boundary == "lock-open":
+        monkeypatch.setattr(
+            "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+            _module_os_proxy(
+                open=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    OSError(errno.EIO, "ordinary lock-open failure")
+                )
+            ),
+        )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            with _exclusive_reconcile_lock(runtime.repository.path):
+                raise AssertionError("lock-open failure was suppressed")
+    else:
+        if boundary == "lock-posix":
+            monkeypatch.setattr(
+                "fcntl.flock",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    OSError(errno.EIO, "ordinary POSIX lock failure")
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                "kestrel_cloud_runpod.pod_capacity_reconciler.os",
+                _module_os_proxy(name="nt"),
+            )
+            monkeypatch.setitem(
+                sys.modules,
+                "msvcrt",
+                SimpleNamespace(
+                    LK_NBLCK=1,
+                    locking=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        OSError(errno.EIO, "ordinary Windows lock failure")
+                    ),
+                ),
+            )
+        with pytest.raises(PodCapacityReconcilerConfigurationError):
+            with _exclusive_reconcile_lock(runtime.repository.path):
+                raise AssertionError("lock failure was suppressed")
+
+    assert provider.create_calls == []
+    assert os.name == host_os_name

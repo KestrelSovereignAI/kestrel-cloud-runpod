@@ -1,13 +1,17 @@
 """Compatibility-provider migration tests for the v2 client boundary."""
 
+import json
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-import json
-from unittest.mock import MagicMock, patch
+from datetime import UTC, datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
+)
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
 from kestrel_cloud_runpod.manager import RunPodManager
@@ -18,7 +22,9 @@ from kestrel_cloud_runpod.models import (
     GPUProfile,
     PodResource,
     PodStatus,
+    RunPodAcknowledgedResourceError,
     RunPodAmbiguousResultError,
+    RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
     RunPodSession,
 )
@@ -142,8 +148,98 @@ def test_direct_provider_selects_from_live_catalog_and_records_placement():
     assert result["gpu"]["id"] == "live-gpu-id"
 
 
+def test_direct_provider_never_exposes_invalid_partial_create_evidence():
+    client = _FakeControlClient()
+
+    def invalid_create(request):
+        client.create_request = request
+        return PodResource.from_dict(
+            {
+                "id": "pod-invalid-cost",
+                "name": request.name,
+                "status": "PROVISIONING",
+                "gpu": {"id": request.gpu_id, "count": request.gpu_count},
+                "cost": True,
+                "env": {"PRIVATE": "must-not-leak"},
+            }
+        )
+
+    client.create_pod = invalid_create
+    provider = DirectRunPodProvider(api_key="", client=client)
+
+    with pytest.raises(RunPodAcknowledgedResourceError) as raised:
+        provider.start_pod(_profile(), {"name": "kestrel-image"})
+
+    assert client.create_request is not None
+    assert raised.value.resource_id == "pod-invalid-cost"
+    assert raised.value.resource_name == "kestrel-image"
+    assert raised.value.reconcile_required is True
+    assert "must-not-leak" not in str(raised.value)
+
+
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+def test_direct_create_validation_control_policy(mode, record_property):
+    client = _FakeControlClient()
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("Pod validation remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    injections: list[str] = []
+
+    class ControlledResource:
+        id = "pod-controlled-validation"
+        name = "kestrel-image"
+
+        def require_valid_fields(self, *, context: str):
+            assert context == "v2 Pod create"
+            injections.append(context)
+            record_control_injection(
+                record_property, "direct-create-validation-" + mode
+            )
+            raise carrier
+
+    def controlled_create(request):
+        client.create_request = request
+        return ControlledResource()
+
+    client.create_pod = controlled_create
+    provider = DirectRunPodProvider(api_key="", client=client)
+    caught = None
+    try:
+        provider.start_pod(_profile(), {"name": "kestrel-image"})
+    except RunPodManagerError as error:
+        caught = error
+
+    assert injections == ["v2 Pod create"]
+    assert client.create_request is not None
+    if mode == "implicit-context":
+        assert type(caught) is RunPodAcknowledgedResourceError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+        assert caught.resource_id == "pod-controlled-validation"
+        assert caught.resource_name == "kestrel-image"
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
+
+
 @pytest.mark.parametrize(
-    ("environment_cloud", "manager_cloud", "profile_cloud", "metadata_cloud", "expected"),
+    (
+        "environment_cloud",
+        "manager_cloud",
+        "profile_cloud",
+        "metadata_cloud",
+        "expected",
+    ),
     [
         (None, None, None, None, CloudType.SECURE),
         (None, " community ", None, None, CloudType.COMMUNITY),
@@ -154,7 +250,12 @@ def test_direct_provider_selects_from_live_catalog_and_records_placement():
     ],
 )
 def test_cloud_policy_reaches_catalog_and_actual_create_payload(
-    monkeypatch, environment_cloud, manager_cloud, profile_cloud, metadata_cloud, expected
+    monkeypatch,
+    environment_cloud,
+    manager_cloud,
+    profile_cloud,
+    metadata_cloud,
+    expected,
 ):
     """Exercise the real typed client's HTTP serialization without network access."""
 
@@ -173,28 +274,46 @@ def test_cloud_policy_reaches_catalog_and_actual_create_payload(
         if request.method == "GET":
             assert request.url.path == "/v2/catalog/gpus"
             assert request.url.params["cloud"] == expected.value
-            return httpx.Response(200, json={"gpus": [{
-                "id": "live-gpu-id", "name": "Live GPU", "pool": "ADA_24",
-                "manufacturer": "NVIDIA", "memory": 24,
-                "secure": True, "community": True,
-                "price": {"secure": 0.69, "community": 0.40},
-                "maxCount": {"secure": 1, "community": 1},
-                "availability": "HIGH",
-            }]})
+            return httpx.Response(
+                200,
+                json={
+                    "gpus": [
+                        {
+                            "id": "live-gpu-id",
+                            "name": "Live GPU",
+                            "pool": "ADA_24",
+                            "manufacturer": "NVIDIA",
+                            "memory": 24,
+                            "secure": True,
+                            "community": True,
+                            "price": {"secure": 0.69, "community": 0.40},
+                            "maxCount": {"secure": 1, "community": 1},
+                            "availability": "HIGH",
+                        }
+                    ]
+                },
+            )
         assert request.method == "POST"
         assert request.url.path == "/v2/pods"
         payload = json.loads(request.content)
         assert payload["cloud"] == expected.value
-        return httpx.Response(201, json={
-            "id": "pod-test", "name": payload["name"], "status": "PROVISIONING",
-            "gpu": {"id": "live-gpu-id", "count": 1},
-            "cost": 0.69 if expected is CloudType.SECURE else 0.40,
-        })
+        return httpx.Response(
+            201,
+            json={
+                "id": "pod-test",
+                "name": payload["name"],
+                "status": "PROVISIONING",
+                "gpu": {"id": "live-gpu-id", "count": 1},
+                "cost": 0.69 if expected is CloudType.SECURE else 0.40,
+            },
+        )
 
     client = RunpodControlPlaneClient(
         api_key="unit-test-only", http_transport=httpx.MockTransport(handle)
     )
-    with patch("kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client):
+    with patch(
+        "kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client
+    ):
         manager = RunPodManager(config=config)
     metadata = {} if metadata_cloud is None else {"cloud_type": metadata_cloud}
     result = manager.provider.start_pod(manager.profiles["llm"], metadata)
@@ -204,11 +323,16 @@ def test_cloud_policy_reaches_catalog_and_actual_create_payload(
 
 @pytest.mark.parametrize(
     ("source", "invalid"),
-    [(source, invalid) for source in ("manager", "profile")
-     for invalid in (None, "", "   ", "cheap", True, 1)]
+    [
+        (source, invalid)
+        for source in ("manager", "profile")
+        for invalid in (None, "", "   ", "cheap", True, 1)
+    ]
     + [("environment", invalid) for invalid in ("", "   ", "cheap")],
 )
-def test_invalid_cloud_configuration_fails_before_provider(monkeypatch, invalid, source):
+def test_invalid_cloud_configuration_fails_before_provider(
+    monkeypatch, invalid, source
+):
     monkeypatch.delenv("RUNPOD_CLOUD_TYPE", raising=False)
     config = deepcopy(MINIMAL_RUNPOD_CONFIG)
     if source == "environment":
@@ -229,7 +353,10 @@ def test_uniform_cloud_binds_actual_profiles_not_mutable_environment(monkeypatch
         manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
     monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "SECURE")
     assert manager.require_uniform_profile_cloud() is CloudType.COMMUNITY
-    assert manager.require_uniform_profile_cloud(CloudType.COMMUNITY) is CloudType.COMMUNITY
+    assert (
+        manager.require_uniform_profile_cloud(CloudType.COMMUNITY)
+        is CloudType.COMMUNITY
+    )
     with pytest.raises(RunPodManagerError, match="does not match"):
         manager.require_uniform_profile_cloud(CloudType.SECURE)
     assert manager.default_cloud_type is CloudType.COMMUNITY
@@ -259,7 +386,9 @@ def test_changed_default_cannot_redirect_saved_resource_cleanup(monkeypatch):
     monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "COMMUNITY")
     monkeypatch.setenv("RUNPOD_API_KEY", "unit-test-only")
     client = _FakeControlClient()
-    with patch("kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client):
+    with patch(
+        "kestrel_cloud_runpod.providers.RunpodControlPlaneClient", return_value=client
+    ):
         manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
     assert manager.provider.cloud is CloudType.COMMUNITY
     manager.provider.terminate_pod("old-secure-pod")
@@ -297,10 +426,7 @@ def test_direct_provider_lifecycle_and_v2_logs():
 
     assert provider.stop_pod("pod-123")["status"] == "EXITED"
     assert provider.resume_pod("pod-123")["status"] == "STARTING"
-    assert provider.terminate_pod("pod-123") == {
-        "id": "pod-123",
-        "status": "TERMINATED",
-    }
+    assert provider.terminate_pod("pod-123") == {"id": "pod-123"}
     assert provider.get_logs("pod-123", tail=2) == "first\nsecond"
     assert client.actions == [
         ("pod-123", "stop"),
@@ -441,23 +567,15 @@ def test_manager_maps_every_v2_pod_status(runpod_status, expected):
 
 
 @pytest.mark.asyncio
-async def test_manager_preserves_ambiguous_create_for_reconciliation():
-    ambiguous = RunPodAmbiguousResultError(
-        title="Runpod transport failed",
-        detail="ReadTimeout",
-        method="POST",
-        resource="/pods",
-    )
+async def test_manager_refuses_legacy_admission_before_provider_post():
     mock_provider = MagicMock(spec=DirectRunPodProvider)
-    mock_provider.start_pod.side_effect = ambiguous
     with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
         manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
 
-    with pytest.raises(RunPodAmbiguousResultError) as raised:
+    with pytest.raises(RunPodLegacyAdmissionRetiredError, match="durable"):
         await manager.start_session("llm", model_name="qwen")
 
-    assert raised.value is ambiguous
-    assert raised.value.reconcile_required is True
+    mock_provider.start_pod.assert_not_called()
     assert manager._session is None
 
 
@@ -595,11 +713,12 @@ async def test_manager_termination_clears_session_only_after_v2_confirmation():
     )
     manager._session = session
 
-    await manager.terminate_session(session)
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_session(session)
 
-    mock_provider.terminate_pod.assert_called_once_with("pod-123")
-    assert manager._session is None
-    assert session.status is PodStatus.OFFLINE
+    mock_provider.terminate_pod.assert_not_called()
+    assert manager._session is session
+    assert session.status is PodStatus.READY
 
 
 @pytest.mark.asyncio
@@ -618,11 +737,74 @@ async def test_manager_termination_failure_preserves_reconciliation_handle():
         ttl_seconds=3600,
         started_at=datetime.now(timezone.utc),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        training_cleanup_token="training:terminate-failure-0001",
+    )
+    manager._session = session
+    manager._session_lease = MagicMock(
+        side_effect=RunPodManagerError("durable lease unavailable")
+    )
+    manager.release_training_pod = AsyncMock(
+        side_effect=AssertionError("release must not run without durable binding")
+    )
+
+    with pytest.raises(RunPodManagerError, match="durable lease unavailable"):
+        await manager.terminate_session(session)
+
+    manager._session_lease.assert_called_once_with(session)
+    manager.release_training_pod.assert_not_awaited()
+    assert manager._session is session
+    assert session.status is PodStatus.READY
+    mock_provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pod_id", ["pod-123", "foreign-pod"])
+async def test_manager_terminate_pod_refuses_ownerless_or_unmatched_id(pod_id):
+    mock_provider = MagicMock(spec=DirectRunPodProvider)
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    session = RunPodSession(
+        pod_id="pod-123",
+        profile=manager.profiles["llm"],
+        task_profile="llm",
+        model_name="qwen",
+        pod_type="dedicated",
+        status=PodStatus.READY,
+        ttl_seconds=3600,
+        started_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
     manager._session = session
 
-    with pytest.raises(RunPodManagerError, match="provider unavailable"):
-        await manager.terminate_session(session)
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_pod(pod_id)
 
     assert manager._session is session
     assert session.status is PodStatus.READY
+    mock_provider.terminate_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manager_terminate_session_refuses_detached_durable_session():
+    mock_provider = MagicMock(spec=DirectRunPodProvider)
+    with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
+        manager = RunPodManager(config=MINIMAL_RUNPOD_CONFIG)
+    session = RunPodSession(
+        pod_id="pod-123",
+        profile=manager.profiles["llm"],
+        task_profile="training",
+        model_name="trainer",
+        pod_type="dedicated",
+        status=PodStatus.READY,
+        ttl_seconds=3600,
+        started_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        training_cleanup_token="training:detached-terminate-0001",
+    )
+    manager.release_training_pod = AsyncMock()
+
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.terminate_session(session)
+
+    manager.release_training_pod.assert_not_awaited()
+    mock_provider.terminate_pod.assert_not_called()

@@ -9,6 +9,10 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    owned_native_http_client,
+)
 from pydantic import SecretStr
 
 from .models import RunPodManagerError
@@ -352,18 +356,24 @@ class CatalogPodWorkloadTransport:
         if bearer is not None:
             headers["Authorization"] = f"Bearer {bearer.get_secret_value()}"
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_seconds,
-                transport=self.http_transport,
-                follow_redirects=False,
-                headers=headers,
+            async with owned_native_http_client(
+                httpx.AsyncClient(
+                    timeout=self.timeout_seconds,
+                    transport=self.http_transport,
+                    follow_redirects=False,
+                    headers=headers,
+                )
             ) as client:
                 return await client.request(method, f"{base}{path}", json=json_payload)
         except httpx.TimeoutException as exc:
+            if is_execution_control_error(exc):
+                raise
             raise CatalogPodTransportError(
                 f"Catalog Pod {method.lower()} timed out"
             ) from exc
         except httpx.TransportError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise CatalogPodTransportError(
                 f"Catalog Pod {method.lower()} transport failed"
             ) from exc
@@ -413,6 +423,8 @@ def _json_object(response: httpx.Response, operation: str) -> Mapping[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
+        if is_execution_control_error(exc):
+            raise
         raise CatalogPodTransportError(
             f"Catalog Pod {operation} response is not JSON"
         ) from exc

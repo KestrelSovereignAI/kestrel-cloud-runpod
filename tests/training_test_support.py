@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from kestrel_cloud_runpod.training_contracts import (
 from kestrel_cloud_runpod.training_provider import (
     CreatedTrainingPod,
     TrainingPodObservation,
+    TrainingPodCapacityProvider,
 )
 from kestrel_cloud_runpod.training_repository import SQLiteTrainingPodRepository
 from kestrel_cloud_runpod.training_service import TrainingPodLeaseService
@@ -84,6 +85,7 @@ class FakeTrainingProvider:
         self.start_error: RunPodManagerError | None = None
         self.create_error: RunPodManagerError | None = None
         self.stop_error: RunPodManagerError | None = None
+        self.error_callback: Callable[[], None] | None = None
         self.stop_confirms = True
 
     async def observe(
@@ -91,6 +93,8 @@ class FakeTrainingProvider:
     ) -> TrainingPodObservation:
         assert profile.task_type == "training"
         if self.observe_error:
+            if self.error_callback is not None:
+                self.error_callback()
             raise self.observe_error
         return TrainingPodObservation(
             provider_pod_id=pod_id,
@@ -103,6 +107,8 @@ class FakeTrainingProvider:
         assert gpu_count == 1
         self.start_calls.append(pod_id)
         if self.start_error:
+            if self.error_callback is not None:
+                self.error_callback()
             raise self.start_error
         self.status = "RUNNING"
 
@@ -113,6 +119,8 @@ class FakeTrainingProvider:
         assert companion_id == "companion-1"
         self.create_calls.append(resource_name)
         if self.create_error:
+            if self.error_callback is not None:
+                self.error_callback()
             raise self.create_error
         self.status = "RUNNING"
         return CreatedTrainingPod(provider_pod_id="pod-created-1", placement=None)
@@ -124,6 +132,8 @@ class FakeTrainingProvider:
     async def stop(self, pod_id: str) -> bool:
         self.stop_calls.append(pod_id)
         if self.stop_error:
+            if self.error_callback is not None:
+                self.error_callback()
             raise self.stop_error
         if self.stop_confirms:
             self.status = "EXITED"
@@ -133,7 +143,7 @@ class FakeTrainingProvider:
 def training_service(
     tmp_path: Path,
     clock: MutableClock,
-    provider: FakeTrainingProvider,
+    provider: FakeTrainingProvider | TrainingPodCapacityProvider,
     *,
     profiles: Mapping[str, GPUProfile] | None = None,
 ) -> TrainingPodLeaseService:

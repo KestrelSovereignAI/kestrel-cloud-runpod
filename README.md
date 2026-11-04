@@ -349,9 +349,12 @@ written to provider lease rows or public metadata. On process restart,
 `status()` re-observes the same deterministic Runpod resource and returns a
 fresh host-only route without creating duplicate capacity.
 
-`manage_gpu` remains available for explicit operator start/stop/status/log
-controls, but it no longer attaches, detaches, or reports an LLM route. The
-provider-neutral inference coordinator is the only LLM routing owner.
+`manage_gpu` remains available for explicit operator stop/status/log controls
+over already retained sessions, but ownerless legacy start and stopped-Pod
+resume are retired before any billable provider action. New private inference
+uses the provider-neutral inference-lease coordinator; catalog and training
+capacity use their durable Pod-capacity services. The legacy tool never
+attaches, detaches, or reports an LLM route.
 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
@@ -441,6 +444,19 @@ authority. Run `kestrel-runpod-reconcile-training` for those compatibility
 callers. New catalog hosts construct `PodCapacityLeaseService` with their
 encrypted capability store and call `reconcile()` from a cheap external timer;
 process-local TTLs are never cleanup authority.
+
+Legacy training error preservation: when an ordinary readiness, submission,
+recovery, or cancellation failure is followed by a control-bearing cleanup
+failure, the public call raises the canonical finite exception aggregate. It
+retains the same cleanup carrier and the same operation error (cleanup first),
+without rewriting the cleanup carrier's explicit cause or control evidence.
+Because both originals derive from `Exception`, the aggregate is an
+`ExceptionGroup`; callers must not assume it is the cleanup exception itself.
+Direct control failures and healthy-cleanup ordinary normalization keep their
+existing behavior. At error conversion, retry, persistence, or later-effect
+boundaries, use public Core `is_execution_control_error(error)` with its default
+recursive behavior and re-raise control-bearing evidence unchanged. Neither an
+error aggregate nor cleanup completion grants new work or financial finality.
 
 Install one host-owned synchronous factory that constructs the public service
 with explicit Runpod v2 credentials, the absolute SQLite repository path, GPU
@@ -535,9 +551,16 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.35,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.13.1,<1` — standalone Kestrel config-file loader (runtime)
-- `httpx>=0.27,<1`
+- `kestrel-sovereign-sdk>=0.43.0,<1` — features, tools, and inference-lease contracts
+- `kestrel-sovereign>=0.54.4,<1` — a published Core compatible with SDK 0.43's
+  trust bundle, providing
+  canonical joined-effect custody,
+  provider-neutral inference terminal-evidence refresh, and direct-node
+  execution-control classification
+- `httpcore>=1.0.9,<1.1` and `httpx>=0.28.1,<0.29` — reviewed public
+  transport exception pairs for bounded safe-read retry classification;
+  implicit backend context is diagnostic only and mutating requests are never
+  automatically retried
 - `requests>=2.32,<3`
 
 ## Development

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 
 from kestrel_cloud_runpod.models import RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import OllamaLeaseMode
@@ -38,6 +39,7 @@ def _environment(**changes: object) -> dict[str, str]:
         "mode": OllamaLeaseMode.DEDICATED_POD,
         "model_storage_path": "/models",
         "provision_requested_at": requested_at,
+        "telemetry_binding_sha256": "b" * 64,
     }
     values.update(changes)
     return build_ollama_runtime_environment(**values)  # type: ignore[arg-type]
@@ -138,6 +140,10 @@ def test_runpod_template_covers_pod_and_native_load_balancer() -> None:
         "/runpod-volume/ollama"
     )
     assert contract["models"]["arbitrary_pull"] is False
+    assert (
+        "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"
+        in (contract["environment"]["required"])
+    )
 
 
 def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
@@ -159,18 +165,25 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
         "golang.org/x/text@v0.42.0",
     ):
         assert fixed_module in dockerfile
-    assert "golang:1.26.9-alpine3.23@sha256:" in dockerfile
-    assert "golang:1.26.9-bookworm@sha256:" in dockerfile
-    assert "ENV GOTOOLCHAIN=local" in dockerfile
+    assert (
+        "golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43"
+        in dockerfile
+    )
+    assert (
+        "golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb"
+        in dockerfile
+    )
+    assert dockerfile.count("ENV GOTOOLCHAIN=local") == 2
     assert "go version -m /out/ollama" in dockerfile
     assert '"github.com/klauspost/compress" {print $3}' in dockerfile
     assert "= v1.20.2" in dockerfile
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
-    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.9\n")
+    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.10\n")
     assert "USER 0:0" in dockerfile
-    assert "prepareRuntimeFilesystem(config.ModelStoragePath)" in (
-        RUNTIME / "main.go"
-    ).read_text()
+    assert (
+        "prepareRuntimeFilesystem(config.ModelStoragePath)"
+        in (RUNTIME / "main.go").read_text()
+    )
     assert 'VOLUME ["/models"]' in dockerfile
     assert "EXPOSE 11434" in dockerfile
     assert "RUNPOD_API_KEY=" not in dockerfile
@@ -196,3 +209,69 @@ def test_runtime_workflow_scans_and_publishes_one_exact_image() -> None:
     assert workflow.count("subject-digest: ${{ steps.publish.outputs.digest }}") == 2
     assert "sbom-path: ollama-runtime.spdx.json" in workflow
     assert "KESTREL_OLLAMA_BEARER_TOKEN" in workflow
+
+
+def test_image_security_tools_share_runner_owned_scratch() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    )
+    security = workflow["jobs"]["image-security"]
+    expected = "${{ runner.temp }}"
+
+    # GitHub permits runner context in step.env, but rejects it in job.env
+    # before any job can run. Both security tools need an explicit step scope.
+    assert "TMPDIR" not in security.get("env", {})
+    tools = {
+        step["name"]: step
+        for step in security["steps"]
+        if step.get("name")
+        in {
+            "Generate SPDX SBOM",
+            "Fail on fixed high or critical vulnerabilities",
+        }
+    }
+    assert set(tools) == {
+        "Generate SPDX SBOM",
+        "Fail on fixed high or critical vulnerabilities",
+    }
+    assert all(step.get("env", {}).get("TMPDIR") == expected for step in tools.values())
+
+
+def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
+    contract = json.loads((RUNTIME / "runpod-template.json").read_text())
+    workflow = (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    smoke = workflow.split(
+        "- name: Verify fresh-volume initialization drops all runtime privilege",
+        maxsplit=1,
+    )[1].split("- name: Generate SPDX SBOM", maxsplit=1)[0]
+
+    invalid_counts = {
+        name: smoke.count(f'--env "{name}=')
+        for name in contract["environment"]["required"]
+        if smoke.count(f'--env "{name}=') != 1
+    }
+
+    assert invalid_counts == {}
+
+
+def test_r29_lease_environment_explicitly_requires_preload(record_property):
+    record_property("injection_entry", "before-managed-preload-environment-build")
+    environment = _environment()
+    preload = environment.get("KESTREL_OLLAMA_PRELOAD_MODEL")
+    record_property(
+        "r29_preload_environment",
+        json.dumps({"value": preload, "type": type(preload).__name__}, sort_keys=True),
+    )
+    assert preload == "true"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "true"])
+def test_r29_profile_cannot_override_lease_owned_preload(value, record_property):
+    record_property("injection_entry", "before-managed-preload-override-build")
+    with pytest.raises(RunPodManagerError, match="cannot override"):
+        _environment(
+            profile_environment={
+                "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
+                "KESTREL_OLLAMA_PRELOAD_MODEL": value,
+            }
+        )

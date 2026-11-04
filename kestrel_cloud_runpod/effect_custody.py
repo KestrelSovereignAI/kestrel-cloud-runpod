@@ -23,7 +23,7 @@ async def await_owned_effect(effect: Awaitable[_T]) -> _T:
     Process death still requires reconciliation from the persisted intent.
     """
 
-    from kestrel_sovereign._async_ownership import (
+    from kestrel_sovereign.async_ownership import (
         await_owned_operation,
         await_owned_task,
     )
@@ -38,8 +38,10 @@ async def await_owned_effect(effect: Awaitable[_T]) -> _T:
         # A redundant coroutine wrapper would hide that original from cleanup.
         outcome = await await_owned_operation(effect, retain_originals=True)
     terminal = execution_terminal_error(
-        outcome.error, outcome.cancellation,
-        retain_originals=True, isolate_control_originals=True,
+        outcome.error,
+        outcome.cancellation,
+        retain_originals=True,
+        isolate_control_originals=True,
     )
     if terminal is not None:
         raise terminal

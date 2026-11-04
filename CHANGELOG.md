@@ -6,6 +6,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Fixed
 
+- Rebuild both private Ollama runtime `1.1.2` binaries with digest-pinned Go
+  `1.26.10` for CVE-2026-111943; preserve the unchanged high/critical image
+  vulnerability gate and disable automatic toolchain upgrades in both builders.
+
 - Bind manual and tag-triggered publication CI and builds to one resolved
   release commit. Reject non-release refs and tag/package-version mismatches
   before CI, and retain the unconditional build-side version check.
@@ -65,6 +69,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   product/count-specific stock, flavor bounds and requested datacenters.
   Preserve unknown rates; compute rate and RAM calculations do not depend on
   ambient decimal precision. Catalog matches do not authorize spending.
+- Retain one immutable Ollama cleanup intent before teardown I/O, its exact-ID
+  verified-absence receipt, authenticated content-free runtime telemetry, and
+  append-only post-teardown Pod or Serverless billing observations in the
+  original lease aggregate. Freeze the first complete billing observation;
+  later revisions remain correction evidence and never claim invoice finality
+  or debit authority.
 
 ### Changed
 
@@ -75,6 +85,20 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   nested JSON or unexpected HTTP success statuses, remain ambiguous and require
   reconciliation before retrying. Hide container environment and arguments in
   request representations.
+- Advance the Ollama SQLite writer contract to version 7 so explicitly drained
+  version-1 through version-6 writers cannot mutate lifecycle evidence. A
+  drained version-6 aggregate preserves every existing raw lifecycle fact,
+  including its billing latest-reference state, while advancing only writer
+  version, revision, and epoch. Version-4 and version-5 facts retain explicit
+  unknown latest-arrival provenance until an exact original-bound version-7
+  poll. Historical rows keep unknown cleanup and cost provenance; only a
+  strictly current request proven never to have reached provider admission may
+  record no provider effect.
+- Require published Core 0.54.4, compatible with SDK 0.43's trust bundle, for
+  provider-neutral refresh of cached terminal
+  inference evidence, the canonical joined-effect owner, and direct-node
+  execution-control classification used by this adapter, including the public
+  owned-operation facade used to retain cancellation and cleanup outcomes.
 
 ## [0.15.1] - 2026-10-20
 

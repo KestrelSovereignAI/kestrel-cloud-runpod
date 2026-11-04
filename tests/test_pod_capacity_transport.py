@@ -10,7 +10,11 @@ from pod_capacity_test_support import (
     REQUEST_SHA,
     RESULT_SHA,
     TOKEN,
+    LateCloseAsyncClient,
     acknowledgement,
+    assert_late_http_close_retained,
+    execution_control_carrier,
+    record_control_injection,
 )
 from pydantic import SecretStr
 
@@ -23,6 +27,135 @@ from kestrel_cloud_runpod.pod_transport import (
 
 ATTEMPT = "attempt:catalog-run-0001"
 BASE = "https://pod-1-8080.proxy.runpod.net"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["timeout", "transport"])
+async def test_catalog_transport_preserves_exact_execution_control(
+    kind, record_property
+) -> None:
+    error_type = httpx.ReadTimeout if kind == "timeout" else httpx.ConnectError
+    carrier, control, explicit = execution_control_carrier(
+        error_type(f"catalog {kind} outcome remains unknown")
+    )
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        record_control_injection(record_property, f"catalog-transport-{kind}")
+        raise carrier
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(type(carrier)) as raised:
+        await transport.health(BASE)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit is control
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["timeout", "transport"])
+async def test_catalog_transport_retains_ordinary_error_contract(kind) -> None:
+    error_type = httpx.ReadTimeout if kind == "timeout" else httpx.ConnectError
+    ordinary = error_type(f"ordinary catalog {kind} failure")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise ordinary
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(CatalogPodTransportError) as raised:
+        await transport.health(BASE)
+
+    assert raised.value.__cause__ is ordinary
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_catalog_transport_retains_request_control_through_late_client_close(
+    monkeypatch: pytest.MonkeyPatch, record_property
+) -> None:
+    carrier, control, explicit = execution_control_carrier(
+        httpx.ConnectError("catalog request outcome remains unknown")
+    )
+    close_error = OSError("catalog client close failed")
+    requests: list[httpx.Request] = []
+    clients: list[LateCloseAsyncClient] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        clients[-1].fail_close = True
+        record_control_injection(record_property, "catalog-request-late-close")
+        raise carrier
+
+    def client_factory(**kwargs):
+        client = LateCloseAsyncClient(close_error=close_error, **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+
+    with pytest.raises(type(carrier)) as raised:
+        await transport.health(BASE)
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit is control
+    assert len(requests) == 1 and len(clients) == 1
+    assert_late_http_close_retained(
+        raised.value, client=clients[0], close_error=close_error
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+async def test_response_json_conversion_control_policy(mode, record_property):
+    carrier, control, explicit = execution_control_carrier(
+        ValueError("catalog response JSON remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    requests: list[httpx.Request] = []
+    injections: list[str] = []
+
+    class ControlledResponse(httpx.Response):
+        def json(self, **_kwargs):
+            injections.append("json")
+            record_control_injection(record_property, "catalog-response-json-" + mode)
+            raise carrier
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return ControlledResponse(200, request=request)
+
+    transport = CatalogPodWorkloadTransport(http_transport=httpx.MockTransport(handler))
+    caught = None
+    try:
+        await transport.health(BASE)
+    except (ValueError, CatalogPodTransportError) as error:
+        caught = error
+
+    assert len(requests) == 1
+    assert injections == ["json"]
+    if mode == "implicit-context":
+        assert type(caught) is CatalogPodTransportError
+        assert caught.__cause__ is carrier
+        assert carrier.__cause__ is None
+        assert carrier.__context__ is control
+    else:
+        assert caught is carrier
+        assert carrier.__cause__ is explicit
+        if mode == "group":
+            assert explicit.exceptions[0] is control
+        else:
+            assert explicit is control
 
 
 def _payload() -> dict[str, object]:
