@@ -219,7 +219,10 @@ async def test_existing_awaitable_contract_is_not_narrowed_to_coroutines(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["coroutine", "closeable_awaitable"])
-async def test_real_task_admission_refusal_closes_only_the_original_unstarted_effect(kind):
+async def test_opaque_factory_failure_retains_original_and_closes_unstarted_effect(kind):
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
     original = RuntimeError("original loop refused owned task admission")
@@ -247,7 +250,23 @@ async def test_real_task_admission_refusal_closes_only_the_original_unstarted_ef
         loop.set_task_factory(refuse)
         with pytest.raises(RuntimeError) as caught:
             await await_owned_effect(effect)
-        assert caught.value is original
+        assert any(error is original for error in _original_errors(caught.value))
+        # A custom factory's exception cannot prove that it allocated no Task.
+        # Newer Core retains that uncertainty in its canonical admission cell,
+        # with the EXACT original error as cause, rather than certifying absence.
+        # Older supported Core returns the source directly. Neither may replace
+        # the source, mutate its graph, run the payload, or invent a joined Task.
+        if caught.value is not original:
+            assert caught.value.__cause__ is original
+            debts = execution_cleanup_debts(caught.value)
+            assert len(debts) == 1
+            admission, task = debts[0]
+            assert type(admission) is OwnedTaskAdmission
+            assert admission.task is None
+            assert admission._acceptance_unknown is True
+            assert task is None
+        assert original.__cause__ is None
+        assert original.__context__ is None
     finally:
         loop.set_task_factory(previous_factory)
         release.set()
