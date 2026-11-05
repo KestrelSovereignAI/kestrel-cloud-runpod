@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_cloud_runpod import PodCapacityQuoteService
-from tests.pod_capacity_test_support import profile
+from pod_capacity_test_support import profile
 
 
 def test_quote_service_requires_an_explicit_profile_catalog() -> None:
