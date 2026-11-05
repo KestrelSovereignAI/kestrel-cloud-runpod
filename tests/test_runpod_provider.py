@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from training_test_support import training_request
 from pod_capacity_test_support import (
     complete_pod_payload,
     execution_control_carrier,
@@ -34,6 +35,9 @@ from kestrel_cloud_runpod.providers import DirectRunPodProvider
 from kestrel_cloud_runpod.training_contracts import (
     TrainingPodCleanupError,
     TrainingPodCleanupState,
+    TrainingPodLifecycleError,
+    TrainingPodSource,
+    fallback_training_cleanup_token,
 )
 
 MINIMAL_RUNPOD_CONFIG = {
@@ -683,7 +687,11 @@ async def test_training_does_not_try_fallback_profile_after_ambiguous_create(tmp
         manager = RunPodManager(config=config)
 
     with pytest.raises(TrainingPodCleanupError) as raised:
-        await manager.start_training_pod("companion-123")
+        service = manager._get_training_pod_lease_service()
+        await service.acquire(training_request(
+            service._clock, token="training:original-ambiguous-create",
+            source=TrainingPodSource.CREATED, companion_id="companion-123",
+        ))
 
     assert raised.value.pod_id is None
     assert raised.value.billing_risk is True
@@ -725,16 +733,29 @@ async def test_training_uses_distinct_cleanup_token_for_safe_profile_fallback(tm
     with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
         manager = RunPodManager(config=config)
 
-    session = await manager.start_training_pod(
-        "companion-123", cleanup_token="training:stable-request-0001"
-    )
+    # Arrange an ORIGINAL two-attempt family in the SAME capacity ledger.
+    # Fresh legacy admission remains retired; no public override/bypass or
+    # successful GPU/model authority is inferred from the declared provider.
+    service = manager._get_training_pod_lease_service()
+    root = "training:stable-request-0001"
+    with pytest.raises(TrainingPodLifecycleError) as rejection:
+        await service.acquire(training_request(
+            service._clock, token=root, source=TrainingPodSource.CREATED,
+            companion_id="companion-123",
+        ))
+    assert rejection.value.billing_risk is False
+    fallback = await service.acquire(training_request(
+        service._clock, token=fallback_training_cleanup_token(root, "training-h100"),
+        root_token=root, profile_id="training-h100", source=TrainingPodSource.CREATED,
+        companion_id="companion-123",
+    ))
 
-    assert session.training_cleanup_token != "training:stable-request-0001"
-    assert session.training_cleanup_token.startswith("training:")
+    assert fallback.cleanup_token != root
+    assert fallback.cleanup_token.startswith("training:")
     first = manager.get_training_pod_lease("training:stable-request-0001")
     assert first.state.value == "released"
     assert first.cleanup_state is TrainingPodCleanupState.COMPLETE
-    fallback = manager.get_training_pod_lease(session.training_cleanup_token)
+    fallback = manager.get_training_pod_lease(fallback.cleanup_token)
     assert fallback.profile_id == "training-h100"
     assert fallback.state.value == "ready"
     public_fallback = fallback.to_public_dict()
@@ -751,15 +772,13 @@ async def test_training_uses_distinct_cleanup_token_for_safe_profile_fallback(tm
     }
     with patch.object(RunPodManager, "_build_provider", return_value=mock_provider):
         restarted = RunPodManager(config=config)
-    recovered_session = await restarted.start_training_pod(
-        "companion-123", cleanup_token="training:stable-request-0001"
-    )
-    assert recovered_session.training_cleanup_token == session.training_cleanup_token
+    recovered = restarted._get_training_pod_lease_service().get_active_family_attempt(root)
+    assert recovered is not None and recovered.cleanup_token == fallback.cleanup_token
     assert mock_provider.start_pod.call_count == 2
     released_root = await restarted.release_training_pod(
         "training:stable-request-0001", reason="restart recovery"
     )
-    released_fallback = restarted.get_training_pod_lease(session.training_cleanup_token)
+    released_fallback = restarted.get_training_pod_lease(fallback.cleanup_token)
     assert released_root.family_release_complete is True
     assert released_fallback.state.value == "released"
     assert restarted._session is None

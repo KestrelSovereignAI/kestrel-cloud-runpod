@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError
+from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError, RunPodSession
 from kestrel_cloud_runpod.training_contracts import (
     TrainingPodRequest,
     TrainingPodSource,
@@ -49,7 +49,7 @@ def training_profile(profile_id: str = "training") -> GPUProfile:
 
 
 def training_request(
-    clock: MutableClock,
+    clock: Callable[[], datetime],
     *,
     token: str = "training:test-token-0001",
     root_token: str | None = None,
@@ -58,11 +58,12 @@ def training_request(
     pod_id: str | None = "pod-training-1",
     readiness_seconds: int = 30,
     hard_seconds: int = 3600,
+    companion_id: str = "companion-1",
 ) -> TrainingPodRequest:
     return TrainingPodRequest(
         cleanup_token=token,
         root_cleanup_token=root_token or token,
-        companion_id="companion-1",
+        companion_id=companion_id,
         profile_id=profile_id,
         source=source,
         resource_name=durable_training_name(token),
@@ -156,3 +157,44 @@ def training_service(
         clock=clock,
         sleep=clock.sleep,
     )
+
+
+async def original_training_session(
+    manager,
+    companion_id: str,
+    *,
+    cleanup_token: str,
+) -> RunPodSession:
+    """Arrange a pre-cutover session through the SAME real capacity service.
+
+    This is declared fixture capacity, never successful public legacy admission
+    or physical GPU/model evidence. It neither overrides a retired public method
+    nor adds a product flag/bypass. Historical operations still run unchanged.
+    """
+    service = manager._get_training_pod_lease_service()
+    profile = manager.profiles["training"]
+    pod_id = profile.persistent_pod_id
+    source = TrainingPodSource.CONFIGURED_PERSISTENT if pod_id else TrainingPodSource.CREATED
+    request = training_request(
+        service._clock, token=cleanup_token, source=source, pod_id=pod_id,
+        companion_id=companion_id,
+    )
+    lease = await service.acquire(request)
+    assert lease.provider_pod_id and lease.backend_base_url
+    session = RunPodSession(
+        pod_id=lease.provider_pod_id,
+        profile=profile,
+        task_profile="training",
+        model_name=profile.default_model,
+        pod_type=profile.pod_type,
+        status=manager._map_status("RUNNING"),
+        ttl_seconds=int((lease.hard_deadline - lease.created_at).total_seconds()),
+        started_at=lease.created_at,
+        expires_at=lease.hard_deadline,
+        backend_base_url=lease.backend_base_url,
+        companion_id=companion_id,
+        training_cleanup_token=lease.cleanup_token,
+    )
+    async with manager._lock:
+        manager._session = session
+    return session

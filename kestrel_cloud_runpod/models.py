@@ -28,12 +28,16 @@ class RunPodManagerError(Exception):
 
 
 class RunPodLegacyAdmissionRetiredError(RunPodManagerError):
-    """Legacy session admission has no durable original-effect owner."""
+    """Legacy fresh work lacks accepted host/catalog input and effect authority."""
 
     def __init__(self) -> None:
         super().__init__(
-            "Legacy Runpod session admission is retired; use the inference-lease "
-            "provider or durable Pod-capacity service"
+            "Legacy Runpod session/training/generation admission is retired; "
+            "use the authorized host catalog workflow for LoRA or the durable "
+            "inference-lease provider for private LLMs. A retained capacity "
+            "token/session is recovery identity, not fresh input or spend "
+            "authority. Historical status, cancellation, download and exact "
+            "resource release remain available; no model/provider fallback."
         )
 
 

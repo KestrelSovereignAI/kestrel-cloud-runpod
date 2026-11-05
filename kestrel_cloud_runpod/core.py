@@ -14,7 +14,7 @@ from typing import Any, Dict, NoReturn, Optional
 
 from kestrel_sdk.config.constants import RUNPOD_URL_POLL_INTERVAL
 from kestrel_sovereign.config import load_config
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import is_execution_control_error, require_execution_work
 
 from .models import (
     CloudType,
@@ -250,6 +250,7 @@ class RunPodManagerCore:
     def _refuse_legacy_admission() -> NoReturn:
         """Reject billable work that has no durable original-effect owner."""
 
+        require_execution_work()
         raise RunPodLegacyAdmissionRetiredError
 
     async def get_status(self, refresh: bool = True) -> Dict[str, Any]:

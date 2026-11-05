@@ -437,11 +437,22 @@ active, uncertain, ready, releasing, released, and fallback-family row. The
 old `TrainingPodLeaseService`, repository, and provider imports are aliases to
 the canonical implementation, so they cannot create a second lifecycle.
 
-Legacy `start_training_pod()` callers retain their exact/root cleanup behavior:
-a newly started Pod is returned with a route, confirmed stopped, or retained as
-retryable state; pre-existing running capacity is never stopped without lease
-authority. Run `kestrel-runpod-reconcile-training` for those compatibility
-callers. New catalog hosts construct `PodCapacityLeaseService` with their
+Legacy NEW `start_training_pod()`, `submit_training_job()`, `start_inference_pod()`
+and `generate_with_lora()` calls now refuse before new config/provider/model
+effects, even with a retained session/token. Use the authorized host catalog
+workflow for LoRA; a legacy FLUX path is not an accepted SDXL artifact or input.
+There is no replacement profile/provider fallback or second queue. Private LLMs
+use the durable inference-lease interface instead. Original native execution
+denial takes precedence over the ordinary retirement message.
+
+Historical exact/root cleanup, status, cancellation and download remain on the
+SAME capacity ledger. Pre-existing running capacity is never stopped without
+lease authority; uncertain/retryable custody is retained. Run
+`kestrel-runpod-reconcile-training` for those original compatibility records.
+The compatible Core dependency floor must name the actual first published
+Core#3954 release before this candidate can release; the old floor is NOT
+cutover acceptance. See [KCR#64](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/64).
+New catalog hosts construct `PodCapacityLeaseService` with their
 encrypted capability store and call `reconcile()` from a cheap external timer;
 process-local TTLs are never cleanup authority.
 
