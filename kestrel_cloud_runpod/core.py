@@ -82,28 +82,12 @@ class RunPodManagerCore:
         self._session: Optional[RunPodSession] = None
         self._lock = asyncio.Lock()
 
-        # Metering callback for usage billing (Vending Machine)
-        # Set via set_metering_callback() after initialization
-        self._metering_callback = None
-
-    def set_metering_callback(self, callback) -> None:
-        """Set the metering callback for GPU usage billing (Vending Machine).
-
-        The callback will be called when a session ends with:
-            await callback(
-                companion_id=str,
-                user_id=str,
-                provider=str,  # 'runpod'
-                resource_type=str,  # GPU type
-                duration_seconds=float,
-                operation_id=str,  # pod_id
-            )
-
-        Args:
-            callback: Async function to call when session ends
-        """
-        self._metering_callback = callback
-        logger.info("RunPod metering enabled")
+    def set_metering_callback(self, callback) -> NoReturn:
+        """Refuse the retired elapsed-session billing integration explicitly."""
+        raise RunPodManagerError(
+            "Wall-clock GPU metering is retired; reconcile actual provider billing "
+            "through the durable inference lease or Pod-capacity service"
+        )
 
     def _load_profiles(self, raw_profiles: Dict[str, Any]) -> Dict[str, GPUProfile]:
         profiles: Dict[str, GPUProfile] = {}

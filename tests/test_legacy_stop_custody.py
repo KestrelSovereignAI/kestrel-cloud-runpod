@@ -69,8 +69,11 @@ def _ready_payload(pod_id):
 
 
 @pytest.mark.asyncio
-async def test_ownerless_stop_refuses_before_native_action_or_metering(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize("status", [
+    PodStatus.READY, PodStatus.TERMINATING, PodStatus.ERROR, PodStatus.OFFLINE,
+])
+async def test_ownerless_stop_refuses_and_preserves_known_identity(
+    tmp_path, monkeypatch, status,
 ):
     with native_pod_action_harness() as (state, direct, provider):
         manager = _native_manager(tmp_path, monkeypatch, direct, provider, state["pod_id"])
@@ -78,22 +81,36 @@ async def test_ownerless_stop_refuses_before_native_action_or_metering(
         session = RunPodSession(
             pod_id=state["pod_id"], profile=manager.profiles["training"],
             task_profile="training", model_name="fixture", pod_type="dedicated",
-            status=PodStatus.READY, ttl_seconds=600,
+            status=status, ttl_seconds=600,
             started_at=now, expires_at=now + timedelta(seconds=600),
             companion_id="companion-1", user_id="user-1",
         )
         manager._session = session
-        metering = []
-
-        async def record_metering(**values):
-            metering.append(values)
-
-        manager.set_metering_callback(record_metering)
         with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
             await manager.stop_session()
 
-        assert manager._session is session and session.status is PodStatus.READY
-        assert state["calls"] == metering == []
+        result = await _feature(manager)._stop()
+        assert result.status == "error"
+        assert result.data["session_before_stop"]["pod_id"] == state["pod_id"]
+        assert "may still be billing" in result.data["warning"]
+        assert manager._session is session and session.status is status
+        assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_metering_registration_refuses_without_callback_or_io(
+    tmp_path, monkeypatch,
+):
+    with native_pod_action_harness() as (state, direct, provider):
+        manager = _native_manager(tmp_path, monkeypatch, direct, provider, state["pod_id"])
+        calls = []
+
+        async def callback(**values):
+            calls.append(values)
+
+        with pytest.raises(RunPodManagerError, match="Wall-clock.*retired"):
+            manager.set_metering_callback(callback)
+        assert calls == state["calls"] == []
 
 
 @pytest.mark.asyncio

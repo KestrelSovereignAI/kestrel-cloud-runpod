@@ -571,9 +571,7 @@ class RunPodFeature(Feature):
                 # A failure does not establish whether hardware stopped.
                 # Preserve the exact original handle without asserting that
                 # this or a foreign manager discarded its own state.
-                if session_before_stop is not None and self._status_was_active(
-                    session_before_stop
-                ):
+                if session_before_stop is not None and session_before_stop.get("pod_id"):
                     fail_data["session_before_stop"] = session_before_stop
                     fail_data["warning"] = (
                         "RunPod cleanup is not confirmed; the pod may still be "

@@ -368,6 +368,9 @@ release/reconciler API, not a new ledger or a replacement acquisition.
 callers that only await it may continue to ignore the result. Borrowed capacity
 can be released locally without stopping its provider resource. Confirmed
 capacity cleanup does not imply provider invoice finality or zero storage cost.
+The old `set_metering_callback` registration now refuses explicitly: elapsed
+session time is not a provider bill. Consume the canonical lease/capacity
+billing observations rather than registering a callback that cannot run.
 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 

@@ -436,7 +436,7 @@ async def test_training_request_control_survives_late_native_client_close(
 
 
 @pytest.mark.asyncio
-async def test_ownerless_stop_refuses_before_metering_execution_control(
+async def test_retired_metering_refuses_before_control_callback_registration(
     tmp_path: Path, record_property
 ):
     provider = FakeTrainingProvider()
@@ -468,11 +468,9 @@ async def test_ownerless_stop_refuses_before_metering_execution_control(
         raise carrier
 
     manager.provider.stop_pod.return_value = {"id": "pod-metered-1"}
-    manager.set_metering_callback(controlled_metering)
-
     original_session = manager._session
-    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
-        await manager.stop_session()
+    with pytest.raises(RunPodManagerError, match="Wall-clock.*retired"):
+        manager.set_metering_callback(controlled_metering)
 
     assert carrier.__cause__ is explicit is control
     assert metering_calls == []
@@ -482,7 +480,7 @@ async def test_ownerless_stop_refuses_before_metering_execution_control(
 
 
 @pytest.mark.asyncio
-async def test_ownerless_stop_refuses_before_ordinary_metering(
+async def test_retired_metering_refuses_before_ordinary_callback_registration(
     tmp_path: Path,
 ) -> None:
     provider = FakeTrainingProvider()
@@ -511,11 +509,9 @@ async def test_ownerless_stop_refuses_before_ordinary_metering(
         raise ordinary
 
     manager.provider.stop_pod.return_value = {"id": "pod-metered-ordinary-1"}
-    manager.set_metering_callback(failed_metering)
-
     original_session = manager._session
-    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
-        await manager.stop_session()
+    with pytest.raises(RunPodManagerError, match="Wall-clock.*retired"):
+        manager.set_metering_callback(failed_metering)
 
     assert metering_calls == []
     manager.provider.stop_pod.assert_not_called()
