@@ -368,6 +368,14 @@ async def test_training_ordinary_cancellation_still_releases_owned_capacity(
     assert durable.cleanup_state is TrainingPodCleanupState.COMPLETE
     assert provider.stop_calls == [session.pod_id]
 
+    # Cancellation completed the same durable obligation independently of
+    # the manager's cached projection. A later user stop is idempotent.
+    stopped = await manager.stop_session()
+    assert stopped["training_cleanup_state"] == "complete"
+    assert manager._session is None
+    assert runtime.repository.get(session.training_cleanup_token) == durable
+    assert provider.stop_calls == [session.pod_id]
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -1479,6 +1487,17 @@ async def test_cancel_stops_pod_and_stop_failure_is_retryable(
     lease = manager.get_training_pod_lease(raised.value.cleanup_token)
     assert lease.provider_pod_id == "pod-training-1"
     assert lease.state is TrainingPodState.RECONCILE_REQUIRED
+
+    provider.stop_error = None
+    await manager.reconcile_training_pods()
+    confirmed = manager.get_training_pod_lease(session.training_cleanup_token)
+    assert confirmed.cleanup_state is TrainingPodCleanupState.COMPLETE
+    stop_calls = list(provider.stop_calls)
+    stopped = await manager.stop_session()
+    assert stopped["training_cleanup_state"] == "complete"
+    assert manager._session is None
+    assert manager.get_training_pod_lease(session.training_cleanup_token) == confirmed
+    assert provider.stop_calls == stop_calls
 
 
 @pytest.mark.asyncio

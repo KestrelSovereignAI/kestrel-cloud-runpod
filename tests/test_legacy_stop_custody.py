@@ -13,7 +13,7 @@ from scripts.check_runpod_openapi import load_openapi
 from kestrel_cloud_runpod.feature import RunPodFeature
 from kestrel_cloud_runpod.manager import RunPodManager
 from kestrel_cloud_runpod.models import PodStatus, RunPodManagerError, RunPodSession
-from kestrel_cloud_runpod.training_contracts import TrainingPodCleanupState
+from kestrel_cloud_runpod.training_contracts import TrainingPodCleanupState, TrainingPodLifecycleError
 from pod_capacity_test_support import complete_pod_payload, native_pod_action_harness
 from training_test_support import (
     MutableClock,
@@ -175,6 +175,81 @@ async def test_no_session_stop_has_no_native_io(tmp_path, monkeypatch):
         manager = _native_manager(tmp_path, monkeypatch, direct, provider, state["pod_id"])
         result = await _feature(manager)._stop()
         assert result.status == "ok" and "no-op" in result.confirmation
+        assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["stop", "terminate", "tool"])
+@pytest.mark.parametrize("borrowed", [False, True])
+async def test_completed_original_release_is_idempotent_through_retained_session(
+    tmp_path, monkeypatch, entrypoint, borrowed,
+):
+    with native_pod_action_harness() as (state, direct, provider):
+        manager = _native_manager(tmp_path, monkeypatch, direct, provider, state["pod_id"])
+        if borrowed:
+            ready = _ready_payload(state["pod_id"])
+            state["readback_payloads"] = [ready, ready]
+            session = await original_training_session(
+                manager, "companion-1", cleanup_token="training:completed-borrow-0001",
+            )
+        else:
+            session = await _owned_session(manager, state)
+            terminal = _ready_payload(state["pod_id"])
+            terminal.update(status="TERMINATED", runtime=None, actions=[])
+            state["readback_payloads"] = [terminal]
+
+        # A separate canonical controller completes the original obligation.
+        # It does not update this manager's process-local projection.
+        service = manager._get_training_pod_lease_service()
+        original = await service.release(session.training_cleanup_token, reason="external original release")
+        assert original.is_terminal and manager._session is session
+        state["calls"].clear()
+        # Contain even a deliberately broken workload-fence request to this
+        # owned peer; no test may contact the vendor's proxy hostname.
+        session.backend_base_url = direct.client.transport.base_url
+        assert manager._session_lease(session) == original
+        with pytest.raises(TrainingPodLifecycleError, match="heartbeat"):
+            await manager.get_current_job(session)
+        assert state["calls"] == []
+
+        if entrypoint == "stop":
+            result = await manager.stop_session()
+            assert result["training_cleanup_state"] == original.cleanup_state.value
+        elif entrypoint == "terminate":
+            assert await manager.terminate_session(session) == original
+        else:
+            result = await _feature(manager)._stop()
+            assert result.status == "ok"
+            assert result.data["session"]["training_cleanup_state"] == original.cleanup_state.value
+        assert manager._session is None
+        assert manager.get_training_pod_lease(original.cleanup_token) == original
+        assert state["calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["pod", "owner", "kind"])
+async def test_terminal_cleanup_still_requires_original_immutable_binding(
+    tmp_path, monkeypatch, mismatch,
+):
+    with native_pod_action_harness() as (state, direct, provider):
+        manager = _native_manager(tmp_path, monkeypatch, direct, provider, state["pod_id"])
+        session = await _owned_session(manager, state)
+        terminal = _ready_payload(state["pod_id"])
+        terminal.update(status="TERMINATED", runtime=None, actions=[])
+        state["readback_payloads"] = [terminal]
+        service = manager._get_training_pod_lease_service()
+        original = await service.release(session.training_cleanup_token, reason="external original release")
+        state["calls"].clear()
+        if mismatch == "pod":
+            session.pod_id = "foreign-pod"
+        elif mismatch == "owner":
+            session.companion_id = "foreign-owner"
+        else:
+            session.task_profile = "llm"
+        with pytest.raises(RunPodManagerError, match="no longer matches"):
+            await manager.stop_session()
+        assert manager._session is session
+        assert manager.get_training_pod_lease(original.cleanup_token) == original
         assert state["calls"] == []
 
 

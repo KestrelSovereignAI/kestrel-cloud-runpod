@@ -368,6 +368,10 @@ release/reconciler API, not a new ledger or a replacement acquisition.
 callers that only await it may continue to ignore the result. Borrowed capacity
 can be released locally without stopping its provider resource. Confirmed
 capacity cleanup does not imply provider invoice finality or zero storage cost.
+If cancellation or reconciliation already completed the same original release,
+stopping its retained session is idempotent: it reuses that result without
+another provider action. Exact session/lease identity remains mandatory;
+completed leases still cannot authorize workload operations.
 The old `set_metering_callback` registration now refuses explicitly: elapsed
 session time is not a provider bill. Consume the canonical lease/capacity
 billing observations rather than registering a callback that cannot run.
