@@ -63,6 +63,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Require published Core 0.63.0, the first release containing the coordinated
   legacy Runpod admission cutover, and its matching SDK 0.49 floor. Earlier Core
   versions can advertise fresh work that the adapter correctly refuses.
+- Exclude only Core 0.64.0, whose confirmed cold tool-effect import regression
+  replaces original ordinary errors with ImportError (Core #4003). Preserve the
+  verified 0.63.0 minimum while the root fix follows the normal Core release path.
 
 - Give the managed startup/telemetry runtime successor version `1.1.3`, keeping
   the published security-only `1.1.2` identity intact. A fresh built/scanned

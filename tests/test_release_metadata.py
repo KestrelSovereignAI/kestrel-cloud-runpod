@@ -3,6 +3,8 @@
 import tomllib
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 
 def test_project_version_has_matching_release_notes():
     root = Path(__file__).resolve().parents[1]
@@ -19,7 +21,7 @@ def test_published_core_floor_matches_operator_and_release_metadata():
     with (root / "pyproject.toml").open("rb") as project_file:
         dependencies = tomllib.load(project_file)["project"]["dependencies"]
 
-    expected = "kestrel-sovereign>=0.63.0,<1"
+    expected = "kestrel-sovereign>=0.63.0,!=0.64.0,<1"
     assert expected in dependencies
     assert f"`{expected}`" in (root / "README.md").read_text(encoding="utf-8")
     assert "Require published Core 0.63.0" in (root / "CHANGELOG.md").read_text(
@@ -38,3 +40,17 @@ def test_installed_core_retires_new_runpod_work_but_keeps_recovery():
     assert capabilities.training is False
     assert capabilities.generation is False
     assert capabilities.supports_lora_download is True
+
+
+def test_core_requirement_excludes_only_proven_broken_release():
+    root = Path(__file__).resolve().parents[1]
+    with (root / "pyproject.toml").open("rb") as project_file:
+        dependencies = tomllib.load(project_file)["project"]["dependencies"]
+    (core,) = [requirement for value in dependencies
+        if (requirement := Requirement(value)).name == "kestrel-sovereign"]
+
+    assert "0.63.0" in core.specifier
+    assert "0.64.0" not in core.specifier
+    assert "0.64.1" in core.specifier
+    assert "0.62.2" not in core.specifier
+    assert "1.0.0" not in core.specifier

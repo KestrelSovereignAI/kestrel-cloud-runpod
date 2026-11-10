@@ -26,7 +26,8 @@ def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     assert "0.54.4" not in core.specifier
     assert "0.62.2" not in core.specifier
     assert "0.63.0" in core.specifier
-    assert {str(value) for value in core.specifier} == {">=0.63.0", "<1"}
+    assert "0.64.0" not in core.specifier
+    assert {str(value) for value in core.specifier} == {">=0.63.0", "!=0.64.0", "<1"}
     test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
     assert test_loop.marker.evaluate({"extra": "test"})
     assert not test_loop.marker.evaluate({"extra": ""})

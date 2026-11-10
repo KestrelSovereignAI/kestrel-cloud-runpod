@@ -6,8 +6,10 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Installation
 
-Requires Core >=0.63.0 and SDK >=0.49. Core and this package retire fresh legacy
+Requires Core >=0.63.0 (excluding 0.64.0) and SDK >=0.49. Core and this package retire fresh legacy
 training/generation admission together; original historical recovery remains.
+Core 0.64.0 has a confirmed cold tool-effect import regression tracked in
+[Core #4003](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/4003).
 
 ```bash
 uv pip install kestrel-cloud-runpod
@@ -564,7 +566,7 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.49.0,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.63.0,<1` — coordinated retirement of fresh legacy Runpod
+- `kestrel-sovereign>=0.63.0,!=0.64.0,<1` — coordinated retirement of fresh legacy Runpod
   training/generation admission, providing
   canonical joined-effect custody,
   provider-neutral inference terminal-evidence refresh, and direct-node

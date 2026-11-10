@@ -38,7 +38,9 @@ dependencies = [
     # ownership algorithm in the cloud adapter.
     # 0.63.0 is the first published coordinated Runpod admission cutover:
     # Core cannot advertise fresh legacy work that this package refuses.
-    "kestrel-sovereign>=0.63.0,<1",
+    # 0.64.0 regresses cold tool-effect imports (Core #4003); keep the tested
+    # minimum without accepting that known-broken intermediate release.
+    "kestrel-sovereign>=0.63.0,!=0.64.0,<1",
     # Direct runtime dep of signed_invocations (Ed25519 receipt signing and
     # verification).  Declared explicitly rather than leaned on transitively:
     # kestrel-sovereign-sdk already puts cryptography behind a `crypto` extra,
