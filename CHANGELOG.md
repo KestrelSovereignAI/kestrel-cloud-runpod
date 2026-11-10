@@ -17,6 +17,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Return the canonical release result from `terminate_session`; historical
   callers may still ignore it. Keep provider acknowledgement, confirmed
   capacity cleanup and actual billing evidence separate.
+- Reuse completed original release results when cancellation or reconciliation
+  left the same session cached. Retain every immutable identity check and the
+  canonical service's separate workload-state fences; never repeat provider
+  cleanup for an already completed obligation.
 - Capture the retained session without a provider refresh before release.
   Report borrowed-capacity release as not stopping its resource; distinguish
   confirmed cleanup from a no-session no-op. Missing/unconfirmed cleanup

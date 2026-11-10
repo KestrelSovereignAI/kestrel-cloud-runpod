@@ -573,13 +573,18 @@ class RunPodTrainingMixin:
         return token
 
     def _session_lease(self, session: RunPodSession) -> TrainingPodLease:
-        """Bind a mutable legacy session to its exact durable lease."""
+        """Bind original cleanup identity independently of lifecycle state.
+
+        This binding is used only by termination. A separate canonical
+        controller may already have completed release while the same session
+        remains cached. Workload eligibility is fenced by the service's own
+        heartbeat/state boundaries, not by this cleanup identity projection.
+        """
 
         cleanup_token = self._training_token(session)
         lease = self.get_training_pod_lease(cleanup_token)
         if (
             session.task_profile != "training"
-            or lease.is_terminal
             or lease.provider_pod_id != session.pod_id
             or lease.profile_id != session.profile.id
             or lease.companion_id != session.companion_id
