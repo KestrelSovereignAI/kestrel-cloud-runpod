@@ -6,7 +6,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Installation
 
-Requires Core >=0.54.4 and SDK >=0.43; older Core SDK pins are incompatible.
+Requires Core >=0.63.0 and SDK >=0.49. Core and this package retire fresh legacy
+training/generation admission together; original historical recovery remains.
 
 ```bash
 uv pip install kestrel-cloud-runpod
@@ -562,9 +563,9 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.43.0,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.54.4,<1` — a published Core compatible with SDK 0.43's
-  trust bundle, providing
+- `kestrel-sovereign-sdk>=0.49.0,<1` — features, tools, and inference-lease contracts
+- `kestrel-sovereign>=0.63.0,<1` — coordinated retirement of fresh legacy Runpod
+  training/generation admission, providing
   canonical joined-effect custody,
   provider-neutral inference terminal-evidence refresh, and direct-node
   execution-control classification

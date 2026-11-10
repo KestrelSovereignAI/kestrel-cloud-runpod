@@ -393,8 +393,8 @@ def test_no_fake_provider_registration_or_cpu_custody_store():
     assert not hasattr(CpuEnvironmentPlanner, "acquire")
     assert not hasattr(CpuEnvironmentPlanner, "release")
     assert not hasattr(CpuEnvironmentProfile, "pod_request")
-    assert "kestrel-sovereign-sdk>=0.43.0,<1" in pyproject["project"]["dependencies"]
-    assert "kestrel-sovereign>=0.54.4,<1" in pyproject["project"]["dependencies"]
+    assert "kestrel-sovereign-sdk>=0.49.0,<1" in pyproject["project"]["dependencies"]
+    assert "kestrel-sovereign>=0.63.0,<1" in pyproject["project"]["dependencies"]
 
 
 def test_request_identity_uses_exact_sdk_digest_even_for_equal_decimal_values():

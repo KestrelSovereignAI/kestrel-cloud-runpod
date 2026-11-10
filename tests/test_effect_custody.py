@@ -18,13 +18,15 @@ def test_owned_effect_metadata_requires_fixed_core_and_test_loop_custody():
     (sdk,) = [
         value for value in dependencies if value.name == "kestrel-sovereign-sdk"
     ]
-    assert {str(value) for value in sdk.specifier} == {">=0.43.0", "<1"}
+    assert {str(value) for value in sdk.specifier} == {">=0.49.0", "<1"}
     assert "0.53.34" not in core.specifier
-    # SDK0.43's trust-bundle profile first resolves with published Core0.54.4.
+    # Core0.63 is the first published coordinated Runpod admission cutover.
     assert "0.53.35" not in core.specifier
     assert "0.54.3" not in core.specifier
-    assert "0.54.4" in core.specifier
-    assert {str(value) for value in core.specifier} == {">=0.54.4", "<1"}
+    assert "0.54.4" not in core.specifier
+    assert "0.62.2" not in core.specifier
+    assert "0.63.0" in core.specifier
+    assert {str(value) for value in core.specifier} == {">=0.63.0", "<1"}
     test_loop, = [value for value in dependencies if value.name == "pytest-asyncio"]
     assert test_loop.marker.evaluate({"extra": "test"})
     assert not test_loop.marker.evaluate({"extra": ""})

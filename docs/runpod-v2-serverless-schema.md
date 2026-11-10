@@ -4,8 +4,8 @@ The production management contract for this package is the OpenAPI document
 served by the Runpod v2 API itself:
 
 - Source: `https://api.runpod.io/v2/openapi.yaml`
-- Observed SHA-256: `7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd`
-- Observed: 2026-11-04 (two independent, byte-identical public downloads)
+- Observed SHA-256: `8405937677c57ff38fd03e998a4a0d79d0a5de3259ed7481b4f3e0cc3e3935d6`
+- Observed: 2026-11-10 (live check and byte-identical direct public download)
 
 That schema requires `type: QUEUE`, puts `idleTimeout` under `workers`, and
 uses `scaling: {type: QUEUE_DELAY, queueDelay: ...}`. In August 2026, the
@@ -27,6 +27,13 @@ The November 4 refresh includes audit logs, organization roles/groups, cost
 centers, resource tags/filters, and Serverless time-series metrics. These are
 vendored provider documentation, not newly implemented client operations or
 permission to mutate accounts. All existing consumed operation IDs remain.
+
+The November 10 refresh adds Pod exec and signup operations and documents a
+network-volume deletion 409. All 19 consumed operations are unchanged. Of their
+125 transitive references, only `CreatePodRequest.startSsh` description punctuation
+changed; request validation and defaults are unchanged. Authentication and
+server declarations are identical. New documented operations are not exposed
+automatically, and do not enable a computer-use provider or account mutation.
 
 Compatibility boundaries checked for our current Pod, Serverless, CPU/GPU
 catalog, inventory, worker/log and billing calls:

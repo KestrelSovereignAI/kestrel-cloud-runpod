@@ -52,13 +52,24 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Changed
 
+- Refresh the API-served v2 OpenAPI pin after reviewing all consumed operations
+  and transitive schemas. Newly documented exec/signup endpoints remain outside
+  this client's implemented surface; accepted plans/receipts are not restamped.
+
+- Retire direct legacy LoRA training/inference admission before provider,
+  configuration or session effects, preserving original native refusal and
+  retained status/cancellation/download/release custody. New LoRA work uses the
+  authorized catalog workflow; private inference uses durable leases.
+- Require published Core 0.63.0, the first release containing the coordinated
+  legacy Runpod admission cutover, and its matching SDK 0.49 floor. Earlier Core
+  versions can advertise fresh work that the adapter correctly refuses.
+
 - Give the managed startup/telemetry runtime successor version `1.1.3`, keeping
   the published security-only `1.1.2` identity intact. A fresh built/scanned
   immutable digest is required; the Python package version is unchanged.
 
-- Require published SDK 0.43 or newer for canonical visual resource contracts
-  and Core 0.54.4 or newer, the first published Core resolving that SDK and its
-  TLS trust bundle.
+- Preserve canonical visual-resource and TLS-trust contracts through the
+  coordinated published Core/SDK floor above.
 
 ## [0.16.0] - 2026-10-20
 
