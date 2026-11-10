@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .models import RunPodManagerError
 from .pod_capacity_contracts import (
     CatalogArtifactHandoffEvidence,
@@ -26,6 +28,7 @@ from .pod_capacity_contracts import (
     TrainingPodLease,
     TrainingPodOwnership,
     TrainingPodRequest,
+    TrainingPodRevisionConflictError,
     TrainingPodSource,
     TrainingPodState,
     iso_datetime,
@@ -281,34 +284,41 @@ class SQLitePodCapacityRepository:
                             f"Training cleanup family '{request.cleanup_family_token}' "
                             "is already releasing"
                         )
-                connection.execute(
-                    """
-                    INSERT INTO pod_capacity_leases (
-                        cleanup_token, root_cleanup_token, request_fingerprint,
-                        companion_id, profile_id, source, resource_name,
-                        provider_pod_id, ownership, state, cleanup_state,
-                        capacity_spec_json, billing_state, evidence_json,
-                        family_release_requested, family_release_complete, created_at,
-                        updated_at, last_heartbeat_at, readiness_deadline, hard_deadline
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                    )
-                    """,
-                    (*values[:14], False, False, *values[14:]),
-                )
-                inserted = True
-            except sqlite3.IntegrityError as exc:
-                row = connection.execute(
-                    "SELECT * FROM pod_capacity_leases WHERE cleanup_token = ?",
+                existing = connection.execute(
+                    "SELECT cleanup_token FROM pod_capacity_leases "
+                    "WHERE cleanup_token = ?",
                     (request.cleanup_token,),
                 ).fetchone()
-                if row is None:
-                    connection.rollback()
-                    raise TrainingPodConflictError(
-                        "The requested training Pod is already claimed by another "
-                        "active cleanup token"
-                    ) from exc
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO pod_capacity_leases (
+                            cleanup_token, root_cleanup_token, request_fingerprint,
+                            companion_id, profile_id, source, resource_name,
+                            provider_pod_id, ownership, state, cleanup_state,
+                            capacity_spec_json, billing_state, evidence_json,
+                            family_release_requested, family_release_complete, created_at,
+                            updated_at, last_heartbeat_at, readiness_deadline, hard_deadline
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        (*values[:14], False, False, *values[14:]),
+                    )
+                    inserted = True
+            except sqlite3.IntegrityError as exc:
+                if (
+                    is_execution_control_error(exc)
+                    or getattr(exc, "sqlite_errorcode", None)
+                    != sqlite3.SQLITE_CONSTRAINT_UNIQUE
+                ):
+                    raise
+                connection.rollback()
+                raise TrainingPodConflictError(
+                    "The requested training Pod is already claimed by another "
+                    "active cleanup token"
+                ) from exc
             row = connection.execute(
                 "SELECT * FROM pod_capacity_leases WHERE cleanup_token = ?",
                 (request.cleanup_token,),
@@ -390,7 +400,7 @@ class SQLitePodCapacityRepository:
                 )
                 if cursor.rowcount != 1:
                     connection.rollback()
-                    raise TrainingPodConflictError(
+                    raise TrainingPodRevisionConflictError(
                         f"Training cleanup token '{lease.cleanup_token}' changed "
                         "concurrently; reconcile it"
                     )
@@ -400,6 +410,12 @@ class SQLitePodCapacityRepository:
                 ).fetchone()
                 connection.commit()
         except sqlite3.IntegrityError as exc:
+            if (
+                is_execution_control_error(exc)
+                or getattr(exc, "sqlite_errorcode", None)
+                != sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            ):
+                raise
             raise TrainingPodConflictError(
                 "The provider Pod is already claimed by another active training lease"
             ) from exc

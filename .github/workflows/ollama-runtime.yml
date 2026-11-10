@@ -35,7 +35,7 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime
-  RUNTIME_VERSION: 1.1.2
+  RUNTIME_VERSION: 1.1.3
 
 jobs:
   proxy-contract:
@@ -104,6 +104,10 @@ jobs:
           VOLUME="ollama-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TOKEN="runtime-integration-0123456789abcdef0123456789abcdef"
           EXPIRES_AT="$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')"
+          TELEMETRY_BINDING_SHA256="$(
+            printf '%s' "$TOKEN|$EXPIRES_AT|dedicated_pod|/workspace/ollama" |
+              sha256sum | awk '{print $1}'
+          )"
           cleanup() {
             docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
             docker volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -118,6 +122,7 @@ jobs:
             --env "KESTREL_OLLAMA_REQUIRED_MODEL=registry.invalid/model:v1" \
             --env "KESTREL_OLLAMA_MODE=dedicated_pod" \
             --env "KESTREL_OLLAMA_MODEL_STORAGE_PATH=/workspace/ollama" \
+            --env "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256=$TELEMETRY_BINDING_SHA256" \
             "$RUNTIME_IMAGE_REF" >/dev/null
           PROVED=false
           for _ in $(seq 1 100); do
@@ -144,7 +149,7 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         env:
-          # Large image extraction belongs on runner scratch, not /tmp quota.
+          # Large extraction uses runner scratch; runner context requires step.env.
           TMPDIR: ${{ runner.temp }}
         with:
           image: ${{ env.RUNTIME_IMAGE_REF }}

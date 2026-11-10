@@ -6,7 +6,10 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Installation
 
-Requires Core >=0.54.4 and SDK >=0.43; older Core SDK pins are incompatible.
+Requires Core >=0.63.0 (excluding 0.64.0) and SDK >=0.49. Core and this package retire fresh legacy
+training/generation admission together; original historical recovery remains.
+Core 0.64.0 has a confirmed cold tool-effect import regression tracked in
+[Core #4003](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/4003).
 
 ```bash
 uv pip install kestrel-cloud-runpod
@@ -349,9 +352,12 @@ written to provider lease rows or public metadata. On process restart,
 `status()` re-observes the same deterministic Runpod resource and returns a
 fresh host-only route without creating duplicate capacity.
 
-`manage_gpu` remains available for explicit operator start/stop/status/log
-controls, but it no longer attaches, detaches, or reports an LLM route. The
-provider-neutral inference coordinator is the only LLM routing owner.
+`manage_gpu` remains available for explicit operator stop/status/log controls
+over already retained sessions, but ownerless legacy start and stopped-Pod
+resume are retired before any billable provider action. New private inference
+uses the provider-neutral inference-lease coordinator; catalog and training
+capacity use their durable Pod-capacity services. The legacy tool never
+attaches, detaches, or reports an LLM route.
 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
@@ -434,13 +440,37 @@ active, uncertain, ready, releasing, released, and fallback-family row. The
 old `TrainingPodLeaseService`, repository, and provider imports are aliases to
 the canonical implementation, so they cannot create a second lifecycle.
 
-Legacy `start_training_pod()` callers retain their exact/root cleanup behavior:
-a newly started Pod is returned with a route, confirmed stopped, or retained as
-retryable state; pre-existing running capacity is never stopped without lease
-authority. Run `kestrel-runpod-reconcile-training` for those compatibility
-callers. New catalog hosts construct `PodCapacityLeaseService` with their
+Legacy NEW `start_training_pod()`, `submit_training_job()`, `start_inference_pod()`
+and `generate_with_lora()` calls now refuse before new config/provider/model
+effects, even with a retained session/token. Use the authorized host catalog
+workflow for LoRA; a legacy FLUX path is not an accepted SDXL artifact or input.
+There is no replacement profile/provider fallback or second queue. Private LLMs
+use the durable inference-lease interface instead. Original native execution
+denial takes precedence over the ordinary retirement message.
+
+Historical exact/root cleanup, status, cancellation and download remain on the
+SAME capacity ledger. Pre-existing running capacity is never stopped without
+lease authority; uncertain/retryable custody is retained. Run
+`kestrel-runpod-reconcile-training` for those original compatibility records.
+The compatible Core dependency floor must name the actual first published
+Core#3954 release before this candidate can release; the old floor is NOT
+cutover acceptance. See [KCR#64](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/64).
+New catalog hosts construct `PodCapacityLeaseService` with their
 encrypted capability store and call `reconcile()` from a cheap external timer;
 process-local TTLs are never cleanup authority.
+
+Legacy training error preservation: when an ordinary readiness, submission,
+recovery, or cancellation failure is followed by a control-bearing cleanup
+failure, the public call raises the canonical finite exception aggregate. It
+retains the same cleanup carrier and the same operation error (cleanup first),
+without rewriting the cleanup carrier's explicit cause or control evidence.
+Because both originals derive from `Exception`, the aggregate is an
+`ExceptionGroup`; callers must not assume it is the cleanup exception itself.
+Direct control failures and healthy-cleanup ordinary normalization keep their
+existing behavior. At error conversion, retry, persistence, or later-effect
+boundaries, use public Core `is_execution_control_error(error)` with its default
+recursive behavior and re-raise control-bearing evidence unchanged. Neither an
+error aggregate nor cleanup completion grants new work or financial finality.
 
 Install one host-owned synchronous factory that constructs the public service
 with explicit Runpod v2 credentials, the absolute SQLite repository path, GPU
@@ -535,9 +565,16 @@ The reviewed v2 schema is pinned in `vendor/runpod-v2-openapi.yaml` with its che
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.35,<1` — features, tools, and inference-lease contracts
-- `kestrel-sovereign>=0.13.1,<1` — standalone Kestrel config-file loader (runtime)
-- `httpx>=0.27,<1`
+- `kestrel-sovereign-sdk>=0.49.0,<1` — features, tools, and inference-lease contracts
+- `kestrel-sovereign>=0.63.0,!=0.64.0,<1` — coordinated retirement of fresh legacy Runpod
+  training/generation admission, providing
+  canonical joined-effect custody,
+  provider-neutral inference terminal-evidence refresh, and direct-node
+  execution-control classification
+- `httpcore>=1.0.9,<1.1` and `httpx>=0.28.1,<0.29` — reviewed public
+  transport exception pairs for bounded safe-read retry classification;
+  implicit backend context is diagnostic only and mutating requests are never
+  automatically retried
 - `requests>=2.32,<3`
 
 ## Development

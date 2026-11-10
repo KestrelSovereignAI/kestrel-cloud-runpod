@@ -3,7 +3,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43 AS proxy-builder
 ENV GOTOOLCHAIN=local
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.1.2
+ARG RUNTIME_VERSION=1.1.3
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -28,19 +28,20 @@ WORKDIR /src/ollama
 RUN go get \
       github.com/buger/jsonparser@v1.1.2 \
       github.com/klauspost/compress@v1.20.2 \
-      golang.org/x/crypto@v0.57.0 \
+      golang.org/x/crypto@v0.58.0 \
       golang.org/x/image@v0.45.0 \
       golang.org/x/mod@v0.41.0 \
-      golang.org/x/net@v0.60.0 \
-      golang.org/x/text@v0.42.0 \
+      golang.org/x/net@v0.62.0 \
+      golang.org/x/text@v0.43.0 \
     && go mod download \
     && CGO_ENABLED=1 go build -buildvcs=false -trimpath -buildmode=pie \
       -ldflags="-s -w -buildid= -X=github.com/ollama/ollama/version.Version=0.32.5 -X=github.com/ollama/ollama/server.mode=release" \
       -o /out/ollama . \
-    && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "github.com/klauspost/compress" {print $3}')" = v1.20.2
+    && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "github.com/klauspost/compress" {print $3}')" = v1.20.2 \
+    && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "golang.org/x/net" {print $3}')" = v0.62.0
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.1.2
+ARG RUNTIME_VERSION=1.1.3
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \
@@ -50,11 +51,15 @@ LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       ai.kestrel.ollama.version="$OLLAMA_VERSION" \
       ai.kestrel.ollama.source.commit="eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
 
-# The pinned upstream image contains OpenSSL from before CVE-2026-84782.
-# Upgrade both installed binary packages to the same fixed Ubuntu build.
+# The pinned upstream image predates fixed OpenSSL and APT releases
+# (CVE-2026-84782 and CVE-2026-109518). Upgrade each installed package pair
+# together; the final image and compiled network dependency are scanned in CI.
 RUN apt-get update \
     && apt-get install --no-install-recommends --only-upgrade -y \
       libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16 \
+      apt=2.8.4ubuntu0.1 libapt-pkg6.0t64=2.8.4ubuntu0.1 \
+    && test "$(dpkg-query --show --showformat='${Version}' apt)" = 2.8.4ubuntu0.1 \
+    && test "$(dpkg-query --show --showformat='${Version}' libapt-pkg6.0t64)" = 2.8.4ubuntu0.1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 kestrel-ollama \
     && useradd --uid 10001 --gid 10001 --home-dir /var/lib/kestrel-ollama --shell /usr/sbin/nologin kestrel-ollama \

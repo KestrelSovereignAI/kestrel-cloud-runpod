@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
+
 from .models import RunPodManagerError
 from .pod_capacity_contracts import (
     PodCapacityBillingState,
@@ -100,6 +105,8 @@ def load_service_factory(reference: str) -> PodCapacityServiceFactory:
     try:
         value: Any = importlib.import_module(module_name)
     except (ImportError, ValueError) as exc:
+        if is_execution_control_error(exc):
+            raise
         raise PodCapacityReconcilerConfigurationError(
             "The Pod capacity service factory module could not be imported"
         ) from exc
@@ -107,6 +114,8 @@ def load_service_factory(reference: str) -> PodCapacityServiceFactory:
         for attribute in attribute_path.split("."):
             value = getattr(value, attribute)
     except AttributeError as exc:
+        if is_execution_control_error(exc):
+            raise
         raise PodCapacityReconcilerConfigurationError(
             "The Pod capacity service factory callable was not found"
         ) from exc
@@ -134,6 +143,8 @@ def run_cli(
         try:
             service = _construct_service(factory)
         except (RunPodManagerError, OSError, TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PodCapacityReconcilerConfigurationError(
                 "The Pod capacity service factory could not construct its dependencies"
             ) from exc
@@ -144,25 +155,35 @@ def run_cli(
                         service.reconcile(), timeout=arguments.timeout_seconds
                     )
                 )
-            except TimeoutError:
+            except TimeoutError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 _write_json(output, {"status": "timeout"})
                 return EXIT_RETRYABLE
             except RunPodManagerError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 _write_json(
                     output,
                     {"status": "error", "error_type": type(exc).__name__},
                 )
                 return EXIT_RUNTIME_ERROR
             except (OSError, sqlite3.Error) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 _write_json(
                     output,
                     {"status": "error", "error_type": type(exc).__name__},
                 )
                 return EXIT_RUNTIME_ERROR
-    except PodCapacityReconcilerBusyError:
+    except PodCapacityReconcilerBusyError as exc:
+        if is_execution_control_error(exc):
+            raise
         _write_json(output, {"status": "busy"})
         return EXIT_RETRYABLE
-    except PodCapacityReconcilerConfigurationError:
+    except PodCapacityReconcilerConfigurationError as exc:
+        if is_execution_control_error(exc):
+            raise
         _write_json(output, {"status": "configuration_error"})
         return EXIT_CONFIGURATION_ERROR
 
@@ -276,24 +297,46 @@ def _exclusive_reconcile_lock(database_path: Path) -> Iterator[None]:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(lock_path, flags, 0o600)
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
     except OSError as exc:
+        if is_execution_control_error(exc):
+            raise
         raise PodCapacityReconcilerConfigurationError(
             "The Pod capacity reconciliation lock could not be opened"
         ) from exc
     locked = False
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+        except OSError as exc:
+            if is_execution_control_error(exc):
+                raise
+            raise PodCapacityReconcilerConfigurationError(
+                "The Pod capacity reconciliation lock could not be opened"
+            ) from exc
         locked = _lock_descriptor(descriptor)
         if not locked:
             raise PodCapacityReconcilerBusyError(
                 "Another Pod capacity reconciliation pass is active"
             )
         yield
+    except BaseException as exc:  # noqa: BLE001 - Original body remains owned through both closers.
+        primary = exc
     finally:
         if locked:
-            _unlock_descriptor(descriptor)
-        os.close(descriptor)
+            try:
+                _unlock_descriptor(descriptor)
+            except BaseException as exc:  # noqa: BLE001 - Unlock refusal must not skip native close.
+                cleanup_errors.append(exc)
+        try:
+            os.close(descriptor)
+        except BaseException as exc:  # noqa: BLE001 - Retain the original close result, without retry.
+            cleanup_errors.append(exc)
+    terminal = execution_terminal_error(primary, *cleanup_errors, retain_originals=True)
+    if terminal is not None:
+        raise terminal
 
 
 def _lock_descriptor(descriptor: int) -> bool:
@@ -303,6 +346,8 @@ def _lock_descriptor(descriptor: int) -> bool:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            if is_execution_control_error(exc):
+                raise
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
                 return False
             raise PodCapacityReconcilerConfigurationError(
@@ -318,6 +363,8 @@ def _lock_descriptor(descriptor: int) -> bool:
         try:
             msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
+            if is_execution_control_error(exc):
+                raise
             if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                 return False
             raise PodCapacityReconcilerConfigurationError(

@@ -1,10 +1,16 @@
 """Billing-safe training acquisition, cancellation, and reconciliation tests."""
 
 import asyncio
+import inspect
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pod_capacity_test_support import (
+    execution_control_carrier,
+    record_control_injection,
+)
 from training_test_support import (
     FakeTrainingProvider,
     MutableClock,
@@ -20,12 +26,471 @@ from kestrel_cloud_runpod.training_contracts import (
     TrainingPodConflictError,
     TrainingPodLifecycleError,
     TrainingPodOwnership,
+    TrainingPodRevisionConflictError,
     TrainingPodSource,
     TrainingPodState,
     fallback_training_cleanup_token,
 )
 from kestrel_cloud_runpod.training_repository import SQLiteTrainingPodRepository
 from kestrel_cloud_runpod.training_service import TrainingPodLeaseService
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "group", "implicit-context"])
+async def test_r27_family_provider_failure_does_not_abandon_owned_sibling(
+    tmp_path, mode, record_property
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    await _persist_fallback_after_released_root(tmp_path, clock, provider, legacy=True)
+    runtime = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={
+            name: training_profile(name)
+            for name in ("training", "training-h100", "training-flex")
+        },
+    )
+    root_token = "training:fallback-family-root-0001"
+    provider.status = "EXITED"
+    second_token = fallback_training_cleanup_token(root_token, "training-flex")
+    await runtime.acquire(
+        training_request(
+            clock,
+            token=second_token,
+            profile_id="training-flex",
+            pod_id="pod-r27-second-original",
+        )
+    )
+    members = tuple(
+        item for item in runtime._cleanup_family(root_token) if not item.is_terminal
+    )
+    assert len(members) == 2
+    first, second = members
+    assert first.provider_pod_id != second.provider_pod_id
+    carrier, control, explicit = execution_control_carrier(
+        RunPodManagerError("original provider cleanup remains unknown"),
+        grouped=mode == "group",
+    )
+    if mode == "implicit-context":
+        carrier.__cause__ = None
+        carrier.__context__ = control
+        carrier.__suppress_context__ = False
+    original_stop = provider.stop
+    entries = []
+
+    async def stop(pod_id):
+        entries.append(pod_id)
+        if pod_id == first.provider_pod_id:
+            record_property("r27_injection", "provider-stop-" + mode)
+            raise carrier
+        return await original_stop(pod_id)
+
+    provider.stop = stop
+    caught = None
+    try:
+        await runtime.release(root_token, reason="r27 original family cleanup")
+    except RunPodManagerError as error:
+        caught = error
+    assert entries == [first.provider_pod_id, second.provider_pod_id]
+    retained_first = runtime.repository.get(first.cleanup_token)
+    retained_second = runtime.repository.get(second.cleanup_token)
+    root = runtime.repository.get(root_token)
+    assert retained_first.provider_pod_id == first.provider_pod_id
+    assert not retained_first.is_terminal
+    assert retained_second.state is TrainingPodState.RELEASED
+    assert root.family_release_requested and not root.family_release_complete
+    if mode == "implicit-context":
+        assert type(caught) is TrainingPodCleanupError
+        assert not is_execution_control_error(caught)
+        assert carrier.__cause__ is None and carrier.__context__ is control
+    else:
+        assert caught is carrier
+        assert is_execution_control_error(caught)
+        assert carrier.__cause__ is explicit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["pre-stop", "provider-failure-bookkeeping"])
+async def test_r27_family_custody_sql_failure_stops_later_effects(tmp_path, door):
+    import sqlite3
+
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    await _persist_fallback_after_released_root(tmp_path, clock, provider, legacy=True)
+    runtime = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={
+            name: training_profile(name)
+            for name in ("training", "training-h100", "training-flex")
+        },
+    )
+    root_token = "training:fallback-family-root-0001"
+    provider.status = "EXITED"
+    second_token = fallback_training_cleanup_token(root_token, "training-flex")
+    await runtime.acquire(
+        training_request(
+            clock,
+            token=second_token,
+            profile_id="training-flex",
+            pod_id="pod-r27-second-original",
+        )
+    )
+    active = tuple(
+        item for item in runtime._cleanup_family(root_token) if not item.is_terminal
+    )
+    assert len(active) == 2
+    first, second = active
+    if door == "pre-stop":
+        predicate = "NEW.stop_attempts > OLD.stop_attempts"
+    else:
+        predicate = (
+            "NEW.last_provider_error IS NOT NULL "
+            "AND NEW.last_provider_error IS NOT OLD.last_provider_error"
+        )
+        provider.stop_error = RunPodManagerError("ordinary provider stop failure")
+    with runtime.repository._connect() as connection:
+        connection.execute(
+            "CREATE TRIGGER r27_required_custody BEFORE UPDATE ON pod_capacity_leases "
+            "WHEN " + predicate + " BEGIN "
+            "SELECT RAISE(ABORT, 'r27 original custody refused'); END"
+        )
+    with pytest.raises(
+        sqlite3.IntegrityError, match="r27 original custody refused"
+    ) as raised:
+        await runtime.release(root_token, reason="r27 custody blocker")
+    assert raised.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    if door == "provider-failure-bookkeeping":
+        assert raised.value.__cause__ is provider.stop_error
+    assert provider.stop_calls == (
+        [] if door == "pre-stop" else [first.provider_pod_id]
+    )
+    assert runtime.repository.get(second.cleanup_token) == second
+    root = runtime.repository.get(root_token)
+    assert root.family_release_requested and not root.family_release_complete
+
+
+async def _r28_three_active_family(tmp_path):
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    await _persist_fallback_after_released_root(tmp_path, clock, provider, legacy=True)
+    runtime = training_service(
+        tmp_path,
+        clock,
+        provider,
+        profiles={
+            name: training_profile(name)
+            for name in (
+                "training",
+                "training-h100",
+                "training-flex",
+                "training-spot",
+            )
+        },
+    )
+    root_token = "training:fallback-family-root-0001"
+    for profile_id, pod_id in (
+        ("training-flex", "pod-r28-second-original"),
+        ("training-spot", "pod-r28-third-original"),
+    ):
+        provider.status = "EXITED"
+        await runtime.acquire(
+            training_request(
+                clock,
+                token=fallback_training_cleanup_token(root_token, profile_id),
+                profile_id=profile_id,
+                pod_id=pod_id,
+            )
+        )
+    active = tuple(
+        item for item in runtime._cleanup_family(root_token) if not item.is_terminal
+    )
+    assert len(active) == 3
+    assert len({item.provider_pod_id for item in active}) == 3
+    return runtime, provider, root_token, active
+
+
+def _r28_refuse_stop_attempt(runtime, cleanup_token):
+    with runtime.repository._connect() as connection:
+        connection.execute(
+            "CREATE TABLE r28_abort_target (cleanup_token TEXT PRIMARY KEY)"
+        )
+        connection.execute("INSERT INTO r28_abort_target VALUES (?)", (cleanup_token,))
+        connection.execute(
+            "CREATE TRIGGER r28_later_custody_abort BEFORE UPDATE "
+            "ON pod_capacity_leases WHEN OLD.cleanup_token = "
+            "(SELECT cleanup_token FROM r28_abort_target) "
+            "AND NEW.stop_attempts > OLD.stop_attempts BEGIN "
+            "SELECT RAISE(ABORT, 'r28 later family custody refused'); END"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_graph", ["direct", "group"])
+@pytest.mark.parametrize("later_abort", ["native-sql", "typed-control"])
+async def test_r28_family_abort_retains_prior_control_and_stops_third_sibling(
+    tmp_path, monkeypatch, record_property, prior_graph, later_abort
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    runtime, provider, root_token, active = await _r28_three_active_family(tmp_path)
+    first, second, third = active
+    second_before = runtime.repository.get(second.cleanup_token)
+    third_before = runtime.repository.get(third.cleanup_token)
+    first_carrier, first_control, first_explicit = execution_control_carrier(
+        RunPodManagerError("r28 first provider result remains unknown"),
+        grouped=prior_graph == "group",
+    )
+    stop_entries = []
+    original_stop = provider.stop
+
+    async def controlled_stop(pod_id):
+        stop_entries.append(pod_id)
+        if pod_id == first.provider_pod_id:
+            record_control_injection(
+                record_property, f"r28-first-provider-{prior_graph}"
+            )
+            raise first_carrier
+        return await original_stop(pod_id)
+
+    monkeypatch.setattr(provider, "stop", controlled_stop)
+    original_compare_and_set = runtime.repository.compare_and_set
+    observed_native = None
+    second_at_injection = None
+    later_carrier = None
+    later_explicit = None
+    if later_abort == "native-sql":
+        _r28_refuse_stop_attempt(runtime, second.cleanup_token)
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal observed_native, second_at_injection
+            try:
+                return original_compare_and_set(current, changes=changes)
+            except sqlite3.IntegrityError as error:
+                assert current.cleanup_token == second.cleanup_token
+                second_at_injection = current
+                observed_native = error
+                record_property("r28_later_abort", "native-sql")
+                raise
+
+    else:
+        later_carrier, _later_control, later_explicit = execution_control_carrier(
+            TrainingPodConflictError("r28 later typed custody remains unknown"),
+            grouped=True,
+        )
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal second_at_injection
+            if (
+                current.cleanup_token == second.cleanup_token
+                and "stop_attempts" in changes
+            ):
+                second_at_injection = current
+                record_control_injection(record_property, "r28-later-typed-custody")
+                raise later_carrier
+            return original_compare_and_set(current, changes=changes)
+
+    monkeypatch.setattr(
+        runtime.repository, "compare_and_set", controlled_compare_and_set
+    )
+    caught = None
+    try:
+        await runtime.release(root_token, reason="r28 retained family abort")
+    except (RunPodManagerError, sqlite3.IntegrityError) as error:
+        caught = error
+
+    actual_later = observed_native if later_abort == "native-sql" else later_carrier
+    assert actual_later is not None
+    assert second_at_injection is not None
+    assert second_at_injection.state is TrainingPodState.RELEASING
+    assert second_at_injection.cleanup_state is TrainingPodCleanupState.PENDING
+    assert second_at_injection.backend_base_url is None
+    assert second_at_injection.revision == second_before.revision + 1
+    assert second_at_injection.stop_attempts == second_before.stop_attempts
+    assert stop_entries == [first.provider_pod_id]
+    assert runtime.repository.get(second.cleanup_token) == second_at_injection
+    assert runtime.repository.get(third.cleanup_token) == third_before
+    root = runtime.repository.get(root_token)
+    assert root is not None
+    assert root.family_release_requested and not root.family_release_complete
+    retained_first = runtime.repository.get(first.cleanup_token)
+    assert retained_first is not None and not retained_first.is_terminal
+    assert retained_first.provider_pod_id == first.provider_pod_id
+    assert caught is first_carrier
+    assert is_execution_control_error(caught)
+    assert isinstance(caught.__cause__, BaseExceptionGroup)
+    assert caught.__cause__.exceptions == (first_explicit, actual_later)
+    assert is_execution_control_error(first_carrier)
+    if isinstance(first_explicit, BaseExceptionGroup):
+        assert first_control in first_explicit.exceptions
+    else:
+        assert first_explicit is first_control
+    if later_abort == "native-sql":
+        assert observed_native.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    else:
+        assert later_carrier.__cause__ is later_explicit
+        assert is_execution_control_error(later_carrier)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_kind", ["native-sql", "typed-control"])
+async def test_r28_family_sole_abort_keeps_identity_and_stops_later_siblings(
+    tmp_path, monkeypatch, record_property, abort_kind
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    runtime, provider, root_token, active = await _r28_three_active_family(tmp_path)
+    first, second, third = active
+    second_before = runtime.repository.get(second.cleanup_token)
+    third_before = runtime.repository.get(third.cleanup_token)
+    stop_calls_before = list(provider.stop_calls)
+    original_compare_and_set = runtime.repository.compare_and_set
+    observed_native = None
+    typed_abort = None
+    typed_explicit = None
+    if abort_kind == "native-sql":
+        _r28_refuse_stop_attempt(runtime, first.cleanup_token)
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal observed_native
+            try:
+                return original_compare_and_set(current, changes=changes)
+            except sqlite3.IntegrityError as error:
+                assert current.cleanup_token == first.cleanup_token
+                observed_native = error
+                record_property("r28_sole_abort", "native-sql")
+                raise
+
+    else:
+        typed_abort, _typed_control, typed_explicit = execution_control_carrier(
+            TrainingPodConflictError("r28 sole typed custody remains unknown")
+        )
+
+        def controlled_compare_and_set(current, *, changes):
+            if (
+                current.cleanup_token == first.cleanup_token
+                and "stop_attempts" in changes
+            ):
+                record_control_injection(record_property, "r28-sole-typed-custody")
+                raise typed_abort
+            return original_compare_and_set(current, changes=changes)
+
+    monkeypatch.setattr(
+        runtime.repository, "compare_and_set", controlled_compare_and_set
+    )
+    caught = None
+    try:
+        await runtime.release(root_token, reason="r28 sole family abort")
+    except (RunPodManagerError, sqlite3.IntegrityError) as error:
+        caught = error
+
+    expected = observed_native if abort_kind == "native-sql" else typed_abort
+    assert expected is not None
+    assert caught is expected
+    assert provider.stop_calls == stop_calls_before
+    assert runtime.repository.get(second.cleanup_token) == second_before
+    assert runtime.repository.get(third.cleanup_token) == third_before
+    root = runtime.repository.get(root_token)
+    assert root is not None
+    assert root.family_release_requested and not root.family_release_complete
+    if abort_kind == "native-sql":
+        assert observed_native.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
+    else:
+        assert typed_abort.__cause__ is typed_explicit
+        assert is_execution_control_error(typed_abort)
+
+
+def _cleanup_carrier(boundary: str):
+    return TrainingPodCleanupError(
+        boundary,
+        cleanup_token=f"training:{boundary}:0001",
+        pod_id="pod-training-1",
+        cleanup_state=TrainingPodCleanupState.RETRYABLE_FAILURE,
+        billing_risk=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    ["stop-attempt", "family-request", "family-complete", "transition", "evidence"],
+)
+async def test_permanent_sql_conflict_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    runtime = training_service(tmp_path, clock, provider)
+    lease, _ = runtime.repository.reserve(training_request(clock))
+    if boundary == "stop-attempt":
+        lease = runtime.repository.compare_and_set(
+            lease,
+            changes={
+                "state": TrainingPodState.RELEASING,
+                "cleanup_state": TrainingPodCleanupState.PENDING,
+            },
+        )
+        operation = lambda: runtime._release_one(
+            lease.cleanup_token, reason="constraint"
+        )
+    elif boundary == "family-request":
+        operation = lambda: runtime._mark_family_release_requested(lease)
+    elif boundary == "family-complete":
+        lease = runtime.repository.compare_and_set(
+            lease, changes={"family_release_requested": True}
+        )
+        operation = lambda: runtime._mark_family_release_complete(lease)
+    elif boundary == "transition":
+        operation = lambda: runtime._transition_nonterminal(
+            lease, changes={"last_provider_error": "constraint"}
+        )
+    else:
+        operation = lambda: runtime._transition_with_evidence(
+            lease, changes={"last_provider_error": "constraint"}
+        )
+    with runtime.repository._connect() as connection:
+        connection.execute("CREATE TABLE r27_unique (value TEXT UNIQUE)")
+        connection.execute("INSERT INTO r27_unique VALUES ('retained')")
+        connection.execute(
+            "CREATE TRIGGER r27_permanent BEFORE UPDATE ON pod_capacity_leases "
+            "BEGIN INSERT INTO r27_unique VALUES ('retained'); END"
+        )
+    compare_and_set = runtime.repository.compare_and_set
+    observed: list[TrainingPodConflictError] = []
+
+    class RepeatedNativeConflict(AssertionError):
+        """Stop a diagnosed repeated native failure without an unbounded loop."""
+
+    def bounded_native_observer(current, *, changes):
+        try:
+            return compare_and_set(current, changes=changes)
+        except TrainingPodConflictError as error:
+            native = error.__cause__
+            assert isinstance(native, sqlite3.IntegrityError)
+            assert native.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            observed.append(error)
+            if len(observed) == 2:
+                raise RepeatedNativeConflict("second actual native conflict") from error
+            raise
+
+    monkeypatch.setattr(runtime.repository, "compare_and_set", bounded_native_observer)
+    caught = None
+    try:
+        result = operation()
+        if inspect.isawaitable(result):
+            await result
+    except (TrainingPodConflictError, RepeatedNativeConflict) as error:
+        caught = error
+    assert observed
+    assert runtime.repository.get(lease.cleanup_token) == lease
+    assert provider.stop_calls == []
+    assert caught is observed[0]
+    assert len(observed) == 1
 
 
 @pytest.mark.asyncio
@@ -605,3 +1070,451 @@ async def test_concurrent_family_release_and_reconcile_are_terminal_aware(
     assert child is not None and child.state is TrainingPodState.RELEASED
     assert released_root.family_release_complete is True
     assert provider.stop_calls == ["pod-created-1", "pod-created-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "existing-observe",
+        "existing-start",
+        "existing-start-cleanup",
+        "ambiguous-create-cleanup",
+        "family-cleanup",
+        "family-manager",
+        "reconcile-family",
+        "reconcile-lease",
+        "reconcile-workload",
+        "stop-attempt-conflict",
+        "family-request-conflict",
+        "family-complete-conflict",
+        "transition-conflict",
+        "record-reconcile-conflict",
+    ],
+)
+async def test_training_service_preserves_exact_execution_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    record_property,
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    runtime = training_service(tmp_path, clock, provider)
+    if boundary.endswith("-cleanup"):
+        error = _cleanup_carrier(boundary)
+    elif boundary.endswith("-conflict"):
+        error = TrainingPodConflictError(f"{boundary} remains unknown")
+    else:
+        error = RunPodManagerError(f"{boundary} remains unknown")
+    carrier, control, explicit = execution_control_carrier(
+        error,
+        grouped=boundary in {"family-manager", "reconcile-family"},
+    )
+    durable_at_injection = None
+    family_at_injection = None
+
+    def capture_injection(cleanup_token: str) -> None:
+        nonlocal durable_at_injection, family_at_injection
+        durable_at_injection = runtime.repository.get(cleanup_token)
+        assert durable_at_injection is not None
+        family_at_injection = runtime.repository.list_cleanup_family(
+            durable_at_injection.root_cleanup_token
+        )
+        record_control_injection(record_property, boundary)
+
+    if boundary == "existing-observe":
+        provider.error_callback = lambda: capture_injection("training:test-token-0001")
+        provider.observe_error = carrier
+        operation = lambda: runtime.acquire(training_request(clock))
+    elif boundary in {"existing-start", "existing-start-cleanup"}:
+        provider.status = "EXITED"
+        provider.start_error = (
+            RunPodManagerError("ordinary Pod start failure")
+            if boundary.endswith("-cleanup")
+            else carrier
+        )
+        if boundary.endswith("-cleanup"):
+
+            async def controlled_release(cleanup_token: str, *_args, **_kwargs):
+                capture_injection(cleanup_token)
+                raise carrier
+
+            monkeypatch.setattr(runtime, "_release_one", controlled_release)
+        else:
+            provider.error_callback = lambda: capture_injection(
+                "training:test-token-0001"
+            )
+        operation = lambda: runtime.acquire(training_request(clock))
+    elif boundary == "ambiguous-create-cleanup":
+        provider.create_error = RunPodAmbiguousResultError(
+            title="unknown",
+            detail="ordinary ambiguous create",
+            method="POST",
+            resource="/pods",
+        )
+
+        async def controlled_release(cleanup_token: str, *_args, **_kwargs):
+            capture_injection(cleanup_token)
+            raise carrier
+
+        monkeypatch.setattr(runtime, "_release_one", controlled_release)
+        operation = lambda: runtime.acquire(
+            training_request(
+                clock,
+                token="training:ambiguous-create-cleanup:0001",
+                source=TrainingPodSource.CREATED,
+            )
+        )
+    elif boundary in {
+        "family-cleanup",
+        "family-manager",
+        "reconcile-family",
+    }:
+        runtime, root_token, _child_token = await _persist_fallback_after_released_root(
+            tmp_path, clock, provider, legacy=False
+        )
+
+        async def controlled_release_one(cleanup_token: str, *_args, **_kwargs):
+            capture_injection(cleanup_token)
+            raise carrier
+
+        async def controlled_family_release(cleanup_token: str, *_args, **_kwargs):
+            capture_injection(cleanup_token)
+            raise carrier
+
+        if boundary == "reconcile-family":
+            root = runtime.repository.get(root_token)
+            assert root is not None
+            runtime.repository.compare_and_set(
+                root,
+                changes={
+                    "family_release_requested": True,
+                    "family_release_complete": False,
+                },
+            )
+            monkeypatch.setattr(runtime, "release", controlled_family_release)
+            operation = runtime.reconcile
+        else:
+            monkeypatch.setattr(runtime, "_release_one", controlled_release_one)
+            operation = lambda: runtime.release(root_token, reason="controlled")
+    elif boundary == "reconcile-lease":
+        lease, _ = runtime.repository.reserve(training_request(clock))
+        monkeypatch.setattr(
+            runtime.repository,
+            "list_for_reconciliation",
+            lambda: (lease,),
+        )
+
+        async def controlled_reconcile_one(_cleanup_token):
+            capture_injection(_cleanup_token)
+            raise carrier
+
+        monkeypatch.setattr(runtime, "_reconcile_one", controlled_reconcile_one)
+        operation = runtime.reconcile
+    elif boundary == "reconcile-workload":
+        ready = await runtime.acquire(training_request(clock))
+        runtime.record_job(ready.cleanup_token, "job-control")
+
+        async def controlled_status(_lease):
+            capture_injection(_lease.cleanup_token)
+            raise carrier
+
+        runtime._workload_status_observer = controlled_status
+        operation = lambda: runtime._reconcile_one(ready.cleanup_token)
+    else:
+        if boundary == "stop-attempt-conflict":
+            lease = await runtime.acquire(training_request(clock))
+            changes_key = "stop_attempts"
+            operation = lambda: runtime.release(
+                lease.cleanup_token, reason="controlled"
+            )
+        else:
+            lease, _ = runtime.repository.reserve(training_request(clock))
+            if boundary == "family-complete-conflict":
+                lease = runtime.repository.compare_and_set(
+                    lease,
+                    changes={
+                        "family_release_requested": True,
+                        "family_release_complete": False,
+                    },
+                )
+                changes_key = "family_release_complete"
+                operation = lambda: runtime._mark_family_release_complete(lease)
+            elif boundary == "family-request-conflict":
+                changes_key = "family_release_requested"
+                operation = lambda: runtime._mark_family_release_requested(lease)
+            elif boundary == "transition-conflict":
+                changes_key = "last_provider_error"
+                operation = lambda: runtime._transition_nonterminal(
+                    lease, changes={"last_provider_error": "controlled"}
+                )
+            else:
+                changes_key = "last_provider_error"
+                operation = lambda: runtime._record_reconcile_error(
+                    lease.cleanup_token, RunPodManagerError("ordinary reconcile error")
+                )
+        compare_and_set = runtime.repository.compare_and_set
+        injected = False
+
+        def controlled_compare_and_set(current, *, changes):
+            nonlocal injected
+            if not injected and changes_key in changes:
+                injected = True
+                capture_injection(current.cleanup_token)
+                raise carrier
+            return compare_and_set(current, changes=changes)
+
+        monkeypatch.setattr(
+            runtime.repository, "compare_and_set", controlled_compare_and_set
+        )
+
+    provider_calls = (
+        tuple(provider.start_calls),
+        tuple(provider.stop_calls),
+        tuple(provider.create_calls),
+    )
+    with pytest.raises(type(carrier)) as raised:
+        outcome = operation()
+        if inspect.isawaitable(outcome):
+            await outcome
+
+    assert raised.value is carrier
+    assert carrier.__cause__ is explicit
+    if isinstance(explicit, BaseExceptionGroup):
+        assert explicit.exceptions[0] is control
+    else:
+        assert explicit is control
+    assert tuple(provider.start_calls) == provider_calls[0] + (
+        ("pod-training-1",) if boundary.startswith("existing-start") else ()
+    )
+    assert tuple(provider.stop_calls) == provider_calls[1]
+    assert len(provider.create_calls) == len(provider_calls[2]) + int(
+        boundary == "ambiguous-create-cleanup"
+    )
+    assert durable_at_injection is not None
+    assert family_at_injection is not None
+    assert (
+        runtime.repository.get(durable_at_injection.cleanup_token)
+        == durable_at_injection
+    )
+    assert (
+        runtime.repository.list_cleanup_family(durable_at_injection.root_cleanup_token)
+        == family_at_injection
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "existing-observe",
+        "existing-start",
+        "existing-start-cleanup",
+        "ambiguous-create-cleanup",
+        "family-cleanup",
+        "family-manager",
+        "reconcile-family",
+        "reconcile-lease",
+        "reconcile-workload",
+        "stop-attempt-conflict",
+        "family-request-conflict",
+        "family-complete-conflict",
+        "transition-conflict",
+        "record-reconcile-conflict",
+    ],
+)
+async def test_training_service_retains_ordinary_normalization_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    clock = MutableClock()
+    provider = FakeTrainingProvider()
+    provider.route = "https://pod-training-1-8888.proxy.runpod.net"
+    runtime = training_service(tmp_path, clock, provider)
+    ordinary_manager = RunPodManagerError(f"ordinary {boundary} failure")
+    ordinary_cleanup = _cleanup_carrier(f"ordinary-{boundary}")
+
+    if boundary == "existing-observe":
+        provider.observe_error = ordinary_manager
+        with pytest.raises(TrainingPodLifecycleError) as raised:
+            await runtime.acquire(training_request(clock))
+        assert raised.value.__cause__ is ordinary_manager
+        assert provider.stop_calls == []
+        return
+
+    if boundary in {"existing-start", "existing-start-cleanup"}:
+        provider.status = "EXITED"
+        provider.start_error = ordinary_manager
+        if boundary.endswith("-cleanup"):
+
+            async def failed_release(*_args, **_kwargs):
+                raise ordinary_cleanup
+
+            monkeypatch.setattr(runtime, "_release_one", failed_release)
+            with pytest.raises(TrainingPodCleanupError) as raised:
+                await runtime.acquire(training_request(clock))
+            assert raised.value is ordinary_cleanup
+            assert raised.value.__cause__ is ordinary_manager
+            assert provider.stop_calls == []
+        else:
+            with pytest.raises(TrainingPodLifecycleError) as raised:
+                await runtime.acquire(training_request(clock))
+            assert raised.value.__cause__ is ordinary_manager
+            assert provider.stop_calls == ["pod-training-1"]
+        return
+
+    if boundary == "ambiguous-create-cleanup":
+        ambiguous = RunPodAmbiguousResultError(
+            title="unknown",
+            detail="ordinary ambiguous create",
+            method="POST",
+            resource="/pods",
+        )
+        provider.create_error = ambiguous
+
+        async def failed_release(*_args, **_kwargs):
+            raise ordinary_cleanup
+
+        monkeypatch.setattr(runtime, "_release_one", failed_release)
+        with pytest.raises(TrainingPodCleanupError) as raised:
+            await runtime.acquire(
+                training_request(
+                    clock,
+                    token="training:ambiguous-create-cleanup:0001",
+                    source=TrainingPodSource.CREATED,
+                )
+            )
+        assert raised.value is ordinary_cleanup
+        assert raised.value.__cause__ is ambiguous
+        assert len(provider.create_calls) == 1
+        assert provider.stop_calls == []
+        return
+
+    if boundary in {"family-cleanup", "family-manager", "reconcile-family"}:
+        runtime, root_token, _child_token = await _persist_fallback_after_released_root(
+            tmp_path, clock, provider, legacy=False
+        )
+
+        async def failed_release(*_args, **_kwargs):
+            raise ordinary_cleanup if boundary == "family-cleanup" else ordinary_manager
+
+        if boundary == "reconcile-family":
+            root = runtime.repository.get(root_token)
+            assert root is not None
+            runtime.repository.compare_and_set(
+                root,
+                changes={
+                    "family_release_requested": True,
+                    "family_release_complete": False,
+                },
+            )
+            monkeypatch.setattr(runtime, "release", failed_release)
+            results = await runtime.reconcile()
+            assert any(lease.cleanup_token == root_token for lease in results)
+            current = runtime.repository.get(root_token)
+            assert current is not None
+            assert current.last_provider_error == "RunPodManagerError"
+        else:
+            monkeypatch.setattr(runtime, "_release_one", failed_release)
+            if boundary == "family-cleanup":
+                with pytest.raises(TrainingPodCleanupError) as raised:
+                    await runtime.release(root_token, reason="ordinary family release")
+                assert raised.value.__cause__ is ordinary_cleanup
+            else:
+                # A failure of the whole step proves no provider-error origin.
+                # It may be lost database custody, so do not normalize/retry it.
+                before = runtime.repository.get(_child_token)
+                with pytest.raises(TrainingPodCleanupError) as raised:
+                    await runtime.release(root_token, reason="ordinary family release")
+                assert raised.value.__cause__ is ordinary_manager
+                assert raised.value.cleanup_token == root_token
+                assert runtime.repository.get(_child_token) == before
+                root = runtime.repository.get(root_token)
+                assert root is not None and not root.family_release_complete
+        return
+
+    if boundary == "reconcile-lease":
+        lease, _ = runtime.repository.reserve(training_request(clock))
+        monkeypatch.setattr(
+            runtime.repository, "list_for_reconciliation", lambda: (lease,)
+        )
+
+        async def failed_reconcile(_cleanup_token):
+            raise ordinary_manager
+
+        monkeypatch.setattr(runtime, "_reconcile_one", failed_reconcile)
+        results = await runtime.reconcile()
+        assert results[0].cleanup_token == lease.cleanup_token
+        assert results[0].last_provider_error == "RunPodManagerError"
+        return
+
+    if boundary == "reconcile-workload":
+        ready = await runtime.acquire(training_request(clock))
+        runtime.record_job(ready.cleanup_token, "job-ordinary")
+
+        async def failed_status(_lease):
+            raise ordinary_manager
+
+        runtime._workload_status_observer = failed_status
+        result = await runtime._reconcile_one(ready.cleanup_token)
+        assert result is not None
+        assert result.last_provider_error == "RunPodManagerError"
+        assert provider.stop_calls == []
+        return
+
+    if boundary == "stop-attempt-conflict":
+        lease = await runtime.acquire(training_request(clock))
+        changes_key = "stop_attempts"
+        operation = lambda: runtime.release(lease.cleanup_token, reason="ordinary")
+    else:
+        lease, _ = runtime.repository.reserve(training_request(clock))
+        if boundary == "family-complete-conflict":
+            lease = runtime.repository.compare_and_set(
+                lease,
+                changes={
+                    "family_release_requested": True,
+                    "family_release_complete": False,
+                },
+            )
+            changes_key = "family_release_complete"
+            operation = lambda: runtime._mark_family_release_complete(lease)
+        elif boundary == "family-request-conflict":
+            changes_key = "family_release_requested"
+            operation = lambda: runtime._mark_family_release_requested(lease)
+        elif boundary == "transition-conflict":
+            changes_key = "last_provider_error"
+            operation = lambda: runtime._transition_nonterminal(
+                lease, changes={"last_provider_error": "ordinary"}
+            )
+        else:
+            changes_key = "last_provider_error"
+            operation = lambda: runtime._record_reconcile_error(
+                lease.cleanup_token, ordinary_manager
+            )
+
+    compare_and_set = runtime.repository.compare_and_set
+    injected = False
+
+    def conflict_once(current, *, changes):
+        nonlocal injected
+        if not injected and changes_key in changes:
+            injected = True
+            raise TrainingPodRevisionConflictError("ordinary concurrent update")
+        return compare_and_set(current, changes=changes)
+
+    monkeypatch.setattr(runtime.repository, "compare_and_set", conflict_once)
+    outcome = operation()
+    result = await outcome if inspect.isawaitable(outcome) else outcome
+    assert result is not None
+    if boundary == "stop-attempt-conflict":
+        assert result.state is TrainingPodState.RELEASED
+        assert provider.stop_calls == ["pod-training-1"]
+    elif boundary == "family-request-conflict":
+        assert result.family_release_requested is True
+    elif boundary == "family-complete-conflict":
+        assert result.family_release_complete is True
+    elif boundary == "transition-conflict":
+        assert result.last_provider_error == "ordinary"
+    else:
+        assert result.last_provider_error is None

@@ -52,9 +52,31 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ### Changed
 
-- Require published SDK 0.43 or newer for canonical visual resource contracts
-  and Core 0.54.4 or newer, the first published Core resolving that SDK and its
-  TLS trust bundle.
+- Refresh the API-served v2 OpenAPI pin after reviewing all consumed operations
+  and transitive schemas. Newly documented exec/signup endpoints remain outside
+  this client's implemented surface; accepted plans/receipts are not restamped.
+
+- Retire direct legacy LoRA training/inference admission before provider,
+  configuration or session effects, preserving original native refusal and
+  retained status/cancellation/download/release custody. New LoRA work uses the
+  authorized catalog workflow; private inference uses durable leases.
+- Require published Core 0.63.0, the first release containing the coordinated
+  legacy Runpod admission cutover, and its matching SDK 0.49 floor. Earlier Core
+  versions can advertise fresh work that the adapter correctly refuses.
+- Exclude only Core 0.64.0, whose confirmed cold tool-effect import regression
+  replaces original ordinary errors with ImportError (Core #4003). Preserve the
+  verified 0.63.0 minimum while the root fix follows the normal Core release path.
+
+- Give the managed startup/telemetry runtime successor version `1.1.3`, keeping
+  the published security-only `1.1.2` identity intact. A fresh built/scanned
+  immutable digest is required; the Python package version is unchanged.
+- Fix the actual amd64 image gate's APT `CVE-2026-109518` and bundled
+  `x/net` `CVE-2026-78661` findings through explicit dependency updates and
+  installed-package/compiled-module checks. No scanner exception or published
+  image-tag overwrite; a fresh actual image scan remains required.
+
+- Preserve canonical visual-resource and TLS-trust contracts through the
+  coordinated published Core/SDK floor above.
 
 ## [0.16.0] - 2026-10-20
 
@@ -69,6 +91,12 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   product/count-specific stock, flavor bounds and requested datacenters.
   Preserve unknown rates; compute rate and RAM calculations do not depend on
   ambient decimal precision. Catalog matches do not authorize spending.
+- Retain one immutable Ollama cleanup intent before teardown I/O, its exact-ID
+  verified-absence receipt, authenticated content-free runtime telemetry, and
+  append-only post-teardown Pod or Serverless billing observations in the
+  original lease aggregate. Freeze the first complete billing observation;
+  later revisions remain correction evidence and never claim invoice finality
+  or debit authority.
 
 ### Changed
 
@@ -79,6 +107,20 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   nested JSON or unexpected HTTP success statuses, remain ambiguous and require
   reconciliation before retrying. Hide container environment and arguments in
   request representations.
+- Advance the Ollama SQLite writer contract to version 7 so explicitly drained
+  version-1 through version-6 writers cannot mutate lifecycle evidence. A
+  drained version-6 aggregate preserves every existing raw lifecycle fact,
+  including its billing latest-reference state, while advancing only writer
+  version, revision, and epoch. Version-4 and version-5 facts retain explicit
+  unknown latest-arrival provenance until an exact original-bound version-7
+  poll. Historical rows keep unknown cleanup and cost provenance; only a
+  strictly current request proven never to have reached provider admission may
+  record no provider effect.
+- Require published Core 0.54.4, compatible with SDK 0.43's trust bundle, for
+  provider-neutral refresh of cached terminal
+  inference evidence, the canonical joined-effect owner, and direct-node
+  execution-control classification used by this adapter, including the public
+  owned-operation facade used to retain cancellation and cleanup outcomes.
 
 ## [0.15.1] - 2026-10-20
 

@@ -39,6 +39,7 @@ def _environment(**changes: object) -> dict[str, str]:
         "mode": OllamaLeaseMode.DEDICATED_POD,
         "model_storage_path": "/models",
         "provision_requested_at": requested_at,
+        "telemetry_binding_sha256": "b" * 64,
     }
     values.update(changes)
     return build_ollama_runtime_environment(**values)  # type: ignore[arg-type]
@@ -139,6 +140,10 @@ def test_runpod_template_covers_pod_and_native_load_balancer() -> None:
         "/runpod-volume/ollama"
     )
     assert contract["models"]["arbitrary_pull"] is False
+    assert (
+        "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"
+        in (contract["environment"]["required"])
+    )
 
 
 def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
@@ -153,11 +158,11 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     for fixed_module in (
         "github.com/buger/jsonparser@v1.1.2",
         "github.com/klauspost/compress@v1.20.2",
-        "golang.org/x/crypto@v0.57.0",
+        "golang.org/x/crypto@v0.58.0",
         "golang.org/x/image@v0.45.0",
         "golang.org/x/mod@v0.41.0",
-        "golang.org/x/net@v0.60.0",
-        "golang.org/x/text@v0.42.0",
+        "golang.org/x/net@v0.62.0",
+        "golang.org/x/text@v0.43.0",
     ):
         assert fixed_module in dockerfile
     assert (
@@ -183,6 +188,16 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "EXPOSE 11434" in dockerfile
     assert "RUNPOD_API_KEY=" not in dockerfile
     assert "KESTREL_OLLAMA_BEARER_TOKEN=" not in dockerfile
+
+
+def test_image_installs_fixed_apt_and_checks_compiled_network_dependency() -> None:
+    dockerfile = (RUNTIME / "Dockerfile").read_text()
+
+    assert "apt=2.8.4ubuntu0.1 libapt-pkg6.0t64=2.8.4ubuntu0.1" in dockerfile
+    assert '"golang.org/x/net" {print $3}' in dockerfile
+    assert "= v0.62.0" in dockerfile
+    for package in ("apt", "libapt-pkg6.0t64"):
+        assert f"dpkg-query --show --showformat='${{Version}}' {package}" in dockerfile
 
 
 def test_tracked_configs_share_the_runtime_policy_surface() -> None:
@@ -230,3 +245,48 @@ def test_image_security_tools_share_runner_owned_scratch() -> None:
         "Fail on fixed high or critical vulnerabilities",
     }
     assert all(step.get("env", {}).get("TMPDIR") == expected for step in tools.values())
+
+
+def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
+    contract = json.loads((RUNTIME / "runpod-template.json").read_text())
+    workflow = (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    smoke = workflow.split(
+        "- name: Verify fresh-volume initialization drops all runtime privilege",
+        maxsplit=1,
+    )[1].split("- name: Generate SPDX SBOM", maxsplit=1)[0]
+
+    invalid_counts = {
+        name: smoke.count(f'--env "{name}=')
+        for name in contract["environment"]["required"]
+        if smoke.count(f'--env "{name}=') != 1
+    }
+
+    assert invalid_counts == {}
+
+
+def test_r29_lease_environment_explicitly_requires_preload(record_property):
+    record_property("injection_entry", "before-managed-preload-environment-build")
+    environment = _environment()
+    preload = environment.get("KESTREL_OLLAMA_PRELOAD_MODEL")
+    record_property(
+        "r29_preload_environment",
+        json.dumps({"value": preload, "type": type(preload).__name__}, sort_keys=True),
+    )
+    assert preload == "true"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "true"])
+def test_r29_profile_cannot_override_lease_owned_preload(value, record_property):
+    record_property("injection_entry", "before-managed-preload-override-build")
+    with pytest.raises(RunPodManagerError, match="cannot override"):
+        _environment(
+            profile_environment={
+                "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
+                "KESTREL_OLLAMA_PRELOAD_MODEL": value,
+            }
+        )
+
+
+def test_changed_runtime_cannot_reuse_the_published_112_image_identity() -> None:
+    """Main already published 1.1.2 without this branch's runtime telemetry."""
+    assert tuple(map(int, OLLAMA_RUNTIME_VERSION.split("."))) > (1, 1, 2)

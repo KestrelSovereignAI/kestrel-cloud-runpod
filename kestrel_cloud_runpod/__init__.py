@@ -5,7 +5,7 @@ Modular structure for the RunPod GPU instance manager:
 - models.py: Data models, enums, exceptions
 - providers.py: GPU provider abstractions (direct, managed proxy)
 - core.py: Core SDK operations, profile loading, session management
-- training.py: LoRA training methods (HTTP API)
+- training.py: original LoRA status/cancel/download/resource custody
 - ollama.py: durable private-Ollama lease integration
 - manager.py: Combined RunPodManager class
 - feature.py: Kestrel feature integration
@@ -16,11 +16,11 @@ Usage:
     # Direct manager usage
     manager = RunPodManager()
 
-    # LoRA Training workflow
-    session = await manager.start_training_pod("companion-123")
-    job_id = await manager.submit_training_job(session, avatar_data, "companion-123")
-    status = await manager.poll_training_status(session, job_id)
-    lora_data = await manager.download_lora(session, job_id)
+    # NEW LoRA work uses the authorized host catalog workflow. Retained
+    # original session/job/cleanup identities can still be observed/released:
+    status = await manager.poll_training_status(original_session, original_job_id)
+    lora_data = await manager.download_lora(original_session, original_job_id)
+    await manager.release_training_pod(original_cleanup_token)
 
     # Private Ollama uses an explicit OllamaLeaseRequest:
     lease = await manager.acquire_ollama_lease(request)
@@ -46,12 +46,17 @@ from .models import (
     GPUProfile,
     PlacementRequirements,
     PodStatus,
+    RunPodAcknowledgedResourceError,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
     RunPodSession,
 )
 from .ollama_contracts import (
+    OllamaActualCostCapStatus,
+    OllamaCleanupBasis,
+    OllamaCleanupIntent,
+    OllamaCleanupReceipt,
     OllamaLease,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -60,11 +65,29 @@ from .ollama_contracts import (
     OllamaLeaseRequest,
     OllamaLeaseState,
     OllamaLeaseTeardownError,
+    OllamaLifecycleBillingCorrection,
+    OllamaLifecycleBillingLatestReference,
+    OllamaLifecycleBillingLatestState,
+    OllamaLifecycleBillingObservation,
+    OllamaLifecycleBillingSelection,
+    OllamaLifecycleBillingState,
+    OllamaProviderRatePrecision,
+    OllamaProvisioningEvidenceError,
+    OllamaProvisioningEvidenceState,
+    OllamaProvisioningIntent,
+    OllamaProvisioningMismatchError,
+    OllamaProvisioningMismatchEvidence,
+    OllamaProvisioningMismatchReason,
+    OllamaProvisioningReceipt,
     OllamaResourceConstraints,
     OllamaResourceType,
+    OllamaRuntimeTelemetryObservation,
+    OllamaRuntimeTelemetrySnapshot,
+    OllamaRuntimeTelemetryState,
     OllamaTeardownState,
     maximum_serverless_cold_starts,
 )
+from .ollama_repository import OllamaWriterDrainAttestation
 from .ollama_service import OllamaLeaseService
 from .pod_billing import read_exact_pod_billing
 from .pod_capacity_contracts import (
@@ -88,6 +111,7 @@ from .pod_capacity_contracts import (
     PodCapacityOwnership,
     PodCapacityQuote,
     PodCapacityQuoteRequest,
+    PodCapacityRevisionConflictError,
     PodCapacitySource,
     PodCapacitySpec,
     PodCapacityState,
@@ -155,6 +179,7 @@ from .training_contracts import (
     TrainingPodLifecycleError,
     TrainingPodOwnership,
     TrainingPodRequest,
+    TrainingPodRevisionConflictError,
     TrainingPodSource,
     TrainingPodState,
 )
@@ -186,6 +211,10 @@ __all__ = [
     "EndpointResourceVersion",
     "FlashBoot",
     "GPUProfile",
+    "OllamaActualCostCapStatus",
+    "OllamaCleanupBasis",
+    "OllamaCleanupIntent",
+    "OllamaCleanupReceipt",
     "OllamaLease",
     "OllamaLeaseAuthorizationError",
     "OllamaLeaseConflictError",
@@ -195,9 +224,27 @@ __all__ = [
     "OllamaLeaseService",
     "OllamaLeaseState",
     "OllamaLeaseTeardownError",
+    "OllamaLifecycleBillingCorrection",
+    "OllamaLifecycleBillingLatestReference",
+    "OllamaLifecycleBillingLatestState",
+    "OllamaLifecycleBillingObservation",
+    "OllamaLifecycleBillingSelection",
+    "OllamaLifecycleBillingState",
+    "OllamaProviderRatePrecision",
+    "OllamaProvisioningEvidenceError",
+    "OllamaProvisioningEvidenceState",
+    "OllamaProvisioningIntent",
+    "OllamaProvisioningMismatchError",
+    "OllamaProvisioningMismatchEvidence",
+    "OllamaProvisioningMismatchReason",
+    "OllamaProvisioningReceipt",
     "OllamaResourceConstraints",
     "OllamaResourceType",
+    "OllamaRuntimeTelemetryObservation",
+    "OllamaRuntimeTelemetrySnapshot",
+    "OllamaRuntimeTelemetryState",
     "OllamaTeardownState",
+    "OllamaWriterDrainAttestation",
     "PlacementRequirements",
     "PlannedServerlessCapacityQuote",
     "PlannedServerlessCapacityQuoteRequest",
@@ -222,12 +269,14 @@ __all__ = [
     "PodCapacityQuoteProvider",
     "PodCapacityQuoteRequest",
     "PodCapacityQuoteService",
+    "PodCapacityRevisionConflictError",
     "PodCapacitySource",
     "PodCapacitySpec",
     "PodCapacityState",
     "PodRealizedPlacement",
     "PodStatus",
     "RunPodAPIError",
+    "RunPodAcknowledgedResourceError",
     "RunPodAmbiguousResultError",
     "RunPodFeature",
     "RunPodManager",
@@ -264,6 +313,7 @@ __all__ = [
     "TrainingPodLifecycleError",
     "TrainingPodOwnership",
     "TrainingPodRequest",
+    "TrainingPodRevisionConflictError",
     "TrainingPodSource",
     "TrainingPodState",
     "__version__",

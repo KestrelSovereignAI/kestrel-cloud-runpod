@@ -22,17 +22,17 @@ class RunPodManager(
 
     Combines:
     - RunPodManagerCore: SDK operations, profile loading, session management
-    - RunPodTrainingMixin: LoRA training methods
+    - RunPodTrainingMixin: original LoRA workload/capacity recovery
     - RunPodOllamaMixin: durable private-Ollama capacity leases
 
     Usage:
         manager = RunPodManager()
 
-        # LoRA Training
-        session = await manager.start_training_pod("companion-123")
-        job_id = await manager.submit_training_job(session, avatar_data, "companion-123")
-        status = await manager.poll_training_status(session, job_id)
-        lora_data = await manager.download_lora(session, job_id)
+        # NEW LoRA work requires the host's authorized catalog workflow.
+        # Exact original identities remain usable for historical recovery:
+        status = await manager.poll_training_status(original_session, original_job_id)
+        lora_data = await manager.download_lora(original_session, original_job_id)
+        await manager.release_training_pod(original_cleanup_token)
 
         # Ollama leases use acquire_ollama_lease(request), then explicitly
         # touch_ollama_lease(...) and release_ollama_lease(...).

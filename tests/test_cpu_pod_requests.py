@@ -2,7 +2,9 @@
 
 import json
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import httpx
 import pytest
@@ -13,6 +15,7 @@ from kestrel_cloud_runpod.models import (
     CpuPodCreateRequest,
     PodCreateRequest,
     PodResource,
+    ResourceFieldState,
     RunPodAmbiguousResultError,
     RunPodAPIError,
     RunPodManagerError,
@@ -124,18 +127,33 @@ def test_cpu_flavor_is_required(cpu_id):
 @pytest.mark.parametrize(
     "fields",
     [
-        {"global_networking": True},
-        {"global_networking": 0},
-        {"mounts": {"persistent": {"size": 10, "path": "/workspace"}}},
-        {"mounts": {"persistent": None}},
-        {"mounts": {"global": []}},
-        {"mounts": {"unknown": []}},
-        {"mounts": []},
-        {"mounts": {"network": None}},
-        {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
-        {"mounts": {"network": [{"volumeId": "v"}]}},
-        {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
-        {"mounts": {"network": [{"volumeId": "v", "path": "/v", "extra": True}]}},
+        pytest.param({"global_networking": True}, id="fields0"),
+        pytest.param({"global_networking": 0}, id="fields1"),
+        pytest.param(
+            {"mounts": {"persistent": {"size": 10, "path": "/workspace"}}},
+            id="fields2",
+        ),
+        pytest.param({"mounts": {"persistent": None}}, id="fields3"),
+        pytest.param({"mounts": {"global": []}}, id="fields4"),
+        pytest.param({"mounts": {"unknown": []}}, id="fields5"),
+        pytest.param({"mounts": []}, id="fields6"),
+        pytest.param({"mounts": {"network": None}}, id="fields7"),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v", "path": "/v"}] * 2}},
+            id="fields9",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v"}]}},
+            id="fields10",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "", "path": "/v"}]}},
+            id="fields11",
+        ),
+        pytest.param(
+            {"mounts": {"network": [{"volumeId": "v", "path": "/v", "extra": True}]}},
+            id="fields12",
+        ),
     ],
 )
 def test_cpu_rejects_unsupported_networking_and_storage(fields):
@@ -143,22 +161,70 @@ def test_cpu_rejects_unsupported_networking_and_storage(fields):
         cpu_request(**fields)
 
 
-def test_mutated_mount_mapping_is_refused_before_sending():
+def test_cpu_request_deeply_owns_environment_and_mount_payload():
     mounts = {"network": [{"volumeId": "v", "path": "/workspace"}]}
-    request = cpu_request(mounts=mounts)
+    environment = {"PRIVATE": "original"}
+    request = cpu_request(mounts=mounts, env=environment)
     mounts["persistent"] = {"size": 1, "path": "/other"}
+    mounts["network"][0]["volumeId"] = "foreign"
+    environment["PRIVATE"] = "mutated"
     calls = []
-    with (
-        closing(
-            RunpodControlPlaneClient(
-                api_key="unit-test",
-                http_transport=httpx.MockTransport(lambda req: calls.append(req)),
-            )
-        ) as client,
-        pytest.raises(ValueError, match="CPU Pod"),
-    ):
+
+    def handler(raw_request):
+        calls.append(raw_request)
+        payload = json.loads(raw_request.content)
+        assert payload["env"] == {"PRIVATE": "original"}
+        assert payload["mounts"] == {
+            "network": [{"volumeId": "v", "path": "/workspace"}]
+        }
+        return httpx.Response(201, json=pod())
+
+    with closing(
+        RunpodControlPlaneClient(
+            api_key="unit-test", http_transport=httpx.MockTransport(handler)
+        )
+    ) as client:
         client.create_pod(request)
-    assert calls == []
+    assert len(calls) == 1
+
+
+def test_frozen_cpu_request_supports_ordinary_dataclass_replacement():
+    original = cpu_request(
+        mounts={"network": [{"volumeId": "owned-volume", "path": "/workspace"}]},
+        env={"PRIVATE": "original"},
+    )
+    replaced = replace(original, name="cpu-browser-next")
+
+    assert replaced.name == "cpu-browser-next"
+    assert replaced.to_payload() == {
+        **original.to_payload(),
+        "name": "cpu-browser-next",
+    }
+
+
+@pytest.mark.parametrize("outer_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("network_kind", ["list", "tuple"])
+@pytest.mark.parametrize("populated", [False, True])
+def test_cpu_mount_sequences_have_one_immutable_value_policy(
+    outer_kind, network_kind, populated
+):
+    mount = {"volumeId": "owned-volume", "path": "/workspace"}
+    items = [mount] if populated else []
+    network = items if network_kind == "list" else tuple(items)
+    mutable_outer = {"network": network}
+    mounts = mutable_outer if outer_kind == "dict" else MappingProxyType(mutable_outer)
+    original = cpu_request(mounts=mounts)
+    first = replace(original, name="cpu-browser-next")
+    second = replace(first, name="cpu-browser-final")
+    expected = [{"volumeId": "owned-volume", "path": "/workspace"}] if populated else []
+    assert second.to_payload()["mounts"] == {"network": expected}
+
+    mount["volumeId"] = "foreign"
+    mutable_outer["network"] = []
+    returned = second.to_payload()
+    if populated:
+        returned["mounts"]["network"][0]["volumeId"] = "mutated"
+    assert second.to_payload()["mounts"] == {"network": expected}
 
 
 def test_cpu_create_inspect_and_delete_use_existing_v2_transport():
@@ -213,7 +279,7 @@ def test_lost_cpu_create_response_remains_unknown_without_replay():
     assert len(calls) == 1
 
 
-def test_invalid_success_receipt_keeps_creation_uncertain():
+def test_known_create_id_retains_invalid_optional_success_evidence():
     calls = []
 
     def handler(request):
@@ -224,18 +290,21 @@ def test_invalid_success_receipt_keeps_creation_uncertain():
             headers={"Retry-After": "3"},
         )
 
-    with (
-        closing(
-            RunpodControlPlaneClient(
-                api_key="unit-test", http_transport=httpx.MockTransport(handler)
-            )
-        ) as client,
-        pytest.raises(RunPodAmbiguousResultError) as result,
-    ):
-        client.create_pod(cpu_request())
-    assert len(calls) == 1 and result.value.reconcile_required
+    with closing(
+        RunpodControlPlaneClient(
+            api_key="unit-test", http_transport=httpx.MockTransport(handler)
+        )
+    ) as client:
+        created = client.create_pod(cpu_request())
+        assert client.transport.last_rate_limit.retry_after_seconds == 3
+    assert len(calls) == 1
+    assert created.id == "cpu-pod"
+    assert created.cost_per_hr is None
+    assert created.field_evidence.state("cost") is ResourceFieldState.INVALID
+    assert created.raw["env"] == {"PRIVATE": "[REDACTED]"}
+    with pytest.raises(RunPodManagerError, match="cost") as result:
+        created.require_valid_fields(context="v2 Pod create")
     assert "must-not-leak" not in str(result.value)
-    assert result.value.rate_limit.retry_after_seconds == 3
 
 
 @pytest.mark.parametrize("body", [b"", b"[]", b"not json", b"{}"])
@@ -300,8 +369,11 @@ def test_missing_rate_remains_unknown_for_every_pod(gpu):
 
 @pytest.mark.parametrize("rate", [-1, float("inf"), float("nan"), 10**400, True, "0.2"])
 def test_invalid_pod_rate_is_not_a_usable_price(rate):
-    with pytest.raises(RunPodManagerError, match="Pod.cost"):
-        PodResource.from_dict(pod(cost=rate))
+    resource = PodResource.from_dict(pod(cost=rate))
+    assert resource.cost_per_hr is None
+    assert resource.field_evidence.state("cost") is ResourceFieldState.INVALID
+    with pytest.raises(RunPodManagerError, match="cost"):
+        resource.require_valid_fields(context="v2 Pod readback")
 
 
 def test_explicit_zero_rate_remains_zero():

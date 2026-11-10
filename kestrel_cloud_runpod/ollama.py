@@ -126,6 +126,7 @@ class RunPodOllamaMixin:
             pod_non_compute_cost=_required_non_compute_cost_policy(
                 raw_settings, "pod_non_compute_cost"
             ),
+            billing_batch_hours=_required_int(raw_settings, "billing_batch_hours"),
         )
         service = OllamaLeaseService(
             repository=SQLiteOllamaLeaseRepository(lease_database_path(raw_settings)),
@@ -138,6 +139,21 @@ class RunPodOllamaMixin:
             ),
             poll_interval_seconds=_required_float(
                 raw_settings, "poll_interval_seconds"
+            ),
+            billing_poll_interval_seconds=_required_float(
+                raw_settings, "billing_poll_interval_seconds"
+            ),
+            reconciliation_batch_size=_required_int(
+                raw_settings, "reconciliation_batch_size"
+            ),
+            maximum_telemetry_observations=_required_int(
+                raw_settings, "maximum_telemetry_observations"
+            ),
+            maximum_billing_observations=_required_int(
+                raw_settings, "maximum_billing_observations"
+            ),
+            maximum_evidence_bytes=_required_int(
+                raw_settings, "maximum_evidence_bytes"
             ),
         )
         self._ollama_lease_service = service

@@ -260,7 +260,7 @@ def test_endpoint_create_shape_is_pinned_to_api_served_openapi() -> None:
 
     assert RUNPOD_V2_OPENAPI_SOURCE_URL == "https://api.runpod.io/v2/openapi.yaml"
     assert RUNPOD_V2_OPENAPI_SHA256 == (
-        "7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd"
+        "8405937677c57ff38fd03e998a4a0d79d0a5de3259ed7481b4f3e0cc3e3935d6"
     )
     assert payload["type"] == "QUEUE"
     assert payload["workers"] == {"min": 0, "max": 1, "idleTimeout": 10}
@@ -708,7 +708,9 @@ def test_serverless_worker_cost_bills_every_gpu_in_the_worker() -> None:
             serverless_worker_cost_usd(Decimal("0.44"), bad, one_hour)
 
 
-def test_openapi_provenance_refresh_does_not_restamp_durable_authority(monkeypatch):
+def test_openapi_provenance_refresh_does_not_restamp_durable_authority(
+    monkeypatch, record_property
+):
     from kestrel_cloud_runpod import serverless_capacity_contracts as contracts
 
     def payloads():
@@ -740,8 +742,10 @@ def test_openapi_provenance_refresh_does_not_restamp_durable_authority(monkeypat
     monkeypatch.setattr(
         contracts,
         "RUNPOD_V2_OPENAPI_SHA256",
-        "7c39b1b1ad66631753d946127587b87e3828240816956d49e6377008deb490bd",
+        "8405937677c57ff38fd03e998a4a0d79d0a5de3259ed7481b4f3e0cc3e3935d6",
     )
     refreshed = payloads()
+    record_property("openapi_original_authority", json.dumps(original, sort_keys=True))
+    record_property("openapi_refreshed_authority", json.dumps(refreshed, sort_keys=True))
     assert refreshed == original
     assert json_sha256(refreshed) == json_sha256(original)
