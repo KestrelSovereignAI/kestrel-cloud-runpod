@@ -158,11 +158,11 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     for fixed_module in (
         "github.com/buger/jsonparser@v1.1.2",
         "github.com/klauspost/compress@v1.20.2",
-        "golang.org/x/crypto@v0.57.0",
+        "golang.org/x/crypto@v0.58.0",
         "golang.org/x/image@v0.45.0",
         "golang.org/x/mod@v0.41.0",
-        "golang.org/x/net@v0.60.0",
-        "golang.org/x/text@v0.42.0",
+        "golang.org/x/net@v0.62.0",
+        "golang.org/x/text@v0.43.0",
     ):
         assert fixed_module in dockerfile
     assert (
@@ -188,6 +188,16 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "EXPOSE 11434" in dockerfile
     assert "RUNPOD_API_KEY=" not in dockerfile
     assert "KESTREL_OLLAMA_BEARER_TOKEN=" not in dockerfile
+
+
+def test_image_installs_fixed_apt_and_checks_compiled_network_dependency() -> None:
+    dockerfile = (RUNTIME / "Dockerfile").read_text()
+
+    assert "apt=2.8.4ubuntu0.1 libapt-pkg6.0t64=2.8.4ubuntu0.1" in dockerfile
+    assert '"golang.org/x/net" {print $3}' in dockerfile
+    assert "= v0.62.0" in dockerfile
+    for package in ("apt", "libapt-pkg6.0t64"):
+        assert f"dpkg-query --show --showformat='${{Version}}' {package}" in dockerfile
 
 
 def test_tracked_configs_share_the_runtime_policy_surface() -> None:

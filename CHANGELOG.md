@@ -70,6 +70,10 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Give the managed startup/telemetry runtime successor version `1.1.3`, keeping
   the published security-only `1.1.2` identity intact. A fresh built/scanned
   immutable digest is required; the Python package version is unchanged.
+- Fix the actual amd64 image gate's APT `CVE-2026-109518` and bundled
+  `x/net` `CVE-2026-78661` findings through explicit dependency updates and
+  installed-package/compiled-module checks. No scanner exception or published
+  image-tag overwrite; a fresh actual image scan remains required.
 
 - Preserve canonical visual-resource and TLS-trust contracts through the
   coordinated published Core/SDK floor above.

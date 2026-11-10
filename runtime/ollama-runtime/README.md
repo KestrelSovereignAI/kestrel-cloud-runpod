@@ -90,6 +90,14 @@ Both binaries must be rebuilt: the previous Go `1.26.9` build is affected by
 which adds distrust of compromised intermediate certificates in `crypto/x509`.
 The official binary is overwritten in the final filesystem, and both installed
 OpenSSL packages are upgraded to Ubuntu's fixed `3.0.13-0ubuntu3.16` build.
+The installed APT/package-library pair is pinned and checked at
+`2.8.4ubuntu0.1` for [CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518).
+The Ollama rebuild pins `golang.org/x/net` to `v0.62.0` for
+[GO-2026-6860 / CVE-2026-78661](https://pkg.go.dev/vuln/GO-2026-6860), with its
+required `x/crypto v0.58.0` and `x/text v0.43.0` minimums. The build checks the
+actual compiled network-module version, not just the requested input. These
+are dependency security updates to the pinned application source, not an
+upstream Ollama application-version upgrade or model/GPU acceptance claim.
 The build refuses toolchain auto-upgrades; the unchanged security gate must
 pass for the actual image, including its operating-system packages.
 Version `1.1.2` is already published from the security-only mainline. The
