@@ -11,6 +11,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Route legacy session stop through the SAME original durable termination and
   capacity-release boundary. Refuse ownerless mutation before provider or
   wall-clock metering effects, retaining the original session handle.
+- Refuse retired wall-clock metering registration instead of reporting an
+  enabled callback that no supported release path invokes. Preserve known Pod
+  IDs in failure responses regardless of local active/expired/error state.
 - Return the canonical release result from `terminate_session`; historical
   callers may still ignore it. Keep provider acknowledgement, confirmed
   capacity cleanup and actual billing evidence separate.
