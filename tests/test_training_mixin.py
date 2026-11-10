@@ -436,7 +436,7 @@ async def test_training_request_control_survives_late_native_client_close(
 
 
 @pytest.mark.asyncio
-async def test_manager_stop_preserves_metering_execution_control(
+async def test_ownerless_stop_refuses_before_metering_execution_control(
     tmp_path: Path, record_property
 ):
     provider = FakeTrainingProvider()
@@ -460,24 +460,29 @@ async def test_manager_stop_preserves_metering_execution_control(
         user_id="user-1",
     )
 
+    metering_calls = []
+
     async def controlled_metering(**_kwargs):
+        metering_calls.append(_kwargs)
         record_control_injection(record_property, "manager-stop-metering")
         raise carrier
 
     manager.provider.stop_pod.return_value = {"id": "pod-metered-1"}
     manager.set_metering_callback(controlled_metering)
 
-    with pytest.raises(type(carrier)) as raised:
+    original_session = manager._session
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
         await manager.stop_session()
 
-    assert raised.value is carrier
     assert carrier.__cause__ is explicit is control
-    manager.provider.stop_pod.assert_called_once_with("pod-metered-1")
-    assert manager._session is None
+    assert metering_calls == []
+    manager.provider.stop_pod.assert_not_called()
+    assert manager._session is original_session
+    assert original_session.status is PodStatus.READY
 
 
 @pytest.mark.asyncio
-async def test_manager_stop_retains_ordinary_metering_nonfatal_contract(
+async def test_ownerless_stop_refuses_before_ordinary_metering(
     tmp_path: Path,
 ) -> None:
     provider = FakeTrainingProvider()
@@ -499,18 +504,23 @@ async def test_manager_stop_retains_ordinary_metering_nonfatal_contract(
     )
     ordinary = RuntimeError("ordinary metering failure")
 
+    metering_calls = []
+
     async def failed_metering(**_kwargs):
+        metering_calls.append(_kwargs)
         raise ordinary
 
     manager.provider.stop_pod.return_value = {"id": "pod-metered-ordinary-1"}
     manager.set_metering_callback(failed_metering)
 
-    result = await manager.stop_session()
+    original_session = manager._session
+    with pytest.raises(RunPodManagerError, match="Ownerless Pod termination"):
+        await manager.stop_session()
 
-    assert result["active"] is False
-    assert result["pod_id"] == "pod-metered-ordinary-1"
-    manager.provider.stop_pod.assert_called_once_with("pod-metered-ordinary-1")
-    assert manager._session is None
+    assert metering_calls == []
+    manager.provider.stop_pod.assert_not_called()
+    assert manager._session is original_session
+    assert original_session.status is PodStatus.READY
 
 
 @pytest.mark.asyncio

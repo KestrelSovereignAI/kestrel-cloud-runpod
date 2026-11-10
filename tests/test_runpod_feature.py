@@ -154,7 +154,9 @@ class FakeRunPodManager:
         return {
             "pod_id": "pod-123",
             "task_profile": "llm",
-            "status": "terminating",
+            "status": "offline",
+            "active": False,
+            "training_cleanup_state": "complete",
             "remaining_ttl_seconds": 0,
         }
 
@@ -429,7 +431,9 @@ async def test_manage_gpu_start_and_stop(runpod_feature):
     stop_result = await feature.manage_gpu(action="off")
     assert isinstance(stop_result, ToolResult)
     assert stop_result.status is ToolResultStatus.OK
-    assert stop_result.data["session"]["status"] == "terminating"
+    assert stop_result.data["session"]["status"] == "offline"
+    assert stop_result.data["session"]["training_cleanup_state"] == "complete"
+    assert "cleanup confirmed" in stop_result.confirmation
     assert manager.started is False
     assert llm_service.deactivate_reasons == []
     assert "router" not in stop_result.data

@@ -4,6 +4,23 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-10
+
+### Fixed
+
+- Route legacy session stop through the SAME original durable termination and
+  capacity-release boundary. Refuse ownerless mutation before provider or
+  wall-clock metering effects, retaining the original session handle.
+- Return the canonical release result from `terminate_session`; historical
+  callers may still ignore it. Keep provider acknowledgement, confirmed
+  capacity cleanup and actual billing evidence separate.
+- Capture the retained session without a provider refresh before release.
+  Report borrowed-capacity release as not stopping its resource; distinguish
+  confirmed cleanup from a no-session no-op. Missing/unconfirmed cleanup
+  evidence cannot produce a successful stopped confirmation.
+
+### Earlier changes included in 0.16.0
+
 ### Fixed
 
 - Rebuild both private Ollama runtime `1.1.2` binaries with digest-pinned Go

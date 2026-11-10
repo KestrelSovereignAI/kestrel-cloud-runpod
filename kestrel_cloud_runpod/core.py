@@ -26,6 +26,7 @@ from .models import (
     sanitize_resource_payload,
 )
 from .providers import DirectRunPodProvider, GPUProvider, ManagedRunPodProvider
+from .training_contracts import TrainingPodLease
 
 logger = logging.getLogger(__name__)
 
@@ -266,63 +267,24 @@ class RunPodManagerCore:
         return payload
 
     async def stop_session(self) -> Dict[str, Any]:
+        """Release through the same original durable boundary as termination.
+
+        A cached ownerless session cannot authorize an infrastructure action or
+        turn elapsed wall time into billing evidence. Retain it for operator
+        reconciliation rather than discarding its last resource handle.
+        """
         async with self._lock:
             session = self._session
             if not session:
                 return {"active": False, "status": PodStatus.OFFLINE.value}
-        if session.training_cleanup_token:
-            release = getattr(self, "release_training_pod", None)
-            if release is None:
-                raise RunPodManagerError(
-                    "Training session has no durable lifecycle release implementation"
-                )
-            lease = await release(
-                session.training_cleanup_token, reason="manager stop_session"
-            )
-            session.status = PodStatus.OFFLINE
-            async with self._lock:
-                if self._session is session:
-                    self._session = None
-            payload = session.to_dict()
-            payload.update(
-                {
-                    "active": False,
-                    "training_cleanup_state": lease.cleanup_state.value,
-                }
-            )
-            return payload
-        await asyncio.to_thread(self.provider.stop_pod, session.pod_id)
-        session.status = PodStatus.TERMINATING
-        async with self._lock:
-            if self._session is session:
-                self._session = None
-
-        # Record GPU usage for billing if metering is enabled
-        if self._metering_callback and session.companion_id and session.user_id:
-            try:
-                duration_seconds = (
-                    datetime.now(timezone.utc) - session.started_at
-                ).total_seconds()
-                await self._metering_callback(
-                    companion_id=session.companion_id,
-                    user_id=session.user_id,
-                    provider="runpod",
-                    resource_type=session.gpu_type_id or "unknown",
-                    duration_seconds=duration_seconds,
-                    operation_id=session.pod_id,
-                )
-                logger.info(
-                    f"Recorded GPU usage: {duration_seconds:.1f}s on "
-                    f"{session.gpu_type_id or 'unknown'} "
-                    f"for companion {session.companion_id}"
-                )
-            except Exception as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.error(f"Failed to record GPU metering: {e}")
-
+        lease = await self.terminate_session(session)
+        if lease is None:
+            raise RunPodManagerError("Retained session has no durable release result")
         payload = session.to_dict()
-        payload["active"] = False
+        payload.update(
+            active=False,
+            training_cleanup_state=lease.cleanup_state.value,
+        )
         return payload
 
     async def find_stopped_pod(
@@ -579,8 +541,10 @@ class RunPodManagerCore:
             return PodStatus.ERROR
         return PodStatus.OFFLINE
 
-    async def terminate_session(self, session: RunPodSession) -> None:
-        """Release a retained durable session; refuse ownerless termination."""
+    async def terminate_session(
+        self, session: RunPodSession
+    ) -> "TrainingPodLease | None":
+        """Return the original durable release result; refuse ownerless mutation."""
         if not session or not session.pod_id:
             return
         async with self._lock:
@@ -598,7 +562,7 @@ class RunPodManagerCore:
                 "capacity lifecycle"
             )
         lease = session_lease(session)
-        await release(lease.cleanup_token, reason="manager terminate_session")
+        return await release(lease.cleanup_token, reason="manager terminate_session")
 
     async def terminate_pod(self, pod_id: str) -> None:
         """Release the current durable session; refuse an ownerless Pod ID."""

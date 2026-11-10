@@ -14,6 +14,7 @@ from kestrel_cloud_runpod.models import (
     RunPodLegacyAdmissionRetiredError,
     RunPodManagerError,
 )
+from kestrel_cloud_runpod.training_contracts import TrainingPodCleanupState
 
 logger = logging.getLogger(__name__)
 
@@ -526,11 +527,9 @@ class RunPodFeature(Feature):
     async def _stop(self) -> ToolResult:
         """Stop the current pod.
 
-        Branch the confirmation between actual-stop and no-op so the
-        LLM doesn't narrate "Stopped" when there was nothing to
-        stop (#1042 honesty contract). The manager returns a status
-        like ``terminating`` or ``terminated`` when there was a pod
-        and ``offline`` when the call was a no-op.
+        Confirm cleanup only from its durable result. Releasing borrowed
+        capacity does not stop it, and a missing receipt is not confirmation.
+        A no-session response is a no-op, not evidence of provider cleanup.
 
         Acquires the same ``_start_lock`` used by ``_start`` to
         prevent stop-vs-start races (codex round 9): if a !gpu on
@@ -543,17 +542,15 @@ class RunPodFeature(Feature):
         """
         async with self._start_lock:
             # Pre-capture session info BEFORE stop_session
-            # (codex round 11). Production stop_session clears
-            # ``_session`` before calling provider.stop_pod, so if
-            # provider.stop_pod fails the manager has lost the pod
-            # handle for any retry. The user must be told both
+            # (codex round 11). Preserve a factual snapshot independently
+            # of a caller's mutable manager state. The user must be told both
             # "stop failed" AND "pod may still be billing — here's
             # the pod_id we tried to stop" so they can clean up
             # out-of-band. Catch broadly here too — pre-capture
             # itself can fail.
             session_before_stop: Optional[Dict[str, Any]] = None
             try:
-                session_before_stop = await self.manager.get_status()
+                session_before_stop = await self.manager.get_status(refresh=False)
             except Exception as pre_err:
                 if is_execution_control_error(pre_err):
                     raise
@@ -571,28 +568,37 @@ class RunPodFeature(Feature):
                 if is_execution_control_error(e):
                     raise
                 fail_data: Dict[str, Any] = {"action": "stop"}
-                # If a session was active pre-stop, the manager has
-                # already cleared its handle by the time
-                # provider.stop_pod raised. Surface the captured
-                # session so the user can stop the pod manually.
+                # A failure does not establish whether hardware stopped.
+                # Preserve the exact original handle without asserting that
+                # this or a foreign manager discarded its own state.
                 if session_before_stop is not None and self._status_was_active(
                     session_before_stop
                 ):
                     fail_data["session_before_stop"] = session_before_stop
                     fail_data["warning"] = (
-                        "stop_session failed AFTER the manager cleared "
-                        "its session handle; the pod may still be "
+                        "RunPod cleanup is not confirmed; the pod may still be "
                         "billing. session_before_stop preserves the "
                         "pod_id so you can stop it manually via the "
                         "RunPod console."
                     )
                 return ToolResult.failed(str(e), data=fail_data)
-        was_no_op = status.get("status") == "offline" and not status.get("active")
-        confirmation = (
-            "No active RunPod session to stop (no-op)"
-            if was_no_op
-            else "Stopped RunPod session"
-        )
+        cleanup_state = status.get("training_cleanup_state")
+        if cleanup_state == TrainingPodCleanupState.NOT_OWNED.value:
+            confirmation = "Released borrowed RunPod session; provider resource not stopped"
+        elif cleanup_state == TrainingPodCleanupState.COMPLETE.value:
+            confirmation = "Stopped RunPod session (durable cleanup confirmed)"
+        else:
+            was_no_op = (
+                cleanup_state is None and not status.get("pod_id")
+                and status.get("status") == "offline" and not status.get("active")
+            )
+            if not was_no_op:
+                return ToolResult.failed(
+                    "RunPod cleanup has no confirmed durable result; provider cleanup "
+                    "and final billing remain unconfirmed",
+                    data={"action": "stop", "session": status},
+                )
+            confirmation = "No active RunPod session to stop (no-op)"
         return ToolResult.ok(
             confirmation=confirmation,
             data={
@@ -607,15 +613,8 @@ class RunPodFeature(Feature):
         # those would otherwise escape the @tool envelope (codex round
         # 6 catch).
         #
-        # Known limitation (codex round 10): _status does NOT take
-        # ``_start_lock``. Manager.stop_session clears ``_session``
-        # before calling provider.stop_pod, so a concurrent !gpu
-        # status during a slow stop will return ``offline`` while
-        # the provider tear-down is still in flight. Acquiring the
-        # lock would block frequent UI status polls for the full
-        # duration of provider.stop_pod (often 10-30s). Accepted as
-        # a transient honesty gap; the deeper fix is in the manager
-        # (refresh from provider before returning offline).
+        # Status polls do not serialize behind slow provider cleanup. The
+        # manager retains the original session until its durable release.
         try:
             status = await self.manager.get_status()
         except Exception as e:

@@ -359,6 +359,16 @@ uses the provider-neutral inference-lease coordinator; catalog and training
 capacity use their durable Pod-capacity services. The legacy tool never
 attaches, detaches, or reports an LLM route.
 
+Legacy `stop_session` and `terminate_session` share the original durable
+capacity-release boundary. A cached ownerless Pod ID is not mutation authority:
+the call refuses without a provider action or fabricated wall-clock charge and
+retains its handle for operator reconciliation. Use the existing owned lease's
+release/reconciler API, not a new ledger or a replacement acquisition.
+`terminate_session` returns that original release result when one exists;
+callers that only await it may continue to ignore the result. Borrowed capacity
+can be released locally without stopping its provider resource. Confirmed
+capacity cleanup does not imply provider invoice finality or zero storage cost.
+
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
 For load-balanced Serverless, use a Runpod key restricted to the one endpoint as the scoped inference capability. Runpod authenticates it at the edge and the workload proxy verifies the same bearer defensively. For a dedicated Pod, `RUNPOD_OLLAMA_BEARER_TOKEN` is the scoped capability. The provider rejects either workload credential when it matches `RUNPOD_API_KEY`, and rejects one credential reused across both products. Rotate the Pod value per bounded lease/deployment; never reuse the full control-plane key. Both modes expose `/ping` on port 11434, returning `204` during model preparation and `200` only while Ollama is live, the capability is unexpired, and the exact pinned model remains present.
