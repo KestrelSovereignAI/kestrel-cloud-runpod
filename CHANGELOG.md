@@ -20,6 +20,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Compare window instants without fractional rounding or raw-string equality;
   accept equivalent offsets while rejecting exact sub-microsecond boundary
   changes. Retain original timestamp text alongside datetime display views.
+- Reject inverted extrema and contradictory percentile ordering while retaining
+  vendor-reported totals without inferring an undocumented sum equation.
 
 ## [0.16.1] - 2026-11-10
 

@@ -154,7 +154,12 @@ class EndpointDurationStats:
             for key in ("min", "max", "p70", "p90", "p95", "p98")
         ]
         total = _optional_decimal(value.get("total"), "cold-start durationMs.total")
-        if total is None or any(item < 0 for item in integers):
+        ordered = (integers[0], *integers[2:], integers[1])
+        if (
+            total is None
+            or any(item < 0 for item in integers)
+            or any(lower > upper for lower, upper in zip(ordered, ordered[1:]))
+        ):
             raise RunPodManagerError("Invalid cold-start duration statistics")
         return cls(integers[0], integers[1], total, *integers[2:])
 
