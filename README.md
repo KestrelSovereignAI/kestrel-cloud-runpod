@@ -222,6 +222,9 @@ equivalent offset spellings. `start_time` and `end_time` are microsecond-limited
 datetime views; `start_time_text` and `end_time_text` retain the full original
 timestamps on both observations and pages. Validation uses exact instants,
 not rounded datetime views or raw-string equality.
+Datetime views retain the received offset. Exact integer UTC coordinates avoid
+overflow at offset boundaries while forwarding future end times unchanged for
+Runpod to clamp; no local clock substitute or timestamp fallback is used.
 
 Every page uses the same original query and exact opaque cursor. The entire read
 fails on malformed responses, cursor cycles, the configurable page bound,

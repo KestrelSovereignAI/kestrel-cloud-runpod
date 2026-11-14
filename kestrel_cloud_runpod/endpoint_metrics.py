@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -42,16 +42,35 @@ class EndpointMetricsInterval(str, Enum):
         return int(self.value[:-1]) * unit
 
 
+def _utc_epoch_second(value: datetime) -> int:
+    """Exact UTC coordinate without constructing an out-of-range UTC date."""
+
+    offset = value.utcoffset()
+    if offset is None or value.microsecond or offset.microseconds:
+        raise RunPodManagerError("Metrics comparison requires aware whole seconds")
+    local_second = (
+        (value.toordinal() - datetime(1970, 1, 1).toordinal()) * 86_400
+        + value.hour * 3_600
+        + value.minute * 60
+        + value.second
+    )
+    return local_second - (offset.days * 86_400 + offset.seconds)
+
+
 @dataclass(frozen=True)
 class _MetricsTimestamp:
     """One exact UTC instant plus its original RFC3339 representation."""
 
-    utc_second: datetime
+    local_second: datetime
     fraction_digits: str
     text: str
 
     @property
-    def key(self) -> tuple[datetime, str]:
+    def utc_second(self) -> int:
+        return _utc_epoch_second(self.local_second)
+
+    @property
+    def key(self) -> tuple[int, str]:
         # Fraction strings have no trailing zeros. Lexicographic order is
         # exact within one UTC second, without float/Decimal precision limits.
         return self.utc_second, self.fraction_digits
@@ -60,7 +79,7 @@ class _MetricsTimestamp:
     def datetime_view(self) -> datetime:
         """A microsecond-limited view; never used for window comparisons."""
 
-        return self.utc_second.replace(
+        return self.local_second.replace(
             microsecond=int((self.fraction_digits + "000000")[:6])
         )
 
@@ -88,7 +107,7 @@ def _parse_metrics_timestamp(
     if whole_seconds and (matched.group("fraction") or "").strip("0"):
         raise RunPodManagerError("Cold-start bucket is not interval-aligned")
     parsed = _optional_response_datetime(
-        value[:-1] + "Z" if value.endswith("z") else value, context
+        value[:-1] + "Z" if value.endswith("z") else value, context, normalize_utc=False
     )
     if parsed is None:
         raise RunPodManagerError(f"Invalid {context} timestamp")
@@ -170,6 +189,10 @@ class EndpointColdStartBucket:
     count: int
     duration_ms: EndpointDurationStats
 
+    @property
+    def utc_second(self) -> int:
+        return _utc_epoch_second(self.time)
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "EndpointColdStartBucket":
         count = _integer(value, "count", "cold-start bucket")
@@ -213,7 +236,7 @@ class EndpointColdStartMetricsPage:
     @property
     def window_identity(
         self,
-    ) -> tuple[tuple[datetime, str], tuple[datetime, str], EndpointMetricsInterval]:
+    ) -> tuple[tuple[int, str], tuple[int, str], EndpointMetricsInterval]:
         return self._start.key, self._end.key, self.interval
 
     def require_query(self, params: Mapping[str, str | int]) -> None:
@@ -263,18 +286,18 @@ class EndpointColdStartMetricsPage:
         if start.key >= end.key:
             raise RunPodManagerError("Invalid cold-start resolved window")
         buckets = tuple(EndpointColdStartBucket.from_dict(item) for item in records)
+        interval_seconds = resolved_interval.duration // timedelta(seconds=1)
         for index, bucket in enumerate(buckets):
-            if (
-                bucket.time - datetime(1970, 1, 1, tzinfo=UTC)
-            ) % resolved_interval.duration:
+            bucket_second = bucket.utc_second
+            if bucket_second % interval_seconds:
                 raise RunPodManagerError("Cold-start bucket is not interval-aligned")
             # A boundary bucket can begin before an unaligned window start.
             if (
-                (bucket.time, "") >= end.key
-                or start.utc_second - bucket.time >= resolved_interval.duration
-            ):
+                bucket_second,
+                "",
+            ) >= end.key or start.utc_second - bucket_second >= interval_seconds:
                 raise RunPodManagerError("Cold-start bucket is outside resolved window")
-            if index and buckets[index - 1].time >= bucket.time:
+            if index and buckets[index - 1].utc_second >= bucket_second:
                 raise RunPodManagerError("Cold-start buckets are not strictly ordered")
         return cls(
             start,
