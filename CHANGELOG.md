@@ -4,6 +4,15 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Read-only REST v2 Serverless cold-start metrics with typed immutable pages,
+  sparse activity buckets and original vendor duration/percentile statistics.
+  Complete bounded reads preserve opaque cursors and original query parameters;
+  malformed, cyclic, conflicting or incomplete responses fail clearly. Reuse
+  the existing authenticated transport and canonical inventory cursor walker.
+  No provisioning, model downloads, readiness, billing or teardown authority.
+
 ## [0.16.1] - 2026-11-10
 
 ### Fixed

@@ -42,6 +42,7 @@ REQUIRED_OPERATIONS = {
     ("/v2/serverless/{id}", "delete"): "deleteEndpoint",
     ("/v2/serverless/{id}/workers", "get"): "listEndpointWorkers",
     ("/v2/serverless/{id}/workers/{workerId}/logs", "get"): "getWorkerLogs",
+    ("/v2/serverless/{id}/metrics/cold-starts", "get"): "getEndpointColdStartMetrics",
     ("/v2/billing/pods", "get"): "listPodBilling",
     ("/v2/billing/serverless", "get"): "listServerlessBilling",
 }
@@ -191,6 +192,70 @@ def test_consumed_request_and_response_shapes_match_pin():
         "restart",
         "terminate",
     }
+
+
+def test_cold_start_consumed_contract_and_typed_example_match_pin():
+    from kestrel_cloud_runpod import (
+        EndpointColdStartMetricsPage,
+        EndpointMetricsInterval,
+    )
+    from kestrel_cloud_runpod.models import CursorPagination
+
+    document = _schema()
+    schemas = document["components"]["schemas"]
+    operation = document["paths"]["/v2/serverless/{id}/metrics/cold-starts"]["get"]
+    assert operation["x-runpod-scope"] == "serverless:read"
+    assert [item["$ref"].rsplit("/", 1)[1] for item in operation["parameters"]] == [
+        "MetricsStartTime",
+        "MetricsEndTime",
+        "MetricsInterval",
+        "PaginationCursor",
+        "PaginationLimit",
+    ]
+    assert set(schemas["EndpointColdStartMetricsResponse"]["required"]) == {
+        "startTime",
+        "endTime",
+        "interval",
+        "records",
+        "pagination",
+    }
+    assert set(schemas["EndpointColdStartMetric"]["required"]) == {
+        "time",
+        "count",
+        "durationMs",
+    }
+    assert (
+        schemas["EndpointColdStartMetric"]["properties"]["count"]["type"] == "integer"
+    )
+    stats = schemas["EndpointDurationStats"]
+    assert set(stats["required"]) == {"min", "max", "total", "p70", "p90", "p95", "p98"}
+    assert stats["properties"]["total"]["type"] == "number"
+    assert all(
+        stats["properties"][key]["type"] == "integer"
+        for key in stats["required"]
+        if key != "total"
+    )
+    assert set(schemas["EndpointMetricsInterval"]["enum"]) == {
+        item.value for item in EndpointMetricsInterval
+    }
+    assert schemas["EndpointMetricsInterval"]["default"] == "1h"
+    assert document["components"]["parameters"]["PaginationLimit"]["schema"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000,
+    }
+    example = operation["responses"]["200"]["content"]["application/json"]["examples"][
+        "metrics"
+    ]["value"]
+    Draft202012Validator(
+        {**document, "$ref": "#/components/schemas/EndpointColdStartMetricsResponse"}
+    ).validate(example)
+    parsed = EndpointColdStartMetricsPage.from_dict(
+        example, pagination=CursorPagination.from_dict(example)
+    )
+    assert parsed.records[0].count == 2
+    assert parsed.records[0].duration_ms.p98_ms == 11900
+    assert parsed.pagination.has_next_page is False
 
 
 def test_typed_create_and_update_payloads_validate_against_pin():
