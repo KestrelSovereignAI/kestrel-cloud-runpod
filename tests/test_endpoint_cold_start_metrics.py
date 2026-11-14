@@ -607,3 +607,58 @@ def test_native_cross_page_submicrosecond_drift_still_fails(cold_start_http, fie
     with pytest.raises(RunPodManagerError):
         client.endpoint_cold_start_metrics("ep")
     assert len(state["calls"]) == 2
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"min": 12000},
+        {"max": 8000},
+        {"p70": 8199},
+        {"p70": 12000},
+        {"p90": 9000},
+        {"p95": 9000},
+        {"p98": 9000},
+        {"p98": 12000},
+    ],
+)
+def test_native_rejects_contradictory_duration_extrema_and_percentiles(
+    cold_start_http, changed
+):
+    state, client = cold_start_http
+    value = page(bucket())
+    value["records"][0]["durationMs"].update(changed)
+    state["responses"] = [(200, value)]
+    with pytest.raises(RunPodManagerError, match="duration"):
+        client.endpoint_cold_start_metrics("ep")
+    assert len(state["calls"]) == 1
+
+
+def test_native_duration_order_accepts_ties_without_rewriting_vendor_total(
+    cold_start_http,
+):
+    state, client = cold_start_http
+    value = page(
+        bucket(
+            durationMs={
+                "min": 10,
+                "max": 11,
+                "total": 21.25,
+                "p70": 10,
+                "p90": 10,
+                "p95": 11,
+                "p98": 11,
+            }
+        )
+    )
+    state["responses"] = [(200, value)]
+    stats = client.endpoint_cold_start_metrics("ep").records[0].duration_ms
+    assert stats.total_ms == Decimal("21.25")
+    assert (
+        stats.minimum_ms,
+        stats.p70_ms,
+        stats.p90_ms,
+        stats.p95_ms,
+        stats.p98_ms,
+        stats.maximum_ms,
+    ) == (10, 10, 10, 11, 11, 11)
