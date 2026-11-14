@@ -220,7 +220,7 @@ the original wire lexeme. Percentiles remain per bucket; do not average them.
 
 Every page uses the same original query and exact opaque cursor. The entire read
 fails on malformed responses, cursor cycles, the configurable page bound,
-changed resolved windows, overlapping/unordered buckets or exceeded page size;
+changed resolved windows, non-UTC-aligned/overlapping/unordered buckets or exceeded page size;
 no partial success is returned. This shares inventory's cursor walker and does
 not change existing inventory bounds or resource-identity checks.
 

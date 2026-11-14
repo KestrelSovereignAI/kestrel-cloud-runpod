@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -42,15 +42,23 @@ class EndpointMetricsInterval(str, Enum):
         return int(self.value[:-1]) * unit
 
 
-def _metrics_time(value: Any, context: str) -> datetime:
+def _metrics_time(value: Any, context: str, *, whole_seconds: bool = False) -> datetime:
     # fromisoformat alone also accepts date-only, space-separated and naive
     # values. Require the documented RFC3339 representation before parsing.
-    if not isinstance(value, str) or not re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})",
+    if not isinstance(value, str):
+        raise RunPodManagerError(f"Invalid {context} timestamp")
+    matched = re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
+        r"(?:\.(?P<fraction>\d+))?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
         value,
         flags=re.ASCII,
-    ):
+    )
+    if matched is None:
         raise RunPodManagerError(f"Invalid {context} timestamp")
+    # All supported buckets are at least one minute. Inspect the original
+    # fraction before datetime can truncate sub-microsecond nonzero digits.
+    if whole_seconds and (matched.group("fraction") or "").strip("0"):
+        raise RunPodManagerError("Cold-start bucket is not interval-aligned")
     parsed = _optional_response_datetime(
         value[:-1] + "Z" if value.endswith("z") else value, context
     )
@@ -131,7 +139,9 @@ class EndpointColdStartBucket:
         if count < 0:
             raise RunPodManagerError("Invalid cold-start bucket count")
         return cls(
-            time=_metrics_time(value.get("time"), "cold-start bucket"),
+            time=_metrics_time(
+                value.get("time"), "cold-start bucket", whole_seconds=True
+            ),
             count=count,
             duration_ms=EndpointDurationStats.from_dict(
                 _mapping(value, "durationMs", "cold-start bucket")
@@ -193,8 +203,12 @@ class EndpointColdStartMetricsPage:
             raise RunPodManagerError("Invalid cold-start resolved window")
         buckets = tuple(EndpointColdStartBucket.from_dict(item) for item in records)
         for index, bucket in enumerate(buckets):
+            if (
+                bucket.time - datetime(1970, 1, 1, tzinfo=UTC)
+            ) % resolved_interval.duration:
+                raise RunPodManagerError("Cold-start bucket is not interval-aligned")
             # A boundary bucket can begin before an unaligned window start.
-            if bucket.time >= end or bucket.time + resolved_interval.duration <= start:
+            if bucket.time >= end or start - bucket.time >= resolved_interval.duration:
                 raise RunPodManagerError("Cold-start bucket is outside resolved window")
             if index and buckets[index - 1].time >= bucket.time:
                 raise RunPodManagerError("Cold-start buckets are not strictly ordered")
