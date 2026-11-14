@@ -748,11 +748,7 @@ class RunpodControlPlaneClient:
             if len(page.records) > (limit if limit is not None else 1000):
                 raise RunPodManagerError("Cold-start page exceeded requested limit")
             page.require_query(params)
-            if pages and (page.start_time_text, page.end_time_text, page.interval) != (
-                pages[0].start_time_text,
-                pages[0].end_time_text,
-                pages[0].interval,
-            ):
+            if pages and page.window_identity != pages[0].window_identity:
                 raise RunPodManagerError(
                     "Cold-start resolved window changed between pages"
                 )

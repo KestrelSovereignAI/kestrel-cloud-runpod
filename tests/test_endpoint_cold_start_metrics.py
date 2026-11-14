@@ -518,3 +518,92 @@ def test_native_last_datetime_bucket_does_not_require_overflowing_its_end(
     ]
     observed = client.endpoint_cold_start_metrics("ep", interval="1d")
     assert observed.records[0].time == datetime(9999, 12, 31, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "field,first,second",
+    [
+        ("startTime", "2026-11-14T00:00:00Z", "2026-11-14T00:00:00+00:00"),
+        ("startTime", "2026-11-14T00:00:00Z", "2026-11-14T01:00:00+01:00"),
+        ("endTime", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00.000Z"),
+        (
+            "startTime",
+            "2026-11-14T00:00:00.123456789Z",
+            "2026-11-14T01:00:00.1234567890+01:00",
+        ),
+    ],
+)
+def test_native_pages_accept_equivalent_exact_window_instants(
+    cold_start_http, field, first, second
+):
+    state, client = cold_start_http
+    state["responses"] = [
+        (200, page(cursor="next", **{field: first})),
+        (200, page(**{field: second})),
+    ]
+    observed = client.endpoint_cold_start_metrics("ep")
+    assert len(observed.pages) == 2
+    actual = "start_time_text" if field == "startTime" else "end_time_text"
+    assert getattr(observed, actual) == first
+    assert getattr(observed.pages[0], actual) == first
+    assert getattr(observed.pages[1], actual) == second
+    view = "start_time" if field == "startTime" else "end_time"
+    assert getattr(observed, view) == datetime.fromisoformat(first).astimezone(UTC)
+
+
+@pytest.mark.parametrize(
+    "key,requested,response",
+    [
+        ("start_time", "2026-11-14T00:00:00.0000001Z", "2026-11-14T00:00:00.0000009Z"),
+        ("end_time", "2026-11-15T00:00:00.0000001Z", "2026-11-15T00:00:00.0000009Z"),
+        (
+            "end_time",
+            "2026-11-15T00:00:00.1Z",
+            "2026-11-15T00:00:00.100000000000000000001Z",
+        ),
+    ],
+)
+def test_native_response_must_honor_full_precision_query_boundaries(
+    cold_start_http, key, requested, response
+):
+    state, client = cold_start_http
+    field = "startTime" if key == "start_time" else "endTime"
+    state["responses"] = [(200, page(**{field: response}))]
+    with pytest.raises(RunPodManagerError):
+        client.endpoint_cold_start_metrics("ep", **{key: requested})
+    assert len(state["calls"]) == 1
+
+
+@pytest.mark.parametrize(
+    "start,end,records",
+    [
+        ("2026-11-14T13:00:00.0000001Z", "2026-11-14T13:00:00.0000002Z", (13,)),
+        ("2026-11-14T13:59:59.9999999Z", "2026-11-14T14:00:00.0000001Z", (13, 14)),
+    ],
+)
+def test_native_submicrosecond_windows_and_bucket_overlap_are_not_rounded_away(
+    cold_start_http, start, end, records
+):
+    state, client = cold_start_http
+    state["responses"] = [
+        (200, page(*(bucket(hour) for hour in records), startTime=start, endTime=end))
+    ]
+    observed = client.endpoint_cold_start_metrics("ep", start_time=start, end_time=end)
+    assert [item.time.hour for item in observed.records] == list(records)
+    assert observed.pages[0].start_time_text == start
+    assert observed.pages[0].end_time_text == end
+
+
+@pytest.mark.parametrize("field", ["startTime", "endTime"])
+def test_native_cross_page_submicrosecond_drift_still_fails(cold_start_http, field):
+    state, client = cold_start_http
+    day = "14" if field == "startTime" else "15"
+    first = f"2026-11-{day}T00:00:00.0000001Z"
+    second = f"2026-11-{day}T00:00:00.0000009Z"
+    state["responses"] = [
+        (200, page(cursor="next", **{field: first})),
+        (200, page(**{field: second})),
+    ]
+    with pytest.raises(RunPodManagerError):
+        client.endpoint_cold_start_metrics("ep")
+    assert len(state["calls"]) == 2
