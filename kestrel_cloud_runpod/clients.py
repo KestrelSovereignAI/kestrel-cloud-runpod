@@ -733,7 +733,7 @@ class RunpodControlPlaneClient:
         )
         observed_at = datetime.now(timezone.utc)
         pages: list[EndpointColdStartMetricsPage] = []
-        last_time: datetime | None = None
+        last_time: int | None = None
         for payload, pagination in self._iter_control_pages(
             f"/serverless/{_segment(endpoint_id)}/metrics/cold-starts",
             key="records",
@@ -753,11 +753,11 @@ class RunpodControlPlaneClient:
                     "Cold-start resolved window changed between pages"
                 )
             if page.records:
-                if last_time is not None and page.records[0].time <= last_time:
+                if last_time is not None and page.records[0].utc_second <= last_time:
                     raise RunPodManagerError(
                         "Conflicting or unordered cold-start pages"
                     )
-                last_time = page.records[-1].time
+                last_time = page.records[-1].utc_second
             pages.append(page)
         return EndpointColdStartObservation(endpoint_id, observed_at, tuple(pages))
 

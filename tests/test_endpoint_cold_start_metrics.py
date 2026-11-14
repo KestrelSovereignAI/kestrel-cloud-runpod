@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -662,3 +662,58 @@ def test_native_duration_order_accepts_ties_without_rewriting_vendor_total(
         stats.p98_ms,
         stats.maximum_ms,
     ) == (10, 10, 10, 11, 11, 11)
+
+
+@pytest.mark.parametrize(
+    "end", ["9999-12-31T23:59:59-01:00", "9999-12-31T23:59:59-23:59"]
+)
+def test_native_valid_future_offset_boundary_is_forwarded_for_provider_clamping(
+    cold_start_http, end
+):
+    state, client = cold_start_http
+    state["responses"] = [(200, page())]
+    observed = client.endpoint_cold_start_metrics("ep", end_time=end)
+    assert observed.end_time_text == "2026-11-15T00:00:00Z"
+    assert parse_qs(urlsplit(state["calls"][0][1]).query)["endTime"] == [end]
+
+
+def test_native_old_offset_boundary_reaches_provider_retention_validation(
+    cold_start_http,
+):
+    state, client = cold_start_http
+    start = "0001-01-01T00:00:00+01:00"
+    state["responses"] = [
+        (422, {"title": "Invalid window", "status": 422, "detail": "Outside retention"})
+    ]
+    with pytest.raises(RunPodAPIError) as caught:
+        client.endpoint_cold_start_metrics("ep", start_time=start)
+    assert caught.value.status_code == 422
+    assert parse_qs(urlsplit(state["calls"][0][1]).query)["startTime"] == [start]
+
+
+def test_native_offset_boundary_bucket_uses_overflow_safe_utc_grid_and_order(
+    cold_start_http,
+):
+    state, client = cold_start_http
+    start = "9999-12-31T22:00:00-01:00"
+    end = "9999-12-31T23:59:59-01:00"
+    stamp = "9999-12-31T23:00:00-01:00"
+    state["responses"] = [(200, page(bucket(time=stamp), startTime=start, endTime=end))]
+    observed = client.endpoint_cold_start_metrics("ep")
+    assert observed.records[0].time.isoformat() == stamp
+    assert observed.records[0].utc_second == 253402300800
+    assert observed.end_time_text == end
+    assert observed.end_time.isoformat() == end
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2026, 11, 14),
+        datetime(2026, 11, 14, microsecond=1, tzinfo=UTC),
+        datetime(2026, 11, 14, tzinfo=timezone(timedelta(microseconds=1))),
+    ],
+)
+def test_integer_utc_coordinate_refuses_non_whole_or_naive_values(value):
+    with pytest.raises(RunPodManagerError, match="aware whole seconds"):
+        metrics._utc_epoch_second(value)

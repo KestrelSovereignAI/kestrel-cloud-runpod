@@ -1,6 +1,7 @@
 """Contracts for RunPod profile-owned model defaults."""
 
 from types import SimpleNamespace
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ from kestrel_cloud_runpod.core import RunPodManagerCore
 from kestrel_cloud_runpod.models import (
     RunPodLegacyAdmissionRetiredError,
     normalize_cuda_floor,
+    _optional_response_datetime,
 )
 
 
@@ -22,6 +24,24 @@ def test_resource_authority_version_is_exported_with_public_contracts():
     from kestrel_cloud_runpod import EndpointResourceVersion
 
     assert EndpointResourceVersion.GA.value == 2
+
+
+def test_optional_response_datetime_preserves_default_utc_and_explicit_offset_mode():
+    value = "2026-11-14T13:00:00+01:00"
+    default = _optional_response_datetime(value, "test")
+    retained = _optional_response_datetime(value, "test", normalize_utc=False)
+    assert default == datetime(2026, 11, 14, 12, tzinfo=UTC)
+    assert default.utcoffset() == timedelta(0)
+    assert retained == default
+    assert retained.isoformat() == value
+    assert retained.utcoffset() == timedelta(hours=1)
+
+
+@pytest.mark.parametrize("normalize_utc", [True, False])
+def test_optional_response_datetime_none_contract_is_unchanged(normalize_utc):
+    assert (
+        _optional_response_datetime(None, "test", normalize_utc=normalize_utc) is None
+    )
 
 
 class _ResumeHarness:

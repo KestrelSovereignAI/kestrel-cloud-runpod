@@ -22,6 +22,11 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   changes. Retain original timestamp text alongside datetime display views.
 - Reject inverted extrema and contradictory percentile ordering while retaining
   vendor-reported totals without inferring an undocumented sum equation.
+- Compare offset-boundary timestamps using exact integer UTC seconds instead
+  of constructing a UTC datetime beyond Python's year range. Forward valid
+  future end times unchanged for provider clamping; retain original offsets
+  in datetime display views. Existing resource datetime parsing defaults to
+  UTC normalization as before.
 
 ## [0.16.1] - 2026-11-10
 

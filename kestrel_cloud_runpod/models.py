@@ -1296,7 +1296,12 @@ def _optional_decimal(value: Any, context: str) -> Decimal | None:
     return parsed
 
 
-def _optional_response_datetime(value: Any, context: str) -> datetime | None:
+def _optional_response_datetime(
+    value: Any,
+    context: str,
+    *,
+    normalize_utc: bool = True,
+) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, str):
@@ -1307,7 +1312,7 @@ def _optional_response_datetime(value: Any, context: str) -> datetime | None:
         raise RunPodManagerError(f"Invalid {context} response") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise RunPodManagerError(f"Invalid {context} response")
-    return parsed.astimezone(UTC)
+    return parsed.astimezone(UTC) if normalize_utc else parsed
 
 
 def _boolean(value: Mapping[str, Any], key: str, context: str) -> bool:
