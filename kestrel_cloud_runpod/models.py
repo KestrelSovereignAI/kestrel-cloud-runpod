@@ -1121,6 +1121,28 @@ class BillingPage:
 
 
 @dataclass(frozen=True)
+class CursorPagination:
+    """One validated v2 page boundary; the opaque cursor is never normalized."""
+
+    has_next_page: bool
+    next_cursor: str | None = field(repr=False)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CursorPagination":
+        pagination = _mapping(value, "pagination", "v2")
+        has_next = pagination.get("hasNextPage")
+        if type(has_next) is not bool or "nextCursor" not in pagination:
+            raise RunPodManagerError("Invalid v2 pagination metadata")
+        cursor = pagination["nextCursor"]
+        if has_next:
+            if not isinstance(cursor, str) or not cursor.strip():
+                raise RunPodManagerError("Invalid v2 pagination cursor")
+        elif cursor is not None:
+            raise RunPodManagerError("Invalid final v2 pagination cursor")
+        return cls(has_next_page=has_next, next_cursor=cursor)
+
+
+@dataclass(frozen=True)
 class ServerlessJob:
     id: str
     status: str

@@ -17,6 +17,12 @@ import httpx
 from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .cpu_catalog import CpuCatalogSnapshot, validate_cpu_query
+from .endpoint_metrics import (
+    EndpointColdStartMetricsPage,
+    EndpointColdStartObservation,
+    EndpointMetricsInterval,
+    cold_start_query,
+)
 from .models import (
     CONTROL_PLANE_BASE_URL,
     SERVERLESS_DATA_PLANE_BASE_URL,
@@ -24,6 +30,7 @@ from .models import (
     CloudType,
     ComputeProduct,
     CpuPodCreateRequest,
+    CursorPagination,
     EndpointCreateRequest,
     EndpointResource,
     EndpointResourceVersion,
@@ -641,38 +648,16 @@ class RunpodControlPlaneClient:
     ) -> Iterator[Mapping[str, Any]]:
         """Walk the complete inventory; incomplete pages cannot prove cleanup."""
 
-        query = dict(params or {})
-        seen_cursors: set[str] = set()
         seen_ids: set[str] = set()
-        pages = 0
-        while True:
-            if pages >= self.max_inventory_pages:
-                raise RunPodManagerError(
-                    "Runpod inventory exceeded max_inventory_pages; completeness is unknown"
-                )
-            payload = _required_payload(
-                self.transport.request_json("GET", path, params=query)
-            )
-            pages += 1
-            items = _list_envelope(payload, key)
-            pagination = payload.get("pagination")
-            if not isinstance(pagination, Mapping):
-                raise RunPodManagerError("Invalid v2 pagination metadata")
-            has_next = pagination.get("hasNextPage")
-            if type(has_next) is not bool or "nextCursor" not in pagination:
-                raise RunPodManagerError("Invalid v2 pagination metadata")
-            cursor = pagination["nextCursor"]
-            if has_next:
-                if (
-                    not isinstance(cursor, str)
-                    or not cursor.strip()
-                    or cursor in seen_cursors
-                ):
-                    raise RunPodManagerError("Invalid or repeated v2 pagination cursor")
-                seen_cursors.add(cursor)
-            elif cursor is not None:
-                raise RunPodManagerError("Invalid final v2 pagination cursor")
-            for item in items:
+        for payload, _pagination in self._iter_control_pages(
+            path,
+            key=key,
+            params=params,
+            max_pages=self.max_inventory_pages,
+            bound_name="max_inventory_pages",
+            context="inventory",
+        ):
+            for item in payload[key]:
                 resource_id = item.get("id")
                 if not isinstance(resource_id, str) or not resource_id:
                     raise RunPodManagerError("Invalid v2 inventory resource identity")
@@ -680,9 +665,105 @@ class RunpodControlPlaneClient:
                     raise RunPodManagerError("Duplicate v2 inventory resource identity")
                 seen_ids.add(resource_id)
                 yield item
-            if not has_next:
+
+    def _iter_control_pages(
+        self,
+        path: str,
+        *,
+        key: str,
+        params: Optional[Mapping[str, Any]],
+        max_pages: int,
+        bound_name: str,
+        context: str,
+    ) -> Iterator[tuple[Mapping[str, Any], CursorPagination]]:
+        """One cursor walker for inventory and read-only metrics."""
+
+        query = dict(params or {})
+        seen_cursors: set[str] = set()
+        pages = 0
+        while True:
+            if pages >= max_pages:
+                raise RunPodManagerError(
+                    f"Runpod {context} exceeded {bound_name}; completeness is unknown"
+                )
+            payload = _required_payload(
+                self.transport.request_json("GET", path, params=query)
+            )
+            pages += 1
+            _list_envelope(payload, key)
+            pagination = CursorPagination.from_dict(payload)
+            cursor = pagination.next_cursor
+            if pagination.has_next_page:
+                if cursor in seen_cursors:
+                    raise RunPodManagerError("Invalid or repeated v2 pagination cursor")
+                seen_cursors.add(cursor)
+            yield payload, pagination
+            if not pagination.has_next_page:
                 return
             query["cursor"] = cursor
+
+    def endpoint_cold_start_metrics(
+        self,
+        endpoint_id: str,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        interval: EndpointMetricsInterval | str | None = None,
+        limit: int | None = None,
+        max_pages: int = 1000,
+    ) -> EndpointColdStartObservation:
+        """Read a complete sparse series without creating workers or jobs.
+
+        Runpod resolves defaults, clamps future end times and enforces retention
+        using its own clock. The identical original query accompanies each
+        cursor; resolved defaults never silently replace caller parameters.
+        """
+
+        if (
+            not isinstance(endpoint_id, str)
+            or not endpoint_id.strip()
+            or endpoint_id in {".", ".."}
+            or any(ord(char) < 32 for char in endpoint_id)
+        ):
+            raise ValueError("A nonempty endpoint identity is required")
+        if type(max_pages) is not int or max_pages < 1:
+            raise ValueError("max_pages must be a positive integer")
+        params = cold_start_query(
+            start_time=start_time, end_time=end_time, interval=interval, limit=limit
+        )
+        observed_at = datetime.now(timezone.utc)
+        pages: list[EndpointColdStartMetricsPage] = []
+        last_time: datetime | None = None
+        for payload, pagination in self._iter_control_pages(
+            f"/serverless/{_segment(endpoint_id)}/metrics/cold-starts",
+            key="records",
+            params=params,
+            max_pages=max_pages,
+            bound_name="max_pages",
+            context="cold-start metrics",
+        ):
+            page = EndpointColdStartMetricsPage.from_dict(
+                payload, pagination=pagination
+            )
+            if len(page.records) > (limit if limit is not None else 1000):
+                raise RunPodManagerError("Cold-start page exceeded requested limit")
+            page.require_query(params)
+            if pages and (page.start_time_text, page.end_time_text, page.interval) != (
+                pages[0].start_time_text,
+                pages[0].end_time_text,
+                pages[0].interval,
+            ):
+                raise RunPodManagerError(
+                    "Cold-start resolved window changed between pages"
+                )
+            if page.records:
+                if last_time is not None and page.records[0].time <= last_time:
+                    raise RunPodManagerError(
+                        "Conflicting or unordered cold-start pages"
+                    )
+                last_time = page.records[-1].time
+            pages.append(page)
+        return EndpointColdStartObservation(endpoint_id, observed_at, tuple(pages))
 
     def update_endpoint(
         self, endpoint_id: str, changes: EndpointUpdateRequest

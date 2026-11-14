@@ -201,6 +201,35 @@ job = jobs.run("endpoint-id", {"prompt": "hello"})
 status = jobs.status("endpoint-id", job.id)
 ```
 
+### Read-only cold-start observations
+
+`control.endpoint_cold_start_metrics(endpoint_id, start_time=..., end_time=...,
+interval="1h", limit=1000, max_pages=1000)` reads the
+[v2 cold-start series](https://docs.runpod.io/api-reference-v2/serverless/get-serverless-endpoint-cold-start-metrics)
+through the existing authenticated control-plane transport. All query parameters
+except the endpoint identity are optional. Timestamps must be RFC3339 strings;
+page size is an integer from 1 to 1000. Runpod owns its retention clock (90 days),
+default window and future-end clamp; provider validation failures remain errors.
+
+The immutable observation retains the endpoint identity, read-start time, typed
+pages, resolved window/interval, original pagination boundaries and vendor
+duration statistics. `observation.records` is the ordered concatenation of only
+the returned buckets: missing or empty activity does not become zero-filled
+data. Duration totals retain the parsed JSON numeric value as a Decimal, not
+the original wire lexeme. Percentiles remain per bucket; do not average them.
+
+Every page uses the same original query and exact opaque cursor. The entire read
+fails on malformed responses, cursor cycles, the configurable page bound,
+changed resolved windows, overlapping/unordered buckets or exceeded page size;
+no partial success is returned. This shares inventory's cursor walker and does
+not change existing inventory bounds or resource-identity checks.
+
+Cold-start duration is neither queue delay nor end-to-end application startup.
+This method does not create workers, submit jobs, download models, change lease
+authority, or establish readiness, actual billing or teardown. Actual Kite
+dogfood must separately measure image pull, model download/load, readiness and
+first output, plus actual cost and cleanup, under an approved live budget.
+
 ### Finite Serverless capacity and billing
 
 `ServerlessCapacityQuoteRequest` binds a normalized inference-parameters SHA-256
