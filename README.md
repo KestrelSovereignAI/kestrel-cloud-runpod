@@ -217,6 +217,11 @@ duration statistics. `observation.records` is the ordered concatenation of only
 the returned buckets: missing or empty activity does not become zero-filled
 data. Duration totals retain the parsed JSON numeric value as a Decimal, not
 the original wire lexeme. Percentiles remain per bucket; do not average them.
+Window comparisons preserve arbitrary RFC3339 fractional precision and accept
+equivalent offset spellings. `start_time` and `end_time` are microsecond-limited
+datetime views; `start_time_text` and `end_time_text` retain the full original
+timestamps on both observations and pages. Validation uses exact instants,
+not rounded datetime views or raw-string equality.
 
 Every page uses the same original query and exact opaque cursor. The entire read
 fails on malformed responses, cursor cycles, the configurable page bound,

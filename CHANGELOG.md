@@ -17,6 +17,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 - Validate UTC-aligned buckets, including nonzero sub-microsecond fractions,
   and strict RFC3339 timezone-offset components. Preserve valid equivalent
   offsets and boundary buckets overlapping an unaligned requested start.
+- Compare window instants without fractional rounding or raw-string equality;
+  accept equivalent offsets while rejecting exact sub-microsecond boundary
+  changes. Retain original timestamp text alongside datetime display views.
 
 ## [0.16.1] - 2026-11-10
 

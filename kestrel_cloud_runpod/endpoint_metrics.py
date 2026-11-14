@@ -42,7 +42,35 @@ class EndpointMetricsInterval(str, Enum):
         return int(self.value[:-1]) * unit
 
 
-def _metrics_time(value: Any, context: str, *, whole_seconds: bool = False) -> datetime:
+@dataclass(frozen=True)
+class _MetricsTimestamp:
+    """One exact UTC instant plus its original RFC3339 representation."""
+
+    utc_second: datetime
+    fraction_digits: str
+    text: str
+
+    @property
+    def key(self) -> tuple[datetime, str]:
+        # Fraction strings have no trailing zeros. Lexicographic order is
+        # exact within one UTC second, without float/Decimal precision limits.
+        return self.utc_second, self.fraction_digits
+
+    @property
+    def datetime_view(self) -> datetime:
+        """A microsecond-limited view; never used for window comparisons."""
+
+        return self.utc_second.replace(
+            microsecond=int((self.fraction_digits + "000000")[:6])
+        )
+
+
+def _parse_metrics_timestamp(
+    value: Any,
+    context: str,
+    *,
+    whole_seconds: bool = False,
+) -> _MetricsTimestamp:
     # fromisoformat alone also accepts date-only, space-separated and naive
     # values. Require the documented RFC3339 representation before parsing.
     if not isinstance(value, str):
@@ -64,7 +92,11 @@ def _metrics_time(value: Any, context: str, *, whole_seconds: bool = False) -> d
     )
     if parsed is None:
         raise RunPodManagerError(f"Invalid {context} timestamp")
-    return parsed
+    return _MetricsTimestamp(
+        parsed.replace(microsecond=0),
+        (matched.group("fraction") or "").rstrip("0"),
+        value,
+    )
 
 
 def cold_start_query(
@@ -77,17 +109,17 @@ def cold_start_query(
     """Validate caller syntax/bounds; provider owns its clock and retention cut."""
 
     params: dict[str, str | int] = {}
-    parsed: dict[str, datetime] = {}
+    parsed: dict[str, _MetricsTimestamp] = {}
     for key, value in (("startTime", start_time), ("endTime", end_time)):
         if value is not None:
             try:
-                parsed[key] = _metrics_time(value, "metrics query")
+                parsed[key] = _parse_metrics_timestamp(value, "metrics query")
             except RunPodManagerError as error:
                 if is_execution_control_error(error):
                     raise
                 raise ValueError("Metrics query requires RFC3339 timestamps") from None
             params[key] = value
-    if len(parsed) == 2 and parsed["startTime"] >= parsed["endTime"]:
+    if len(parsed) == 2 and parsed["startTime"].key >= parsed["endTime"].key:
         raise ValueError("Metrics start_time must precede end_time")
     if interval is not None:
         if (
@@ -139,9 +171,9 @@ class EndpointColdStartBucket:
         if count < 0:
             raise RunPodManagerError("Invalid cold-start bucket count")
         return cls(
-            time=_metrics_time(
+            time=_parse_metrics_timestamp(
                 value.get("time"), "cold-start bucket", whole_seconds=True
-            ),
+            ).datetime_view,
             count=count,
             duration_ms=EndpointDurationStats.from_dict(
                 _mapping(value, "durationMs", "cold-start bucket")
@@ -151,13 +183,33 @@ class EndpointColdStartBucket:
 
 @dataclass(frozen=True)
 class EndpointColdStartMetricsPage:
-    start_time: datetime
-    end_time: datetime
+    _start: _MetricsTimestamp
+    _end: _MetricsTimestamp
     interval: EndpointMetricsInterval
     records: tuple[EndpointColdStartBucket, ...]
     pagination: CursorPagination
-    start_time_text: str
-    end_time_text: str
+
+    @property
+    def start_time(self) -> datetime:
+        return self._start.datetime_view
+
+    @property
+    def end_time(self) -> datetime:
+        return self._end.datetime_view
+
+    @property
+    def start_time_text(self) -> str:
+        return self._start.text
+
+    @property
+    def end_time_text(self) -> str:
+        return self._end.text
+
+    @property
+    def window_identity(
+        self,
+    ) -> tuple[tuple[datetime, str], tuple[datetime, str], EndpointMetricsInterval]:
+        return self._start.key, self._end.key, self.interval
 
     def require_query(self, params: Mapping[str, str | int]) -> None:
         """Reject a response that contradicts the original explicit query."""
@@ -167,14 +219,18 @@ class EndpointColdStartMetricsPage:
         )
         if self.interval.value != expected_interval:
             raise RunPodManagerError("Cold-start response changed requested interval")
-        if "startTime" in params and self.start_time != _metrics_time(
-            params["startTime"], "metrics query"
+        if (
+            "startTime" in params
+            and self._start.key
+            != _parse_metrics_timestamp(params["startTime"], "metrics query").key
         ):
             raise RunPodManagerError("Cold-start response changed requested startTime")
         # A future request end may be clamped by Runpod's clock. It can never
         # extend the response beyond the caller's exclusive end boundary.
-        if "endTime" in params and self.end_time > _metrics_time(
-            params["endTime"], "metrics query"
+        if (
+            "endTime" in params
+            and self._end.key
+            > _parse_metrics_timestamp(params["endTime"], "metrics query").key
         ):
             raise RunPodManagerError("Cold-start response exceeded requested endTime")
 
@@ -185,8 +241,8 @@ class EndpointColdStartMetricsPage:
         *,
         pagination: CursorPagination,
     ) -> "EndpointColdStartMetricsPage":
-        start = _metrics_time(value.get("startTime"), "cold-start startTime")
-        end = _metrics_time(value.get("endTime"), "cold-start endTime")
+        start = _parse_metrics_timestamp(value.get("startTime"), "cold-start startTime")
+        end = _parse_metrics_timestamp(value.get("endTime"), "cold-start endTime")
         interval = value.get("interval")
         if (
             not isinstance(interval, str)
@@ -199,7 +255,7 @@ class EndpointColdStartMetricsPage:
             not isinstance(item, Mapping) for item in records
         ):
             raise RunPodManagerError("Invalid cold-start records envelope")
-        if start >= end:
+        if start.key >= end.key:
             raise RunPodManagerError("Invalid cold-start resolved window")
         buckets = tuple(EndpointColdStartBucket.from_dict(item) for item in records)
         for index, bucket in enumerate(buckets):
@@ -208,7 +264,10 @@ class EndpointColdStartMetricsPage:
             ) % resolved_interval.duration:
                 raise RunPodManagerError("Cold-start bucket is not interval-aligned")
             # A boundary bucket can begin before an unaligned window start.
-            if bucket.time >= end or start - bucket.time >= resolved_interval.duration:
+            if (
+                (bucket.time, "") >= end.key
+                or start.utc_second - bucket.time >= resolved_interval.duration
+            ):
                 raise RunPodManagerError("Cold-start bucket is outside resolved window")
             if index and buckets[index - 1].time >= bucket.time:
                 raise RunPodManagerError("Cold-start buckets are not strictly ordered")
@@ -218,8 +277,6 @@ class EndpointColdStartMetricsPage:
             resolved_interval,
             buckets,
             pagination,
-            value["startTime"],
-            value["endTime"],
         )
 
 
@@ -246,3 +303,11 @@ class EndpointColdStartObservation:
     @property
     def interval(self) -> EndpointMetricsInterval:
         return self.pages[0].interval
+
+    @property
+    def start_time_text(self) -> str:
+        return self.pages[0].start_time_text
+
+    @property
+    def end_time_text(self) -> str:
+        return self.pages[0].end_time_text
