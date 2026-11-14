@@ -4,6 +4,8 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-14
+
 ### Added
 
 - Read-only REST v2 Serverless cold-start metrics with typed immutable pages,
@@ -12,6 +14,9 @@ All notable changes to `kestrel-cloud-runpod` are documented here.
   malformed, cyclic, conflicting or incomplete responses fail clearly. Reuse
   the existing authenticated transport and canonical inventory cursor walker.
   No provisioning, model downloads, readiness, billing or teardown authority.
+- Validate UTC-aligned buckets, including nonzero sub-microsecond fractions,
+  and strict RFC3339 timezone-offset components. Preserve valid equivalent
+  offsets and boundary buckets overlapping an unaligned requested start.
 
 ## [0.16.1] - 2026-11-10
 

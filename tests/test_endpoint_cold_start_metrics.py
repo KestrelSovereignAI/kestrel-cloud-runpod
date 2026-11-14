@@ -401,3 +401,120 @@ def test_first_response_must_match_explicit_query_and_documented_defaults(
     state["responses"] = [(200, value)]
     with pytest.raises(RunPodManagerError):
         client.endpoint_cold_start_metrics("ep", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "interval,time",
+    [
+        ("1m", "13:00:30"),
+        ("5m", "13:01:00"),
+        ("15m", "13:05:00"),
+        ("30m", "13:15:00"),
+        ("1h", "13:30:00"),
+        ("6h", "13:00:00"),
+        ("12h", "06:00:00"),
+        ("1d", "12:00:00"),
+        ("1h", "13:00:00.000001"),
+        ("1h", "13:00:00.0000001"),
+    ],
+)
+def test_native_rejects_bucket_not_on_utc_interval_grid(
+    cold_start_http, interval, time
+):
+    state, client = cold_start_http
+    state["responses"] = [
+        (200, page(bucket(time=f"2026-11-14T{time}Z"), interval=interval))
+    ]
+    with pytest.raises(RunPodManagerError, match="align"):
+        client.endpoint_cold_start_metrics("ep", interval=interval)
+    assert len(state["calls"]) == 1
+
+
+@pytest.mark.parametrize("across_pages", [False, True])
+@pytest.mark.parametrize("time", ["13:30:00", "13:00:00.000001", "13:00:00.0000001"])
+def test_native_rejects_overlapping_hour_buckets(cold_start_http, across_pages, time):
+    state, client = cold_start_http
+    second = bucket(time=f"2026-11-14T{time}Z")
+    if across_pages:
+        state["responses"] = [(200, page(bucket(), cursor="next")), (200, page(second))]
+    else:
+        state["responses"] = [(200, page(bucket(), second))]
+    with pytest.raises(RunPodManagerError):
+        client.endpoint_cold_start_metrics("ep")
+    assert len(state["calls"]) == (2 if across_pages else 1)
+
+
+@pytest.mark.parametrize("offset", ["+00:60", "+01:99", "-00:60"])
+@pytest.mark.parametrize("key", ["start_time", "end_time"])
+def test_bad_rfc3339_offset_fails_before_native_http(cold_start_http, offset, key):
+    state, client = cold_start_http
+    value = f"2026-11-14T13:00:00{offset}"
+    wire_key = "startTime" if key == "start_time" else "endTime"
+    state["responses"] = [(200, page(**{wire_key: value}))]
+    with pytest.raises(ValueError, match="RFC3339"):
+        client.endpoint_cold_start_metrics("ep", **{key: value})
+    assert state["calls"] == []
+
+
+@pytest.mark.parametrize("offset", ["+00:60", "+01:99", "-00:60"])
+@pytest.mark.parametrize("field", ["startTime", "endTime", "bucket"])
+def test_native_rejects_malformed_response_offset(cold_start_http, offset, field):
+    state, client = cold_start_http
+    value = page(bucket())
+    day = "15" if field == "endTime" else "14"
+    timestamp = f"2026-11-{day}T13:00:00{offset}"
+    if field == "bucket":
+        value["records"][0]["time"] = timestamp
+    else:
+        value[field] = timestamp
+    state["responses"] = [(200, value)]
+    with pytest.raises(RunPodManagerError):
+        client.endpoint_cold_start_metrics("ep")
+    assert len(state["calls"]) == 1
+
+
+def test_native_aligned_instants_allow_equivalent_offsets_and_partial_query_window(
+    cold_start_http,
+):
+    state, client = cold_start_http
+    start = "2026-11-14T13:15:00Z"
+    state["responses"] = [
+        (
+            200,
+            page(
+                bucket(time="2026-11-14T13:30:00+01:30"), startTime=start, interval="6h"
+            ),
+        )
+    ]
+    observed = client.endpoint_cold_start_metrics("ep", start_time=start, interval="6h")
+    assert observed.records[0].time == datetime(2026, 11, 14, 12, tzinfo=UTC)
+    assert observed.records[0].time < observed.start_time
+
+
+def test_native_valid_offset_components_preserve_the_original_query(cold_start_http):
+    state, client = cold_start_http
+    start = "2026-11-14T13:00:00+00:59"
+    state["responses"] = [(200, page(startTime="2026-11-14T12:01:00Z"))]
+    observed = client.endpoint_cold_start_metrics("ep", start_time=start)
+    assert observed.start_time == datetime(2026, 11, 14, 12, 1, tzinfo=UTC)
+    assert parse_qs(urlsplit(state["calls"][0][1]).query)["startTime"] == [start]
+
+
+def test_native_last_datetime_bucket_does_not_require_overflowing_its_end(
+    cold_start_http,
+):
+    state, client = cold_start_http
+    start = "9999-12-31T00:00:00Z"
+    state["responses"] = [
+        (
+            200,
+            page(
+                bucket(time=start),
+                startTime=start,
+                endTime="9999-12-31T23:59:59.999999Z",
+                interval="1d",
+            ),
+        )
+    ]
+    observed = client.endpoint_cold_start_metrics("ep", interval="1d")
+    assert observed.records[0].time == datetime(9999, 12, 31, tzinfo=UTC)
