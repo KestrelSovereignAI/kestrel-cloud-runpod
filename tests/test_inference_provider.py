@@ -486,6 +486,8 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
     assert quote.region == "us-tx-3"
     assert quote.estimated_ready_seconds == 30
     assert quote.metadata["mode"] == "serverless_load_balancer"
+    assert quote.metadata["planned_resource_type"] == "serverless_endpoint"
+    assert quote.metadata["planned_resource_name"].startswith("kestrel-ollama-")
     assert quote.metadata["maximum_serverless_cold_starts"] == 1
     assert capacity.provision_calls == 0
 
@@ -494,6 +496,7 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
     assert lease.state is InferenceLeaseState.PENDING
     assert lease.route is None
     assert capacity.provision_calls == 1
+    assert service.repository.get(lease.lease_id).resource_name == quote.metadata["planned_resource_name"]
     assert service.repository.get(lease.lease_id).route_url is None
 
 
