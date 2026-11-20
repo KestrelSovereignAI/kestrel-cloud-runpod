@@ -1060,7 +1060,16 @@ def _lease_costs(lease: OllamaLease) -> tuple[Decimal, Decimal]:
         )
     total = lease.estimated_cost
     if total is None:
-        total = lease.max_authorized_cost
+        # The repository marks NOT_APPLICABLE only after proving no provider
+        # create was dispatched. Do not misreport the hard ceiling as the
+        # cost of a terminal, never-allocated lease.
+        total = (
+            0
+            if lease.state is OllamaLeaseState.TERMINATED
+            and lease.lifecycle_billing_state
+            is OllamaLifecycleBillingState.NOT_APPLICABLE
+            else lease.max_authorized_cost
+        )
     return _money(hourly), _money(total)
 
 
