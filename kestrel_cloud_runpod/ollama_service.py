@@ -317,6 +317,7 @@ class OllamaLeaseService:
         *,
         wait_until_ready: bool = True,
         plan: OllamaPlacementPlan | None = None,
+        journal_identity: str | None = None,
     ) -> OllamaLease:
         now = self._now()
         existing = self.repository.get(request.lease_id)
@@ -339,7 +340,9 @@ class OllamaLeaseService:
             normalized_request = normalize_new_ollama_request_money(request)
             if existing.request_fingerprint == normalized_request.fingerprint:
                 request = normalized_request
-        lease, inserted = self.repository.insert_request(request, now=now)
+        lease, inserted = self.repository.insert_request(
+            request, now=now, journal_identity=journal_identity
+        )
         if not inserted:
             self._authorize(lease, request.owner_id, request.workload_id)
         if (

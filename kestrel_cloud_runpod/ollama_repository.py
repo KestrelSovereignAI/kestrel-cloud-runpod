@@ -15,6 +15,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 from .billing import exact_decimal_integer_scale, exact_decimal_sum
 from .models import CloudType, RunPodManagerError
@@ -1713,6 +1714,15 @@ class SQLiteOllamaLeaseRepository:
                 raise RunPodManagerError(
                     "Ollama lease database writer contract installation failed"
                 )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS ollama_lease_journal_identity ("
+                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                "identity TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO ollama_lease_journal_identity VALUES (1, ?)",
+                (uuid4().hex,),
+            )
             # Routes are re-observed from Runpod and exist only in the host
             # process.  Clear values written by releases before the SDK
             # inference boundary made addressable endpoints host-only.
@@ -1741,17 +1751,67 @@ class SQLiteOllamaLeaseRepository:
             connection.execute("PRAGMA journal_mode = WAL")
 
     def insert_request(
-        self, request: OllamaLeaseRequest, *, now: datetime
+        self, request: OllamaLeaseRequest, *, now: datetime,
+        journal_identity: str | None = None,
+    ) -> tuple[OllamaLease, bool]:
+        return self._insert_request(
+            request, now=now, journal_identity=journal_identity, fence_absent=False
+        )
+
+    def journal_identity(self) -> str:
+        """Return the identity of the authoritative lease journal, not its path."""
+        with self._connect() as connection:
+            return self._journal_identity_locked(connection)
+
+    @staticmethod
+    def _journal_identity_locked(connection: sqlite3.Connection) -> str:
+        row = connection.execute(
+            "SELECT identity FROM ollama_lease_journal_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is not None:
+            identity = row["identity"]
+            if isinstance(identity, str):
+                try:
+                    if UUID(hex=identity).hex == identity:
+                        return identity
+                except ValueError:
+                    pass
+        raise RunPodManagerError("Ollama lease journal identity is missing or invalid")
+
+    def fence_absent_expired_request(
+        self, request: OllamaLeaseRequest, *, now: datetime, journal_identity: str
+    ) -> OllamaLease:
+        """Settle absent intent atomically without a window for first dispatch."""
+        lease, _ = self._insert_request(
+            request, now=now, journal_identity=journal_identity, fence_absent=True
+        )
+        return lease
+
+    def _insert_request(
+        self, request: OllamaLeaseRequest, *, now: datetime,
+        journal_identity: str | None, fence_absent: bool,
     ) -> tuple[OllamaLease, bool]:
         inserted = False
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if (
+                journal_identity is not None
+                and self._journal_identity_locked(connection) != journal_identity
+            ):
+                raise OllamaLeaseConflictError("Original Ollama lease journal changed")
             row = connection.execute(
                 "SELECT * FROM ollama_leases WHERE lease_id = ?", (request.lease_id,)
             ).fetchone()
             if row is None:
                 request = normalize_new_ollama_request_money(request)
                 request_started_at = request.requested_at or now
+                created_at = now
+                if fence_absent:
+                    if request.requested_at is None or request.requested_at >= now:
+                        raise ValueError("Expired inference requires an original request timestamp")
+                    # Represents the original approved intent, not an allocation
+                    # made now (which could be well past its hard deadline).
+                    created_at = request.requested_at
                 constraints = asdict(request.constraints)
                 constraints["cloud"] = request.constraints.cloud.value
                 values = (
@@ -1770,9 +1830,9 @@ class SQLiteOllamaLeaseRepository:
                     request.mode.value,
                     OllamaLeaseState.REQUESTED.value,
                     OllamaTeardownState.NOT_REQUESTED.value,
+                    iso_datetime(created_at),
                     iso_datetime(now),
-                    iso_datetime(now),
-                    iso_datetime(now),
+                    iso_datetime(created_at),
                     iso_datetime(
                         min(
                             now + timedelta(seconds=request.idle_timeout_seconds),
@@ -1817,6 +1877,21 @@ class SQLiteOllamaLeaseRepository:
                     values,
                 )
                 inserted = True
+                if fence_absent:
+                    original = self._locked_lease(connection, request.lease_id)
+                    terminal = self._update_locked(
+                        connection, original,
+                        {
+                            "state": OllamaLeaseState.TERMINATED,
+                            "teardown_state": OllamaTeardownState.COMPLETE,
+                            "updated_at": now,
+                            "termination_reason": "expired",
+                            "lifecycle_billing_state": OllamaLifecycleBillingState.NOT_APPLICABLE,
+                            "accrued_estimated_cost": 0.0,
+                        },
+                        "fence expired inference without a provider row",
+                    )
+                    return terminal, True
             elif row["request_fingerprint"] != request.fingerprint:
                 normalized_request = normalize_new_ollama_request_money(request)
                 if row["request_fingerprint"] == normalized_request.fingerprint:
