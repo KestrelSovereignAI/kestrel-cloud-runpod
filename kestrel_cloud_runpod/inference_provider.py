@@ -239,6 +239,8 @@ class RunpodInferenceLeaseProvider:
     ) -> InferenceLease:
         runtime = self._get_runtime()
         now = self._now()
+        if quote.expires_at <= now:
+            return await self.reconcile_expired_acquisition(request, quote)
         lease_id = _lease_id(request)
         existing = runtime.service.repository.get(lease_id)
         if existing is not None:
@@ -250,9 +252,6 @@ class RunpodInferenceLeaseProvider:
             now=now,
             allow_elapsed_deadline=existing is not None,
         )
-        if existing is None and quote.expires_at <= now:
-            raise InferenceLeaseConstraintError("Runpod quote is expired")
-
         mode = _quote_mode(quote)
         provider_region = runtime.policy.regions[quote.region]
         internal_request = self._internal_request(
@@ -323,6 +322,32 @@ class RunpodInferenceLeaseProvider:
             self._authorize(persisted, request.owner_id)
             internal = persisted
         return self._to_sdk_lease(internal, runtime=runtime)
+
+    async def reconcile_expired_acquisition(
+        self,
+        request: InferenceLeaseRequest,
+        quote: InferenceLeaseQuote,
+    ) -> InferenceLease:
+        """Adopt or retire the original lease without creating expired capacity."""
+        runtime = self._get_runtime()
+        now = self._now()
+        if now < quote.expires_at:
+            raise InferenceLeaseConstraintError("Runpod quote is not expired")
+        quote.validate_for(request, now=quote.expires_at - timedelta(microseconds=1))
+        if quote.provider_name != self.provider_name:
+            raise InferenceLeaseConstraintError("quote provider does not match Runpod")
+        lease_id = _lease_id(request)
+        existing = runtime.service.repository.get(lease_id)
+        if existing is None:
+            raise InferenceLeaseConstraintError(
+                "Runpod quote expired without an original lease"
+            )
+        self._authorize(existing, request.owner_id)
+        if existing.state is OllamaLeaseState.REQUESTED:
+            # Neither a replan nor status reconciliation may dispatch a first
+            # create from REQUESTED after this quote's authorization expired.
+            return await self.release(request.owner_id, lease_id)
+        return await self.status(request.owner_id, lease_id)
 
     async def status(self, owner_id: str, lease_id: str) -> InferenceLease:
         runtime = self._get_runtime()

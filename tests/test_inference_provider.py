@@ -496,8 +496,57 @@ async def test_quote_is_read_only_and_acquire_returns_pending(tmp_path):
     assert lease.state is InferenceLeaseState.PENDING
     assert lease.route is None
     assert capacity.provision_calls == 1
-    assert service.repository.get(lease.lease_id).resource_name == quote.metadata["planned_resource_name"]
+    assert (
+        service.repository.get(lease.lease_id).resource_name
+        == quote.metadata["planned_resource_name"]
+    )
     assert service.repository.get(lease.lease_id).route_url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted", [False, True])
+async def test_expired_acquisition_cannot_create_capacity(tmp_path, submitted):
+    clock = MutableClock()
+    adapter, _service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    original = await adapter.acquire(request, quote) if submitted else None
+    await clock.sleep((quote.expires_at - clock()).total_seconds())
+    if original is None:
+        with pytest.raises(
+            InferenceLeaseConstraintError, match="without an original lease"
+        ):
+            await adapter.reconcile_expired_acquisition(request, quote)
+        assert capacity.provision_calls == 0
+    else:
+        recovered = await adapter.reconcile_expired_acquisition(request, quote)
+        assert recovered.lease_id == original.lease_id
+        assert recovered.quote_id == original.quote_id
+        assert capacity.provision_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_unsubmitted_provider_record_is_retired_without_creation(
+    tmp_path, monkeypatch
+):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+
+    async def refuse_before_create(*_args, **_kwargs):
+        raise RunPodManagerError("provider was never submitted")
+
+    with monkeypatch.context() as local:
+        local.setattr(service, "_provision_requested", refuse_before_create)
+        original = await adapter.acquire(request, quote)
+    assert service.repository.get(original.lease_id).state is OllamaLeaseState.REQUESTED
+    assert capacity.provision_calls == 0
+    await clock.sleep((quote.expires_at - clock()).total_seconds())
+    recovered = await adapter.reconcile_expired_acquisition(request, quote)
+    assert recovered.lease_id == original.lease_id
+    assert recovered.is_terminal
+    assert capacity.provision_calls == 0
 
 
 @pytest.mark.asyncio
