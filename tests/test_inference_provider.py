@@ -23,7 +23,10 @@ from kestrel_sdk.llm import (
     InferencePrivacy,
     InferenceRoute,
 )
-from kestrel_sovereign.llm.inference_leases import InferenceLeaseCoordinator
+from kestrel_sovereign.llm.inference_leases import (
+    InferenceLeaseCoordinator,
+    InferenceLeaseRecord,
+)
 from ollama_test_support import (
     FakeOllamaProvider,
     MutableClock,
@@ -543,9 +546,39 @@ async def test_expired_unsubmitted_provider_record_is_retired_without_creation(
     assert service.repository.get(original.lease_id).state is OllamaLeaseState.REQUESTED
     assert capacity.provision_calls == 0
     await clock.sleep((quote.expires_at - clock()).total_seconds())
-    recovered = await adapter.reconcile_expired_acquisition(request, quote)
+    durable = []
+
+    async def persist(value):
+        durable.append(value)
+
+    class _NoRoute:
+        async def deactivate_inference_lease(self, _lease_id, *, require_active=False):
+            assert not require_active
+            return None
+
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=_NoRoute(),
+        owner_id=request.owner_id,
+        providers={"runpod": adapter},
+        persist_state=persist,
+    )
+    # Exercise Core's real lease/result validation, not just the provider
+    # terminal flag. The request cap is deliberately above the offered total.
+    assert request.max_total_cost_usd > quote.estimated_total_cost_usd
+    recovered = await coordinator.restore(
+        InferenceLeaseRecord(
+            provider_name="runpod",
+            request=request,
+            quote=quote,
+        ).to_persisted_dict()
+    )
+    assert recovered is not None
     assert recovered.lease_id == original.lease_id
     assert recovered.is_terminal
+    assert recovered.estimated_total_cost_usd == 0
+    assert durable[-1]["lease"]["lease_id"] == original.lease_id
+    status = await coordinator.status(recovered.lease_id)
+    assert status.estimated_total_cost_usd == 0
     assert capacity.provision_calls == 0
 
 
