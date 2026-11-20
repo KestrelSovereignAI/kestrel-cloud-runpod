@@ -52,6 +52,7 @@ from .ollama_contracts import (
     maximum_serverless_cold_starts,
     optional_iso_datetime,
     require_aware,
+    resource_name,
 )
 from .ollama_provider import RunpodOllamaCapacityProvider
 from .ollama_runtime import parse_ollama_model_allowlist
@@ -216,7 +217,7 @@ class RunpodInferenceLeaseProvider:
             raise InferenceLeaseConstraintError(
                 "Runpod quote cannot outlive the requested readiness deadline"
             )
-        metadata = _quote_metadata(plan)
+        metadata = _quote_metadata(plan, lease_id=_lease_id(request))
         return InferenceLeaseQuote(
             quote_id=_quote_id(request),
             request_id=request.request_id,
@@ -851,9 +852,11 @@ def _lease_id(request: InferenceLeaseRequest) -> str:
     return f"runpod-lease-{digest}"
 
 
-def _quote_metadata(plan: OllamaPlacementPlan) -> dict[str, Any]:
+def _quote_metadata(plan: OllamaPlacementPlan, *, lease_id: str) -> dict[str, Any]:
     return {
         "mode": plan.mode.value,
+        "planned_resource_type": plan.resource_type.value,
+        "planned_resource_name": resource_name(lease_id),
         "gpu_id": plan.placement.gpu_id,
         "gpu_pool": plan.placement.gpu_pool,
         "gpu_name": plan.placement.gpu_name,
