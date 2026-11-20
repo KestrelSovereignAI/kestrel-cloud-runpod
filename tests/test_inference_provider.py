@@ -516,16 +516,78 @@ async def test_expired_acquisition_cannot_create_capacity(tmp_path, submitted):
     original = await adapter.acquire(request, quote) if submitted else None
     await clock.sleep((quote.expires_at - clock()).total_seconds())
     if original is None:
-        with pytest.raises(
-            InferenceLeaseConstraintError, match="without an original lease"
-        ):
-            await adapter.reconcile_expired_acquisition(request, quote)
+        recovered = await adapter.reconcile_expired_acquisition(request, quote)
+        assert recovered.is_terminal
+        assert recovered.estimated_total_cost_usd == 0
         assert capacity.provision_calls == 0
     else:
         recovered = await adapter.reconcile_expired_acquisition(request, quote)
         assert recovered.lease_id == original.lease_id
         assert recovered.quote_id == original.quote_id
         assert capacity.provision_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(InferenceLeaseCoordinator, "_dispatch_acquisition"),
+    reason="Core #4193's explicit expired-intent reconciliation is not installed",
+)
+async def test_restore_fences_expired_intent_missing_original_provider_row(tmp_path):
+    class CountedCapacity(FakeOllamaProvider):
+        def __init__(self):
+            super().__init__(serverless_plan())
+            self.plan_count = 0
+
+        async def plan(self, request):
+            self.plan_count += 1
+            return await super().plan(request)
+
+    clock = MutableClock()
+    clock.value = datetime.now(UTC) - timedelta(minutes=10)
+    capacity = CountedCapacity()
+    original, _service, _capacity = _adapter(tmp_path / "original", clock, capacity)
+    request = _request(clock)
+    quote = await original.quote(request)
+    durable_record = InferenceLeaseRecord(
+        provider_name="runpod", request=request, quote=quote,
+    ).to_persisted_dict()
+    plan_count = capacity.plan_count
+    # Core committed intent, but Runpod never even opened the lease row. The
+    # recovery must work after the absolute session deadline, not only TTL.
+    clock.value = datetime.now(UTC)
+    replacement, replacement_service, _ = _adapter(tmp_path / "replacement", clock, capacity)
+    with pytest.raises(InferenceLeaseConstraintError, match="original lease journal"):
+        await replacement.reconcile_expired_acquisition(request, quote)
+    adapter, service, _capacity = _adapter(tmp_path / "original", clock, capacity)
+    durable = []
+
+    async def persist(value):
+        durable.append(value)
+
+    class NoRoute:
+        async def deactivate_inference_lease(self, _lease_id, *, require_active=False):
+            assert not require_active
+
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=NoRoute(), owner_id=request.owner_id, providers={"runpod": adapter},
+        persist_state=persist,
+    )
+    recovered = await coordinator.restore(durable_record)
+    assert recovered is not None and recovered.state is InferenceLeaseState.EXPIRED
+    assert recovered.estimated_total_cost_usd == 0
+    assert replacement_service.repository.get(recovered.lease_id) is None
+    assert durable[-1]["lease"]["lease_id"] == recovered.lease_id
+    assert service.repository.get(recovered.lease_id).state is OllamaLeaseState.TERMINATED
+    assert (await coordinator.status(recovered.lease_id)).is_terminal
+    assert (await adapter.acquire(request, quote)).is_terminal
+    assert capacity.plan_count == plan_count
+    assert capacity.provision_calls == 0
+    assert capacity.teardown_calls == 0
+
+    next_lease = await coordinator.acquire(_request(clock, request_id="new-request"))
+    assert next_lease.lease_id != recovered.lease_id
+    assert next_lease.state is InferenceLeaseState.PENDING
+    assert capacity.provision_calls == 1
 
 
 @pytest.mark.asyncio
