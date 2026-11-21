@@ -87,6 +87,14 @@ func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 	if config.RequiredModel.Digest != "sha256:"+strings.Repeat("a", 64) {
 		t.Fatalf("unexpected required model pin: %#v", config.RequiredModel)
 	}
+	if config.RequireCachedModel {
+		t.Fatal("omitted cache policy must preserve pull-on-miss startup")
+	}
+	valid["KESTREL_OLLAMA_REQUIRE_CACHED_MODEL"] = "true"
+	strict, err := loadConfig(getenv, started)
+	if err != nil || !strict.RequireCachedModel {
+		t.Fatalf("require-cached policy not loaded: %v", err)
+	}
 
 	tests := []struct {
 		name  string
@@ -97,6 +105,7 @@ func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 		{name: "expired token", key: "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT", value: started.Add(-time.Second).Format(time.RFC3339)},
 		{name: "mutable latest", key: "KESTREL_OLLAMA_ALLOWED_MODELS", value: "model:latest"},
 		{name: "required absent", key: "KESTREL_OLLAMA_REQUIRED_MODEL", value: "different:v1"},
+		{name: "invalid cache policy", key: "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL", value: "maybe"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -666,6 +675,7 @@ func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 		}
 	})
 	config := testConfig(upstream)
+	config.RequireCachedModel = true
 	state := newStartupState("initializing", time.Now())
 	state.ollamaProcessRunning = true
 	if err := bootstrap(context.Background(), config, state, http.DefaultClient); err != nil {
@@ -677,6 +687,44 @@ func TestBootstrapUsesPinnedCacheAndPreloadsBeforeReadiness(t *testing.T) {
 	}
 	if generateCalls.Load() != 1 {
 		t.Fatalf("preload called %d times", generateCalls.Load())
+	}
+}
+
+func TestBootstrapRequiresExactCacheWithoutDownloadingOrPreloading(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		models []map[string]any
+	}{
+		{name: "missing", models: []map[string]any{}},
+		{name: "wrong digest", models: []map[string]any{
+			toolModel("registry.example/team/model:v1", strings.Repeat("b", 64)),
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var mutatingCalls atomic.Int32
+			server, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/api/version":
+					writeJSON(writer, http.StatusOK, map[string]string{"version": "test"})
+				case "/api/tags":
+					writeJSON(writer, http.StatusOK, map[string]any{"models": scenario.models})
+				default:
+					mutatingCalls.Add(1)
+					writeJSON(writer, http.StatusInternalServerError, nil)
+				}
+			})
+			config := testConfig(upstream)
+			config.RequireCachedModel = true
+			state := newStartupState("initializing", time.Now())
+			err := bootstrap(context.Background(), config, state, server.Client())
+			if err == nil || !strings.Contains(err.Error(), "cache") {
+				t.Fatalf("expected a pinned cache error, got %v", err)
+			}
+			snapshot := state.snapshot(config)
+			if snapshot.Ready || snapshot.CacheHit || snapshot.ModelPullStartedAt != nil || mutatingCalls.Load() != 0 {
+				t.Fatalf("cache refusal took a download/preload or readiness path: %#v", snapshot)
+			}
+		})
 	}
 }
 

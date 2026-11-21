@@ -41,6 +41,13 @@ After startup every readiness probe revalidates Ollama, the exact digest, and
 the model's completion/tool support. A mismatch, missing capability, expired
 workload capability, or upstream failure returns `503`.
 
+Set `KESTREL_OLLAMA_REQUIRE_CACHED_MODEL=true` for a standalone launch that
+must use an already-seeded cache. A missing model or wrong digest fails startup
+without a registry pull. An exact cache hit still preloads before readiness
+when preload is enabled; a missing or corrupt model blob fails preload. This
+option does not mount a volume or serialize writers. Use deployment-owned
+storage or enforce a single writer independently before sharing a volume.
+
 Python 0.16 managed leases require preload: the provider owns
 `KESTREL_OLLAMA_PRELOAD_MODEL` and sets it to `true`. Profile overrides are
 rejected before provisioning, including an explicit `true` override. This is
