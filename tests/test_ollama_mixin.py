@@ -71,7 +71,8 @@ def test_mixin_has_no_in_memory_or_managed_provider_fallback():
         harness._get_ollama_lease_service()
 
 
-def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cache_only", (None, True, "true"))
+def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch, cache_only):
     monkeypatch.setenv("RUNPOD_SERVERLESS_API_KEY", "serverless-key")
     monkeypatch.setenv("RUNPOD_OLLAMA_BEARER_TOKEN", "pod-token")
     harness = _Harness()
@@ -123,11 +124,25 @@ def test_mixin_builds_one_configured_durable_service(tmp_path, monkeypatch):
         min_vram_gb=24,
     )
     harness._select_profile = lambda name: profile
+    if cache_only is not None:
+        settings = harness.config["ollama_leases"]
+        settings["require_cached_model"] = cache_only
+    if cache_only is True:
+        from dataclasses import replace
+
+        profile = replace(profile, network_volume_id="volume-1")
+        settings["pod_non_compute_cost"]["covered_components"].append("network_volume")
+        settings["serverless_non_compute_cost"]["covered_components"].append("network_volume")
+    if cache_only == "true":
+        with pytest.raises(RunPodManagerError, match="require_cached_model must be a boolean"):
+            harness._get_ollama_lease_service()
+        return
 
     first = harness._get_ollama_lease_service()
     second = harness._get_ollama_lease_service()
 
     assert first is second
+    assert first.provider.deployment.require_cached_model is (cache_only is True)
     assert first.repository.path == tmp_path / "leases.sqlite3"
     assert first.provider.deployment.serverless_non_compute_cost.maximum_cost_usd == (
         0.02

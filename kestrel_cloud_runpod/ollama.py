@@ -107,6 +107,9 @@ class RunPodOllamaMixin:
             raise RunPodManagerError(
                 "ollama_leases.serverless_flashboot is invalid"
             ) from exc
+        require_cached_model = raw_settings.get("require_cached_model", False)
+        if type(require_cached_model) is not bool:
+            raise RunPodManagerError("ollama_leases.require_cached_model must be a boolean")
         deployment = RunpodOllamaDeployment(
             profile=host._select_profile("ollama"),
             serverless_workers_max=_required_int(
@@ -127,6 +130,7 @@ class RunPodOllamaMixin:
                 raw_settings, "pod_non_compute_cost"
             ),
             billing_batch_hours=_required_int(raw_settings, "billing_batch_hours"),
+            require_cached_model=require_cached_model,
         )
         service = OllamaLeaseService(
             repository=SQLiteOllamaLeaseRepository(lease_database_path(raw_settings)),

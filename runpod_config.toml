@@ -16,6 +16,7 @@ poll_interval_seconds = 10
 orphan_timeout_seconds = 90
 
 [ollama_leases]
+require_cached_model = false     # Opt in only with an approved cache-only image and exclusive colocated network volume.
 database_path = "${KESTREL_HOME}/state/runpod-ollama-leases.sqlite3"
 poll_interval_seconds = 5
 billing_poll_interval_seconds = 3600

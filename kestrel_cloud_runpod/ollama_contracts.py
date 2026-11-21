@@ -48,6 +48,9 @@ _SECRET_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 
 
+OLLAMA_REQUIRE_CACHED_MODEL_ENV = "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL"
+
+
 def _positive_public_number(value: object) -> bool:
     return (
         isinstance(value, (int, float))
@@ -832,6 +835,24 @@ class OllamaProvisioningIntent:
             raise ValueError("Ollama Pod request does not bind its intent")
 
     @property
+    def requires_cached_model(self) -> bool:
+        """This reserved key is emitted only for approved cache-only starts."""
+        return OLLAMA_REQUIRE_CACHED_MODEL_ENV in self.environment_keys
+
+    @property
+    def network_volume_ids(self) -> frozenset[str]:
+        """Read volume identity from the original canonical v2 request."""
+        request = _canonical_json_object(self.provider_request_json, "provider_request_json")
+        if self.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            return frozenset(_string_tuple_value(request.get("networkVolumes", [])))
+        mounts = request.get("mounts")
+        network = mounts.get("network", []) if isinstance(mounts, Mapping) else []
+        return frozenset(
+            item["volumeId"] for item in network
+            if isinstance(item, Mapping) and isinstance(item.get("volumeId"), str)
+        )
+
+    @property
     def intent_sha256(self) -> str:
         return _json_sha256(self.to_dict())
 
@@ -1602,6 +1623,16 @@ class OllamaRuntimeTelemetrySnapshot:
     inference_idle_ms: int
     schema_version: int = 2
 
+    @property
+    def proves_model_cache_hit(self) -> bool:
+        return (
+            self.cache_hit is True
+            and self.startup_strategy == "cache_hit"
+            and self.model_pull_started_at is None
+            and self.model_pull_completed_at is None
+            and self.model_pull_ms is None
+        )
+
     def __post_init__(self) -> None:
         _require_exact_int_version(
             self.schema_version, 2, "Unsupported Ollama telemetry schema"
@@ -1909,6 +1940,8 @@ class OllamaRuntimeTelemetryObservation:
         """
 
         snapshot = self.snapshot
+        if intent.requires_cached_model and not snapshot.proves_model_cache_hit:
+            return False
         return (
             snapshot.provision_requested_at == intent.provision_requested_at
             and snapshot.ready is True

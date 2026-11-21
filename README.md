@@ -419,6 +419,22 @@ billing observations rather than registering a callback that cannot run.
 
 Control-plane, Serverless data-plane, and Pod workload credentials are separate. The reviewed [private Ollama runtime](runtime/ollama-runtime/README.md) is published independently to GHCR. `RUNPOD_OLLAMA_IMAGE` must select it by immutable digest; mutable tags and other repositories fail before a billable create call. The runtime enforces bearer authentication on every non-health route, expires the workload capability at the lease deadline, permits only digest-pinned operator models, and never receives Kestrel's control-plane credential. Every operator-allowlisted model must support Ollama `completion` and `tools`; readiness revalidates both so Kestrel's default full-agent route never falls back to a tool-free lane. The provider refuses to publish a Pod route unless an anonymous `/api/tags` probe receives `401` or `403`. Tokens are never returned in lease state. AUTO mode considers only products whose scoped credential is configured.
 
+Set `ollama_leases.require_cached_model = true` to require reuse of a seeded cache.
+Configure one existing `profiles.ollama.network_volume_id` in the requested data
+center, a supported immutable runtime digest from the packaged
+the managed runtime release allowlist, the exact model pin, and the network-volume
+cost component in both non-compute policies. Keep Serverless limited to one
+worker. The provider owns the runtime flag; attempts to set it in a profile's
+environment are rejected. Changing the policy invalidates an earlier cache
+quote. A strict lease cannot publish or restore a route without authenticated
+cache-hit and preload evidence.
+
+Strict cache admission excludes a competing mount in the same managed lease
+journal until the prior allocation is released. It does not coordinate other
+Runpod clients, accounts, or journals; use an exclusive cache, and run the
+independent reconciler with the same durable journal and provider scope before
+starting paid work. Reusing a cache does not require keeping a GPU allocated.
+
 For load-balanced Serverless, use a Runpod key restricted to the one endpoint as the scoped inference capability. Runpod authenticates it at the edge and the workload proxy verifies the same bearer defensively. For a dedicated Pod, `RUNPOD_OLLAMA_BEARER_TOKEN` is the scoped capability. The provider rejects either workload credential when it matches `RUNPOD_API_KEY`, and rejects one credential reused across both products. Rotate the Pod value per bounded lease/deployment; never reuse the full control-plane key. Both modes expose `/ping` on port 11434, returning `204` during model preparation and `200` only while Ollama is live, the capability is unexpired, and the exact pinned model remains present.
 
 `accrued_estimated_cost` is the conservative accrued-compute bound, not settled

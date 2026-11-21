@@ -8,10 +8,17 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 from .models import RunPodManagerError
-from .ollama_contracts import OllamaLeaseMode
+from .ollama_contracts import OLLAMA_REQUIRE_CACHED_MODEL_ENV, OllamaLeaseMode
 
 OLLAMA_RUNTIME_CONTRACT = "ollama-runtime/v1"
 OLLAMA_RUNTIME_VERSION = "1.1.5"
+_CACHE_ONLY_RELEASE_DIGESTS = frozenset(
+    {
+        # 1.1.5: main a8caa52f07a00d6073aa22ebcfb57bf32e5ea2d8,
+        # publish 44931259242. Add releases after checking provenance and SBOM.
+        "sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3",
+    }
+)
 OLLAMA_RUNTIME_IMAGE_REPOSITORY = (
     "ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime"
 )
@@ -30,7 +37,7 @@ _RESERVED_ENV = frozenset(
         "KESTREL_OLLAMA_MODEL_STORAGE_PATH",
         "KESTREL_OLLAMA_PRELOAD_MODEL",
         "KESTREL_OLLAMA_PROVISION_REQUESTED_AT",
-        "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL",
+        OLLAMA_REQUIRE_CACHED_MODEL_ENV,
         "KESTREL_OLLAMA_REQUIRED_MODEL",
         "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256",
         "OLLAMA_HOST",
@@ -59,6 +66,16 @@ def require_immutable_ollama_image(image: str) -> str:
     return image
 
 
+def require_cache_only_ollama_image(image: str) -> str:
+    """Admit only an exact release reviewed for the cache-only contract."""
+    require_immutable_ollama_image(image)
+    if image.split("@", 1)[1] not in _CACHE_ONLY_RELEASE_DIGESTS:
+        raise RunPodManagerError(
+            "Managed cache-only Ollama requires an approved cache-only runtime image digest"
+        )
+    return image
+
+
 def build_ollama_runtime_environment(
     profile_environment: Mapping[str, str],
     *,
@@ -69,6 +86,7 @@ def build_ollama_runtime_environment(
     model_storage_path: str,
     provision_requested_at: datetime,
     telemetry_binding_sha256: str,
+    require_cached_model: bool = False,
 ) -> dict[str, str]:
     """Create the sole Pod/LB runtime environment from trusted policy inputs."""
 
@@ -115,6 +133,8 @@ def build_ollama_runtime_environment(
             "PORT_HEALTH": str(OLLAMA_RUNTIME_PORT),
         }
     )
+    if require_cached_model:
+        environment[OLLAMA_REQUIRE_CACHED_MODEL_ENV] = "true"
     return environment
 
 

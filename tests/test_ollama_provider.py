@@ -64,6 +64,7 @@ from kestrel_cloud_runpod.models import (
     environment_values_sha256,
 )
 from kestrel_cloud_runpod.ollama_contracts import (
+    OLLAMA_REQUIRE_CACHED_MODEL_ENV,
     OllamaCleanupBasis,
     OllamaCleanupIntent,
     OllamaFirstCreateExpiredError,
@@ -7381,6 +7382,209 @@ async def test_existing_cache_cannot_change_after_ollama_placement(monkeypatch, 
     with pytest.raises(RunPodManagerError, match="Ollama model cache binding changed"):
         changed_provider.validate_runtime_request(request, plan, provision_requested_at=clock())
     assert client.pod_request is None
+
+
+_APPROVED_CACHE_IMAGE = (
+    f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}"
+    "@sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3"
+)
+
+
+def _managed_cache_deployment(*, strict: bool = True):
+    costs = non_compute_cost_policy(include_network_volume=True)
+    return replace(
+        _deployment(),
+        profile=replace(_profile(), network_volume_id="volume-1"),
+        require_cached_model=strict,
+        serverless_non_compute_cost=costs,
+        pod_non_compute_cost=costs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", (OllamaLeaseMode.DEDICATED_POD, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER))
+async def test_managed_cache_only_binds_the_approved_image_and_runtime_flag(monkeypatch, mode):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _APPROVED_CACHE_IMAGE)
+    client = _ControlClient()
+    clock = MutableClock()
+    request = _cache_request(clock, mode=mode, max_authorized_cost=5.0)
+    strict = _provider(client=client, deployment=_managed_cache_deployment())
+    legacy = _provider(client=client, deployment=_managed_cache_deployment(strict=False))
+    plan = await strict.plan(request)
+    nonstrict_plan = await legacy.plan(request)
+    assert plan.model_cache_binding_sha256 != nonstrict_plan.model_cache_binding_sha256
+    prepared = strict.validate_runtime_request(request, plan, provision_requested_at=clock())
+    assert prepared.provider_request.env[OLLAMA_REQUIRE_CACHED_MODEL_ENV] == "true"
+    assert prepared.provider_request.image == _APPROVED_CACHE_IMAGE
+    persisted = type(prepared.intent).from_dict(prepared.intent.to_dict())
+    assert persisted.requires_cached_model
+    assert persisted.network_volume_ids == {"volume-1"}
+    with pytest.raises(RunPodManagerError, match="cache binding changed"):
+        strict.validate_runtime_request(request, nonstrict_plan, provision_requested_at=clock())
+    with pytest.raises(RunPodManagerError, match="cache binding changed"):
+        legacy.validate_runtime_request(request, plan, provision_requested_at=clock())
+    assert client.pod_request is client.endpoint_request is None
+
+
+@pytest.mark.asyncio
+async def test_managed_cache_only_rejects_unapproved_digest_before_inventory(monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    provider = _provider(client=object(), deployment=_managed_cache_deployment())
+    with pytest.raises(RunPodManagerError, match="approved cache-only runtime"):
+        await provider.plan(_cache_request(MutableClock()))
+
+
+@pytest.mark.parametrize("invalid", ("volume", "worker_count", "setting_type"))
+def test_managed_cache_only_fails_closed_for_incomplete_configuration(invalid):
+    deployment = _managed_cache_deployment()
+    if invalid == "volume":
+        with pytest.raises(RunPodManagerError, match="existing network volume"):
+            replace(deployment, profile=_profile())
+    elif invalid == "worker_count":
+        with pytest.raises(RunPodManagerError, match="one-worker"):
+            replace(deployment, serverless_workers_max=2)
+    else:
+        with pytest.raises(TypeError, match="must be a boolean"):
+            replace(deployment, require_cached_model="false")
+
+
+class _CacheLeaseLifecycle(FakeOllamaProvider):
+    """Isolated lifecycle fixture using the actual managed create encoder."""
+
+    def __init__(self, provider, plan, *, model_ready=True, pulled=False):
+        super().__init__(plan)
+        self.encoder = provider
+        self.models = self.models if model_ready else ()
+        self.pulled = pulled
+
+    def validate_runtime_request(self, request, plan, *, provision_requested_at):
+        return self.encoder.validate_runtime_request(
+            request, plan, provision_requested_at=provision_requested_at
+        )
+
+    async def observe(self, resource, intent, provisioning):
+        observation = await super().observe(resource, intent, provisioning)
+        if not self.pulled:
+            return observation
+        telemetry = observation.runtime_telemetry
+        assert telemetry is not None
+        snapshot = replace(
+            telemetry.snapshot,
+            cache_hit=False,
+            startup_strategy="pulled",
+            model_pull_started_at=intent.provision_requested_at,
+            model_pull_completed_at=intent.provision_requested_at,
+            model_pull_ms=0,
+        )
+        return replace(observation, runtime_telemetry=replace(
+            telemetry, snapshot=snapshot,
+            snapshot_sha256=ollama_provider_module._json_sha256(snapshot.to_dict()),
+        ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_strict,second_strict", [(True, True), (True, False), (False, True)])
+async def test_managed_cache_only_serializes_mounts_across_journal_connections(
+    monkeypatch, tmp_path, first_strict, second_strict,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _APPROVED_CACHE_IMAGE)
+    clock = MutableClock()
+    journal = tmp_path / "managed-cache.sqlite3"
+    services = []
+    requests = []
+    for idx, strict in enumerate((first_strict, second_strict)):
+        request = _cache_request(
+            clock, mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
+            lease_id=f"cache-lease-{idx}", max_authorized_cost=5.0,
+        )
+        encoder = _provider(deployment=_managed_cache_deployment(strict=strict))
+        provider = _CacheLeaseLifecycle(encoder, await encoder.plan(request))
+        services.append(OllamaLeaseService(
+            repository=SQLiteOllamaLeaseRepository(journal),
+            provider=provider, clock=clock, poll_interval_seconds=1,
+        ))
+        requests.append(request)
+    first, second = services
+    opening = await first.acquire(requests[0], wait_until_ready=False)
+    assert opening.state is OllamaLeaseState.WAITING_FOR_MODEL
+    with pytest.raises(OllamaLeaseConflictError, match="outstanding lease"):
+        await second.acquire(requests[1], wait_until_ready=False)
+    assert second.provider.provision_calls == 0
+    rejected = second.repository.get(requests[1].lease_id)
+    assert rejected is not None and rejected.provisioning_intent is None
+    first.provider.teardown_failures = 1
+    with pytest.raises(OllamaLeaseTeardownError):
+        await first.release(
+            opening.lease_id, owner_id=opening.owner_id, workload_id=opening.workload_id
+        )
+    with pytest.raises(OllamaLeaseConflictError, match="outstanding lease"):
+        await second.acquire(requests[1], wait_until_ready=False)
+    closed = await first.release(
+        opening.lease_id, owner_id=opening.owner_id, workload_id=opening.workload_id
+    )
+    assert closed.state is OllamaLeaseState.TERMINATED
+    assert (await second.acquire(
+        requests[1], wait_until_ready=False
+    )).state is OllamaLeaseState.WAITING_FOR_MODEL
+    assert second.provider.provision_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime", ("hit", "hit_then_idle", "missing", "pulled", "pulled_after_restart")
+)
+async def test_managed_cache_only_requires_no_pull_evidence_to_publish_or_restore(
+    monkeypatch, tmp_path, runtime,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _APPROVED_CACHE_IMAGE)
+    clock = MutableClock()
+    request = _cache_request(
+        clock, mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER, max_authorized_cost=5.0,
+    )
+    encoder = _provider(deployment=_managed_cache_deployment())
+    plan = await encoder.plan(request)
+    provider = _CacheLeaseLifecycle(
+        encoder, plan, model_ready=runtime != "missing", pulled=runtime == "pulled",
+    )
+    journal = tmp_path / "cache-evidence.sqlite3"
+    def start():
+        return OllamaLeaseService(
+            repository=SQLiteOllamaLeaseRepository(journal),
+            provider=provider, clock=clock, poll_interval_seconds=1,
+        )
+    original = start()
+    waiting = await original.acquire(request, wait_until_ready=False)
+    checked = await original.reconcile_lease(
+        waiting.lease_id, owner_id=request.owner_id, workload_id=request.workload_id,
+    )
+    if runtime == "pulled_after_restart":
+        assert checked.state is OllamaLeaseState.READY
+        provider.pulled = True
+        checked = await start().get(
+            waiting.lease_id, owner_id=request.owner_id, workload_id=request.workload_id,
+        )
+    if runtime == "hit_then_idle":
+        assert checked.state is OllamaLeaseState.READY
+        clock.value = checked.idle_deadline
+        (closed,) = await start().reconcile()
+        assert closed.state is OllamaLeaseState.TERMINATED
+        assert closed.public_route_url is None
+        assert closed.provisioning_intent is not None
+        assert closed.provisioning_intent.network_volume_ids == {"volume-1"}
+        assert closed.cleanup_intent is not None
+        assert closed.cleanup_receipt is not None
+        assert closed.cleanup_intent.provider_resource_id == checked.provider_resource_id
+        closed.cleanup_receipt.validate_intent(closed.cleanup_intent)
+        assert provider.teardown_calls == 1
+    elif runtime == "hit":
+        assert checked.state is OllamaLeaseState.READY
+        assert checked.public_route_url
+    else:
+        assert checked.state is OllamaLeaseState.TERMINATED
+        assert checked.public_route_url is None
+        assert checked.termination_reason == "required_cache_model_unavailable"
+        assert provider.teardown_calls == 1
+    assert provider.pull_calls == 0
 
 
 def test_persistent_pod_volume_is_not_billed_as_a_network_volume():
