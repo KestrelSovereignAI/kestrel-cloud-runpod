@@ -442,6 +442,24 @@ class OllamaResourceConstraints:
         )
 
 
+OLLAMA_WRITER_CONTRACT_VERSION = 8
+INFERENCE_LEASE_ID_PREFIX = "runpod-lease-"
+
+
+@dataclass(frozen=True)
+class OllamaInferenceAdmission:
+    """Immutable authority for the first create, distinct from readiness."""
+
+    offer_sha256: str
+    first_create_before: datetime
+
+    def __post_init__(self) -> None:
+        _sha256(self.offer_sha256, "accepted inference offer")
+        if not isinstance(self.first_create_before, datetime):
+            raise TypeError("Ollama first-create deadline must be a datetime")
+        require_aware(self.first_create_before, "inference first-create deadline")
+
+
 @dataclass(frozen=True)
 class OllamaLeaseRequest:
     """Complete, idempotent request for bounded private inference capacity."""
@@ -2390,7 +2408,7 @@ class OllamaLease:
     # silently meant something new would misread every existing row. Defaults
     # to a single GPU, which is what every pre-existing lease had.
     placement_gpu_count: int = 1
-    writer_contract_version: int = 7
+    writer_contract_version: int = OLLAMA_WRITER_CONTRACT_VERSION
     writer_epoch: int = 1
     reconcile_after: datetime | None = None
     provisioning_evidence_state: OllamaProvisioningEvidenceState = (
@@ -2408,6 +2426,7 @@ class OllamaLease:
     # restart clock or from mutable lifecycle deadlines.
     original_requested_at: datetime | None = None
     original_readiness_timeout_seconds: int | None = None
+    inference_admission: OllamaInferenceAdmission | None = None
     runtime_telemetry_binding_sha256: str | None = None
     cleanup_intent: OllamaCleanupIntent | None = None
     cleanup_receipt: OllamaCleanupReceipt | None = None

@@ -351,19 +351,18 @@ Confirmed fields are checked before reporting independent omissions so missing
 evidence cannot hide a known policy violation on an owned resource.
 
 The lease aggregate has one writer contract. Every insert starts at contract
-version 7/epoch 1, and every update must advance both the revision CAS and the
+version 8/epoch 1, and every update must advance both the revision CAS and the
 writer epoch exactly once; SQLite triggers reject old update shapes, inserts,
-and deletes. Version 7 also prevents a retained version-1 through version-6
-binary or migrator from reinstalling its weaker trigger set over a newer
-aggregate. Its explicit drained version-6 migration preserves every existing
-raw fact, including the billing latest-reference state, and changes only
-`writer_contract_version` from 6 to 7 while incrementing revision and writer
-epoch exactly once. The distinct drained version-4 or version-5 migrations
+and deletes. A retained older binary or migrator cannot reinstall its weaker
+trigger set over a newer aggregate. The explicit drained version-6 and
+version-7 migrations preserve existing lifecycle and billing facts, advance the
+writer contract, revision and epoch, and leave the new quote fields empty.
+The distinct drained version-4 or version-5 migrations
 preserve accepted intent, provisioning, cleanup, telemetry, billing,
 correction, retention, scheduling, route, and cost facts. Because those older
 predecessors retained a deduplicated billing fact set rather than receipt
 arrival order, their facts migrate with an explicit `historical_unknown`
-latest-reference state. The first successful, exact, original-bound version-7
+latest-reference state. The first successful, exact, original-bound
 poll establishes the latest retained receipt without reordering facts,
 replacing the immutable selection, or erasing corrections.
 Runtime startup never upgrades a legacy database. Operators must
@@ -380,8 +379,21 @@ implicit and explicit index origins/columns, and trigger text before touching
 the target. It does not case-fold or whitespace-normalize executable SQL.
 Schema addition, historical classification, route scrub, and
 trigger installation occur in that same transaction, so a failed or concurrent
-initializer cannot expose a partly fenced store. Existing
-non-requested rows are classified `HISTORICAL_UNKNOWN` and remain cleanup-only;
+initializer cannot expose a partly fenced store.
+
+An SDK inference admission atomically stores the canonical request fingerprint,
+accepted offer digest and first-create deadline in the original journal. The
+provisioning transition checks that deadline with a fresh clock under the SQLite
+write lock, separately from readiness and hard session expiry. Only an owner retry
+holding the exact original offer may revalidate placement and enter first create.
+Status and the background reconciler never start a quoted `REQUESTED` lease. An
+expired original request is fenced without creating capacity, including when it
+already had an unstarted row. Missing legacy quote authority never authorizes a
+first create, and an already admitted provider intent retains its original
+observation, cleanup and billing obligations.
+
+Non-requested rows from schemas without a writer contract are classified
+`HISTORICAL_UNKNOWN` and remain cleanup-only;
 saved routes are cleared in the same pre-trigger classification write, and no
 migration backfills missing original fingerprint inputs or derives original
 evidence from current configuration. A legacy provider ID is retained only as

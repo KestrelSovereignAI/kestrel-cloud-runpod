@@ -7,7 +7,7 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, closing
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -20,9 +20,12 @@ from uuid import UUID, uuid4
 from .billing import exact_decimal_integer_scale, exact_decimal_sum
 from .models import CloudType, RunPodManagerError
 from .ollama_contracts import (
+    INFERENCE_LEASE_ID_PREFIX,
+    OLLAMA_WRITER_CONTRACT_VERSION,
     OllamaAdditionalCleanupTarget,
     OllamaCleanupIntent,
     OllamaCleanupReceipt,
+    OllamaInferenceAdmission,
     OllamaLease,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
@@ -47,25 +50,34 @@ from .ollama_contracts import (
     ProvisionedOllamaResource,
     iso_datetime,
     normalize_new_ollama_request_money,
+    optional_iso_datetime,
     require_aware,
     resource_from_lease,
     runtime_telemetry_binding_for_intent,
 )
 from .sqlite_store import lease_database_connection
 
-_CURRENT_WRITER_CONTRACT_VERSION = 7
+_CURRENT_WRITER_CONTRACT_VERSION = OLLAMA_WRITER_CONTRACT_VERSION
 _BILLING_RETENTION_MANUAL_ERROR = (
     "billing evidence retention requires manual reconciliation"
 )
 _WRITER_TRIGGER_NAMES = (
+    "ollama_writer_insert_v8",
+    "ollama_writer_update_v8",
+    "ollama_writer_delete_v8",
+    "ollama_provisioning_evidence_insert_v8",
+    "ollama_provisioning_evidence_update_v8",
+    "ollama_lifecycle_evidence_update_v8",
+    "ollama_inference_admission_insert_v8",
+    "ollama_inference_admission_update_v8",
+)
+_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v7",
     "ollama_writer_update_v7",
     "ollama_writer_delete_v7",
     "ollama_provisioning_evidence_insert_v7",
     "ollama_provisioning_evidence_update_v7",
     "ollama_lifecycle_evidence_update_v7",
-)
-_PREVIOUS_WRITER_TRIGGER_NAMES = (
     "ollama_writer_insert_v6",
     "ollama_writer_update_v6",
     "ollama_writer_delete_v6",
@@ -117,6 +129,8 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
         "ambiguous_create_candidate_id",
         "original_requested_at",
         "original_readiness_timeout_seconds",
+        "inference_offer_sha256",
+        "inference_first_create_before",
         "runtime_telemetry_binding_sha256",
         "cleanup_intent_json",
         "cleanup_receipt_json",
@@ -135,7 +149,10 @@ _WRITER_CONTRACT_COLUMNS = frozenset(
         "billing_retention_exhausted",
     }
 )
-_V5_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+_V7_WRITER_CONTRACT_COLUMNS = _WRITER_CONTRACT_COLUMNS - {
+    "inference_offer_sha256", "inference_first_create_before",
+}
+_V5_WRITER_CONTRACT_COLUMNS = _V7_WRITER_CONTRACT_COLUMNS - {
     "lifecycle_billing_latest_reference_json",
 }
 _V3_WRITER_CONTRACT_COLUMNS = _V5_WRITER_CONTRACT_COLUMNS - {
@@ -207,6 +224,8 @@ _LEASE_COLUMNS = (
     _LeaseColumn("request_fingerprint", "TEXT", not_null=True),
     _LeaseColumn("original_requested_at", "TEXT"),
     _LeaseColumn("original_readiness_timeout_seconds", "INTEGER"),
+    _LeaseColumn("inference_offer_sha256", "TEXT"),
+    _LeaseColumn("inference_first_create_before", "TEXT"),
     _LeaseColumn("model", "TEXT", not_null=True),
     _LeaseColumn("constraints_json", "TEXT", not_null=True),
     _LeaseColumn("mode", "TEXT"),
@@ -260,7 +279,8 @@ _LEASE_COLUMNS = (
     _LeaseColumn("termination_reason", "TEXT"),
     _LeaseColumn("teardown_attempts", "INTEGER", not_null=True, default_sql="0"),
     _LeaseColumn("revision", "INTEGER", not_null=True, default_sql="0"),
-    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True, default_sql="7"),
+    _LeaseColumn("writer_contract_version", "INTEGER", not_null=True,
+                 default_sql=str(_CURRENT_WRITER_CONTRACT_VERSION)),
     _LeaseColumn("writer_epoch", "INTEGER", not_null=True, default_sql="0"),
     _LeaseColumn("reconcile_after", "TEXT"),
     _LeaseColumn(
@@ -393,9 +413,9 @@ def _execute_sql_script_transactionally(
 
 def _writer_trigger_script() -> str:
     return """
-        CREATE TRIGGER ollama_writer_insert_v7
+        CREATE TRIGGER ollama_writer_insert_v8
         BEFORE INSERT ON ollama_leases
-        WHEN NEW.writer_contract_version IS NOT 7
+        WHEN NEW.writer_contract_version IS NOT 8
           OR NEW.writer_epoch IS NOT 1
           OR NEW.revision IS NOT 0
           OR NEW.reconcile_after IS NULL
@@ -403,9 +423,9 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'current Ollama writer contract required');
         END;
 
-        CREATE TRIGGER ollama_writer_update_v7
+        CREATE TRIGGER ollama_writer_update_v8
         BEFORE UPDATE ON ollama_leases
-        WHEN OLD.writer_contract_version IS NOT 7
+        WHEN OLD.writer_contract_version IS NOT 8
           OR NEW.writer_contract_version IS NOT OLD.writer_contract_version
           OR NEW.writer_epoch IS NOT OLD.writer_epoch + 1
           OR NEW.revision IS NOT OLD.revision + 1
@@ -413,13 +433,13 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'stale Ollama writer');
         END;
 
-        CREATE TRIGGER ollama_writer_delete_v7
+        CREATE TRIGGER ollama_writer_delete_v8
         BEFORE DELETE ON ollama_leases
         BEGIN
             SELECT RAISE(ABORT, 'Ollama lease deletion is unsupported');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_insert_v7
+        CREATE TRIGGER ollama_provisioning_evidence_insert_v8
         BEFORE INSERT ON ollama_leases
         WHEN NEW.state IS NOT 'requested'
           OR NEW.provisioning_evidence_state IS NOT 'required'
@@ -457,7 +477,7 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'new Ollama lease must begin without provider evidence');
         END;
 
-        CREATE TRIGGER ollama_provisioning_evidence_update_v7
+        CREATE TRIGGER ollama_provisioning_evidence_update_v8
         BEFORE UPDATE ON ollama_leases
         WHEN
           (OLD.provisioning_evidence_state = 'required'
@@ -614,7 +634,7 @@ def _writer_trigger_script() -> str:
             SELECT RAISE(ABORT, 'invalid Ollama provisioning evidence mutation');
         END;
 
-        CREATE TRIGGER ollama_lifecycle_evidence_update_v7
+        CREATE TRIGGER ollama_lifecycle_evidence_update_v8
         BEFORE UPDATE ON ollama_leases
         WHEN
           (NEW.state = 'terminated'
@@ -856,7 +876,7 @@ def _writer_trigger_script() -> str:
                              '$.state') IS NOT 'not_observed'
           ))
           OR (NEW.lifecycle_billing_state = 'not_applicable' AND (
-                NEW.writer_contract_version IS NOT 7
+                NEW.writer_contract_version IS NOT 8
              OR NEW.provisioning_evidence_state IS NOT 'required'
              OR NEW.provisioning_intent_json IS NOT NULL
              OR NEW.provisioning_receipt_json IS NOT NULL
@@ -1045,6 +1065,47 @@ def _writer_trigger_script() -> str:
         BEGIN
             SELECT RAISE(ABORT, 'invalid Ollama lifecycle evidence mutation');
         END;
+        """ + f"""
+        CREATE TRIGGER ollama_inference_admission_insert_v8
+        BEFORE INSERT ON ollama_leases
+        WHEN (
+            NEW.lease_id GLOB '{INFERENCE_LEASE_ID_PREFIX}*' AND (
+                NEW.inference_offer_sha256 IS NULL
+                OR length(NEW.inference_offer_sha256) != 64
+                OR NEW.inference_offer_sha256 GLOB '*[^0-9a-f]*'
+                OR NEW.inference_first_create_before IS NULL
+                OR NEW.original_requested_at IS NULL
+                OR NEW.inference_first_create_before <= NEW.original_requested_at
+                OR NEW.inference_first_create_before > NEW.readiness_deadline
+            )
+        ) OR (
+            NEW.lease_id NOT GLOB '{INFERENCE_LEASE_ID_PREFIX}*'
+            AND (NEW.inference_offer_sha256 IS NOT NULL
+                 OR NEW.inference_first_create_before IS NOT NULL)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'inference lease requires original quote authority');
+        END;
+
+        CREATE TRIGGER ollama_inference_admission_update_v8
+        BEFORE UPDATE ON ollama_leases
+        WHEN NEW.lease_id IS NOT OLD.lease_id
+          OR NEW.inference_offer_sha256 IS NOT OLD.inference_offer_sha256
+          OR NEW.inference_first_create_before IS NOT OLD.inference_first_create_before
+          OR (
+            OLD.lease_id GLOB '{INFERENCE_LEASE_ID_PREFIX}*'
+            AND OLD.provisioning_intent_json IS NULL
+            AND NEW.provisioning_intent_json IS NOT NULL
+            AND (
+                OLD.inference_first_create_before IS NULL
+                OR NEW.provisioning_started_at IS NULL
+                OR NEW.provisioning_started_at >= OLD.inference_first_create_before
+                OR NEW.updated_at >= OLD.inference_first_create_before
+            )
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'inference first-create authority is immutable and bounded');
+        END;
         """
 
 
@@ -1173,6 +1234,7 @@ def _legacy_schema_is_supported(
             ("INTEGER", True, "4", False, 0),
             ("INTEGER", True, "5", False, 0),
             ("INTEGER", True, "6", False, 0),
+            ("INTEGER", True, "7", False, 0),
         )
 
     if not set(actual).issubset(expected) or any(
@@ -1183,6 +1245,7 @@ def _legacy_schema_is_supported(
     writer_columns = names & _WRITER_CONTRACT_COLUMNS
     if writer_columns and writer_columns not in {
         _WRITER_CONTRACT_COLUMNS,
+        _V7_WRITER_CONTRACT_COLUMNS,
         _V5_WRITER_CONTRACT_COLUMNS,
         _V3_WRITER_CONTRACT_COLUMNS,
         _V2_WRITER_CONTRACT_COLUMNS,
@@ -1196,7 +1259,7 @@ def _legacy_schema_is_supported(
                 "SELECT DISTINCT writer_contract_version FROM ollama_leases"
             ).fetchall()
         }
-        if not versions.issubset({1, 2, 3, 4, 5, 6, _CURRENT_WRITER_CONTRACT_VERSION}):
+        if not versions.issubset({1, 2, 3, 4, 5, 6, 7, _CURRENT_WRITER_CONTRACT_VERSION}):
             return False
         if len(versions) > 1:
             return False
@@ -1206,7 +1269,8 @@ def _legacy_schema_is_supported(
             3: _V3_WRITER_CONTRACT_COLUMNS,
             4: _V5_WRITER_CONTRACT_COLUMNS,
             5: _V5_WRITER_CONTRACT_COLUMNS,
-            6: _WRITER_CONTRACT_COLUMNS,
+            6: _V7_WRITER_CONTRACT_COLUMNS,
+            7: _V7_WRITER_CONTRACT_COLUMNS,
             _CURRENT_WRITER_CONTRACT_VERSION: _WRITER_CONTRACT_COLUMNS,
         }
         writer_default = actual["writer_contract_version"][2]
@@ -1311,13 +1375,13 @@ def _rebuild_current_lease_schema(
         source_names & _WRITER_CONTRACT_COLUMNS == _V3_WRITER_CONTRACT_COLUMNS
         and source_version == 3
     )
-    repairing_v7 = (
+    repairing_current = (
         source_names & _WRITER_CONTRACT_COLUMNS == _WRITER_CONTRACT_COLUMNS
         and source_version == _CURRENT_WRITER_CONTRACT_VERSION
     )
-    upgrading_v6 = (
-        source_names & _WRITER_CONTRACT_COLUMNS == _WRITER_CONTRACT_COLUMNS
-        and source_version == 6
+    upgrading_v6_or_v7 = (
+        source_names & _WRITER_CONTRACT_COLUMNS == _V7_WRITER_CONTRACT_COLUMNS
+        and source_version in (6, 7)
     )
     upgrading_v5 = (
         source_names & _WRITER_CONTRACT_COLUMNS == _V5_WRITER_CONTRACT_COLUMNS
@@ -1346,7 +1410,7 @@ def _rebuild_current_lease_schema(
         connection.execute(
             """
             UPDATE ollama_leases
-            SET writer_contract_version = 7,
+            SET writer_contract_version = 8,
                 writer_epoch = 0,
                 reconcile_after = updated_at,
                 provisioning_evidence_state = 'historical_unknown',
@@ -1382,13 +1446,13 @@ def _rebuild_current_lease_schema(
     else:
         if "ambiguous_candidate_mismatch_json" not in source_names:
             _translate_previous_candidate_mismatches(connection)
-        if repairing_v7:
+        if repairing_current:
             pass
-        elif upgrading_v6:
+        elif upgrading_v6_or_v7:
             connection.execute(
                 """
                 UPDATE ollama_leases
-                   SET writer_contract_version = 7,
+                   SET writer_contract_version = 8,
                        revision = revision + 1,
                        writer_epoch = writer_epoch + 1
                 """
@@ -1397,7 +1461,7 @@ def _rebuild_current_lease_schema(
             connection.execute(
                 """
                 UPDATE ollama_leases
-                   SET writer_contract_version = 7,
+                   SET writer_contract_version = 8,
                        lifecycle_billing_latest_reference_json = CASE
                            WHEN json_array_length(
                                   lifecycle_billing_observations_json
@@ -1413,7 +1477,7 @@ def _rebuild_current_lease_schema(
             connection.execute(
                 """
                 UPDATE ollama_leases
-                   SET writer_contract_version = 7,
+                   SET writer_contract_version = 8,
                        reconcile_after = updated_at,
                        lifecycle_billing_latest_reference_json = CASE
                            WHEN json_array_length(
@@ -1437,7 +1501,7 @@ def _rebuild_current_lease_schema(
             connection.execute(
                 """
                 UPDATE ollama_leases
-                    SET writer_contract_version = 7,
+                    SET writer_contract_version = 8,
                         lifecycle_billing_latest_reference_json =
                             '{"observation_id":null,"received_at":null,"state":"not_observed"}',
                         reconcile_after = updated_at,
@@ -1452,8 +1516,8 @@ def _rebuild_current_lease_schema(
                     """
             )
         if (
-            not repairing_v7
-            and not upgrading_v6
+            not repairing_current
+            and not upgrading_v6_or_v7
             and not upgrading_v4
             and not upgrading_v5
         ):
@@ -1477,8 +1541,8 @@ def _rebuild_current_lease_schema(
                     ),
                 )
         if (
-            not repairing_v7
-            and not upgrading_v6
+            not repairing_current
+            and not upgrading_v6_or_v7
             and not upgrading_v3
             and not upgrading_v4
             and not upgrading_v5
@@ -1614,7 +1678,7 @@ class SQLiteOllamaLeaseRepository:
         *,
         attestation: OllamaWriterDrainAttestation,
     ) -> SQLiteOllamaLeaseRepository:
-        """Install the v7 writer fence after an operator-controlled drain."""
+        """Install the current writer fence after an operator-controlled drain."""
 
         resolved = Path(path)
         if not resolved.is_absolute():
@@ -1673,9 +1737,12 @@ class SQLiteOllamaLeaseRepository:
                         and source_writer_version in (4, 5)
                     )
                     or (
+                        source_writer_columns == _V7_WRITER_CONTRACT_COLUMNS
+                        and source_writer_version in (6, 7)
+                    )
+                    or (
                         source_writer_columns == _WRITER_CONTRACT_COLUMNS
-                        and source_writer_version
-                        in (6, _CURRENT_WRITER_CONTRACT_VERSION)
+                        and source_writer_version == _CURRENT_WRITER_CONTRACT_VERSION
                     )
                 )
             )
@@ -1753,9 +1820,11 @@ class SQLiteOllamaLeaseRepository:
     def insert_request(
         self, request: OllamaLeaseRequest, *, now: datetime,
         journal_identity: str | None = None,
+        admission: OllamaInferenceAdmission | None = None,
     ) -> tuple[OllamaLease, bool]:
         return self._insert_request(
-            request, now=now, journal_identity=journal_identity, fence_absent=False
+            request.lease_id, request, now=now, journal_identity=journal_identity,
+            admission=admission, expire=False,
         )
 
     def journal_identity(self) -> str:
@@ -1778,19 +1847,31 @@ class SQLiteOllamaLeaseRepository:
                     pass
         raise RunPodManagerError("Ollama lease journal identity is missing or invalid")
 
-    def fence_absent_expired_request(
-        self, request: OllamaLeaseRequest, *, now: datetime, journal_identity: str
+    def fence_expired_inference_request(
+        self, lease_id: str, request: OllamaLeaseRequest | None, *,
+        now: datetime, journal_identity: str, admission: OllamaInferenceAdmission,
     ) -> OllamaLease:
-        """Settle absent intent atomically without a window for first dispatch."""
+        """Prove the original offer, then retire absent or unstarted intent."""
+        if now < admission.first_create_before:
+            raise ValueError("Inference first-create deadline has not elapsed")
         lease, _ = self._insert_request(
-            request, now=now, journal_identity=journal_identity, fence_absent=True
+            lease_id, request, now=now, journal_identity=journal_identity,
+            admission=admission, expire=True,
         )
         return lease
 
     def _insert_request(
-        self, request: OllamaLeaseRequest, *, now: datetime,
-        journal_identity: str | None, fence_absent: bool,
+        self, lease_id: str, request: OllamaLeaseRequest | None, *,
+        now: datetime, journal_identity: str | None,
+        admission: OllamaInferenceAdmission | None, expire: bool,
     ) -> tuple[OllamaLease, bool]:
+        if (
+            lease_id.startswith(INFERENCE_LEASE_ID_PREFIX) != (admission is not None)
+            or (admission is None) != (journal_identity is None)
+        ):
+            raise OllamaLeaseConflictError("Inference lease lacks original quote authority")
+        if request is not None and request.lease_id != lease_id:
+            raise OllamaLeaseConflictError("Original Ollama lease ID changed")
         inserted = False
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1800,13 +1881,15 @@ class SQLiteOllamaLeaseRepository:
             ):
                 raise OllamaLeaseConflictError("Original Ollama lease journal changed")
             row = connection.execute(
-                "SELECT * FROM ollama_leases WHERE lease_id = ?", (request.lease_id,)
+                "SELECT * FROM ollama_leases WHERE lease_id = ?", (lease_id,)
             ).fetchone()
             if row is None:
+                if request is None:
+                    raise OllamaLeaseConflictError("Original Ollama lease disappeared")
                 request = normalize_new_ollama_request_money(request)
                 request_started_at = request.requested_at or now
                 created_at = now
-                if fence_absent:
+                if expire:
                     if request.requested_at is None or request.requested_at >= now:
                         raise ValueError("Expired inference requires an original request timestamp")
                     # Represents the original approved intent, not an allocation
@@ -1825,6 +1908,10 @@ class SQLiteOllamaLeaseRepository:
                         else None
                     ),
                     request.readiness_timeout_seconds,
+                    admission.offer_sha256 if admission is not None else None,
+                    optional_iso_datetime(
+                        admission.first_create_before if admission is not None else None
+                    ),
                     request.model,
                     json.dumps(constraints, sort_keys=True, separators=(",", ":")),
                     request.mode.value,
@@ -1863,7 +1950,8 @@ class SQLiteOllamaLeaseRepository:
                     INSERT INTO ollama_leases (
                         lease_id, owner_id, workload_id, request_fingerprint,
                         original_requested_at,
-                        original_readiness_timeout_seconds, model,
+                        original_readiness_timeout_seconds,
+                        inference_offer_sha256, inference_first_create_before, model,
                         constraints_json, mode, state, teardown_state, created_at,
                         updated_at, last_used_at, idle_deadline, hard_deadline,
                         readiness_deadline, expected_session_seconds,
@@ -1872,38 +1960,73 @@ class SQLiteOllamaLeaseRepository:
                         max_authorized_cost, writer_contract_version, writer_epoch,
                         reconcile_after,
                         provisioning_evidence_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     values,
                 )
                 inserted = True
-                if fence_absent:
-                    original = self._locked_lease(connection, request.lease_id)
-                    terminal = self._update_locked(
-                        connection, original,
-                        {
-                            "state": OllamaLeaseState.TERMINATED,
-                            "teardown_state": OllamaTeardownState.COMPLETE,
-                            "updated_at": now,
-                            "termination_reason": "expired",
-                            "lifecycle_billing_state": OllamaLifecycleBillingState.NOT_APPLICABLE,
-                            "accrued_estimated_cost": 0.0,
-                        },
-                        "fence expired inference without a provider row",
-                    )
-                    return terminal, True
-            elif row["request_fingerprint"] != request.fingerprint:
+            elif request is not None and row["request_fingerprint"] != request.fingerprint:
                 normalized_request = normalize_new_ollama_request_money(request)
                 if row["request_fingerprint"] == normalized_request.fingerprint:
                     request = normalized_request
+            original = self._locked_lease(connection, lease_id)
+            if original.inference_admission != admission or (
+                request is not None and original.request_fingerprint != request.fingerprint
+            ):
+                raise OllamaLeaseConflictError(
+                    f"Lease '{lease_id}' already represents a different request or quote"
+                )
+            if expire and original.state is OllamaLeaseState.REQUESTED:
+                return self._retire_unstarted_inference(connection, original, now=now), inserted
             lease = self._decode_and_commit_locked(
-                connection, request.lease_id, "request insert"
-            )
-        if lease.request_fingerprint != request.fingerprint:
-            raise OllamaLeaseConflictError(
-                f"Lease '{request.lease_id}' already represents a different request"
+                connection, lease_id, "request insert"
             )
         return lease, inserted
+
+    def _retire_unstarted_inference(
+        self, connection: sqlite3.Connection, lease: OllamaLease, *, now: datetime,
+    ) -> OllamaLease:
+        if (
+            lease.state is not OllamaLeaseState.REQUESTED
+            or lease.provisioning_intent is not None
+            or lease.provider_resource_id is not None
+            or lease.ambiguous_create_candidate_id is not None
+            or lease.provision_attempt_id is not None
+            or lease.provision_attempts != 0
+            or lease.creation_uncertain
+        ):
+            raise OllamaLeaseConflictError("Inference lease has unresolved create custody")
+        return self._update_locked(
+            connection, lease,
+            {
+                "state": OllamaLeaseState.TERMINATED,
+                "teardown_state": OllamaTeardownState.COMPLETE,
+                "updated_at": now,
+                "termination_reason": "expired",
+                "lifecycle_billing_state": OllamaLifecycleBillingState.NOT_APPLICABLE,
+                "accrued_estimated_cost": 0.0,
+            },
+            "fence unstarted inference create",
+        )
+
+    def expire_inference_request_if_due(
+        self, lease: OllamaLease, *, clock: Callable[[], datetime],
+    ) -> OllamaLease:
+        """Background status may retire an unstarted quote, but never start it."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            now = clock()
+            if (
+                current.state is OllamaLeaseState.REQUESTED
+                and current.lease_id.startswith(INFERENCE_LEASE_ID_PREFIX)
+                and (
+                    current.inference_admission is None
+                    or now >= current.inference_admission.first_create_before
+                )
+            ):
+                return self._retire_unstarted_inference(connection, current, now=now)
+            return current
 
     def get(self, lease_id: str) -> OllamaLease | None:
         with self._connect() as connection:
@@ -1918,6 +2041,11 @@ class SQLiteOllamaLeaseRepository:
         unknown = set(changes).difference(self._COLUMNS)
         if unknown:
             raise ValueError(f"Unsupported Ollama lease updates: {sorted(unknown)}")
+        if (
+            lease.lease_id.startswith(INFERENCE_LEASE_ID_PREFIX)
+            and changes.get("state") == OllamaLeaseState.PROVISIONING
+        ):
+            raise OllamaLeaseConflictError("Inference first create requires guarded admission")
         changes = dict(changes)
         changes.setdefault("updated_at", datetime.now(UTC))
         with self._connect() as connection:
@@ -1927,6 +2055,41 @@ class SQLiteOllamaLeaseRepository:
                 lease,
                 changes,
                 "compare and set",
+            )
+
+    def admit_provisioning(
+        self, lease: OllamaLease, *, changes: Mapping[str, Any],
+        clock: Callable[[], datetime],
+    ) -> OllamaLease:
+        """Read the first-create clock after taking the actual write lock."""
+        if set(changes) - self._COLUMNS or "state" in changes or "updated_at" in changes:
+            raise ValueError("Unsupported Ollama provisioning admission fields")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._locked_lease(connection, lease.lease_id)
+            if (
+                current.state is OllamaLeaseState.TERMINATED
+                and current.request_fingerprint == lease.request_fingerprint
+                and current.inference_admission is not None
+                and current.inference_admission == lease.inference_admission
+                and current.provisioning_intent is None
+                and current.lifecycle_billing_state is OllamaLifecycleBillingState.NOT_APPLICABLE
+            ):
+                return current
+            if current.revision != lease.revision or current.state is not OllamaLeaseState.REQUESTED:
+                raise OllamaLeaseConflictError("Original Ollama first-create request changed")
+            now = clock()
+            if current.lease_id.startswith(INFERENCE_LEASE_ID_PREFIX):
+                admission = current.inference_admission
+                if admission is None or now >= min(
+                    admission.first_create_before, current.readiness_deadline,
+                    current.hard_deadline,
+                ):
+                    return self._retire_unstarted_inference(connection, current, now=now)
+            return self._update_locked(
+                connection, current,
+                {**changes, "state": OllamaLeaseState.PROVISIONING, "updated_at": now},
+                "admit original provider create",
             )
 
     def claim_cleanup_attempt(
@@ -3388,6 +3551,23 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
             raise RunPodManagerError(
                 "Stored Ollama candidate mismatch does not bind its intent"
             ) from exc
+    offer_sha256 = row["inference_offer_sha256"]
+    first_create_before = _optional_datetime(row["inference_first_create_before"])
+    if (offer_sha256 is None) != (first_create_before is None):
+        raise RunPodManagerError("Incomplete stored Ollama inference authority")
+    admission = None
+    if offer_sha256 is not None and first_create_before is not None:
+        try:
+            admission = OllamaInferenceAdmission(offer_sha256, first_create_before)
+        except (TypeError, ValueError) as exc:
+            raise RunPodManagerError("Invalid stored Ollama inference authority") from exc
+        original_time = _optional_datetime(row["original_requested_at"])
+        if (
+            not row["lease_id"].startswith(INFERENCE_LEASE_ID_PREFIX)
+            or original_time is None
+            or not original_time < first_create_before <= _datetime(row["readiness_deadline"])
+        ):
+            raise RunPodManagerError("Stored Ollama inference authority does not bind its row")
     lease = OllamaLease(
         lease_id=row["lease_id"],
         owner_id=row["owner_id"],
@@ -3395,6 +3575,7 @@ def _lease_from_row(row: sqlite3.Row) -> OllamaLease:
         request_fingerprint=row["request_fingerprint"],
         original_requested_at=_optional_datetime(row["original_requested_at"]),
         original_readiness_timeout_seconds=row["original_readiness_timeout_seconds"],
+        inference_admission=admission,
         model=row["model"],
         constraints_json=row["constraints_json"],
         mode=OllamaLeaseMode(row["mode"]) if row["mode"] else None,
