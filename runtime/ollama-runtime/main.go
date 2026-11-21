@@ -304,6 +304,9 @@ func loadConfig(getenv func(string) string, startedAt time.Time) (runtimeConfig,
 			return runtimeConfig{}, errors.New("KESTREL_OLLAMA_REQUIRE_CACHED_MODEL must be true or false")
 		}
 	}
+	if requireCached && !preload {
+		return runtimeConfig{}, errors.New("requiring a cached model also requires preload to verify it can be opened")
+	}
 	var provisionRequested *time.Time
 	if raw := getenv("KESTREL_OLLAMA_PROVISION_REQUESTED_AT"); raw != "" {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, raw)

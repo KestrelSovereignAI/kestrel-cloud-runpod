@@ -106,6 +106,7 @@ func TestLoadConfigRequiresSecretExpiryAndDigestPinnedAllowlist(t *testing.T) {
 		{name: "mutable latest", key: "KESTREL_OLLAMA_ALLOWED_MODELS", value: "model:latest"},
 		{name: "required absent", key: "KESTREL_OLLAMA_REQUIRED_MODEL", value: "different:v1"},
 		{name: "invalid cache policy", key: "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL", value: "maybe"},
+		{name: "cache required without preload", key: "KESTREL_OLLAMA_PRELOAD_MODEL", value: "false"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -725,6 +726,39 @@ func TestBootstrapRequiresExactCacheWithoutDownloadingOrPreloading(t *testing.T)
 				t.Fatalf("cache refusal took a download/preload or readiness path: %#v", snapshot)
 			}
 		})
+	}
+}
+
+func TestBootstrapRequiredCacheDoesNotPullWhenPreloadFails(t *testing.T) {
+	var pullCalls atomic.Int32
+	var preloadCalls atomic.Int32
+	server, upstream := testUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/version":
+			writeJSON(writer, http.StatusOK, map[string]string{"version": "test"})
+		case "/api/tags":
+			writeJSON(writer, http.StatusOK, map[string]any{"models": []map[string]any{
+				toolModel("registry.example/team/model:v1", strings.Repeat("a", 64)),
+			}})
+		case "/api/generate":
+			preloadCalls.Add(1)
+			writeJSON(writer, http.StatusInternalServerError, nil)
+		case "/api/pull":
+			pullCalls.Add(1)
+			writeJSON(writer, http.StatusInternalServerError, nil)
+		default:
+			writeJSON(writer, http.StatusNotFound, nil)
+		}
+	})
+	config := testConfig(upstream)
+	config.RequireCachedModel = true
+	state := newStartupState("initializing", time.Now())
+	err := bootstrap(context.Background(), config, state, server.Client())
+	if err == nil || !strings.Contains(err.Error(), "preload") {
+		t.Fatalf("expected a preload error, got %v", err)
+	}
+	if snapshot := state.snapshot(config); snapshot.Ready || pullCalls.Load() != 0 || preloadCalls.Load() != 1 {
+		t.Fatalf("failed preload published readiness or tried a pull: %#v", snapshot)
 	}
 }
 
