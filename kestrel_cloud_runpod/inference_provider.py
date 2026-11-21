@@ -1102,6 +1102,24 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
             if lease.runtime_telemetry_observations
             else None
         ),
+        "original_runtime_startup": _original_runtime_startup(lease),
+        "idle_deadline_at": (
+            optional_iso_datetime(lease.idle_deadline) if lease.ready_at else None
+        ),
+        "original_cleanup": (
+            {
+                "receipt_id": lease.cleanup_receipt.cleanup_receipt_id,
+                "basis": lease.cleanup_receipt.basis.value,
+                "delete_started_at": optional_iso_datetime(
+                    lease.cleanup_intent.delete_started_at
+                ),
+                "verified_absent_at": optional_iso_datetime(
+                    lease.cleanup_receipt.verified_absent_at
+                ),
+            }
+            if lease.cleanup_intent is not None and lease.cleanup_receipt is not None
+            else None
+        ),
         "lifecycle_billing_state": lease.lifecycle_billing_state.value,
         "lifecycle_billing_selected_observation_id": (
             lease.lifecycle_billing_selection.observation_id
@@ -1156,6 +1174,42 @@ def _lease_metadata(lease: OllamaLease) -> dict[str, Any]:
             }
         )
     return metadata
+
+
+def _original_runtime_startup(lease: OllamaLease) -> dict[str, Any] | None:
+    """Project only the original retained startup proof, not a later worker."""
+    intent = lease.provisioning_intent
+    if (
+        lease.ready_at is None
+        or intent is None
+        or not lease.runtime_telemetry_observations
+    ):
+        return None
+    observation = lease.runtime_telemetry_observations[0]
+    # Legacy readiness can predate the first attested snapshot. A final read
+    # made during cleanup is useful evidence, but did not prove lease startup.
+    if (
+        observation.observed_at > lease.ready_at
+        or (
+            lease.cleanup_intent is not None
+            and observation.observed_at >= lease.cleanup_intent.delete_started_at
+        )
+        or not observation.is_complete_startup_for(intent)
+    ):
+        return None
+    snapshot = observation.snapshot
+    return {
+        "observation_id": observation.observation_id,
+        "cache_only": intent.requires_cached_model,
+        "cache_hit": snapshot.proves_model_cache_hit,
+        "provision_requested_at": optional_iso_datetime(intent.provision_requested_at),
+        "runtime_ready_at": optional_iso_datetime(snapshot.ready_at),
+        "placement_and_image_pull_wall_ms": snapshot.placement_and_image_pull_wall_ms,
+        "ollama_boot_ms": snapshot.ollama_boot_ms,
+        "model_pull_ms": snapshot.model_pull_ms,
+        "model_load_ms": snapshot.model_load_ms,
+        "container_to_ready_ms": snapshot.container_to_ready_ms,
+    }
 
 
 def _quoted_maximum_serverless_cold_starts(
