@@ -81,6 +81,7 @@ from .ollama_contracts import (
 from .ollama_runtime import (
     build_ollama_runtime_environment,
     require_immutable_ollama_image,
+    require_ollama_model_digest,
 )
 from .placement import select_gpu
 from .pod_billing import read_exact_pod_billing
@@ -329,7 +330,16 @@ class RunpodOllamaCapacityProvider:
             serverless_max_workers=self.deployment.serverless_workers_max,
             failures=failures,
         )
-        return replace(plan, model_network_volume=observed_cache)
+        if observed_cache is None:
+            return plan
+        return replace(
+            plan,
+            model_network_volume=observed_cache,
+            model_cache_binding_sha256=self._model_cache_binding_sha256(
+                request, plan.mode, observed_cache, image=self._runtime_image(),
+                profile_environment=_resolve_env_vars(self.deployment.profile.env),
+            ),
+        )
 
     def _validate_model_cache_placement(
         self, request: OllamaLeaseRequest, observed_cache: NetworkVolume | None,
@@ -346,6 +356,28 @@ class RunpodOllamaCapacityProvider:
             raise RunPodManagerError(
                 "Ollama model cache must be in the one explicitly requested data center"
             )
+
+    def _runtime_image(self) -> str:
+        profile = self.deployment.profile
+        return require_immutable_ollama_image(
+            _resolve_env_vars({"image": profile.image_name})["image"]
+        )
+
+    def _model_cache_binding_sha256(
+        self, request: OllamaLeaseRequest, mode: OllamaLeaseMode, volume: NetworkVolume,
+        *, image: str, profile_environment: Mapping[str, str],
+    ) -> str:
+        return _json_sha256({
+            "contract": "runpod-ollama-model-cache/v1",
+            "volume_id": volume.id,
+            "volume_size_gb": volume.size_gb,
+            "volume_type": volume.volume_type.value,
+            "data_center": volume.data_center.casefold(),
+            "storage_path": self._model_storage_path(mode),
+            "image": image,
+            "model": request.model,
+            "model_digest": require_ollama_model_digest(profile_environment, request.model),
+        })
 
     def validate_runtime_request(
         self,
@@ -365,9 +397,16 @@ class RunpodOllamaCapacityProvider:
         ):
             raise RunPodManagerError("Runtime preflight requires a consistent plan")
         profile = self.deployment.profile
-        image = require_immutable_ollama_image(
-            _resolve_env_vars({"image": profile.image_name})["image"]
-        )
+        image = self._runtime_image()
+        profile_environment = _resolve_env_vars(profile.env)
+        if (
+            plan.model_network_volume is not None
+            and plan.model_cache_binding_sha256 != self._model_cache_binding_sha256(
+                request, mode, plan.model_network_volume, image=image,
+                profile_environment=profile_environment,
+            )
+        ):
+            raise RunPodManagerError("Ollama model cache binding changed before create")
         name = resource_name(request.lease_id)
         attempt_id = provision_attempt_id(request)
         telemetry_binding = ollama_runtime_telemetry_binding_sha256(
@@ -383,6 +422,7 @@ class RunpodOllamaCapacityProvider:
         environment = self._runtime_environment(
             request=request,
             mode=mode,
+            profile_environment=profile_environment,
             provision_requested_at=provision_requested_at,
             telemetry_binding_sha256=telemetry_binding,
         )
@@ -1018,18 +1058,24 @@ class RunpodOllamaCapacityProvider:
             transport=self._http_transport,
         )
 
+    def _model_storage_path(self, mode: OllamaLeaseMode) -> str:
+        profile = self.deployment.profile
+        if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER:
+            return "/runpod-volume/ollama" if profile.network_volume_id else "/models"
+        if profile.network_volume_id or profile.volume_gb:
+            return f"{(profile.volume_mount_path or '/workspace').rstrip('/')}/ollama"
+        return "/models"
+
     def _runtime_environment(
         self,
         *,
         request: OllamaLeaseRequest,
         mode: OllamaLeaseMode,
+        profile_environment: Mapping[str, str],
         provision_requested_at: datetime,
         telemetry_binding_sha256: str,
     ) -> dict[str, str]:
         profile = self.deployment.profile
-        require_immutable_ollama_image(
-            _resolve_env_vars({"image": profile.image_name})["image"]
-        )
         resource_type = (
             OllamaResourceType.SERVERLESS_ENDPOINT
             if mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
@@ -1045,22 +1091,13 @@ class RunpodOllamaCapacityProvider:
                     "A shared Ollama network-volume cache requires exactly one "
                     "Serverless worker to prevent concurrent mutation"
                 )
-            storage_path = (
-                "/runpod-volume/ollama" if profile.network_volume_id else "/models"
-            )
-        else:
-            storage_path = (
-                f"{(profile.volume_mount_path or '/workspace').rstrip('/')}/ollama"
-                if profile.network_volume_id or profile.volume_gb
-                else "/models"
-            )
         return build_ollama_runtime_environment(
-            _resolve_env_vars(profile.env),
+            profile_environment,
             requested_model=request.model,
             bearer_token=token,
             bearer_token_expires_at=request.hard_deadline,
             mode=mode,
-            model_storage_path=storage_path,
+            model_storage_path=self._model_storage_path(mode),
             provision_requested_at=provision_requested_at,
             telemetry_binding_sha256=telemetry_binding_sha256,
         )

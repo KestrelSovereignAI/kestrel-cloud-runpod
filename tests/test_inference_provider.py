@@ -47,7 +47,12 @@ from kestrel_cloud_runpod.inference_provider import (
     _inference_admission,
     _lease_id,
 )
-from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError
+from kestrel_cloud_runpod.models import (
+    GPUProfile,
+    NetworkVolume,
+    RunPodManagerError,
+    VolumeType,
+)
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -1782,6 +1787,30 @@ async def test_catalog_drift_above_the_accepted_quote_is_rejected_on_acquire(
     ):
         await adapter.acquire(request, quote)
     assert capacity.provision_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_same_region_cache_substitution_cannot_spend_an_accepted_quote(tmp_path):
+    clock = MutableClock()
+    volume = NetworkVolume("cache-a", "model-cache", 50, "US-TX-3", VolumeType.STANDARD)
+    plan = replace(
+        serverless_plan(), model_network_volume=volume,
+        model_cache_binding_sha256="a" * 64,
+    )
+    capacity = FakeOllamaProvider(plan)
+    adapter, service, _ = _adapter(tmp_path, clock, capacity=capacity)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    assert quote.metadata["model_cache_binding_sha256"] == "a" * 64
+
+    capacity.drift_plan = replace(
+        plan, model_network_volume=replace(volume, id="cache-b"),
+        model_cache_binding_sha256="b" * 64,
+    )
+    with pytest.raises(InferenceLeaseConstraintError, match="model cache binding"):
+        await adapter.acquire(request, quote)
+    assert capacity.provision_calls == 0
+    assert service.repository.get(_lease_id(request)) is None
 
 
 @pytest.mark.asyncio

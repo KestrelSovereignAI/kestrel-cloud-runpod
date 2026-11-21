@@ -98,17 +98,7 @@ def build_ollama_runtime_environment(
         )
     if expires_at <= requested_at:
         raise RunPodManagerError("Ollama workload bearer expires before provisioning")
-    allowed_raw = profile_environment.get("KESTREL_OLLAMA_ALLOWED_MODELS")
-    if not isinstance(allowed_raw, str) or not allowed_raw.strip():
-        raise RunPodManagerError(
-            "profiles.ollama.env.KESTREL_OLLAMA_ALLOWED_MODELS must configure "
-            + "digest-pinned operator policy"
-        )
-    allowed = parse_ollama_model_allowlist(allowed_raw)
-    if requested_model not in allowed:
-        raise RunPodManagerError(
-            f"Ollama model '{requested_model}' is not in the operator allowlist"
-        )
+    require_ollama_model_digest(profile_environment, requested_model)
     environment = dict(profile_environment)
     environment.update(
         {
@@ -126,6 +116,25 @@ def build_ollama_runtime_environment(
         }
     )
     return environment
+
+
+def require_ollama_model_digest(
+    profile_environment: Mapping[str, str], requested_model: str,
+) -> str:
+    """Return the exact operator pin for the same model used in runtime input."""
+
+    allowed_raw = profile_environment.get("KESTREL_OLLAMA_ALLOWED_MODELS")
+    if not isinstance(allowed_raw, str) or not allowed_raw.strip():
+        raise RunPodManagerError(
+            "profiles.ollama.env.KESTREL_OLLAMA_ALLOWED_MODELS must configure "
+            "digest-pinned operator policy"
+        )
+    digest = parse_ollama_model_allowlist(allowed_raw).get(requested_model)
+    if digest is None:
+        raise RunPodManagerError(
+            f"Ollama model '{requested_model}' is not in the operator allowlist"
+        )
+    return digest
 
 
 def parse_ollama_model_allowlist(raw: str) -> dict[str, str]:

@@ -67,7 +67,10 @@ written there. Fresh root-owned mounts are initialized safely before privilege
 drop; symlinks in a reused cache fail closed. Serverless network-volume mode
 requires one worker because Runpod does not serialize concurrent writers to a
 shared volume. Do not assume a reusable volume is available in the selected
-zone. The lease policy must choose cached, baked, or pull-on-start from the
+zone. A network-cache offer binds the observed volume and data center to the
+required mount, immutable image, and model digest. Changing any of those
+inputs requires a new offer; a content-free hash is enough to compare them.
+The lease policy must choose cached, baked, or pull-on-start from the
 measurements gathered in the live release gate.
 
 Authenticated `GET /kestrel/telemetry` reports content-free timestamps and

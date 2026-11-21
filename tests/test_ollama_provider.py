@@ -3860,11 +3860,16 @@ async def test_native_pod_mounts_separate_invalid_from_confirmed_foreign_storage
         sleep=clock.sleep,
     )
     request = _cache_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    volume = NetworkVolume(
+        "approved-volume", "model-cache", 50, "US-TX-3", VolumeType.STANDARD,
+    )
     plan = replace(
         pod_plan(rate=0.5),
         non_compute_components=(deployment.pod_non_compute_cost.covered_components),
-        model_network_volume=NetworkVolume(
-            "approved-volume", "model-cache", 50, "US-TX-3", VolumeType.STANDARD,
+        model_network_volume=volume,
+        model_cache_binding_sha256=provider._model_cache_binding_sha256(
+            request, request.mode, volume, image=_TEST_IMAGE,
+            profile_environment=deployment.profile.env,
         ),
     )
 
@@ -7348,6 +7353,34 @@ async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch)
     assert pod_client.pod_request.env["KESTREL_OLLAMA_MODEL_STORAGE_PATH"] == (
         "/workspace/ollama"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ("image", "model", "mount"))
+async def test_existing_cache_cannot_change_after_ollama_placement(monkeypatch, changed):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    profile = replace(_profile(), network_volume_id="volume-1")
+    cache_cost = non_compute_cost_policy(include_network_volume=True)
+    deployment = replace(
+        _deployment(), profile=profile,
+        serverless_non_compute_cost=cache_cost, pod_non_compute_cost=cache_cost,
+    )
+    client = _ControlClient()
+    clock = MutableClock()
+    request = _cache_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    quoted = _provider(client=client, deployment=deployment)
+    plan = await quoted.plan(request)
+    different_digest = "sha256:" + "b" * 64
+    if changed == "image":
+        monkeypatch.setenv("TEST_OLLAMA_IMAGE", f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@{different_digest}")
+    elif changed == "model":
+        profile = replace(profile, env={"KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{different_digest}"})
+    else:
+        profile = replace(profile, volume_mount_path="/workspace/different")
+    changed_provider = _provider(client=client, deployment=replace(deployment, profile=profile))
+    with pytest.raises(RunPodManagerError, match="Ollama model cache binding changed"):
+        changed_provider.validate_runtime_request(request, plan, provision_requested_at=clock())
+    assert client.pod_request is None
 
 
 def test_persistent_pod_volume_is_not_billed_as_a_network_volume():
