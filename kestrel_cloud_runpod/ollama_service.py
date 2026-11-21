@@ -30,6 +30,7 @@ from .ollama_contracts import (
     INFERENCE_LEASE_ID_PREFIX,
     OllamaCapacityProvider,
     OllamaCleanupIntent,
+    OllamaFirstCreateExpiredError,
     OllamaInferenceAdmission,
     OllamaLease,
     OllamaLeaseAuthorizationError,
@@ -496,6 +497,10 @@ class OllamaLeaseService:
         )
         if lease.state is OllamaLeaseState.TERMINATED:
             return lease
+        if lease.inference_admission is not None:
+            prepared = replace(
+                prepared, first_create_before=lease.inference_admission.first_create_before,
+            )
         return await await_owned_effect(self._provision_effect(lease, prepared))
 
     async def _provision_effect(
@@ -510,14 +515,14 @@ class OllamaLeaseService:
         if _provisioning_deadline_reached(lease, now) or (
             admission is not None and now >= admission.first_create_before
         ):
-            lease = self.repository.compare_and_set(
-                lease,
-                changes={"creation_uncertain": False},
-            )
-            return await self._release(lease, reason="expired")
+            return await self._release_expired_before_post(lease)
 
         try:
             resource = await self.provider.provision(prepared)
+        except OllamaFirstCreateExpiredError as exc:
+            if is_execution_control_error(exc):
+                raise
+            return await self._release_expired_before_post(lease)
         except OllamaProvisioningMismatchError as exc:
             if is_execution_control_error(exc):
                 raise
@@ -586,6 +591,13 @@ class OllamaLeaseService:
         if _provisioning_deadline_reached(lease, self._now()):
             return await self._release(lease, reason="expired")
         return lease
+
+    async def _release_expired_before_post(self, lease: OllamaLease) -> OllamaLease:
+        """Only the original owned worker may report it never sent this POST."""
+        lease = self.repository.compare_and_set(
+            lease, changes={"creation_uncertain": False},
+        )
+        return await self._release(lease, reason="expired")
 
     async def get(
         self, lease_id: str, *, owner_id: str, workload_id: str
@@ -701,12 +713,16 @@ class OllamaLeaseService:
             OllamaLeaseState.RECONCILE_REQUIRED,
             OllamaLeaseState.WAITING_FOR_MODEL,
         }:
+            admission = lease.inference_admission
             for cutoff in (
                 lease.hard_deadline,
                 lease.readiness_deadline,
                 authorized_cost_deadline(lease),
+                admission.first_create_before
+                if admission is not None and lease.state is OllamaLeaseState.REQUESTED
+                else None,
             ):
-                if now < cutoff < retry:
+                if cutoff is not None and now < cutoff < retry:
                     retry = cutoff
         elif lease.state is OllamaLeaseState.READY:
             for cutoff in (

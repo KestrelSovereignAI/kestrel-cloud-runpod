@@ -261,6 +261,8 @@ class RunpodInferenceLeaseProvider:
             # no provisioning or route authority. Return its owner-only state.
             self._authorize(existing, request.owner_id)
             return self._to_sdk_lease(existing, runtime=runtime)
+        if existing is not None and existing.inference_admission is None:
+            return self._recover_predecessor_reference(request, quote, existing, runtime)
         if quote.expires_at <= now:
             if existing is None:
                 raise InferenceLeaseConstraintError("Runpod quote expired before acquisition")
@@ -365,6 +367,8 @@ class RunpodInferenceLeaseProvider:
             raise InferenceLeaseConstraintError("quote does not identify this Runpod request")
         lease_id = _lease_id(request)
         existing = runtime.service.repository.get(lease_id)
+        if existing is not None and existing.inference_admission is None:
+            return self._recover_predecessor_reference(request, quote, existing, runtime)
         journal_identity = self._validate_lease_journal(runtime, quote)
         original_request = (
             self._original_quote_request(request, quote, policy=runtime.policy)
@@ -376,6 +380,8 @@ class RunpodInferenceLeaseProvider:
                 admission=_inference_admission(request, quote),
             )
         except OllamaLeaseConflictError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseConstraintError(
                 "expired offer does not match the original Runpod request and quote"
             ) from exc
@@ -386,6 +392,41 @@ class RunpodInferenceLeaseProvider:
         ):
             return self._to_sdk_lease(original, runtime=runtime)
         return await self.status(request.owner_id, lease_id)
+
+    def _recover_predecessor_reference(
+        self, request: InferenceLeaseRequest, quote: InferenceLeaseQuote,
+        lease: OllamaLease, runtime: _Runtime,
+    ) -> InferenceLease:
+        """Recover an old Core pending record without inventing quote authority."""
+        self._authorize(lease, request.owner_id)
+        if "lease_journal_identity" in quote.metadata:
+            raise InferenceLeaseConstraintError("Runpod quote has no original admission row")
+        self._validate_quote(
+            request, quote, policy=runtime.policy, now=self._now(),
+            allow_elapsed_deadline=True,
+        )
+        original = self._quote_request(
+            request, quote, policy=runtime.policy,
+            provider_region=runtime.policy.regions[quote.region],
+        )
+        intent = lease.provisioning_intent
+        if lease.request_fingerprint != original.fingerprint or (
+            intent is not None and (
+                quote.metadata.get("gpu_id") != intent.selected_gpu_id
+                or quote.metadata.get("gpu_pool") != intent.selected_gpu_pool
+                or quote.metadata.get("gpu_name") != intent.selected_gpu_name
+            )
+        ):
+            raise InferenceLeaseConstraintError(
+                "Predecessor lease does not match the retained request and placement"
+            )
+        if lease.state is OllamaLeaseState.REQUESTED:
+            # No recorded quote is not permission to start a new POST. Retire
+            # only a proved unstarted row; no provider client is contacted here.
+            lease = runtime.service.repository.expire_inference_request_if_due(
+                lease, clock=self._now,
+            )
+        return self._to_sdk_lease(lease, runtime=runtime, observe_only=True)
 
     @staticmethod
     def _validate_lease_journal(
@@ -806,9 +847,15 @@ class RunpodInferenceLeaseProvider:
                 "live Runpod cold-start exposure differs from the accepted quote"
             )
 
-    def _to_sdk_lease(self, lease: OllamaLease, *, runtime: _Runtime) -> InferenceLease:
+    def _to_sdk_lease(
+        self, lease: OllamaLease, *, runtime: _Runtime, observe_only: bool = False,
+    ) -> InferenceLease:
         now = self._now()
         state = _sdk_state(lease, now)
+        if observe_only and state is InferenceLeaseState.READY:
+            # Do not resurrect a route from a journal read. A later owner
+            # status call must observe the original provider and ready model.
+            state = InferenceLeaseState.PENDING
         updated_at = max(lease.created_at, min(lease.updated_at, now))
         if (
             lease.provisioning_evidence_state

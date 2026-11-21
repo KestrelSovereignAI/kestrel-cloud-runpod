@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -65,6 +66,7 @@ from kestrel_cloud_runpod.models import (
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaCleanupBasis,
     OllamaCleanupIntent,
+    OllamaFirstCreateExpiredError,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
@@ -581,6 +583,68 @@ def test_workload_credentials_must_not_reuse_control_or_cross_product_keys():
             serverless_api_key=_SERVERLESS_TOKEN,
             pod_bearer_token=_SERVERLESS_TOKEN,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", (OllamaLeaseMode.DEDICATED_POD, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER))
+async def test_runpod_worker_does_not_dispatch_a_queued_create_after_its_deadline(
+    monkeypatch, mode,
+):
+    monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
+    clock = MutableClock()
+    request = make_request(clock, mode=mode)
+    plan = pod_plan() if mode is OllamaLeaseMode.DEDICATED_POD else serverless_plan()
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            paths.append(self.path)
+            self.send_error(500)
+
+    server = OwnedLoopbackHTTPServer(
+        server_factory=lambda: ThreadingHTTPServer(("127.0.0.1", 0), Handler),
+        thread_factory=lambda item: threading.Thread(target=item.serve_forever),
+        client_factory=lambda item: RunpodControlPlaneClient(
+            api_key="loopback-only",
+            base_url=f"http://127.0.0.1:{item.server_port}/v2",
+            max_safe_retries=0,
+        ),
+    )
+    loop = asyncio.get_running_loop()
+    worker_blocked = asyncio.Event()
+    release_worker = threading.Event()
+
+    def occupy_worker():
+        loop.call_soon_threadsafe(worker_blocked.set)
+        if not release_worker.wait(timeout=10):
+            raise AssertionError("test did not release its executor")
+
+    with server as client, ThreadPoolExecutor(max_workers=1) as executor:
+        loop.set_default_executor(executor)
+        blocker = loop.run_in_executor(executor, occupy_worker)
+        queued = None
+        try:
+            await asyncio.wait_for(worker_blocked.wait(), timeout=5)
+            provider = _provider(client=client)
+            provider._clock = clock
+            deadline = clock() + timedelta(seconds=1)
+            prepared = replace(
+                provider.validate_runtime_request(request, plan, provision_requested_at=clock()),
+                first_create_before=deadline,
+            )
+            queued = asyncio.create_task(provider.provision(prepared))
+            await asyncio.sleep(0)
+            assert not queued.done()
+            clock.value = deadline
+            release_worker.set()
+            with pytest.raises(OllamaFirstCreateExpiredError, match="first create POST"):
+                await queued
+        finally:
+            release_worker.set()
+            await blocker
+            if queued is not None and not queued.done():
+                await queued
+    assert paths == []
 
 
 @pytest.mark.asyncio

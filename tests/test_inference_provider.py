@@ -576,6 +576,8 @@ async def test_expired_quote_fences_first_create_after_requested_row_wins(
         before = observer_service.repository.get(_lease_id(request))
         assert before.state is OllamaLeaseState.REQUESTED
         assert before.inference_admission.first_create_before == quote.expires_at
+        observer_service.poll_interval_seconds = 200
+        assert observer_service._next_reconcile_at(before, now=clock()) == quote.expires_at
         if background_first:
             still_pending = await competing.status(request.owner_id, before.lease_id)
             assert still_pending.state is InferenceLeaseState.PENDING
@@ -621,6 +623,84 @@ async def test_expired_recovery_requires_the_exact_original_offer(tmp_path, chan
     recovered = await adapter.reconcile_expired_acquisition(request, quote)
     assert recovered.state is InferenceLeaseState.EXPIRED
     assert capacity.provision_calls == capacity.teardown_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(InferenceLeaseCoordinator, "_dispatch_acquisition"),
+    reason="Core #4193's explicit expired-intent reconciliation is not installed",
+)
+@pytest.mark.parametrize("expired", (False, True))
+@pytest.mark.parametrize("submitted", (False, True))
+async def test_core_restores_migrated_v7_pending_reference_without_provider_effects(
+    tmp_path, expired, submitted,
+):
+    from test_ollama_repository import _rewrite_writer_contract_default
+
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    if submitted:
+        await adapter.acquire(request, quote)
+    else:
+        _insert_sdk_request(adapter, service, clock, request, quote)
+    legacy_quote = replace(quote, metadata={
+        name: value for name, value in quote.metadata.items()
+        if name not in {"lease_journal_identity", "lease_data_center_id", "lease_request_fingerprint"}
+    })
+    database = service.repository.path
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for (trigger,) in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ollama_leases'"
+        ).fetchall():
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("UPDATE ollama_leases SET writer_contract_version = 7")
+        _rewrite_writer_contract_default(connection, 7)
+    service.repository = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        database,
+        attestation=OllamaWriterDrainAttestation(
+            database_path=database, drained_at=clock(), drain_reference_sha256=_DIGEST,
+        ),
+    )
+    before = service.repository.get(_lease_id(request))
+    assert before is not None and before.inference_admission is None
+    if expired:
+        clock.value = quote.expires_at
+
+    class RouteLessHost:
+        async def deactivate_inference_lease(self, lease_id, *, require_active=False):
+            assert lease_id == before.lease_id
+            assert not require_active
+
+    core_state = tmp_path / "core-lease.json"
+
+    async def persist(payload):
+        core_state.write_text(json.dumps(payload), encoding="utf-8")
+
+    record = InferenceLeaseRecord(
+        provider_name="runpod", request=request, quote=legacy_quote,
+    )
+    await persist(record.to_persisted_dict())
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=RouteLessHost(), owner_id=request.owner_id,
+        providers={"runpod": adapter}, clock=clock, persist_state=persist,
+    )
+    recovered = await coordinator.restore(json.loads(core_state.read_text(encoding="utf-8")))
+    assert recovered is not None and recovered.lease_id == before.lease_id
+    assert json.loads(core_state.read_text(encoding="utf-8"))["lease"]["lease_id"] == before.lease_id
+    assert recovered.route is None
+    assert capacity.provision_calls == int(submitted)
+    assert capacity.teardown_calls == 0
+    after = service.repository.get(before.lease_id)
+    assert after is not None and after.inference_admission is None
+    if submitted:
+        assert recovered.state is InferenceLeaseState.PENDING
+        assert after == before
+    else:
+        assert recovered.state is InferenceLeaseState.EXPIRED
+        assert recovered.estimated_total_cost_usd == 0
+        assert after.provisioning_intent is None
 
 
 @pytest.mark.asyncio
