@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -40,7 +42,11 @@ from pod_capacity_test_support import (
 from pydantic import SecretStr
 
 from kestrel_cloud_runpod.billing import exact_decimal_integer_scale
-from kestrel_cloud_runpod.inference_provider import RunpodInferenceLeaseProvider
+from kestrel_cloud_runpod.inference_provider import (
+    RunpodInferenceLeaseProvider,
+    _inference_admission,
+    _lease_id,
+)
 from kestrel_cloud_runpod.models import GPUProfile, RunPodManagerError
 from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseAuthorizationError,
@@ -131,6 +137,16 @@ def _adapter(tmp_path, clock, capacity=None, gpu_count=1):
         clock=clock,
     )
     return adapter, service, capacity
+
+
+def _insert_sdk_request(adapter, service, clock, request, quote):
+    original = adapter._original_quote_request(
+        request, quote, policy=adapter._get_runtime().policy,
+    )
+    return service.repository.insert_request(
+        original, now=clock(), admission=_inference_admission(request, quote),
+        journal_identity=quote.metadata["lease_journal_identity"],
+    )
 
 
 @pytest.mark.asyncio
@@ -525,6 +541,86 @@ async def test_expired_acquisition_cannot_create_capacity(tmp_path, submitted):
         assert recovered.lease_id == original.lease_id
         assert recovered.quote_id == original.quote_id
         assert capacity.provision_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("background_first", (False, True))
+async def test_expired_quote_fences_first_create_after_requested_row_wins(
+    tmp_path, background_first,
+):
+    prepared = threading.Event()
+    permit_commit = threading.Event()
+
+    class PausedCapacity(FakeOllamaProvider):
+        def validate_runtime_request(self, *args, **kwargs):
+            result = super().validate_runtime_request(*args, **kwargs)
+            prepared.set()
+            if not permit_commit.wait(timeout=10):
+                raise AssertionError("test did not release the paused create")
+            return result
+
+    clock = MutableClock()
+    capacity = FakeOllamaProvider(serverless_plan())
+    owning, owner_service, _ = _adapter(tmp_path, clock, capacity)
+    request = _request(clock)
+    quote = await owning.quote(request)
+    # A separate process would obtain its own repository and SQLite connections.
+    # Keep both actors in-process while actually crossing the journal boundary.
+    competing, observer_service, observer = _adapter(tmp_path, clock)
+    owner_service.provider = PausedCapacity(serverless_plan())
+    acquiring = asyncio.create_task(asyncio.to_thread(
+        lambda: asyncio.run(owning.acquire(request, quote))
+    ))
+    try:
+        assert await asyncio.to_thread(prepared.wait, 5)
+        before = observer_service.repository.get(_lease_id(request))
+        assert before.state is OllamaLeaseState.REQUESTED
+        assert before.inference_admission.first_create_before == quote.expires_at
+        if background_first:
+            still_pending = await competing.status(request.owner_id, before.lease_id)
+            assert still_pending.state is InferenceLeaseState.PENDING
+            assert observer.provision_calls == 0
+        clock.value = quote.expires_at
+        assert clock() < before.readiness_deadline
+        if background_first:
+            expired = await competing.status(request.owner_id, before.lease_id)
+            assert expired.state is InferenceLeaseState.EXPIRED
+    finally:
+        permit_commit.set()
+        final = await acquiring
+    assert final.state is InferenceLeaseState.EXPIRED
+    assert final.estimated_total_cost_usd == 0
+    assert owner_service.provider.provision_calls == observer.provision_calls == 0
+    assert owner_service.provider.teardown_calls == observer.teardown_calls == 0
+    durable = observer_service.repository.get(_lease_id(request))
+    assert durable.state is OllamaLeaseState.TERMINATED
+    assert durable.provisioning_intent is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("model", "gpu", "cost", "expiry"))
+async def test_expired_recovery_requires_the_exact_original_offer(tmp_path, change):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    quote = await adapter.quote(request)
+    original, _ = _insert_sdk_request(adapter, service, clock, request, quote)
+    clock.value = quote.expires_at + timedelta(seconds=2)
+    different_request, different_quote = request, quote
+    if change == "model":
+        different_request = replace(request, model="other:model")
+    elif change == "gpu":
+        different_quote = replace(quote, metadata={**quote.metadata, "gpu_id": "other"})
+    elif change == "cost":
+        different_request = replace(request, max_total_cost_usd=Decimal("2.00"))
+    else:
+        different_quote = replace(quote, expires_at=quote.expires_at + timedelta(seconds=1))
+    with pytest.raises(InferenceLeaseConstraintError, match="original Runpod request and quote"):
+        await adapter.reconcile_expired_acquisition(different_request, different_quote)
+    assert service.repository.get(original.lease_id) == original
+    recovered = await adapter.reconcile_expired_acquisition(request, quote)
+    assert recovered.state is InferenceLeaseState.EXPIRED
+    assert capacity.provision_calls == capacity.teardown_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1354,24 +1450,18 @@ async def test_total_cost_planning_never_rounds_below_exact_multi_gpu_exposure(
     assert capacity.provision_calls == 0
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "internal_state", [OllamaLeaseState.READY, OllamaLeaseState.TERMINATED]
 )
-def test_sdk_projection_exposes_historical_unknown_manual_debt(
+async def test_sdk_projection_exposes_historical_unknown_manual_debt(
     tmp_path, internal_state
 ):
     clock = MutableClock()
     adapter, service, _capacity = _adapter(tmp_path, clock)
     request = _request(clock)
-    internal_request = adapter._internal_request(
-        request,
-        policy=adapter._get_runtime().policy,
-        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-        provider_region="US-TX-3",
-        max_hourly_cost=request.max_hourly_cost_usd,
-        max_total_cost=request.max_total_cost_usd,
-    )
-    lease, _ = service.repository.insert_request(internal_request, now=clock())
+    quote = await adapter.quote(request)
+    lease, _ = _insert_sdk_request(adapter, service, clock, request, quote)
     historical = replace(
         lease,
         state=internal_state,
@@ -1379,6 +1469,7 @@ def test_sdk_projection_exposes_historical_unknown_manual_debt(
             OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
         ),
         route_url=None,
+        inference_admission=None,
     )
 
     projected = adapter._to_sdk_lease(historical, runtime=adapter._get_runtime())
@@ -1388,7 +1479,7 @@ def test_sdk_projection_exposes_historical_unknown_manual_debt(
     assert projected.failure is None
     assert projected.metadata["provisioning_evidence_state"] == "historical_unknown"
     assert projected.metadata["manual_reconciliation_required"] is True
-    assert projected.hourly_cost_usd == request.max_hourly_cost_usd
+    assert projected.hourly_cost_usd == quote.hourly_cost_usd
     assert projected.estimated_total_cost_usd == request.max_total_cost_usd
 
 
@@ -1486,26 +1577,21 @@ async def test_core_coordinator_retains_historical_unknown_as_manual_debt(tmp_pa
     assert llm.deactivated == 5
 
 
-def test_installed_core_accepts_manual_debt_from_every_live_predecessor(tmp_path):
+@pytest.mark.asyncio
+async def test_installed_core_accepts_manual_debt_from_every_live_predecessor(tmp_path):
     """Pin the real Core transition contract used by the UNKNOWN projection."""
 
     clock = MutableClock()
     adapter, service, _capacity = _adapter(tmp_path, clock)
     request = _request(clock)
-    internal_request = adapter._internal_request(
-        request,
-        policy=adapter._get_runtime().policy,
-        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-        provider_region="US-TX-3",
-        max_hourly_cost=request.max_hourly_cost_usd,
-        max_total_cost=request.max_total_cost_usd,
-    )
-    internal, _ = service.repository.insert_request(internal_request, now=clock())
+    quote = await adapter.quote(request)
+    internal, _ = _insert_sdk_request(adapter, service, clock, request, quote)
     historical = replace(
         internal,
         provisioning_evidence_state=(
             OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
         ),
+        inference_admission=None,
     )
     current = adapter._to_sdk_lease(historical, runtime=adapter._get_runtime())
     assert current.state is InferenceLeaseState.RELEASING
@@ -1570,15 +1656,7 @@ async def test_unprovisioned_lease_reports_the_whole_lease_hourly_cost(tmp_path)
     request = _request(clock, max_hourly_cost_usd=D("1.00"))
     quote = await adapter.quote(request)
     runtime = adapter._get_runtime()
-    internal_request = adapter._internal_request(
-        request,
-        policy=runtime.policy,
-        mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
-        provider_region=runtime.policy.regions[quote.region],
-        max_hourly_cost=quote.hourly_cost_usd,
-        max_total_cost=request.max_total_cost_usd,
-    )
-    stored, inserted = service.repository.insert_request(internal_request, now=clock())
+    stored, inserted = _insert_sdk_request(adapter, service, clock, request, quote)
     assert inserted is True
 
     # Exercise the genuine pre-provision crash window: the durable REQUESTED

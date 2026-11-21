@@ -38,6 +38,8 @@ from .billing import (
 from .models import GPUProfile, RunPodManagerError
 from .ollama import _required_int
 from .ollama_contracts import (
+    INFERENCE_LEASE_ID_PREFIX,
+    OllamaInferenceAdmission,
     OllamaLease,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -58,6 +60,7 @@ from .ollama_provider import RunpodOllamaCapacityProvider
 from .ollama_runtime import parse_ollama_model_allowlist
 from .ollama_service import OllamaLeaseService
 from .providers import _resolve_env_vars
+from .signed_invocations import canonical_sha256
 
 _PROVIDER_NAME = "runpod"
 _RUNTIME = "ollama"
@@ -220,7 +223,7 @@ class RunpodInferenceLeaseProvider:
         metadata = _quote_metadata(plan, lease_id=_lease_id(request))
         metadata["lease_journal_identity"] = runtime.service.repository.journal_identity()
         metadata["lease_data_center_id"] = provider_region
-        return InferenceLeaseQuote(
+        quote = InferenceLeaseQuote(
             quote_id=_quote_id(request),
             request_id=request.request_id,
             provider_name=self.provider_name,
@@ -233,6 +236,12 @@ class RunpodInferenceLeaseProvider:
             expires_at=expires_at,
             metadata=metadata,
         )
+        original_request = self._quote_request(
+            request, quote, policy=runtime.policy, provider_region=provider_region,
+        )
+        return replace(quote, metadata={
+            **metadata, "lease_request_fingerprint": original_request.fingerprint,
+        })
 
     async def acquire(
         self,
@@ -243,13 +252,27 @@ class RunpodInferenceLeaseProvider:
         now = self._now()
         lease_id = _lease_id(request)
         existing = runtime.service.repository.get(lease_id)
+        if (
+            existing is not None
+            and existing.provisioning_evidence_state
+            is OllamaProvisioningEvidenceState.HISTORICAL_UNKNOWN
+        ):
+            # A legacy manual liability has no accepted quote to replay and
+            # no provisioning or route authority. Return its owner-only state.
+            self._authorize(existing, request.owner_id)
+            return self._to_sdk_lease(existing, runtime=runtime)
         if quote.expires_at <= now:
             if existing is None:
                 raise InferenceLeaseConstraintError("Runpod quote expired before acquisition")
             return await self.reconcile_expired_acquisition(request, quote)
-        journal_identity = self._validate_lease_journal(runtime, quote, existing)
+        journal_identity = self._validate_lease_journal(runtime, quote)
+        admission = _inference_admission(request, quote)
         if existing is not None:
             self._authorize(existing, request.owner_id)
+            if existing.inference_admission != admission:
+                raise InferenceLeaseConstraintError(
+                    "request_id already represents different Runpod constraints or quote"
+                )
         self._validate_quote(
             request,
             quote,
@@ -258,12 +281,8 @@ class RunpodInferenceLeaseProvider:
             allow_elapsed_deadline=existing is not None,
         )
         mode = _quote_mode(quote)
-        provider_region = runtime.policy.regions[quote.region]
-        internal_request = self._quote_request(
-            request,
-            quote,
-            policy=runtime.policy,
-            provider_region=provider_region,
+        internal_request = self._original_quote_request(
+            request, quote, policy=runtime.policy,
         )
         plan: OllamaPlacementPlan | None = None
         readiness_elapsed = now >= (
@@ -301,6 +320,7 @@ class RunpodInferenceLeaseProvider:
                 wait_until_ready=False,
                 plan=plan,
                 journal_identity=journal_identity,
+                admission=admission,
             )
         except OllamaLeaseAuthorizationError as exc:
             if is_execution_control_error(exc):
@@ -323,6 +343,10 @@ class RunpodInferenceLeaseProvider:
                     "Runpod could not persist the Ollama acquisition"
                 ) from exc
             self._authorize(persisted, request.owner_id)
+            if persisted.inference_admission != admission:
+                raise InferenceLeaseConstraintError(
+                    "request_id already represents different Runpod constraints or quote"
+                ) from exc
             internal = persisted
         return self._to_sdk_lease(internal, runtime=runtime)
 
@@ -341,37 +365,33 @@ class RunpodInferenceLeaseProvider:
             raise InferenceLeaseConstraintError("quote does not identify this Runpod request")
         lease_id = _lease_id(request)
         existing = runtime.service.repository.get(lease_id)
-        journal_identity = self._validate_lease_journal(runtime, quote, existing)
-        if existing is None:
-            # The authoritative journal must also atomically fence the old
-            # lease ID. A read-only absence check would race a paused writer.
-            if journal_identity is None:
-                raise InferenceLeaseConstraintError("Runpod quote has no original journal")
-            original_region = quote.metadata.get("lease_data_center_id")
-            if not isinstance(original_region, str) or original_region.strip().lower() != quote.region:
-                raise InferenceLeaseConstraintError("Runpod quote has no original data center")
-            internal_request = self._quote_request(
-                request, quote, policy=runtime.policy, provider_region=original_region
+        journal_identity = self._validate_lease_journal(runtime, quote)
+        original_request = (
+            self._original_quote_request(request, quote, policy=runtime.policy)
+            if existing is None else None
+        )
+        try:
+            original = runtime.service.repository.fence_expired_inference_request(
+                lease_id, original_request, now=now, journal_identity=journal_identity,
+                admission=_inference_admission(request, quote),
             )
-            existing = runtime.service.repository.fence_absent_expired_request(
-                internal_request, now=now, journal_identity=journal_identity
-            )
-        self._authorize(existing, request.owner_id)
-        if existing.state is OllamaLeaseState.REQUESTED:
-            # Neither a replan nor status reconciliation may dispatch a first
-            # create from REQUESTED after this quote's authorization expired.
-            return await self.release(request.owner_id, lease_id)
+        except OllamaLeaseConflictError as exc:
+            raise InferenceLeaseConstraintError(
+                "expired offer does not match the original Runpod request and quote"
+            ) from exc
+        self._authorize(original, request.owner_id)
+        if original.state is OllamaLeaseState.TERMINATED and (
+            original.provisioning_intent is None
+            and original.lifecycle_billing_state is OllamaLifecycleBillingState.NOT_APPLICABLE
+        ):
+            return self._to_sdk_lease(original, runtime=runtime)
         return await self.status(request.owner_id, lease_id)
 
     @staticmethod
     def _validate_lease_journal(
-        runtime: _Runtime, quote: InferenceLeaseQuote, existing: OllamaLease | None,
-    ) -> str | None:
+        runtime: _Runtime, quote: InferenceLeaseQuote,
+    ) -> str:
         identity = quote.metadata.get("lease_journal_identity")
-        if identity is None and existing is not None:
-            # Older quotes did not bind the journal. Their exact existing
-            # owner/lease row may be reconciled, but absence proves nothing.
-            return None
         if (
             not isinstance(identity, str)
             or identity != runtime.service.repository.journal_identity()
@@ -380,6 +400,22 @@ class RunpodInferenceLeaseProvider:
                 "Runpod quote does not identify this original lease journal"
             )
         return identity
+
+    def _original_quote_request(
+        self, request: InferenceLeaseRequest, quote: InferenceLeaseQuote, *,
+        policy: _InferencePolicy,
+    ) -> OllamaLeaseRequest:
+        data_center = quote.metadata.get("lease_data_center_id")
+        if not isinstance(data_center, str) or data_center.lower() != quote.region:
+            raise InferenceLeaseConstraintError("Runpod quote has no original data center")
+        original = self._quote_request(
+            request, quote, policy=policy, provider_region=data_center,
+        )
+        if quote.metadata.get("lease_request_fingerprint") != original.fingerprint:
+            raise InferenceLeaseConstraintError(
+                "Runpod quote no longer identifies the original lease policy"
+            )
+        return original
 
     def _quote_request(
         self, request: InferenceLeaseRequest, quote: InferenceLeaseQuote, *,
@@ -916,7 +952,23 @@ def _lease_id(request: InferenceLeaseRequest) -> str:
     digest = hashlib.sha256(
         f"{_PROVIDER_NAME}\0{request.owner_id}\0{request.request_id}".encode()
     ).hexdigest()[:32]
-    return f"runpod-lease-{digest}"
+    return f"{INFERENCE_LEASE_ID_PREFIX}{digest}"
+
+
+def _inference_admission(
+    request: InferenceLeaseRequest, quote: InferenceLeaseQuote,
+) -> OllamaInferenceAdmission:
+    # The SDK public request excludes owner_id; retain it in this binding.
+    digest = canonical_sha256({
+        "contract": "runpod-inference-admission-v1",
+        "owner_id": request.owner_id,
+        "request": request.to_public_dict(),
+        "quote": quote.to_public_dict(),
+    })
+    return OllamaInferenceAdmission(
+        offer_sha256=digest.removeprefix("sha256:"),
+        first_create_before=quote.expires_at,
+    )
 
 
 def _quote_metadata(plan: OllamaPlacementPlan, *, lease_id: str) -> dict[str, Any]:

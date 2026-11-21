@@ -27,8 +27,10 @@ from .models import (
     RunPodManagerError,
 )
 from .ollama_contracts import (
+    INFERENCE_LEASE_ID_PREFIX,
     OllamaCapacityProvider,
     OllamaCleanupIntent,
+    OllamaInferenceAdmission,
     OllamaLease,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
@@ -318,6 +320,7 @@ class OllamaLeaseService:
         wait_until_ready: bool = True,
         plan: OllamaPlacementPlan | None = None,
         journal_identity: str | None = None,
+        admission: OllamaInferenceAdmission | None = None,
     ) -> OllamaLease:
         now = self._now()
         existing = self.repository.get(request.lease_id)
@@ -341,7 +344,7 @@ class OllamaLeaseService:
             if existing.request_fingerprint == normalized_request.fingerprint:
                 request = normalized_request
         lease, inserted = self.repository.insert_request(
-            request, now=now, journal_identity=journal_identity
+            request, now=now, journal_identity=journal_identity, admission=admission
         )
         if not inserted:
             self._authorize(lease, request.owner_id, request.workload_id)
@@ -360,6 +363,18 @@ class OllamaLeaseService:
         if lease.state is OllamaLeaseState.READY:
             return await self._ready_with_route(lease)
         if lease.state is OllamaLeaseState.REQUESTED:
+            if lease.inference_admission is not None:
+                lease = self.repository.expire_inference_request_if_due(
+                    lease, clock=self._now
+                )
+                if lease.state is OllamaLeaseState.TERMINATED:
+                    return lease
+                if lease.state is not OllamaLeaseState.REQUESTED:
+                    raise OllamaLeaseConflictError("Original inference admission changed")
+                if plan is None:
+                    raise OllamaLeaseConflictError(
+                        "Inference first create requires the exact validated offer plan"
+                    )
             if _provisioning_deadline_reached(lease, now):
                 return await self._release(lease, reason="expired")
             lease = await self._provision_requested(lease, request, plan=plan)
@@ -444,43 +459,43 @@ class OllamaLeaseService:
                 last_provider_error=sanitize_provider_error(exc),
             )
             raise
-        lease = self._transition(
+        lease = self.repository.admit_provisioning(
             lease,
-            OllamaLeaseState.PROVISIONING,
-            mode=plan.mode,
-            resource_type=plan.resource_type,
-            resource_name=intent.resource_name,
-            creation_uncertain=True,
-            provision_attempt_id=intent.provision_attempt_id,
-            provision_attempts=lease.provision_attempts + 1,
-            provisioning_started_at=intent.provision_requested_at,
-            offered_rate_per_hr=plan.placement.offered_cost_per_hr,
-            placement_gpu_count=plan.placement.gpu_count,
-            estimated_cost=plan.estimated_cost,
-            estimated_compute_cost=plan.estimated_compute_cost,
-            maximum_compute_cost=plan.maximum_compute_cost,
-            estimated_non_compute_cost=plan.estimated_non_compute_cost,
-            maximum_non_compute_cost=plan.maximum_non_compute_cost,
-            cost_ceiling=plan.cost_ceiling,
-            cost_policy_components_json=json.dumps(
-                [item.value for item in plan.non_compute_components],
-                separators=(",", ":"),
-            ),
-            maximum_concurrent_workers=plan.maximum_concurrent_workers,
-            estimated_billable_seconds=plan.estimated_billable_seconds,
-            maximum_billable_seconds=plan.maximum_billable_seconds,
-            selected_gpu_id=plan.placement.gpu_id,
-            selected_gpu_pool=plan.placement.gpu_pool,
-            selected_gpu_name=plan.placement.gpu_name,
-            catalog_observed_at=plan.placement.catalog_observed_at,
-            provisioning_evidence_state=(
-                OllamaProvisioningEvidenceState.INTENT_RECORDED
-            ),
-            provisioning_intent_json=intent,
-            runtime_telemetry_binding_sha256=(
-                prepared.runtime_telemetry_binding_sha256
-            ),
+            clock=self._now,
+            changes={
+                "mode": plan.mode,
+                "resource_type": plan.resource_type,
+                "resource_name": intent.resource_name,
+                "creation_uncertain": True,
+                "provision_attempt_id": intent.provision_attempt_id,
+                "provision_attempts": lease.provision_attempts + 1,
+                "provisioning_started_at": intent.provision_requested_at,
+                "offered_rate_per_hr": plan.placement.offered_cost_per_hr,
+                "placement_gpu_count": plan.placement.gpu_count,
+                "estimated_cost": plan.estimated_cost,
+                "estimated_compute_cost": plan.estimated_compute_cost,
+                "maximum_compute_cost": plan.maximum_compute_cost,
+                "estimated_non_compute_cost": plan.estimated_non_compute_cost,
+                "maximum_non_compute_cost": plan.maximum_non_compute_cost,
+                "cost_ceiling": plan.cost_ceiling,
+                "cost_policy_components_json": json.dumps(
+                    [item.value for item in plan.non_compute_components],
+                    separators=(",", ":"),
+                ),
+                "maximum_concurrent_workers": plan.maximum_concurrent_workers,
+                "estimated_billable_seconds": plan.estimated_billable_seconds,
+                "maximum_billable_seconds": plan.maximum_billable_seconds,
+                "selected_gpu_id": plan.placement.gpu_id,
+                "selected_gpu_pool": plan.placement.gpu_pool,
+                "selected_gpu_name": plan.placement.gpu_name,
+                "catalog_observed_at": plan.placement.catalog_observed_at,
+                "provisioning_evidence_state": OllamaProvisioningEvidenceState.INTENT_RECORDED,
+                "provisioning_intent_json": intent,
+                "runtime_telemetry_binding_sha256": prepared.runtime_telemetry_binding_sha256,
+            },
         )
+        if lease.state is OllamaLeaseState.TERMINATED:
+            return lease
         return await await_owned_effect(self._provision_effect(lease, prepared))
 
     async def _provision_effect(
@@ -490,7 +505,11 @@ class OllamaLeaseService:
     ) -> OllamaLease:
         """Keep the original admitted create and its durable receipt together."""
 
-        if _provisioning_deadline_reached(lease, self._now()):
+        now = self._now()
+        admission = lease.inference_admission
+        if _provisioning_deadline_reached(lease, now) or (
+            admission is not None and now >= admission.first_create_before
+        ):
             lease = self.repository.compare_and_set(
                 lease,
                 changes={"creation_uncertain": False},
@@ -764,9 +783,18 @@ class OllamaLeaseService:
         if lease.provisioning_mismatch is not None:
             return lease
         if lease.state is OllamaLeaseState.REQUESTED:
-            if _provisioning_deadline_reached(lease, now):
-                return await self._release(lease, reason="expired")
-            lease = await self._provision_requested(lease, request_from_lease(lease))
+            if lease.lease_id.startswith(INFERENCE_LEASE_ID_PREFIX):
+                # Only the original SDK acquisition can re-prove every quoted
+                # placement and cost bound. Status and sweeps never plan/create.
+                lease = self.repository.expire_inference_request_if_due(
+                    lease, clock=self._now
+                )
+                if lease.state in {OllamaLeaseState.REQUESTED, OllamaLeaseState.TERMINATED}:
+                    return lease
+            else:
+                if _provisioning_deadline_reached(lease, now):
+                    return await self._release(lease, reason="expired")
+                lease = await self._provision_requested(lease, request_from_lease(lease))
         if lease.state in {
             OllamaLeaseState.PROVISIONING,
             OllamaLeaseState.RECONCILE_REQUIRED,
