@@ -384,13 +384,17 @@ initializer cannot expose a partly fenced store.
 An SDK inference admission atomically stores the canonical request fingerprint,
 accepted offer digest and first-create deadline in the original journal. The
 provisioning transition checks that deadline with a fresh clock under the SQLite
-write lock, separately from readiness and hard session expiry. Only an owner retry
+write lock, and the original dispatch thread checks it again before sending
+the create POST. It is separate from readiness and hard session expiry. Only an owner retry
 holding the exact original offer may revalidate placement and enter first create.
 Status and the background reconciler never start a quoted `REQUESTED` lease. An
 expired original request is fenced without creating capacity, including when it
 already had an unstarted row. Missing legacy quote authority never authorizes a
-first create, and an already admitted provider intent retains its original
-observation, cleanup and billing obligations.
+first create. For a migrated v7 acquisition whose Core result was lost, the
+retained request fingerprint and placement can recover a route-less reference
+or retire an unstarted row; neither action issues a provider request. An already
+admitted provider intent retains its original observation, cleanup and billing
+obligations.
 
 Non-requested rows from schemas without a writer contract are classified
 `HISTORICAL_UNKNOWN` and remain cleanup-only;

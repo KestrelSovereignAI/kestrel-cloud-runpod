@@ -44,9 +44,11 @@ from .models import (
     normalize_cuda_floor,
 )
 from .ollama_contracts import (
+    INFERENCE_LEASE_ID_PREFIX,
     OllamaCleanupBasis,
     OllamaCleanupIntent,
     OllamaCleanupReceipt,
+    OllamaFirstCreateExpiredError,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
@@ -488,27 +490,7 @@ class RunpodOllamaCapacityProvider:
         self, prepared: PreparedOllamaProvisioning
     ) -> ProvisionedOllamaResource:
         intent = prepared.intent
-        current = _safe_provider_request(prepared.provider_request.to_payload())
-        if _json_sha256(current) != intent.provider_request_sha256:
-            raise RunPodManagerError(
-                "Prepared Ollama create request changed before POST"
-            )
-        if intent.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
-            if not isinstance(prepared.provider_request, EndpointCreateRequest):
-                raise RunPodManagerError(
-                    "Prepared Ollama resource type is inconsistent"
-                )
-            created = await asyncio.to_thread(
-                self.client.create_endpoint, prepared.provider_request
-            )
-        else:
-            if not isinstance(prepared.provider_request, PodCreateRequest):
-                raise RunPodManagerError(
-                    "Prepared Ollama resource type is inconsistent"
-                )
-            created = await asyncio.to_thread(
-                self.client.create_pod, prepared.provider_request
-            )
+        created = await asyncio.to_thread(self._post_prepared_create, prepared)
         if created.name != intent.resource_name:
             _raise_mismatch(
                 created,
@@ -523,6 +505,36 @@ class RunpodOllamaCapacityProvider:
             provider_resource_id=created.id,
             resource_name=created.name,
         )
+
+    def _post_prepared_create(
+        self, prepared: PreparedOllamaProvisioning,
+    ) -> EndpointResource | PodResource:
+        intent = prepared.intent
+        current = _safe_provider_request(prepared.provider_request.to_payload())
+        if _json_sha256(current) != intent.provider_request_sha256:
+            raise RunPodManagerError(
+                "Prepared Ollama create request changed before POST"
+            )
+        # This clock read must happen in the actual worker, not the coroutine
+        # that queues it. Executor scheduling may outlast an otherwise valid quote.
+        if (
+            intent.lease_id.startswith(INFERENCE_LEASE_ID_PREFIX)
+            and prepared.first_create_before is None
+        ):
+            raise RunPodManagerError("Runpod inference create lacks its first-create deadline")
+        if (
+            prepared.first_create_before is not None
+            and self._clock() >= prepared.first_create_before
+        ):
+            raise OllamaFirstCreateExpiredError(
+                "Accepted Runpod quote expired before the first create POST"
+            )
+        if intent.resource_type is OllamaResourceType.SERVERLESS_ENDPOINT:
+            if isinstance(prepared.provider_request, EndpointCreateRequest):
+                return self.client.create_endpoint(prepared.provider_request)
+        elif isinstance(prepared.provider_request, PodCreateRequest):
+            return self.client.create_pod(prepared.provider_request)
+        raise RunPodManagerError("Prepared Ollama resource type is inconsistent")
 
     async def _read_original_provisioning(
         self,

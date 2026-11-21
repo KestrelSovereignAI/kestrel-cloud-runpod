@@ -340,6 +340,10 @@ class OllamaProvisioningEvidenceError(RunPodManagerError):
     """The exact created resource cannot yet prove its original request."""
 
 
+class OllamaFirstCreateExpiredError(RunPodManagerError):
+    """The original dispatch worker refused before sending any create POST."""
+
+
 class OllamaProvisioningMismatchError(OllamaProvisioningEvidenceError):
     """A known resource is confirmed incompatible with its original intent."""
 
@@ -891,8 +895,13 @@ class PreparedOllamaProvisioning:
     intent: OllamaProvisioningIntent
     provider_request: PodCreateRequest | EndpointCreateRequest = field(repr=False)
     runtime_telemetry_binding_sha256: str
+    first_create_before: datetime | None = None
 
     def __post_init__(self) -> None:
+        if self.first_create_before is not None:
+            require_aware(self.first_create_before, "first-create deadline")
+            if self.first_create_before <= self.intent.provision_requested_at:
+                raise ValueError("Ollama create intent did not precede its deadline")
         _sha256(
             self.runtime_telemetry_binding_sha256,
             "runtime telemetry binding",
