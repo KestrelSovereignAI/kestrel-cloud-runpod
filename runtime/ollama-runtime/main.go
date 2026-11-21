@@ -65,6 +65,7 @@ type runtimeConfig struct {
 	StartupTimeout     time.Duration
 	PollInterval       time.Duration
 	PreloadModel       bool
+	RequireCachedModel bool
 	ProvisionRequested *time.Time
 	ContainerStartedAt time.Time
 	TelemetryBinding   string
@@ -296,6 +297,13 @@ func loadConfig(getenv func(string) string, startedAt time.Time) (runtimeConfig,
 			return runtimeConfig{}, errors.New("KESTREL_OLLAMA_PRELOAD_MODEL must be true or false")
 		}
 	}
+	var requireCached bool
+	if raw := getenv("KESTREL_OLLAMA_REQUIRE_CACHED_MODEL"); raw != "" {
+		requireCached, err = strconv.ParseBool(raw)
+		if err != nil {
+			return runtimeConfig{}, errors.New("KESTREL_OLLAMA_REQUIRE_CACHED_MODEL must be true or false")
+		}
+	}
 	var provisionRequested *time.Time
 	if raw := getenv("KESTREL_OLLAMA_PROVISION_REQUESTED_AT"); raw != "" {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, raw)
@@ -317,6 +325,7 @@ func loadConfig(getenv func(string) string, startedAt time.Time) (runtimeConfig,
 		StartupTimeout:     startupTimeout,
 		PollInterval:       pollInterval,
 		PreloadModel:       preload,
+		RequireCachedModel: requireCached,
 		ProvisionRequested: provisionRequested,
 		ContainerStartedAt: startedAt,
 		TelemetryBinding:   telemetryBinding,
@@ -551,6 +560,9 @@ func bootstrap(parent context.Context, config runtimeConfig, state *startupState
 	if present {
 		state.setStrategy("cache_hit", true)
 	} else {
+		if config.RequireCachedModel {
+			return errors.New("model cache does not contain the required pinned digest; refusing download")
+		}
 		state.setStrategy("pulled", false)
 		state.markPullStarted()
 		if err = ollamaJSON(ctx, client, config.Upstream, "/api/pull", map[string]any{

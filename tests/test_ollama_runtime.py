@@ -97,6 +97,16 @@ def test_runtime_environment_rejects_weak_or_expired_capability() -> None:
         )
 
 
+def test_lease_profiles_cannot_inject_standalone_cache_policy() -> None:
+    with pytest.raises(RunPodManagerError, match="KESTREL_OLLAMA_REQUIRE_CACHED_MODEL"):
+        _environment(
+            profile_environment={
+                "KESTREL_OLLAMA_ALLOWED_MODELS": f"qwen3:8b@{MODEL_DIGEST}",
+                "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL": "true",
+            }
+        )
+
+
 def test_runtime_environment_restricts_mode_specific_storage_roots() -> None:
     assert (
         _environment(model_storage_path="/workspace/ollama")[
