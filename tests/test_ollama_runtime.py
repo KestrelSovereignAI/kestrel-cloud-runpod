@@ -132,6 +132,7 @@ def test_runpod_template_covers_pod_and_native_load_balancer() -> None:
     contract = json.loads((RUNTIME / "runpod-template.json").read_text())
 
     assert contract["contract"] == OLLAMA_RUNTIME_CONTRACT
+    assert "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL" in contract["environment"]["optional"]
     assert contract["runtime_version"] == OLLAMA_RUNTIME_VERSION
     assert contract["image"] == {
         "repository": OLLAMA_RUNTIME_IMAGE_REPOSITORY,
