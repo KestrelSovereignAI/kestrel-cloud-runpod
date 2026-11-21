@@ -2200,6 +2200,7 @@ class SQLiteOllamaLeaseRepository:
         mismatch: OllamaProvisioningMismatchEvidence | None = None,
         candidate_mismatch: bool = False,
         provider_error: str | None = None,
+        never_dispatched: bool = False,
     ) -> OllamaLease:
         """Fold one post-await result into the latest immutable create lineage.
 
@@ -2210,6 +2211,13 @@ class SQLiteOllamaLeaseRepository:
         """
 
         require_aware(now, "provider acknowledgment")
+        provider_outcomes = (
+            acknowledged_resource, ambiguous_candidate, receipt, mismatch, provider_error,
+        )
+        if never_dispatched and (
+            candidate_mismatch or any(value is not None for value in provider_outcomes)
+        ):
+            raise ValueError("No-dispatch proof cannot accompany a provider outcome")
         intent = lease.provisioning_intent
         if intent is None:
             raise OllamaLeaseConflictError(
@@ -2247,6 +2255,43 @@ class SQLiteOllamaLeaseRepository:
                 raise OllamaLeaseConflictError(
                     f"Lease '{lease.lease_id}' changed provisioning lineage before "
                     "create acknowledgment"
+                )
+            if never_dispatched:
+                # A late local proof clears only the original effect's
+                # unresolved POST. Any preserved provider target still owns
+                # its original cleanup and cannot be erased by this result.
+                if (
+                    current.state is OllamaLeaseState.TERMINATED
+                    or current.provider_resource_id is not None
+                    or current.ambiguous_create_candidate_id is not None
+                    or current.additional_cleanup_targets
+                ):
+                    connection.commit()
+                    return current
+                if current.state not in {
+                    OllamaLeaseState.PROVISIONING,
+                    OllamaLeaseState.RECONCILE_REQUIRED,
+                    OllamaLeaseState.RELEASING,
+                    OllamaLeaseState.FAILED,
+                }:
+                    raise OllamaLeaseConflictError(
+                        f"Lease '{lease.lease_id}' cannot accept original no-dispatch proof"
+                    )
+                # There is no cleanup effect to schedule. Terminalize in
+                # this same update rather than releasing a stale snapshot.
+                # Keep intent, admission, and prior billing facts unchanged.
+                return self._update_locked(
+                    connection,
+                    current,
+                    {
+                        "state": OllamaLeaseState.TERMINATED,
+                        "creation_uncertain": False,
+                        "teardown_state": OllamaTeardownState.COMPLETE,
+                        "termination_reason": current.termination_reason or "expired",
+                        "last_provider_error": None,
+                        "updated_at": now,
+                    },
+                    "original create not dispatched",
                 )
             acknowledged_id = (
                 acknowledged_resource.provider_resource_id

@@ -842,6 +842,19 @@ def _provisioning_mismatch(lease, *, provider_resource_id):
     )
 
 
+@pytest.mark.asyncio
+async def test_no_dispatch_outcome_cannot_clear_retained_provider_identity(tmp_path):
+    clock, repository, _provider, pending = await _pending_without_receipt(
+        tmp_path, database_name="no-dispatch-known-resource.sqlite3",
+    )
+    assert pending.provider_resource_id
+    outcome = repository.record_provisioning_outcome(
+        pending, now=clock(), never_dispatched=True,
+    )
+    assert outcome == pending
+    assert repository.get(pending.lease_id) == pending
+
+
 async def _first_write_version_transition(tmp_path, case):
     if case == "provisioning-intent":
         clock = MutableClock()

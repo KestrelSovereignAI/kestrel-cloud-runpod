@@ -67,6 +67,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaCleanupBasis,
     OllamaCleanupIntent,
     OllamaFirstCreateExpiredError,
+    OllamaInferenceAdmission,
     OllamaLeaseAuthorizationError,
     OllamaLeaseConflictError,
     OllamaLeaseMode,
@@ -587,12 +588,15 @@ def test_workload_credentials_must_not_reuse_control_or_cross_product_keys():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", (OllamaLeaseMode.DEDICATED_POD, OllamaLeaseMode.SERVERLESS_LOAD_BALANCER))
+@pytest.mark.parametrize("reconcile_while_queued", (False, True))
 async def test_runpod_worker_does_not_dispatch_a_queued_create_after_its_deadline(
-    monkeypatch, mode,
+    monkeypatch, tmp_path, mode, reconcile_while_queued,
 ):
     monkeypatch.setenv("TEST_OLLAMA_IMAGE", _TEST_IMAGE)
     clock = MutableClock()
-    request = make_request(clock, mode=mode)
+    request = make_request(
+        clock, mode=mode, requested_at=clock(), lease_id="runpod-lease-queued-worker",
+    )
     plan = pod_plan() if mode is OllamaLeaseMode.DEDICATED_POD else serverless_plan()
     paths = []
 
@@ -612,38 +616,84 @@ async def test_runpod_worker_does_not_dispatch_a_queued_create_after_its_deadlin
     )
     loop = asyncio.get_running_loop()
     worker_blocked = asyncio.Event()
+    create_enqueued = asyncio.Event()
     release_worker = threading.Event()
+
+    class CreateExecutor(ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            submitted = super().submit(fn, *args, **kwargs)
+            if worker_blocked.is_set():
+                create_enqueued.set()
+            return submitted
 
     def occupy_worker():
         loop.call_soon_threadsafe(worker_blocked.set)
         if not release_worker.wait(timeout=10):
             raise AssertionError("test did not release its executor")
 
-    with server as client, ThreadPoolExecutor(max_workers=1) as executor:
+    with server as client, CreateExecutor(max_workers=1) as executor:
         loop.set_default_executor(executor)
         blocker = loop.run_in_executor(executor, occupy_worker)
         queued = None
+        joined = False
         try:
             await asyncio.wait_for(worker_blocked.wait(), timeout=5)
             provider = _provider(client=client)
             provider._clock = clock
             deadline = clock() + timedelta(seconds=1)
-            prepared = replace(
-                provider.validate_runtime_request(request, plan, provision_requested_at=clock()),
-                first_create_before=deadline,
-            )
-            queued = asyncio.create_task(provider.provision(prepared))
-            await asyncio.sleep(0)
+            if reconcile_while_queued:
+                journal = tmp_path / "queued-worker.sqlite3"
+                repository = SQLiteOllamaLeaseRepository(journal)
+                racer = SQLiteOllamaLeaseRepository(journal)
+                service = OllamaLeaseService(
+                    repository=repository, provider=provider, clock=clock,
+                    poll_interval_seconds=1,
+                )
+                admission = OllamaInferenceAdmission("a" * 64, deadline)
+                queued = asyncio.create_task(service.acquire(
+                    request, plan=plan, wait_until_ready=False,
+                    admission=admission, journal_identity=repository.journal_identity(),
+                ))
+            else:
+                prepared = replace(
+                    provider.validate_runtime_request(request, plan, provision_requested_at=clock()),
+                    first_create_before=deadline,
+                )
+                queued = asyncio.create_task(provider.provision(prepared))
+            await asyncio.wait_for(create_enqueued.wait(), timeout=5)
             assert not queued.done()
             clock.value = deadline
+            if reconcile_while_queued:
+                original = racer.get(request.lease_id)
+                assert original.state is OllamaLeaseState.PROVISIONING
+                advanced = racer.record_provisioning_outcome(
+                    original, now=clock(), provider_error="no attributable resource",
+                )
+                assert advanced.revision > original.revision
+                assert advanced.state is OllamaLeaseState.RECONCILE_REQUIRED
+                assert advanced.creation_uncertain
             release_worker.set()
-            with pytest.raises(OllamaFirstCreateExpiredError, match="first create POST"):
-                await queued
+            joined = True
+            if reconcile_while_queued:
+                stopped = await queued
+                assert stopped == racer.get(request.lease_id)
+                assert stopped.state is OllamaLeaseState.TERMINATED
+                assert stopped.teardown_state is OllamaTeardownState.COMPLETE
+                assert not stopped.creation_uncertain
+                assert stopped.provisioning_intent == original.provisioning_intent
+                assert stopped.inference_admission == admission
+                assert stopped.provider_resource_id is None
+                assert stopped.lifecycle_billing_state is OllamaLifecycleBillingState.UNKNOWN
+            else:
+                with pytest.raises(OllamaFirstCreateExpiredError, match="first create POST"):
+                    await queued
         finally:
             release_worker.set()
             await blocker
-            if queued is not None and not queued.done():
-                await queued
+            if queued is not None and not joined:
+                await release_gates_and_boundedly_join_owned_tasks(
+                    queued, primary=sys.exception(),
+                )
     assert paths == []
 
 

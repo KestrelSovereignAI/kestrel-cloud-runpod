@@ -594,8 +594,8 @@ class OllamaLeaseService:
 
     async def _release_expired_before_post(self, lease: OllamaLease) -> OllamaLease:
         """Only the original owned worker may report it never sent this POST."""
-        lease = self.repository.compare_and_set(
-            lease, changes={"creation_uncertain": False},
+        lease = self.repository.record_provisioning_outcome(
+            lease, now=self._now(), never_dispatched=True,
         )
         return await self._release(lease, reason="expired")
 
