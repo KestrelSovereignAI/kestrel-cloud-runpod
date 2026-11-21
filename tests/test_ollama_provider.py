@@ -53,9 +53,11 @@ from kestrel_cloud_runpod.models import (
     FlashBoot,
     GPUOffer,
     GPUProfile,
+    NetworkVolume,
     PodResource,
     RunPodAPIError,
     RunPodManagerError,
+    VolumeType,
     assess_endpoint_mounts,
     assess_pod_mounts,
     environment_values_sha256,
@@ -155,6 +157,7 @@ def _offer(product: ComputeProduct) -> GPUOffer:
         secure_max_count=0 if product is ComputeProduct.SERVERLESS else 1,
         community_max_count=0,
         availability=Availability.HIGH,
+        data_centers=({"id": "US-TX-3", "availability": "HIGH"},),
     )
 
 
@@ -184,6 +187,11 @@ class _ControlClient:
                 _offer(products[0]),
                 availability_min_cuda_version=kwargs.get("min_cuda_version"),
             ),
+        )
+
+    def list_network_volumes(self):
+        return (
+            NetworkVolume("volume-1", "model-cache", 50, "US-TX-3", VolumeType.STANDARD),
         )
 
     def create_endpoint(self, request):
@@ -590,7 +598,7 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
         pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
     )
     provider = _provider(deployment=deployment)
-    request = make_request(
+    request = _cache_request(
         MutableClock(),
         mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
         max_authorized_cost=5.0,
@@ -602,6 +610,68 @@ async def test_network_volume_cache_rejects_concurrent_serverless_writers(
             request, plan, provision_requested_at=provider._clock()
         )
         await provider.provision(prepared)
+
+
+def _cache_request(clock, **changes):
+    request = make_request(clock, **changes)
+    return replace(request, constraints=replace(
+        request.constraints, allowed_data_center_ids=("US-TX-3",),
+    ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inventory", ("wrong-region", "absent", "duplicate"))
+async def test_volume_cache_refusal_reads_only_v2_storage_inventory(inventory):
+    deployment = replace(
+        _deployment(),
+        profile=replace(_profile(), network_volume_id="volume-1"),
+        serverless_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+        pod_non_compute_cost=non_compute_cost_policy(include_network_volume=True),
+    )
+    paths = []
+    volume = {
+        "id": "volume-1", "name": "model-cache", "size": 50,
+        "dataCenter": "US-TX-3" if inventory == "duplicate" else "EU-CZ-1",
+        "type": "STANDARD",
+    }
+    variants = {"wrong-region": [volume], "absent": [], "duplicate": [volume, volume]}
+    expected = {
+        "wrong-region": "explicitly requested data center",
+        "absent": "absent from volume inventory",
+        "duplicate": "Duplicate v2 inventory",
+    }[inventory]
+    payload = json.dumps({
+        "networkVolumes": variants[inventory],
+        "pagination": {"nextCursor": None, "hasNextPage": False},
+    }).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            paths.append((self.command, self.path))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            paths.append((self.command, self.path))
+            self.send_error(500)
+
+    owner = OwnedLoopbackHTTPServer(
+        server_factory=lambda: ThreadingHTTPServer(("127.0.0.1", 0), Handler),
+        thread_factory=lambda server: threading.Thread(target=server.serve_forever),
+        client_factory=lambda server: RunpodControlPlaneClient(
+            api_key="loopback-only",
+            base_url=f"http://127.0.0.1:{server.server_port}/v2",
+            max_safe_retries=0,
+        ),
+    )
+    with owner as client:
+        provider = _provider(client=client, deployment=deployment)
+        with pytest.raises(RunPodManagerError, match=expected):
+            await provider.plan(_cache_request(MutableClock()))
+    assert paths == [("GET", "/v2/network-volumes")]
 
 
 @pytest.mark.asyncio
@@ -3675,10 +3745,13 @@ async def test_native_pod_mounts_separate_invalid_from_confirmed_foreign_storage
         clock=clock,
         sleep=clock.sleep,
     )
-    request = make_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
+    request = _cache_request(clock, mode=OllamaLeaseMode.DEDICATED_POD)
     plan = replace(
         pod_plan(rate=0.5),
         non_compute_components=(deployment.pod_non_compute_cost.covered_components),
+        model_network_volume=NetworkVolume(
+            "approved-volume", "model-cache", 50, "US-TX-3", VolumeType.STANDARD,
+        ),
     )
 
     expected_error = (
@@ -7125,12 +7198,13 @@ async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch)
 
     serverless_client = _ControlClient()
     serverless = _provider(client=serverless_client, deployment=deployment)
-    serverless_request = make_request(
+    serverless_request = _cache_request(
         MutableClock(),
         mode=OllamaLeaseMode.SERVERLESS_LOAD_BALANCER,
         max_authorized_cost=5.0,
     )
     serverless_plan = await serverless.plan(serverless_request)
+    assert serverless_plan.model_network_volume.data_center == "US-TX-3"
     serverless_prepared = serverless.validate_runtime_request(
         serverless_request,
         serverless_plan,
@@ -7145,8 +7219,9 @@ async def test_volume_cache_paths_follow_runpod_product_conventions(monkeypatch)
 
     pod_client = _ControlClient()
     pod = _provider(client=pod_client, deployment=deployment)
-    pod_request = make_request(MutableClock(), mode=OllamaLeaseMode.DEDICATED_POD)
+    pod_request = _cache_request(MutableClock(), mode=OllamaLeaseMode.DEDICATED_POD)
     pod_plan = await pod.plan(pod_request)
+    assert pod_plan.model_network_volume.id == "volume-1"
     pod_prepared = pod.validate_runtime_request(
         pod_request,
         pod_plan,

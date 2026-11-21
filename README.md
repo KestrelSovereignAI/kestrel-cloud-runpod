@@ -351,9 +351,13 @@ Set `quote_ttl_seconds`, `serverless_estimated_ready_seconds`, and
 `pod_estimated_ready_seconds` in `[ollama_leases]` from measured p95 startup
 data. Configure at least one exact `profiles.ollama.allowed_data_center_ids`;
 the provider advertises those normalized IDs as its regions and constrains the
-v2 create request to the quoted region. A shared model network volume reduces
-download time, but can narrow placement availability and Serverless requires a
-single writer.
+v2 create request to the quoted region. For a shared model network volume,
+the controller verifies the configured volume against the read-only v2
+inventory and requires its data center to match the one exact requested
+location. A missing or foreign volume is a refusal, not a region change or
+an ephemeral cache fallback. A volume is only storage: it does not establish
+that the pinned model is present or rule out concurrent writers in other
+deployments. Verify both before using it for reusable private inference.
 
 Both `[ollama_leases.serverless_non_compute_cost]` and
 `[ollama_leases.pod_non_compute_cost]` are mandatory and deliberately contain
