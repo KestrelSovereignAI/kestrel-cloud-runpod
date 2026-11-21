@@ -88,7 +88,7 @@ does not reproduce that original binding is not authoritative for the lease.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.4`; it does not change the
+The runtime is independently versioned as `1.1.5`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds

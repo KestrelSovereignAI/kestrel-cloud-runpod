@@ -4,7 +4,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine3.23@sha256:23f198931d4bd83b4f5a613bd75656257ae8bf832dcbc2db80e1050b5219ca2a AS proxy-builder
 ENV GOTOOLCHAIN=local
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.1.4
+ARG RUNTIME_VERSION=1.1.5
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -42,7 +42,7 @@ RUN go get \
     && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "golang.org/x/net" {print $3}')" = v0.62.0
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.1.4
+ARG RUNTIME_VERSION=1.1.5
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \
