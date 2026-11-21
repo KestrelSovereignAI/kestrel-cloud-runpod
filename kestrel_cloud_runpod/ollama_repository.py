@@ -2086,11 +2086,41 @@ class SQLiteOllamaLeaseRepository:
                     current.hard_deadline,
                 ):
                     return self._retire_unstarted_inference(connection, current, now=now)
+            proposed = changes.get("provisioning_intent_json")
+            if isinstance(proposed, OllamaProvisioningIntent):
+                self._require_available_model_cache(connection, proposed)
             return self._update_locked(
                 connection, current,
                 {**changes, "state": OllamaLeaseState.PROVISIONING, "updated_at": now},
                 "admit original provider create",
             )
+
+    def _require_available_model_cache(
+        self, connection: sqlite3.Connection, proposed: OllamaProvisioningIntent,
+    ) -> None:
+        """Serialize strict cache admission with other mounts in this journal."""
+        volume_ids = proposed.network_volume_ids
+        if not volume_ids:
+            if proposed.requires_cached_model:
+                raise OllamaLeaseConflictError("Cache-only provisioning has no original network volume")
+            return
+        rows = connection.execute(
+            """SELECT provisioning_intent_json FROM ollama_leases
+                 WHERE lease_id != ? AND provisioning_intent_json IS NOT NULL
+                 AND (state != 'terminated' OR creation_uncertain != 0)""",
+            (proposed.lease_id,),
+        )
+        for row in rows:
+            original = OllamaProvisioningIntent.from_dict(
+                json.loads(row["provisioning_intent_json"])
+            )
+            if (
+                (proposed.requires_cached_model or original.requires_cached_model)
+                and volume_ids & original.network_volume_ids
+            ):
+                raise OllamaLeaseConflictError(
+                    "The managed Ollama model-cache volume already has an outstanding lease"
+                )
 
     def claim_cleanup_attempt(
         self, lease: OllamaLease, *, now: datetime

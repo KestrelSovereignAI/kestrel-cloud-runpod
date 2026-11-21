@@ -49,6 +49,7 @@ from .ollama_contracts import (
     OllamaProvisioningMismatchError,
     OllamaProvisioningMismatchEvidence,
     OllamaProvisioningReceipt,
+    OllamaReadinessObservation,
     OllamaResourceType,
     OllamaRuntimeTelemetryState,
     OllamaTeardownState,
@@ -953,6 +954,8 @@ class OllamaLeaseService:
             return await self._release(lease, reason="deadline_or_cost_cap")
         if now >= lease.readiness_deadline:
             return await self._release(lease, reason="readiness_timeout")
+        if self._cache_only_observation_conflicts(intent, lease, observation):
+            return await self._release(lease, reason="required_cache_model_unavailable")
         if (
             not observation.provider_ready
             or not observation.route_url
@@ -1066,6 +1069,8 @@ class OllamaLeaseService:
             or over_authorized_cost(lease, now)
         ):
             return await self._release(lease, reason="deadline_or_cost_cap")
+        if self._cache_only_observation_conflicts(intent, lease, observation):
+            return await self._release(lease, reason="required_cache_model_unavailable")
         if (
             not observation.provider_ready
             or not observation.route_url
@@ -1094,6 +1099,21 @@ class OllamaLeaseService:
             durable,
             route_url=observation.route_url,
             provider_health_url=observation.provider_health_url,
+        )
+
+    @staticmethod
+    def _cache_only_observation_conflicts(
+        intent: OllamaProvisioningIntent,
+        lease: OllamaLease,
+        observation: OllamaReadinessObservation,
+    ) -> bool:
+        if not intent.requires_cached_model or not observation.provider_ready:
+            return False
+        telemetry = observation.runtime_telemetry
+        return not observation.has_model(lease.model) or (
+            telemetry is not None
+            and telemetry.snapshot.ready
+            and not telemetry.snapshot.proves_model_cache_hit
         )
 
     async def _reconcile_creation(self, lease: OllamaLease) -> OllamaLease:

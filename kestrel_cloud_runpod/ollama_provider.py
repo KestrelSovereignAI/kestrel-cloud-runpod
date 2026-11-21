@@ -80,6 +80,7 @@ from .ollama_contracts import (
 )
 from .ollama_runtime import (
     build_ollama_runtime_environment,
+    require_cache_only_ollama_image,
     require_immutable_ollama_image,
     require_ollama_model_digest,
 )
@@ -140,8 +141,18 @@ class RunpodOllamaDeployment:
     serverless_non_compute_cost: OllamaNonComputeCostPolicy
     pod_non_compute_cost: OllamaNonComputeCostPolicy
     billing_batch_hours: int = 24
+    require_cached_model: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.require_cached_model) is not bool:
+            raise TypeError("Managed Ollama require_cached_model must be a boolean")
+        if self.require_cached_model and (
+            not self.profile.network_volume_id or self.serverless_workers_max != 1
+        ):
+            raise RunPodManagerError(
+                "Managed cache-only Ollama requires an existing network volume "
+                "and a one-worker Serverless limit"
+            )
         if self.serverless_workers_max < 1 or self.serverless_request_count < 1:
             raise ValueError(
                 "Runpod Ollama Serverless worker settings must be positive"
@@ -259,6 +270,8 @@ class RunpodOllamaCapacityProvider:
         return token
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
+        if self.deployment.require_cached_model:
+            self._runtime_image()
         observed_cache = None
         volume_id = self.deployment.profile.network_volume_id
         if volume_id:
@@ -359,9 +372,10 @@ class RunpodOllamaCapacityProvider:
 
     def _runtime_image(self) -> str:
         profile = self.deployment.profile
-        return require_immutable_ollama_image(
-            _resolve_env_vars({"image": profile.image_name})["image"]
-        )
+        image = _resolve_env_vars({"image": profile.image_name})["image"]
+        if self.deployment.require_cached_model:
+            return require_cache_only_ollama_image(image)
+        return require_immutable_ollama_image(image)
 
     def _model_cache_binding_sha256(
         self, request: OllamaLeaseRequest, mode: OllamaLeaseMode, volume: NetworkVolume,
@@ -377,6 +391,7 @@ class RunpodOllamaCapacityProvider:
             "image": image,
             "model": request.model,
             "model_digest": require_ollama_model_digest(profile_environment, request.model),
+            **({"require_cached_model": True} if self.deployment.require_cached_model else {}),
         })
 
     def validate_runtime_request(
@@ -1100,6 +1115,7 @@ class RunpodOllamaCapacityProvider:
             model_storage_path=self._model_storage_path(mode),
             provision_requested_at=provision_requested_at,
             telemetry_binding_sha256=telemetry_binding_sha256,
+            require_cached_model=self.deployment.require_cached_model,
         )
 
 

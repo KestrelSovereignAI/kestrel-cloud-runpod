@@ -49,6 +49,12 @@ startup without a pull. This option does not mount a volume or serialize
 writers. Use deployment-owned storage or enforce a single writer independently
 before sharing a volume.
 
+For managed leases set `ollama_leases.require_cached_model` instead. The
+provider verifies the approved runtime digest and exact volume, owns this
+environment key, and requires the authenticated cache-hit/preload observation
+before exposing an inference route. The strict mode does not grant access to
+any existing volume or create a cache on demand.
+
 Python 0.16 managed leases require preload: the provider owns
 `KESTREL_OLLAMA_PRELOAD_MODEL` and sets it to `true`. Profile overrides are
 rejected before provisioning, including an explicit `true` override. This is
