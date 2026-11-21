@@ -780,6 +780,10 @@ class RunpodInferenceLeaseProvider:
             raise InferenceLeaseConstraintError(
                 "live Runpod plan changed the quoted execution mode"
             )
+        if quote.metadata.get("model_cache_binding_sha256") != plan.model_cache_binding_sha256:
+            raise InferenceLeaseConstraintError(
+                "live Runpod model cache binding differs from the accepted quote"
+            )
         for metadata_name, realized in (
             ("gpu_id", plan.placement.gpu_id),
             ("gpu_pool", plan.placement.gpu_pool),
@@ -1023,6 +1027,8 @@ def _quote_metadata(plan: OllamaPlacementPlan, *, lease_id: str) -> dict[str, An
         "mode": plan.mode.value,
         "planned_resource_type": plan.resource_type.value,
         "planned_resource_name": resource_name(lease_id),
+        **({"model_cache_binding_sha256": plan.model_cache_binding_sha256}
+           if plan.model_cache_binding_sha256 is not None else {}),
         "gpu_id": plan.placement.gpu_id,
         "gpu_pool": plan.placement.gpu_pool,
         "gpu_name": plan.placement.gpu_name,

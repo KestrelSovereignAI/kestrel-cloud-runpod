@@ -633,12 +633,17 @@ class OllamaPlacementPlan:
     non_compute_components: tuple[OllamaNonComputeCostComponent, ...]
     maximum_serverless_cold_starts: int = 0
     model_network_volume: NetworkVolume | None = None
+    model_cache_binding_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.model_network_volume is not None and not isinstance(
             self.model_network_volume, NetworkVolume
         ):
             raise TypeError("Ollama model-cache placement must use v2 volume inventory")
+        if (self.model_network_volume is None) != (self.model_cache_binding_sha256 is None):
+            raise ValueError("Ollama network cache placement requires its exact artifact binding")
+        if self.model_cache_binding_sha256 is not None:
+            _sha256(self.model_cache_binding_sha256, "Ollama model cache binding")
         maximum = self.maximum_serverless_cold_starts
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
             raise ValueError("Ollama Serverless cold-start bound must be nonnegative")
