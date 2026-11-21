@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -31,6 +31,7 @@ from .models import (
     EndpointResource,
     FlashBoot,
     GPUProfile,
+    NetworkVolume,
     PlacementDecision,
     PodCreateRequest,
     PodResource,
@@ -255,6 +256,15 @@ class RunpodOllamaCapacityProvider:
         return token
 
     async def plan(self, request: OllamaLeaseRequest) -> OllamaPlacementPlan:
+        observed_cache = None
+        volume_id = self.deployment.profile.network_volume_id
+        if volume_id:
+            volumes = await asyncio.to_thread(self.client.list_network_volumes)
+            matches = tuple(volume for volume in volumes if volume.id == volume_id)
+            if len(matches) != 1:
+                raise RunPodManagerError("Configured Ollama model cache is absent from volume inventory")
+            observed_cache = matches[0]
+        self._validate_model_cache_placement(request, observed_cache)
         products = (
             (ComputeProduct.SERVERLESS,)
             if request.mode is OllamaLeaseMode.SERVERLESS_LOAD_BALANCER
@@ -309,7 +319,7 @@ class RunpodOllamaCapacityProvider:
                 if is_execution_control_error(exc):
                     raise
                 failures.append(f"{product.value}: {exc}")
-        return select_ollama_plan(
+        plan = select_ollama_plan(
             request,
             decisions,
             non_compute_cost_policies=self.deployment.non_compute_cost_policies,
@@ -317,6 +327,23 @@ class RunpodOllamaCapacityProvider:
             serverless_max_workers=self.deployment.serverless_workers_max,
             failures=failures,
         )
+        return replace(plan, model_network_volume=observed_cache)
+
+    def _validate_model_cache_placement(
+        self, request: OllamaLeaseRequest, observed_cache: NetworkVolume | None,
+    ) -> None:
+        volume_id = self.deployment.profile.network_volume_id
+        if not volume_id:
+            if observed_cache is not None:
+                raise RunPodManagerError("Ollama model cache plan was not configured")
+            return
+        if observed_cache is None or observed_cache.id != volume_id:
+            raise RunPodManagerError("Ollama plan lacks its observed model cache")
+        regions = request.constraints.allowed_data_center_ids
+        if len(regions) != 1 or regions[0].casefold() != observed_cache.data_center.casefold():
+            raise RunPodManagerError(
+                "Ollama model cache must be in the one explicitly requested data center"
+            )
 
     def validate_runtime_request(
         self,
@@ -327,6 +354,7 @@ class RunpodOllamaCapacityProvider:
     ) -> PreparedOllamaProvisioning:
         """Prepare exactly one secret-bearing create request without provider I/O."""
 
+        self._validate_model_cache_placement(request, plan.model_network_volume)
         mode = plan.mode
         if mode is OllamaLeaseMode.AUTO or plan.resource_type is not (
             OllamaResourceType.SERVERLESS_ENDPOINT

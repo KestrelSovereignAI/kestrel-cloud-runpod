@@ -80,11 +80,13 @@ does not reproduce that original binding is not authoritative for the lease.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.3`; it does not change the
+The runtime is independently versioned as `1.1.4`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds
-that exact source commit with Go `1.26.10` and explicit fixed module versions.
+that exact source commit with Go `1.26.11` and explicit fixed module versions.
+Both HTTP binaries are built with that patched Go toolchain to address
+[CVE-2026-97054](https://pkg.go.dev/vuln/GO-2026-6859).
 Both binaries must be rebuilt: the previous Go `1.26.9` build is affected by
 [GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809),
 which adds distrust of compromised intermediate certificates in `crypto/x509`.

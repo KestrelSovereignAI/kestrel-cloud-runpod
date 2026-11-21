@@ -166,11 +166,11 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     ):
         assert fixed_module in dockerfile
     assert (
-        "golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43"
+        "golang:1.26.11-alpine3.23@sha256:23f198931d4bd83b4f5a613bd75656257ae8bf832dcbc2db80e1050b5219ca2a"
         in dockerfile
     )
     assert (
-        "golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb"
+        "golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0"
         in dockerfile
     )
     assert dockerfile.count("ENV GOTOOLCHAIN=local") == 2
@@ -178,7 +178,7 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert '"github.com/klauspost/compress" {print $3}' in dockerfile
     assert "= v1.20.2" in dockerfile
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
-    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.10\n")
+    assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.11\n")
     assert "USER 0:0" in dockerfile
     assert (
         "prepareRuntimeFilesystem(config.ModelStoragePath)"

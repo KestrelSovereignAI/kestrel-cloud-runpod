@@ -24,6 +24,7 @@ from .models import (
     CloudType,
     ComputeProduct,
     EndpointCreateRequest,
+    NetworkVolume,
     PlacementDecision,
     PlacementRequirements,
     PodCreateRequest,
@@ -609,8 +610,13 @@ class OllamaPlacementPlan:
     maximum_concurrent_workers: int
     non_compute_components: tuple[OllamaNonComputeCostComponent, ...]
     maximum_serverless_cold_starts: int = 0
+    model_network_volume: NetworkVolume | None = None
 
     def __post_init__(self) -> None:
+        if self.model_network_volume is not None and not isinstance(
+            self.model_network_volume, NetworkVolume
+        ):
+            raise TypeError("Ollama model-cache placement must use v2 volume inventory")
         maximum = self.maximum_serverless_cold_starts
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
             raise ValueError("Ollama Serverless cold-start bound must be nonnegative")
