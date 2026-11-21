@@ -451,6 +451,20 @@ produce a finite invocation-independent quote, so it is not eligible for
 interactive Serverless. Actual provider settlement remains a separate billing
 concern and must never be inferred from these authorization ceilings.
 
+Managed SDK lease status projects `original_runtime_startup` from the first
+retained, authenticated startup proof observed by lease readiness and before
+any cleanup intent. It reports cache evidence and phase timings, not client
+time to first token. `original_cleanup` reports the original allocation's deletion and
+verified absence times only after an exact cleanup receipt; it is not a claim
+about any additional resource or cache storage. Both fields are `null` until
+their proof is recorded. `idle_deadline_at` is the last durable idle deadline
+after readiness; compare it with timestamps from the independent reconciler
+and the read-only provider observer. Use
+`provider_capacity_selected_actual_cost_usd` for a selected provider billing
+observation, report its finality, and account for
+the retained network volume separately. Don't treat estimated compute or a
+missing billing observation as the amount charged.
+
 `PodCapacityLeaseService` is the one writable dedicated-Pod lifecycle for new
 catalog attempts and old training callers. It quotes an exact live v2 GPU ID,
 display name, hourly price, startup/execution estimate, maximum runtime, and

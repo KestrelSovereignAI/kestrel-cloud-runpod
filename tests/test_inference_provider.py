@@ -60,6 +60,7 @@ from kestrel_cloud_runpod.ollama_contracts import (
     OllamaLeaseState,
     OllamaProvisioningEvidenceState,
     OllamaResourceType,
+    _json_sha256,
 )
 from kestrel_cloud_runpod.ollama_repository import (
     _WRITER_CONTRACT_COLUMNS,
@@ -990,6 +991,9 @@ async def test_status_returns_only_exact_authenticated_ready_route(tmp_path):
     quote = await adapter.quote(request)
     pending = await adapter.acquire(request, quote)
 
+    assert pending.metadata["original_runtime_startup"] is None
+    assert pending.metadata["original_cleanup"] is None
+    assert pending.metadata["idle_deadline_at"] is None
     ready = await adapter.status(request.owner_id, pending.lease_id)
 
     assert ready.state is InferenceLeaseState.READY
@@ -1001,6 +1005,19 @@ async def test_status_returns_only_exact_authenticated_ready_route(tmp_path):
     public = json.dumps(ready.to_public_dict(), sort_keys=True)
     assert "private.example" not in public
     assert _ROUTE_KEY not in public
+    startup = ready.metadata["original_runtime_startup"]
+    assert startup == {
+        "observation_id": ready.metadata["runtime_telemetry_first_observation_id"],
+        "cache_only": False,
+        "cache_hit": True,
+        "provision_requested_at": clock().isoformat(),
+        "runtime_ready_at": clock().isoformat(),
+        "placement_and_image_pull_wall_ms": 0,
+        "ollama_boot_ms": 0,
+        "model_pull_ms": None,
+        "model_load_ms": 0,
+        "container_to_ready_ms": 0,
+    }
     assert service.repository.get(ready.lease_id).route_url is None
     host_lease = await service.get(
         ready.lease_id,
@@ -1010,6 +1027,20 @@ async def test_status_returns_only_exact_authenticated_ready_route(tmp_path):
     assert host_lease.public_route_url == "https://private.example"
     assert "route_url" not in host_lease.to_dict()
     assert "private.example" not in json.dumps(host_lease.to_dict())
+
+    clock.advance(1)
+    closed = await adapter.release(request.owner_id, pending.lease_id)
+    retained = service.repository.get(pending.lease_id)
+    assert retained is not None
+    assert retained.cleanup_intent is not None
+    assert retained.cleanup_receipt is not None
+    assert closed.metadata["original_runtime_startup"] == startup
+    assert closed.metadata["original_cleanup"] == {
+        "receipt_id": retained.cleanup_receipt.cleanup_receipt_id,
+        "basis": retained.cleanup_receipt.basis.value,
+        "delete_started_at": retained.cleanup_intent.delete_started_at.isoformat(),
+        "verified_absent_at": retained.cleanup_receipt.verified_absent_at.isoformat(),
+    }
 
 
 @pytest.mark.asyncio
@@ -1225,6 +1256,152 @@ async def test_idle_expiry_tears_down_capacity_and_returns_expired(tmp_path):
     assert expired.state is InferenceLeaseState.EXPIRED
     assert expired.route is None
     assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_status_reports_cleanup_completed_by_a_restarted_reconciler(tmp_path):
+    clock = MutableClock()
+    adapter, service, capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    pending = await adapter.acquire(request, await adapter.quote(request))
+    ready = await adapter.status(request.owner_id, pending.lease_id)
+    assert ready.state is InferenceLeaseState.READY
+    clock.advance(61)
+
+    reaper = OllamaLeaseService(
+        repository=SQLiteOllamaLeaseRepository(tmp_path / "leases.sqlite3"),
+        provider=capacity,
+        poll_interval_seconds=1,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    await reaper.reconcile()
+    assert capacity.teardown_calls == 1
+    retained = service.repository.get(ready.lease_id)
+    assert retained is not None and retained.cleanup_receipt is not None
+
+    expired = await adapter.status(request.owner_id, pending.lease_id)
+    assert expired.state is InferenceLeaseState.EXPIRED
+    assert expired.route is None
+    assert expired.metadata["original_runtime_startup"] == ready.metadata[
+        "original_runtime_startup"
+    ]
+    assert expired.metadata["original_cleanup"]["receipt_id"] == (
+        retained.cleanup_receipt.cleanup_receipt_id
+    )
+    assert expired.metadata["idle_deadline_at"] == ready.metadata["idle_deadline_at"]
+    assert expired.metadata["idle_deadline_at"] == (
+        request.requested_at + timedelta(seconds=request.idle_ttl_seconds)
+    ).isoformat()
+    assert capacity.teardown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_status_does_not_project_partial_startup_as_proof(tmp_path):
+    class PartialStartupProvider(FakeOllamaProvider):
+        async def observe(self, resource, intent, provisioning):
+            observation = await super().observe(resource, intent, provisioning)
+            telemetry = observation.runtime_telemetry
+            assert telemetry is not None
+            snapshot = replace(telemetry.snapshot, ready=False, ready_at=None)
+            return replace(
+                observation,
+                runtime_telemetry=replace(
+                    telemetry,
+                    snapshot=snapshot,
+                    snapshot_sha256=_json_sha256(snapshot.to_dict()),
+                ),
+            )
+
+    clock = MutableClock()
+    adapter, _service, _capacity = _adapter(
+        tmp_path, clock, capacity=PartialStartupProvider(serverless_plan())
+    )
+    request = _request(clock)
+    pending = await adapter.acquire(request, await adapter.quote(request))
+    waiting = await adapter.status(request.owner_id, pending.lease_id)
+
+    assert waiting.route is None
+    assert waiting.metadata["runtime_telemetry_first_observation_id"] is not None
+    assert waiting.metadata["original_runtime_startup"] is None
+    assert waiting.metadata["original_cleanup"] is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_without_ready_lease_does_not_project_final_read_as_startup(tmp_path):
+    clock = MutableClock()
+    adapter, _service, _capacity = _adapter(tmp_path, clock)
+    request = _request(clock)
+    pending = await adapter.acquire(request, await adapter.quote(request))
+
+    released = await adapter.release(request.owner_id, pending.lease_id)
+
+    assert released.metadata["runtime_telemetry_first_observation_id"] is not None
+    assert released.metadata["original_runtime_startup"] is None
+    assert released.metadata["idle_deadline_at"] is None
+    assert released.metadata["original_cleanup"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", (0, 1))
+async def test_cleanup_does_not_turn_legacy_ready_at_into_startup_proof(tmp_path, elapsed):
+    from test_ollama_repository import _WRITER_TRIGGERS, _rewrite_writer_contract_default
+
+    clock = MutableClock()
+
+    class ClockedTelemetryProvider(FakeOllamaProvider):
+        async def observe(self, resource, intent, provisioning):
+            observation = await super().observe(resource, intent, provisioning)
+            assert observation.runtime_telemetry is not None
+            return replace(
+                observation,
+                runtime_telemetry=replace(
+                    observation.runtime_telemetry,
+                    fetch_started_at=clock(),
+                    observed_at=clock(),
+                ),
+            )
+
+    adapter, service, _capacity = _adapter(
+        tmp_path, clock, capacity=ClockedTelemetryProvider(serverless_plan())
+    )
+    request = _request(clock)
+    pending = await adapter.acquire(request, await adapter.quote(request))
+    assert (await adapter.status(request.owner_id, pending.lease_id)).state is (
+        InferenceLeaseState.READY
+    )
+
+    # Older lease writers could persist READY without retained runtime proof.
+    database = service.repository.path
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for trigger in _WRITER_TRIGGERS:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(
+            "UPDATE ollama_leases SET writer_contract_version = 7, "
+            "runtime_telemetry_state = 'unknown', runtime_telemetry_observations_json = '[]'"
+        )
+        _rewrite_writer_contract_default(connection, 7)
+    service.repository = SQLiteOllamaLeaseRepository.migrate_legacy_database(
+        database,
+        attestation=OllamaWriterDrainAttestation(
+            database_path=database, drained_at=clock(), drain_reference_sha256=_DIGEST,
+        ),
+    )
+    clock.advance(elapsed)
+    released = await adapter.release(request.owner_id, pending.lease_id)
+
+    retained = service.repository.get(pending.lease_id)
+    assert retained is not None and retained.ready_at is not None
+    assert retained.provisioning_intent is not None
+    assert retained.cleanup_intent is not None
+    (final_observation,) = retained.runtime_telemetry_observations
+    assert final_observation.is_complete_startup_for(retained.provisioning_intent)
+    assert final_observation.observed_at == retained.cleanup_intent.delete_started_at
+    assert final_observation.observed_at - retained.ready_at == timedelta(
+        seconds=elapsed
+    )
+    assert released.metadata["original_runtime_startup"] is None
+    assert released.metadata["original_cleanup"] is not None
 
 
 @pytest.mark.asyncio
