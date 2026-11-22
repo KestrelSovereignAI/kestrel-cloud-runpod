@@ -21,9 +21,9 @@ streaming reverse proxy.
 - Ollama create, copy, delete, pull, push, and blob-management APIs are disabled
   externally. Bootstrap is the sole digest-verifying model-pull path.
   Unrecognized future routes fail closed instead of being forwarded.
-- The entrypoint uses root only to reject cache symlinks and assign an attached
-  cache tree to numeric UID/GID `10001`; it drops all user and group privilege
-  before Ollama starts or the public listener opens. Neither request bodies nor
+- The entrypoint uses root only to initialize owned model storage. It drops
+  to UID/GID `10001` before validating a preseeded Serverless network cache,
+  starting Ollama, or opening the listener. Neither request bodies nor
   authorization values are logged.
 
 The bearer is a workload-scoped inference capability, not a Runpod control
@@ -69,8 +69,11 @@ container storage, `/workspace/ollama` for a Pod volume, or
 `/runpod-volume/ollama` for a Serverless network volume, matching Runpod's
 product-specific mount conventions. These paths are exclusively for public
 model weights; user prompts, responses, tokens, and private state must not be
-written there. Fresh root-owned mounts are initialized safely before privilege
-drop; symlinks in a reused cache fail closed. Serverless network-volume mode
+written there. Fresh owned storage is initialized before privilege drop.
+Cache-only Serverless on `/runpod-volume` requires an existing tree readable
+but not writable by UID/GID `10001`. The runtime does not change ownership,
+create a probe file, or allow Ollama to prune the cache. Symlinks and objects
+other than regular files or directories fail closed. Serverless network-volume mode
 requires one worker because Runpod does not serialize concurrent writers to a
 shared volume. Do not assume a reusable volume is available in the selected
 zone. A network-cache offer binds the observed volume and data center to the
@@ -97,7 +100,7 @@ does not reproduce that original binding is not authoritative for the lease.
 
 ## Build and local validation
 
-The runtime is independently versioned as `1.1.5`; it does not change the
+The runtime is independently versioned as `1.1.6`; it does not change the
 Python package version. All build and final bases are pinned by immutable OCI
 digest, and the resulting image is linux/amd64-only for the reviewed Runpod
 GPU target. The image retains the GPU backends from Ollama `0.32.5` but rebuilds

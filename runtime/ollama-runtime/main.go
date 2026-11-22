@@ -167,7 +167,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err = prepareRuntimeFilesystem(config.ModelStoragePath); err != nil {
+	if err = prepareRuntimeFilesystem(config); err != nil {
 		return err
 	}
 	scrubSensitiveProcessEnvironment()
@@ -351,23 +351,38 @@ func validateModelStoragePath(storagePath, mode string) (string, error) {
 	return "", fmt.Errorf("KESTREL_OLLAMA_MODEL_STORAGE_PATH is invalid for %s", mode)
 }
 
-func prepareRuntimeFilesystem(storagePath string) error {
+func (config runtimeConfig) usesExternalReadOnlyCache() bool {
+	return config.Mode == "serverless_load_balancer" && config.RequireCachedModel &&
+		(config.ModelStoragePath == "/runpod-volume" || strings.HasPrefix(config.ModelStoragePath, "/runpod-volume/"))
+}
+
+func prepareRuntimeFilesystem(config runtimeConfig) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("runtime init requires root before dropping to UID %d", runtimeUID)
 	}
+	readOnly := config.usesExternalReadOnlyCache()
+	if !readOnly {
+		if err := prepareOwnedModelStorage(config.ModelStoragePath); err != nil {
+			return err
+		}
+	}
+	if err := dropRuntimePrivilege(); err != nil {
+		return err
+	}
+	if readOnly {
+		return validateExternalModelCache(config.ModelStoragePath)
+	}
+	return probeOwnedModelStorage(config.ModelStoragePath)
+}
+
+func prepareOwnedModelStorage(storagePath string) error {
 	if err := os.MkdirAll(storagePath, 0o750); err != nil {
 		return fmt.Errorf("prepare model storage: %w", err)
 	}
 	if err := validateModelStorageTree(storagePath); err != nil {
 		return err
 	}
-	if err := filepath.WalkDir(storagePath, func(itemPath string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("model storage contains unsupported symlink %q", itemPath)
-		}
+	if err := walkModelStorageTree(storagePath, func(itemPath string, _ os.DirEntry) error {
 		if err := os.Lchown(itemPath, runtimeUID, runtimeGID); err != nil {
 			return fmt.Errorf("set model storage ownership for %q: %w", itemPath, err)
 		}
@@ -375,6 +390,10 @@ func prepareRuntimeFilesystem(storagePath string) error {
 	}); err != nil {
 		return fmt.Errorf("secure model storage: %w", err)
 	}
+	return nil
+}
+
+func dropRuntimePrivilege() error {
 	if err := syscall.Setgroups([]int{runtimeGID}); err != nil {
 		return fmt.Errorf("set runtime supplementary groups: %w", err)
 	}
@@ -384,10 +403,15 @@ func prepareRuntimeFilesystem(storagePath string) error {
 	if err := syscall.Setuid(runtimeUID); err != nil {
 		return fmt.Errorf("drop runtime user privilege: %w", err)
 	}
-	if os.Geteuid() != runtimeUID || os.Getegid() != runtimeGID {
+	if os.Getuid() != runtimeUID || os.Geteuid() != runtimeUID ||
+		os.Getgid() != runtimeGID || os.Getegid() != runtimeGID {
 		return errors.New("runtime privilege drop did not reach the configured UID/GID")
 	}
 	syscall.Umask(0o027)
+	return nil
+}
+
+func probeOwnedModelStorage(storagePath string) error {
 	probe, err := os.CreateTemp(storagePath, ".kestrel-write-probe-")
 	if err != nil {
 		return fmt.Errorf("model storage is not writable by the runtime user: %w", err)
@@ -403,6 +427,10 @@ func prepareRuntimeFilesystem(storagePath string) error {
 }
 
 func validateModelStorageTree(storagePath string) error {
+	return walkModelStorageTree(storagePath, nil)
+}
+
+func walkModelStorageTree(storagePath string, check func(string, os.DirEntry) error) error {
 	return filepath.WalkDir(storagePath, func(itemPath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -410,7 +438,61 @@ func validateModelStorageTree(storagePath string) error {
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("model storage contains unsupported symlink %q", itemPath)
 		}
+		if check != nil {
+			return check(itemPath, entry)
+		}
 		return nil
+	})
+}
+
+const (
+	accessExecute = 1
+	accessWrite   = 2
+	accessRead    = 4
+)
+
+func requireReadOnlyCacheAccess(itemPath string, directory bool) error {
+	var required uint32 = accessRead
+	if directory {
+		required |= accessExecute
+	}
+	if err := syscall.Access(itemPath, required); err != nil {
+		return fmt.Errorf("external model cache is unreadable by the runtime: %w", err)
+	}
+	switch err := syscall.Access(itemPath, accessWrite); {
+	case err == nil:
+		return errors.New("external model cache must not be writable by the runtime")
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EROFS):
+		return nil
+	default:
+		return fmt.Errorf("external model cache write access is unknown: %w", err)
+	}
+}
+
+func validateExternalModelCache(storagePath string) error {
+	if os.Getuid() != runtimeUID || os.Geteuid() != runtimeUID ||
+		os.Getgid() != runtimeGID || os.Getegid() != runtimeGID {
+		return errors.New("validate the external model cache only as the runtime UID/GID")
+	}
+	// An immutable cache child is not proof if its directory (or mount root)
+	// can be replaced by this process. Check every component, not just leaves.
+	for current := storagePath; current != "/"; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("inspect external model cache directory: %w", err)
+		}
+		if !info.IsDir() {
+			return errors.New("external model cache requires real directory components")
+		}
+		if err := requireReadOnlyCacheAccess(current, true); err != nil {
+			return err
+		}
+	}
+	return walkModelStorageTree(storagePath, func(itemPath string, entry os.DirEntry) error {
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return errors.New("external model cache only accepts regular files and directories")
+		}
+		return requireReadOnlyCacheAccess(itemPath, entry.IsDir())
 	})
 }
 
@@ -460,13 +542,7 @@ func startOllama(config runtimeConfig, state *startupState) (*exec.Cmd, <-chan e
 	// immediate SIGKILL as soon as the runtime context is cancelled, bypassing
 	// the bounded SIGTERM shutdown below.
 	cmd := exec.Command("/bin/ollama", "serve")
-	cmd.Env = replaceEnvironment(filterSensitiveEnvironment(os.Environ()), map[string]string{
-		"HOME":              "/var/lib/kestrel-ollama",
-		"OLLAMA_DEBUG":      "false",
-		"OLLAMA_HOST":       strings.TrimPrefix(config.Upstream.String(), "http://"),
-		"OLLAMA_KEEP_ALIVE": "-1",
-		"OLLAMA_MODELS":     config.ModelStoragePath,
-	})
+	cmd.Env = ollamaProcessEnvironment(config, os.Environ())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -480,6 +556,20 @@ func startOllama(config runtimeConfig, state *startupState) (*exec.Cmd, <-chan e
 	exit := make(chan error, 1)
 	go func() { exit <- cmd.Wait() }()
 	return cmd, exit, nil
+}
+
+func ollamaProcessEnvironment(config runtimeConfig, inherited []string) []string {
+	settings := map[string]string{
+		"HOME":              "/var/lib/kestrel-ollama",
+		"OLLAMA_DEBUG":      "false",
+		"OLLAMA_HOST":       strings.TrimPrefix(config.Upstream.String(), "http://"),
+		"OLLAMA_KEEP_ALIVE": "-1",
+		"OLLAMA_MODELS":     config.ModelStoragePath,
+	}
+	if config.usesExternalReadOnlyCache() {
+		settings["OLLAMA_NOPRUNE"] = "true"
+	}
+	return replaceEnvironment(filterSensitiveEnvironment(inherited), settings)
 }
 
 func scrubSensitiveProcessEnvironment() {

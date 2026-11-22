@@ -23,7 +23,7 @@ from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.registered_ollama import RegisteredOllamaEndpoint, RegisteredOllamaLifecycle
 from kestrel_cloud_runpod.registered_ollama_journal import RegisteredActivationState, RegisteredOllamaJournal
 from kestrel_cloud_runpod.ollama_runtime import OLLAMA_RUNTIME_IMAGE_REPOSITORY
-from kestrel_cloud_runpod.ollama_runtime import OLLAMA_RUNTIME_VERSION
+from kestrel_cloud_runpod.ollama_runtime import cache_only_ollama_runtime_version
 from kestrel_cloud_runpod.registered_inference_provider import RegisteredInferenceLeaseProvider
 from kestrel_cloud_runpod.registered_ollama_admission import RegisteredQuotePolicy
 
@@ -121,7 +121,7 @@ def home(tmp_path):
                     }]
                     self.send_json({
                         **runtime_telemetry_payload(state["env"]["KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"], timestamp),
-                        "runtime_version": OLLAMA_RUNTIME_VERSION,
+                        "runtime_version": cache_only_ollama_runtime_version(endpoint.baseline.image),
                     })
                 else:
                     if state.get("_replace_during_observation"):

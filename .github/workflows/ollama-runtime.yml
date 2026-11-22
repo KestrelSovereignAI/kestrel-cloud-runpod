@@ -35,7 +35,7 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/kestrelsovereignai/kestrel-cloud-runpod-ollama-runtime
-  RUNTIME_VERSION: 1.1.5
+  RUNTIME_VERSION: 1.1.6
 
 jobs:
   proxy-contract:
@@ -57,6 +57,12 @@ jobs:
           go test -race ./...
           go vet ./...
           test -z "$(gofmt -l .)"
+      - name: Read seeded cache after dropping UID and ownership capabilities
+        working-directory: runtime/ollama-runtime
+        run: |
+          sudo --non-interactive setpriv --bounding-set=-chown env \
+            PATH="$(dirname "$(command -v go)"):/usr/bin:/bin" GOTOOLCHAIN=local \
+            go test -run '^TestPrivilegeDroppedExternalCacheWithoutChown$' -count=1 -v ./...
       - name: Validate Runpod template JSON
         run: python -m json.tool runtime/ollama-runtime/runpod-template.json >/dev/null
 
@@ -144,6 +150,43 @@ jobs:
           fi
           if docker history --no-trunc "$RUNTIME_IMAGE_REF" | grep -Eiq '(api[_-]?key|authorization|bearer|password|secret|token)'; then
             echo 'runtime image history contains secret-shaped material' >&2
+            exit 1
+          fi
+      - name: Start the packaged server on a read-only cache without CHOWN
+        run: |
+          CACHE_ROOT="$(mktemp -d)"
+          CACHE_SMOKE_LOG="$(mktemp)"
+          cleanup_cache_smoke() {
+            rmdir "$CACHE_ROOT/ollama/blobs" "$CACHE_ROOT/ollama/manifests" "$CACHE_ROOT/ollama" "$CACHE_ROOT"
+            rm -f -- "$CACHE_SMOKE_LOG"
+          }
+          trap cleanup_cache_smoke EXIT
+          chmod 0755 "$CACHE_ROOT"
+          mkdir -p "$CACHE_ROOT/ollama/blobs" "$CACHE_ROOT/ollama/manifests"
+          TOKEN="$(openssl rand -hex 32)"
+          EXPIRES_AT="$(date -u -d '+5 minutes' '+%Y-%m-%dT%H:%M:%SZ')"
+          DIGEST="$(printf '%064d' 0)"
+          binding="$(printf '%s' 'read-only-cache-smoke' | sha256sum | awk '{print $1}')"
+          run_flags=(
+            --cap-drop=CHOWN
+            --mount "type=bind,source=$CACHE_ROOT,target=/runpod-volume,readonly"
+            --env "KESTREL_OLLAMA_BEARER_TOKEN=$TOKEN"
+            --env "KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT=$EXPIRES_AT"
+            --env "KESTREL_OLLAMA_ALLOWED_MODELS=registry.invalid/model:v1@sha256:$DIGEST"
+            --env "KESTREL_OLLAMA_REQUIRED_MODEL=registry.invalid/model:v1"
+            --env "KESTREL_OLLAMA_MODE=serverless_load_balancer"
+            --env "KESTREL_OLLAMA_MODEL_STORAGE_PATH=/runpod-volume/ollama"
+            --env "KESTREL_OLLAMA_REQUIRE_CACHED_MODEL=true"
+            --env "KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256=$binding"
+          )
+          code=0
+          timeout 30s docker run --rm "${run_flags[@]}" "$RUNTIME_IMAGE_REF" > "$CACHE_SMOKE_LOG" 2>&1 || code=$?
+          if ! (
+            test "$code" -eq 1 &&
+            grep -q 'proxy_listening' "$CACHE_SMOKE_LOG" &&
+            grep -q 'model cache does not contain the required pinned digest; refusing download' "$CACHE_SMOKE_LOG"
+          ); then
+            sed -E 's/[a-f0-9]{64}/[digest redacted]/g' "$CACHE_SMOKE_LOG" >&2
             exit 1
           fi
       - name: Generate SPDX SBOM

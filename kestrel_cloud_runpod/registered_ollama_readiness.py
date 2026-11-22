@@ -10,7 +10,6 @@ from typing import Any
 
 from .clients import endpoint_worker_population_is_empty
 from .ollama_contracts import OllamaProvisioningEvidenceError, OllamaRuntimeTelemetrySnapshot
-from .ollama_runtime import OLLAMA_RUNTIME_VERSION
 
 _WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,254}")
 
@@ -64,6 +63,7 @@ class RegisteredWorkerReadback:
 def verify_registered_runtime(
     telemetry: Mapping[str, Any], tags: Mapping[str, Any], *,
     telemetry_binding_sha256: str, expected_model: str, model_digest: str,
+    expected_runtime_version: str,
     first_worker: RegisteredWorkerReadback, last_worker: RegisteredWorkerReadback,
 ) -> OllamaRuntimeTelemetrySnapshot:
     """Match exact worker lineage before/after reading cache-only telemetry."""
@@ -74,7 +74,7 @@ def verify_registered_runtime(
     except (TypeError, ValueError):
         raise OllamaProvisioningEvidenceError("Registered workload telemetry is invalid") from None
     if (
-        snapshot.runtime_version != OLLAMA_RUNTIME_VERSION
+        snapshot.runtime_version != expected_runtime_version
         or snapshot.telemetry_binding_sha256 != telemetry_binding_sha256
         or snapshot.ready is not True or snapshot.ollama_process_running is not True
         or snapshot.ready_at is None or snapshot.terminal_error is not None
