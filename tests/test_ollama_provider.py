@@ -50,7 +50,9 @@ from kestrel_cloud_runpod.effect_custody import await_owned_effect
 from kestrel_cloud_runpod.models import (
     Availability,
     ComputeProduct,
+    EndpointCreateRequest,
     EndpointResource,
+    EndpointResourceVersion,
     FlashBoot,
     GPUOffer,
     GPUProfile,
@@ -87,6 +89,7 @@ from kestrel_cloud_runpod.ollama_provider import (
     RunpodOllamaCapacityProvider,
     RunpodOllamaDeployment,
     _pod_base_url,
+    validate_registered_ollama_endpoint,
 )
 from kestrel_cloud_runpod.ollama_repository import (
     SQLiteOllamaLeaseRepository,
@@ -7388,6 +7391,127 @@ _APPROVED_CACHE_IMAGE = (
     f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}"
     "@sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3"
 )
+
+
+@pytest.fixture
+def registered_endpoint():
+    policy = EndpointCreateRequest(
+        name="registered-ollama",
+        image=_APPROVED_CACHE_IMAGE,
+        endpoint_type="LOAD_BALANCER",
+        gpu_pools=("ADA_24",),
+        scaling={"type": "REQUEST_COUNT", "requestCount": 1},
+        workers_max=0,
+        idle_timeout_seconds=5,
+        data_center_ids=("US-NC-1",),
+        network_volume_ids=("approved-network-cache",),
+        min_cuda_version="12.8",
+        flashboot=FlashBoot.OFF,
+        ports=("11434/http",),
+        registry_id="approved-registry",
+        env={"PORT": "11434"},
+    )
+    created = datetime(2026, 8, 1, tzinfo=UTC)
+    readback = {
+        **policy.to_payload(),
+        "id": "approved-endpoint-id",
+        "createdAt": created.isoformat(),
+    }
+    readback["workers"]["initTimeout"] = None
+    return policy, created, readback
+
+
+@pytest.mark.parametrize("max_workers", [0, 1])
+def test_registered_endpoint_binds_original_identity_without_create_receipt(registered_endpoint, max_workers):
+    policy, created, readback = registered_endpoint
+    policy = replace(policy, workers_max=max_workers)
+    readback["workers"]["max"] = max_workers
+    assert validate_registered_ollama_endpoint(
+        EndpointResource.from_dict(readback),
+        endpoint_id="approved-endpoint-id", original_created_at=created, expected=policy,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "drift, problem",
+    [
+        ({"id": "foreign-endpoint"}, "identity changed"),
+        ({"name": "foreign-name"}, "identity changed"),
+        ({"createdAt": "2026-08-02T00:00:00Z"}, "identity changed"),
+        ({"type": "QUEUE"}, "type does not match"),
+        ({"env": {"PORT": "80"}}, "image or environment does not match"),
+        ({"registry": "foreign-registry"}, "runtime configuration does not match"),
+        ({"flashboot": "FLASHBOOT"}, "runtime configuration does not match"),
+        ({"dataCenterIds": ["EU-RO-1"]}, "placement policy does not match"),
+        (
+            {"gpu": {"count": True, "pools": ["ADA_24"], "minCudaVersion": "12.8"}},
+            r"gpu.count \(invalid\)",
+        ),
+        (
+            {"workers": {"min": 1, "max": 1, "idleTimeout": 5}},
+            "placement policy does not match",
+        ),
+        (
+            {"workers": {"min": 0, "max": 0, "idleTimeout": 5, "initTimeout": 60}},
+            "placement policy does not match",
+        ),
+        (
+            {"workers": {"min": 0, "max": 0, "idleTimeout": 5, "initTimeout": False}},
+            "placement policy does not match",
+        ),
+        ({"mounts": None}, "omitted original policy evidence"),
+        ({"mounts": {"network": [], "global": []}}, "storage policy does not match"),
+        (
+            {"mounts": {"network": [{"volumeId": "approved-network-cache"}], "global": [
+                {"volumeId": "other-storage"},
+            ]}},
+            "storage policy does not match",
+        ),
+    ],
+)
+def test_registered_endpoint_refuses_unexpected_definition_without_create_evidence(
+    registered_endpoint, drift, problem,
+):
+    policy, created, readback = registered_endpoint
+    with pytest.raises(OllamaProvisioningEvidenceError, match=problem) as captured:
+        validate_registered_ollama_endpoint(
+            EndpointResource.from_dict({**readback, **drift}),
+            endpoint_id="approved-endpoint-id", original_created_at=created, expected=policy,
+        )
+    assert type(captured.value) is OllamaProvisioningEvidenceError
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"workers_max": 2},
+        {"workers_min": True, "workers_max": 1},
+        {"network_volume_ids": ()},
+        {"data_center_ids": ("US-NC-1", "US-KS-2")},
+        {"idle_timeout_seconds": 0},
+        {"min_cuda_version": None},
+        {"registry_id": None},
+    ],
+)
+def test_registered_endpoint_constraints_cannot_be_relaxed_by_readback(registered_endpoint, invalid):
+    policy, created, readback = registered_endpoint
+    with pytest.raises(OllamaProvisioningEvidenceError, match="Invalid registered Ollama endpoint policy"):
+        validate_registered_ollama_endpoint(
+            EndpointResource.from_dict(readback),
+            endpoint_id="approved-endpoint-id", original_created_at=created,
+            expected=replace(policy, **invalid),
+        )
+
+
+def test_registered_endpoint_rejects_legacy_policy_with_no_realized_cuda_floor(registered_endpoint):
+    policy, created, readback = registered_endpoint
+    readback["gpu"].pop("minCudaVersion")
+    with pytest.raises(OllamaProvisioningEvidenceError, match="Invalid registered Ollama endpoint policy"):
+        validate_registered_ollama_endpoint(
+            EndpointResource.from_dict(readback),
+            endpoint_id="approved-endpoint-id", original_created_at=created,
+            expected=replace(policy, resource_schema_version=EndpointResourceVersion.LEGACY),
+        )
 
 
 def _managed_cache_deployment(*, strict: bool = True):
