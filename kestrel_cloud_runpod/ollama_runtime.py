@@ -86,6 +86,11 @@ def cache_only_ollama_runtime_version(image: str) -> str:
     return _CACHE_ONLY_RUNTIME_VERSIONS[digest]
 
 
+def approved_cache_only_ollama_images() -> tuple[str, ...]:
+    """Return the immutable runtime references approved for cache-only use."""
+    return tuple(f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@{digest}" for digest in _CACHE_ONLY_RUNTIME_VERSIONS)
+
+
 def build_ollama_runtime_environment(
     profile_environment: Mapping[str, str],
     *,

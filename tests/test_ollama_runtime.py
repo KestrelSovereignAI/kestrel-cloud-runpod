@@ -16,6 +16,7 @@ from kestrel_cloud_runpod.ollama_runtime import (
     OLLAMA_RUNTIME_IMAGE_REPOSITORY,
     OLLAMA_RUNTIME_PORT,
     OLLAMA_RUNTIME_VERSION,
+    approved_cache_only_ollama_images,
     build_ollama_runtime_environment,
     cache_only_ollama_runtime_version,
     require_cache_only_ollama_image,
@@ -33,6 +34,7 @@ MODEL_DIGEST = "sha256:" + "a" * 64
 ])
 def test_cache_only_runtime_version_is_bound_to_the_enrolled_digest(digest, runtime_version):
     image = f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@sha256:{digest}"
+    assert image in approved_cache_only_ollama_images()
     assert require_cache_only_ollama_image(image) == image
     assert cache_only_ollama_runtime_version(image) == runtime_version
     with pytest.raises(RunPodManagerError):

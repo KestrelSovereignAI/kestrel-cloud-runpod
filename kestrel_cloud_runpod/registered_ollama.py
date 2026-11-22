@@ -16,6 +16,7 @@ from .ollama_contracts import (
     OllamaProvisioningEvidenceError, iso_datetime,
 )
 from .ollama_provider import validate_registered_ollama_endpoint
+from .ollama_runtime import approved_cache_only_ollama_images
 from .registered_ollama_journal import RegisteredActivation, RegisteredActivationIntent, RegisteredActivationState, RegisteredInferenceTerms, RegisteredOllamaJournal
 from .signed_invocations import canonical_sha256
 
@@ -58,6 +59,16 @@ class RegisteredOllamaEndpoint:
             endpoint, endpoint_id=self.endpoint_id, original_created_at=self.original_created_at,
             expected=replace(self.baseline, workers_max=max_workers),
             expected_environment_sha256=env_sha256,
+        )
+
+    def matches_parked_registration(self, registration_sha256: str) -> bool:
+        """Require the exact enrollment, permitting only an approved image rotation."""
+        if registration_sha256 == self.digest:
+            return True
+        approved = approved_cache_only_ollama_images()
+        return self.baseline.image in approved and any(
+            replace(self, baseline=replace(self.baseline, image=image)).digest == registration_sha256
+            for image in approved if image != self.baseline.image
         )
 
     def park_environment(self, lease_id: str, admission_sha256: str) -> dict[str, str]:
@@ -118,6 +129,11 @@ class RegisteredOllamaLifecycle:
             else environment_values_sha256(self.endpoint.baseline.env)
         )
         existing = self.journal.get(lease_id)
+        if existing is None and last is not None and (
+            last.intent.cache_id != self.endpoint.baseline.network_volume_ids[0]
+            or not self.endpoint.matches_parked_registration(last.intent.registration_sha256)
+        ):
+            raise OllamaLeaseConflictError("Registered endpoint predecessor changed before admission")
         park_env = self.endpoint.park_environment(lease_id, admission_sha256)
         intent = RegisteredActivationIntent(
             lease_id, owner_id, self.endpoint.endpoint_id, self.endpoint.baseline.network_volume_ids[0],
@@ -128,7 +144,9 @@ class RegisteredOllamaLifecycle:
         )
         if existing is None:
             self._verify_parked(prior_sha)
-        row, fresh = self.journal.reserve(intent)
+        row, fresh = self.journal.reserve(
+            intent, expected_parked_predecessor=last.intent if existing is None and last is not None else None,
+        )
         if not fresh:
             return row, False
         self._verify_parked(prior_sha)

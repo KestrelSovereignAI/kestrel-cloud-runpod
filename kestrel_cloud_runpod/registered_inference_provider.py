@@ -274,7 +274,11 @@ class RegisteredInferenceLeaseProvider:
 
     async def status(self, owner_id: str, lease_id: str) -> InferenceLease:
         lifecycle, _policy = self._runtime()
-        row = self._owned(lifecycle, owner_id, lease_id)
+        row = self._owned(lifecycle, owner_id, lease_id, historical_parked=True)
+        if row.intent.registration_sha256 != lifecycle.endpoint.digest:
+            # This original lease already has durable, observed zero evidence.
+            # The current enrollment owns no effects for it, including PARK.
+            return self._sdk(lifecycle, row)
         row, proof, revoked = lifecycle.journal.route_view(row.intent)
         if revoked or lifecycle.clock() >= row.expires_at or row.state in (
             RegisteredActivationState.PARKING, RegisteredActivationState.FENCED,
@@ -349,14 +353,23 @@ class RegisteredInferenceLeaseProvider:
             raise InferenceLeaseConstraintError("Offer does not match its original registered activation")
 
     @staticmethod
-    def _owned(lifecycle: RegisteredOllamaLifecycle, owner_id: str, lease_id: str) -> RegisteredActivation:
+    def _owned(
+        lifecycle: RegisteredOllamaLifecycle, owner_id: str, lease_id: str, *,
+        historical_parked: bool = False,
+    ) -> RegisteredActivation:
         row = lifecycle.journal.get(lease_id)
         if row is None or row.intent.terms is None:
             raise InferenceLeaseNotFoundError("No original registered lease was found")
         if row.intent.owner_id != owner_id:
             raise InferenceLeaseOwnershipError("Registered lease is owned by another agent")
         if row.intent.registration_sha256 != lifecycle.endpoint.digest:
-            raise InferenceLeaseConstraintError("Registered lease's original endpoint changed")
+            if not (
+                historical_parked and row.state is RegisteredActivationState.PARKED
+                and row.intent.endpoint_id == lifecycle.endpoint.endpoint_id
+                and lifecycle.endpoint.baseline.network_volume_ids == (row.intent.cache_id,)
+                and lifecycle.endpoint.matches_parked_registration(row.intent.registration_sha256)
+            ):
+                raise InferenceLeaseConstraintError("Registered lease's original endpoint changed")
         return row
 
     def _sdk(
@@ -367,7 +380,10 @@ class RegisteredInferenceLeaseProvider:
         terms = row.intent.terms
         if terms is None:
             raise InferenceLeaseConstraintError("Registered lease is missing its approved terms")
-        if proof is not None and terms.model_digest != self._model_digest:
+        if (
+            row.state not in (RegisteredActivationState.PARKED, RegisteredActivationState.FENCED_ZERO)
+            and proof is not None and terms.model_digest != self._model_digest
+        ):
             row = lifecycle.journal.revoke(row.intent)
             releasing = True
         route = None
