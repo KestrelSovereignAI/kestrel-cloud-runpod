@@ -293,6 +293,9 @@ def test_typed_create_and_update_payloads_validate_against_pin():
             gpu_pools=("BLACKWELL_24",),
             gpu_count=1,
             flashboot=FlashBoot.OFF,
+            workers_min=0,
+            workers_max=0,
+            env={"PORT": "11434"},
         ).to_payload(),
     )
 

@@ -785,7 +785,7 @@ class EndpointCreateRequest:
 
 @dataclass(frozen=True)
 class EndpointUpdateRequest:
-    """Typed PATCH fields supported by Kestrel's endpoint manager."""
+    """Typed v2 PATCH fields; an explicit env replaces the existing map."""
 
     name: Optional[str] = None
     image: Optional[str] = None
@@ -799,10 +799,14 @@ class EndpointUpdateRequest:
     network_volume_ids: Optional[tuple[str, ...]] = None
     execution_timeout_ms: Optional[int] = None
     flashboot: Optional[FlashBoot] = None
+    env: Optional[Mapping[str, str]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.flashboot is not None and not isinstance(self.flashboot, FlashBoot):
             raise ValueError("flashboot must be a FlashBoot enum value")
+        if self.env is not None:
+            environment = _string_mapping(self.env, "Endpoint update env")
+            object.__setattr__(self, "env", _freeze_json_value(environment))
 
     def to_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
@@ -837,6 +841,8 @@ class EndpointUpdateRequest:
             payload["timeout"] = self.execution_timeout_ms
         if self.flashboot is not None:
             payload["flashboot"] = self.flashboot.value
+        if self.env is not None:
+            payload["env"] = _mutable_json_value(self.env)
         if not payload:
             raise ValueError("Endpoint update cannot be empty")
         return payload
