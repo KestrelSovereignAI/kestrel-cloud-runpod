@@ -298,6 +298,7 @@ async def test_serverless_post_ack_validation_control_policy(mode, record_proper
         "create-readback",
         "cleanup-ambiguous",
         "cleanup-manager",
+        "cleanup-worker-inventory",
     ],
 )
 async def test_serverless_provider_preserves_exact_execution_control(
@@ -364,7 +365,15 @@ async def test_serverless_provider_preserves_exact_execution_control(
             accepted_cost_ceiling_usd=accepted.cost_ceiling_usd,
         )
         control_client.list_pages.append((control_client.created,))
-        control_client.delete_error = carrier
+        if boundary == "cleanup-worker-inventory":
+            class InterruptedWorkerInventory(dict):
+                def get(self, key, default=None):
+                    capture_injection("workers")
+                    raise carrier
+
+            control_client.worker_page = InterruptedWorkerInventory()
+        else:
+            control_client.delete_error = carrier
         operation = lambda: provider.cleanup_planned_endpoint(
             value,
             accepted,
@@ -386,8 +395,10 @@ async def test_serverless_provider_preserves_exact_execution_control(
         tuple(control_client.get_calls),
         tuple(control_client.delete_calls),
     ) == entry_counts
-    if boundary.startswith("cleanup-"):
+    if boundary in {"cleanup-ambiguous", "cleanup-manager"}:
         assert control_client.delete_calls == [activation.endpoint_id]
+    else:
+        assert control_client.delete_calls == []
 
 
 @pytest.mark.asyncio

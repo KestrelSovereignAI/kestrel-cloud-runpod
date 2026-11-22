@@ -22,6 +22,7 @@ from kestrel_cloud_runpod.clients import (
     RunpodControlPlaneClient,
     RunpodServerlessClient,
     RunpodTransport,
+    endpoint_worker_population_is_empty,
     is_retryable_runpod_api_error,
 )
 from kestrel_cloud_runpod.models import (
@@ -37,6 +38,50 @@ from kestrel_cloud_runpod.models import (
     RunPodAPIError,
     RunPodManagerError,
 )
+
+
+@pytest.mark.parametrize("state", ["running", "idle", "initializing", "throttled", "unhealthy"])
+def test_serverless_endpoint_worker_inventory_distinguishes_zero_from_any_worker_state(state):
+    summary = dict.fromkeys(
+        ("running", "idle", "initializing", "throttled", "unhealthy", "total"), 0
+    )
+    assert endpoint_worker_population_is_empty(
+        {
+            "workers": [],
+            "summary": summary,
+            "pagination": {"hasNextPage": False, "nextCursor": None},
+        }
+    )
+    assert not endpoint_worker_population_is_empty(
+        {"workers": [{"status": state.upper()}], "summary": {**summary, state: 1, "total": 1}}
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"workers": None},
+        {"workers": [{"status": "RUNNING"}]},
+        {"summary": {"total": 0}},
+        {"pagination": {"hasNextPage": True, "nextCursor": "another-page"}},
+    ),
+)
+def test_serverless_endpoint_worker_inventory_refuses_unproven_empty_state(override):
+    summary = dict.fromkeys(
+        ("running", "idle", "initializing", "throttled", "unhealthy", "total"), 0
+    )
+    with pytest.raises(RunPodManagerError):
+        endpoint_worker_population_is_empty({"workers": [], "summary": summary, **override})
+
+
+@pytest.mark.parametrize(("field", "value"), [("total", False), ("idle", -1), ("running", 1)])
+def test_serverless_endpoint_worker_inventory_refuses_invalid_or_inconsistent_counts(field, value):
+    summary = dict.fromkeys(
+        ("running", "idle", "initializing", "throttled", "unhealthy", "total"), 0
+    )
+    summary[field] = value
+    with pytest.raises(RunPodManagerError):
+        endpoint_worker_population_is_empty({"workers": [], "summary": summary})
 
 
 def _page(key, items, next_cursor=None):

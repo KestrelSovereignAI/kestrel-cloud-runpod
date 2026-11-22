@@ -47,6 +47,9 @@ from .models import (
 )
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_ENDPOINT_WORKER_STATUS_KEYS = frozenset(
+    {"running", "idle", "initializing", "throttled", "unhealthy"}
+)
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _RETRYABLE_TRANSPORT_PAIRS = {
     httpx.ConnectTimeout: httpcore.ConnectTimeout,
@@ -116,6 +119,34 @@ def is_exact_runpod_not_found(error: RunPodAPIError) -> bool:
         and error.__cause__ is None
         and not is_execution_control_error(error)
     )
+
+
+def endpoint_worker_population_is_empty(payload: Mapping[str, Any]) -> bool:
+    """Prove scale-to-zero from a complete v2 control-plane worker inventory.
+
+    Do not probe the inference or health route: a data-plane request can wake
+    the endpoint being observed. An inconsistent inventory cannot prove either
+    quiescence or any individual worker's state.
+    """
+    workers, summary = payload.get("workers"), payload.get("summary")
+    if not isinstance(workers, list) or not isinstance(summary, Mapping):
+        raise RunPodManagerError("Invalid v2 endpoint worker inventory")
+    if set(summary) != _ENDPOINT_WORKER_STATUS_KEYS | {"total"}:
+        raise RunPodManagerError("Invalid v2 endpoint worker summary")
+    if any(
+        not isinstance(amount, int) or isinstance(amount, bool) or amount < 0
+        for amount in summary.values()
+    ):
+        raise RunPodManagerError("Invalid v2 endpoint worker counts")
+    total = summary["total"]
+    if not (
+        sum(summary[key] for key in _ENDPOINT_WORKER_STATUS_KEYS)
+        == total == len(workers)
+    ):
+        raise RunPodManagerError("Inconsistent v2 endpoint worker inventory")
+    if "pagination" in payload and CursorPagination.from_dict(payload).has_next_page:
+        raise RunPodManagerError("Incomplete v2 endpoint worker inventory")
+    return total == 0
 
 
 class RunpodTransport:
