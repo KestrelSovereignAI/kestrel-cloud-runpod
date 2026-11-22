@@ -16,7 +16,7 @@ from .ollama_contracts import (
     OllamaProvisioningEvidenceError, iso_datetime,
 )
 from .ollama_provider import validate_registered_ollama_endpoint
-from .registered_ollama_journal import RegisteredActivation, RegisteredActivationIntent, RegisteredActivationState, RegisteredOllamaJournal
+from .registered_ollama_journal import RegisteredActivation, RegisteredActivationIntent, RegisteredActivationState, RegisteredInferenceTerms, RegisteredOllamaJournal
 from .signed_invocations import canonical_sha256
 
 _PARK_MARKER_ENV = "KESTREL_OLLAMA_PARKED_ACTIVATION"
@@ -92,6 +92,7 @@ class RegisteredOllamaLifecycle:
         self, *, lease_id: str, owner_id: str, admission_sha256: str,
         active_env: Mapping[str, str], first_patch_before: datetime,
         ready_before: datetime, hard_deadline: datetime, idle_seconds: int,
+        terms: RegisteredInferenceTerms | None = None,
     ) -> tuple[RegisteredActivation, bool]:
         try:
             expiry = datetime.fromisoformat(active_env.get("KESTREL_OLLAMA_BEARER_TOKEN_EXPIRES_AT", ""))
@@ -123,7 +124,7 @@ class RegisteredOllamaLifecycle:
             admission_sha256, self.endpoint.digest,
             existing.intent.prior_environment_sha256 if existing else prior_sha,
             environment_values_sha256(active_env), environment_values_sha256(park_env),
-            first_patch_before, ready_before, hard_deadline, idle_seconds,
+            first_patch_before, ready_before, hard_deadline, idle_seconds, terms,
         )
         if existing is None:
             self._verify_parked(prior_sha)

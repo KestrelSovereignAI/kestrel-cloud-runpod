@@ -79,9 +79,11 @@ RunPodFeature = "kestrel_cloud_runpod.feature:RunPodFeature"
 
 [project.entry-points."kestrel_sovereign.inference_lease_providers"]
 runpod = "kestrel_cloud_runpod.inference_provider:RunpodInferenceLeaseProvider"
+runpod_registered = "kestrel_cloud_runpod.registered_inference_provider:RegisteredInferenceLeaseProvider"
 
 [project.scripts]
 kestrel-runpod-reconcile-ollama = "kestrel_cloud_runpod.ollama_reconciler:main"
+kestrel-runpod-reconcile-registered-ollama = "kestrel_cloud_runpod.registered_ollama_reconciler:main"
 kestrel-runpod-reconcile-capacity = "kestrel_cloud_runpod.pod_capacity_reconciler:main"
 kestrel-runpod-reconcile-training = "kestrel_cloud_runpod.training_reconciler:main"
 

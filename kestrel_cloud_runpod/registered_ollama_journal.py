@@ -14,6 +14,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Self
@@ -22,6 +23,7 @@ from .ollama_contracts import OllamaLeaseConflictError, OllamaProvisioningIntent
 from .sqlite_store import lease_database_connection
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}")
+_SDK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 _DIGEST = re.compile(r"[a-f0-9]{64}")
 _TABLE = "ollama_registered_activations"
 _CREATE = f"""
@@ -37,6 +39,8 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     hard_deadline TEXT NOT NULL
 )
 """
+_READINESS_TABLE = "ollama_registered_readiness"
+_REVOCATION_TABLE = "ollama_registered_route_revocations"
 
 
 class RegisteredActivationState(str, Enum):
@@ -46,6 +50,39 @@ class RegisteredActivationState(str, Enum):
     PARKED = "parked"
     FENCED = "fenced"
     FENCED_ZERO = "fenced_zero"
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredInferenceTerms:
+    """Credential-free projection required to rebuild the SDK lease on restart."""
+
+    request_id: str
+    quote_id: str
+    model: str
+    model_digest: str
+    region: str
+    hourly_usd: str
+    estimated_total_usd: str
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(value, str) or _SDK_ID.fullmatch(value) is None for value in (
+            self.request_id, self.quote_id, self.model, self.region,
+        )):
+            raise ValueError("Invalid registered inference terms")
+        if (
+            not isinstance(self.model_digest, str) or not self.model_digest.startswith("sha256:")
+            or _DIGEST.fullmatch(self.model_digest.removeprefix("sha256:")) is None
+        ):
+            raise ValueError("Invalid registered model digest")
+        for value in (self.hourly_usd, self.estimated_total_usd):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) is None:
+                raise ValueError("Invalid registered inference cost")
+            try:
+                cost = Decimal(value)
+            except InvalidOperation:
+                raise ValueError("Invalid registered inference cost") from None
+            if not cost.is_finite() or cost <= 0:
+                raise ValueError("Invalid registered inference cost")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,11 +100,13 @@ class RegisteredActivationIntent:
     ready_before: datetime
     hard_deadline: datetime
     idle_seconds: int
+    terms: RegisteredInferenceTerms | None = None
 
     def __post_init__(self) -> None:
         for name in ("lease_id", "owner_id", "endpoint_id", "cache_id"):
             value = getattr(self, name)
-            if not isinstance(value, str) or not _ID.fullmatch(value):
+            pattern = _SDK_ID if name == "owner_id" else _ID
+            if not isinstance(value, str) or not pattern.fullmatch(value):
                 raise ValueError("Invalid registered activation identity")
         for name in (
             "admission_sha256", "registration_sha256", "prior_environment_sha256",
@@ -90,11 +129,17 @@ class RegisteredActivationIntent:
             object.__setattr__(self, name, value.astimezone(UTC))
         if not self.first_patch_before <= self.ready_before < self.hard_deadline:
             raise ValueError("Registered activation cannot outlive its hard deadline")
+        if self.terms is not None and not isinstance(self.terms, RegisteredInferenceTerms):
+            raise ValueError("Invalid registered inference terms")
 
     def _encode(self) -> str:
         wire = {item.name: getattr(self, item.name) for item in fields(self)}
         for key in ("first_patch_before", "ready_before", "hard_deadline"):
             wire[key] = iso_datetime(wire[key])
+        if self.terms is None:
+            wire.pop("terms")
+        else:
+            wire["terms"] = {item.name: getattr(self.terms, item.name) for item in fields(self.terms)}
         return json.dumps(wire, separators=(",", ":"), sort_keys=True)
 
     @classmethod
@@ -102,6 +147,8 @@ class RegisteredActivationIntent:
         wire = json.loads(value)
         for key in ("first_patch_before", "ready_before", "hard_deadline"):
             wire[key] = datetime.fromisoformat(wire[key])
+        if "terms" in wire:
+            wire["terms"] = RegisteredInferenceTerms(**wire["terms"])
         intent = cls(**wire)
         if intent._encode() != value:
             raise ValueError("Noncanonical registered activation intent")
@@ -169,6 +216,15 @@ class RegisteredOllamaJournal:
             ).fetchone() is None:
                 raise OllamaLeaseConflictError("Original Ollama lease journal identity is missing")
             db.execute(_CREATE)
+            db.execute(
+                f"CREATE TABLE IF NOT EXISTS {_READINESS_TABLE} ("
+                f"lease_id TEXT PRIMARY KEY REFERENCES {_TABLE}(lease_id),"
+                "proof TEXT NOT NULL)"
+            )
+            db.execute(
+                f"CREATE TABLE IF NOT EXISTS {_REVOCATION_TABLE} ("
+                f"lease_id TEXT PRIMARY KEY REFERENCES {_TABLE}(lease_id))"
+            )
             for column in ("endpoint_id", "cache_id"):
                 db.execute(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS registered_active_{column}"
@@ -245,7 +301,8 @@ class RegisteredOllamaJournal:
         with lease_database_connection(self._path) as db:
             rows = db.execute(
                 f"SELECT * FROM {_TABLE} WHERE state IN ('parking', 'fenced') OR"
-                " (state IN ('arming', 'active') AND (hard_deadline <= ? OR idle_deadline <= ?))"
+                " (state IN ('arming', 'active') AND (hard_deadline <= ? OR idle_deadline <= ?"
+                f" OR EXISTS (SELECT 1 FROM {_REVOCATION_TABLE} AS r WHERE r.lease_id = {_TABLE}.lease_id)))"
                 " ORDER BY created_at",
                 (now, now),
             ).fetchall()
@@ -293,10 +350,85 @@ class RegisteredOllamaJournal:
             db.execute("BEGIN IMMEDIATE")
             record = self._required(db, original)
             now = self._now()
-            if record.state is not RegisteredActivationState.ACTIVE or now >= record.expires_at:
+            if (
+                record.state is not RegisteredActivationState.ACTIVE or now >= record.expires_at
+                or self._revoked(db, original.lease_id)
+            ):
                 raise OllamaLeaseConflictError("Registered lease cannot be renewed")
             idle = min(original.hard_deadline, now + timedelta(seconds=original.idle_seconds))
             return self._write(db, record, record.state, idle=idle)
+
+    def readiness(self, lease_id: str) -> dict[str, object] | None:
+        with lease_database_connection(self._path) as db:
+            row = db.execute(
+                f"SELECT proof FROM {_READINESS_TABLE} WHERE lease_id = ?", (lease_id,),
+            ).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def route_view(
+        self, original: RegisteredActivationIntent,
+    ) -> tuple[RegisteredActivation, dict[str, object] | None, bool]:
+        """Read readiness and latest route revocation from one WAL snapshot."""
+        with lease_database_connection(self._path) as db:
+            db.execute("BEGIN")
+            latest = self._required(db, original)
+            row = db.execute(
+                f"SELECT proof FROM {_READINESS_TABLE} WHERE lease_id = ?", (original.lease_id,),
+            ).fetchone()
+            return latest, json.loads(row[0]) if row else None, self._revoked(db, original.lease_id)
+
+    def record_ready(
+        self, original: RegisteredActivationIntent, *, worker_id: str,
+        cache_hit: bool, startup_ms: int, model_load_ms: int,
+    ) -> RegisteredActivation:
+        """Store startup proof and start the idle deadline in the same commit."""
+        if (
+            not isinstance(worker_id, str) or _ID.fullmatch(worker_id) is None
+            or cache_hit is not True
+            or any(type(item) is not int or item < 0 for item in (startup_ms, model_load_ms))
+        ):
+            raise ValueError("Incomplete registered inference readiness proof")
+        proof = json.dumps({
+            "worker_id": worker_id, "cache_hit": cache_hit,
+            "startup_ms": startup_ms, "model_load_ms": model_load_ms,
+        }, separators=(",", ":"), sort_keys=True)
+        with lease_database_connection(self._path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            record = self._required(db, original)
+            now = self._now()
+            if (
+                record.state is not RegisteredActivationState.ACTIVE
+                or now >= min(original.ready_before, record.expires_at)
+                or self._revoked(db, original.lease_id)
+            ):
+                raise OllamaLeaseConflictError("Registered readiness expired before delivery")
+            if db.execute(
+                f"SELECT 1 FROM {_READINESS_TABLE} WHERE lease_id = ?", (original.lease_id,),
+            ).fetchone() is not None:
+                raise OllamaLeaseConflictError("Registered startup already has original evidence")
+            db.execute(f"INSERT INTO {_READINESS_TABLE} VALUES (?, ?)", (original.lease_id, proof))
+            idle = min(original.hard_deadline, now + timedelta(seconds=original.idle_seconds))
+            return self._write(db, record, record.state, idle=idle)
+
+    def revoke(self, original: RegisteredActivationIntent) -> RegisteredActivation:
+        """Stop granting a route before external cleanup, even on uncertain readback."""
+        with lease_database_connection(self._path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            record = self._required(db, original)
+            if record.state in (RegisteredActivationState.PARKED, RegisteredActivationState.FENCED_ZERO):
+                return record
+            db.execute(
+                f"INSERT OR IGNORE INTO {_REVOCATION_TABLE} VALUES (?)", (original.lease_id,),
+            )
+            cutoff = max(record.created_at + timedelta(microseconds=1), self._now())
+            deadline = min(cutoff, record.idle_deadline)
+            return self._write(db, record, record.state, idle=deadline)
+
+    @staticmethod
+    def _revoked(db: sqlite3.Connection, lease_id: str) -> bool:
+        return db.execute(
+            f"SELECT 1 FROM {_REVOCATION_TABLE} WHERE lease_id = ?", (lease_id,),
+        ).fetchone() is not None
 
     def _advance(
         self, original: RegisteredActivationIntent,
