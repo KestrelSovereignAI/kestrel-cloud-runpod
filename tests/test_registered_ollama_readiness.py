@@ -47,6 +47,7 @@ def evidence(snapshot, models, *, change_worker=False):
     return verify_registered_runtime(
         snapshot, {"models": models}, telemetry_binding_sha256=BINDING,
         expected_model=MODEL, model_digest="sha256:" + DIGEST, first_worker=worker,
+        expected_runtime_version=OLLAMA_RUNTIME_VERSION,
         last_worker=replace(worker, worker_id="different-worker") if change_worker else worker,
     )
 
@@ -65,3 +66,5 @@ def test_route_evidence_binds_cache_only_snapshot_and_exact_model_without_persis
         evidence(telemetry(), [model], change_worker=True)
     with pytest.raises(OllamaProvisioningEvidenceError, match="pinned cache"):
         evidence({**telemetry(), "telemetry_binding_sha256": "d" * 64}, [model])
+    with pytest.raises(OllamaProvisioningEvidenceError, match="pinned cache"):
+        evidence({**telemetry(), "runtime_version": "older-image"}, [model])

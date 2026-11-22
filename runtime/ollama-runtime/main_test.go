@@ -13,8 +13,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -186,6 +189,113 @@ func TestModelStorageTreeRejectsSymlinksBeforePrivilegedOwnershipChange(t *testi
 	if err := validateModelStorageTree(storage); err == nil || !strings.Contains(err.Error(), "unsupported symlink") {
 		t.Fatalf("expected symlink rejection, got %v", err)
 	}
+}
+
+func TestServerlessExternalCacheUsesReadOnlyPolicy(t *testing.T) {
+	upstream, _ := url.Parse(defaultUpstream)
+	config := testConfig(upstream)
+	config.Mode = "serverless_load_balancer"
+	config.ModelStoragePath = "/runpod-volume/ollama"
+	config.RequireCachedModel = true
+	if !config.usesExternalReadOnlyCache() {
+		t.Fatal("serverless cache-only mount must not be initialized as owned storage")
+	}
+	env := ollamaProcessEnvironment(config, []string{"OLLAMA_NOPRUNE=false"})
+	if !slices.Contains(env, "OLLAMA_NOPRUNE=true") || slices.Contains(env, "OLLAMA_NOPRUNE=false") {
+		t.Fatalf("read-only startup must override the pruning policy: %v", env)
+	}
+	config.ModelStoragePath = "/models"
+	if config.usesExternalReadOnlyCache() {
+		t.Fatal("the container's owned storage is not a mounted cache")
+	}
+	config.ModelStoragePath = "/workspace/ollama"
+	config.Mode = "dedicated_pod"
+	if config.usesExternalReadOnlyCache() {
+		t.Fatal("the existing dedicated Pod storage initialization changed")
+	}
+}
+
+func TestPrivilegeDroppedExternalCacheWithoutChown(t *testing.T) {
+	if target := os.Getenv("KESTREL_TEST_EXTERNAL_CACHE_TARGET"); target != "" {
+		if err := dropRuntimePrivilege(); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateExternalModelCache(target); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("Linux root fixture; CI also runs this with CAP_CHOWN removed")
+	}
+	storage, err := os.MkdirTemp("/", ".kestrel-test-cache-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(storage); err != nil {
+			t.Errorf("cleanup exact fixture: %v", err)
+		}
+	})
+	if err := os.Chmod(storage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := filepath.Join(storage, "ollama")
+	blob := filepath.Join(store, "sha256-pinned-fixture")
+	if err := os.Mkdir(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("already-seeded-model")
+	if err := os.WriteFile(blob, data, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	validate := func(target, wantFailure string) {
+		t.Helper()
+		child := exec.Command(os.Args[0], "-test.run", "^TestPrivilegeDroppedExternalCacheWithoutChown$")
+		child.Env = replaceEnvironment(os.Environ(), map[string]string{"KESTREL_TEST_EXTERNAL_CACHE_TARGET": target})
+		output, err := child.CombinedOutput()
+		if wantFailure == "" {
+			if err != nil {
+				t.Fatalf("owned cache is readable without mutation: %v: %s", err, output)
+			}
+		} else if err == nil || !strings.Contains(string(output), wantFailure) {
+			t.Fatalf("want %q refusal, got %v: %s", wantFailure, err, output)
+		}
+	}
+	validate(store, "")
+	info, err := os.Stat(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	got, err := os.ReadFile(blob)
+	if err != nil || stat.Uid != 0 || stat.Gid != 0 || info.Mode().Perm() != 0o444 || !bytes.Equal(got, data) {
+		t.Fatalf("runtime changed the seed: %v", err)
+	}
+	items, err := os.ReadDir(store)
+	if err != nil || len(items) != 1 || items[0].Name() != filepath.Base(blob) {
+		t.Fatalf("runtime wrote cache entries: %v", err)
+	}
+	if err := os.Chmod(blob, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	validate(store, "must not be writable")
+	if err := os.Chmod(blob, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	validate(store, "unreadable")
+	if err := os.Chmod(blob, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(storage, "alias")
+	if err := os.Symlink(store, alias); err != nil {
+		t.Fatal(err)
+	}
+	validate(alias, "real directory components")
+	if err := os.Symlink(blob, filepath.Join(store, "foreign")); err != nil {
+		t.Fatal(err)
+	}
+	validate(store, "unsupported symlink")
 }
 
 func TestAnonymousAndWrongBearerAreDeniedOnEveryNonHealthSurface(t *testing.T) {

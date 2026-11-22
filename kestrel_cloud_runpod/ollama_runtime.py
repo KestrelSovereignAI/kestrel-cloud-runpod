@@ -6,17 +6,18 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
+from types import MappingProxyType
 
 from .models import RunPodManagerError
 from .ollama_contracts import OLLAMA_REQUIRE_CACHED_MODEL_ENV, OllamaLeaseMode
 
 OLLAMA_RUNTIME_CONTRACT = "ollama-runtime/v1"
-OLLAMA_RUNTIME_VERSION = "1.1.5"
-_CACHE_ONLY_RELEASE_DIGESTS = frozenset(
+OLLAMA_RUNTIME_VERSION = "1.1.6"
+_CACHE_ONLY_RUNTIME_VERSIONS = MappingProxyType(
     {
         # 1.1.5: main a8caa52f07a00d6073aa22ebcfb57bf32e5ea2d8,
         # publish 44931259242. Add releases after checking provenance and SBOM.
-        "sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3",
+        "sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3": "1.1.5",
     }
 )
 OLLAMA_RUNTIME_IMAGE_REPOSITORY = (
@@ -69,11 +70,17 @@ def require_immutable_ollama_image(image: str) -> str:
 def require_cache_only_ollama_image(image: str) -> str:
     """Admit only an exact release reviewed for the cache-only contract."""
     require_immutable_ollama_image(image)
-    if image.split("@", 1)[1] not in _CACHE_ONLY_RELEASE_DIGESTS:
+    if image.split("@", 1)[1] not in _CACHE_ONLY_RUNTIME_VERSIONS:
         raise RunPodManagerError(
             "Managed cache-only Ollama requires an approved cache-only runtime image digest"
         )
     return image
+
+
+def cache_only_ollama_runtime_version(image: str) -> str:
+    """Resolve runtime telemetry from the enrolled image, not the latest build."""
+    digest = require_cache_only_ollama_image(image).split("@", 1)[1]
+    return _CACHE_ONLY_RUNTIME_VERSIONS[digest]
 
 
 def build_ollama_runtime_environment(

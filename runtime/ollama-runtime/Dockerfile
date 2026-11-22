@@ -4,7 +4,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine3.23@sha256:23f198931d4bd83b4f5a613bd75656257ae8bf832dcbc2db80e1050b5219ca2a AS proxy-builder
 ENV GOTOOLCHAIN=local
 ARG TARGETARCH
-ARG RUNTIME_VERSION=1.1.5
+ARG RUNTIME_VERSION=1.1.6
 ARG OLLAMA_VERSION=0.32.5
 WORKDIR /src
 COPY go.mod main.go ./
@@ -42,7 +42,7 @@ RUN go get \
     && test "$(go version -m /out/ollama | awk '$1 == "dep" && $2 == "golang.org/x/net" {print $3}')" = v0.62.0
 
 FROM ollama/ollama:0.32.5@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131
-ARG RUNTIME_VERSION=1.1.5
+ARG RUNTIME_VERSION=1.1.6
 ARG OLLAMA_VERSION=0.32.5
 LABEL org.opencontainers.image.title="Kestrel private Ollama runtime" \
       org.opencontainers.image.description="Digest-pinned Ollama behind an authenticated, allowlisted streaming proxy" \
@@ -79,9 +79,9 @@ ENV HOME=/var/lib/kestrel-ollama \
     OLLAMA_NO_CLOUD=true \
     PORT=11434 \
     PORT_HEALTH=11434
-# The entrypoint starts as root only to initialize a fresh Runpod volume, rejects
-# symlinks in the cache tree, recursively assigns it to 10001:10001, and drops
-# all user/group privilege before starting Ollama or opening the public port.
+# The entrypoint starts as root only for owned storage initialization.
+# A preseeded Serverless mount is validated without writes after the runtime
+# drops to 10001:10001, before Ollama or the public listener starts.
 USER 0:0
 VOLUME ["/models"]
 EXPOSE 11434

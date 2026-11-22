@@ -28,7 +28,9 @@ from .effect_custody import await_owned_effect
 from .models import SERVERLESS_DATA_PLANE_BASE_URL, CloudType, ComputeProduct, RunPodManagerError, VolumeType
 from .ollama_contracts import OllamaLeaseMode, OllamaProvisioningEvidenceError
 from .ollama_repository import SQLiteOllamaLeaseRepository, lease_database_path
-from .ollama_runtime import build_ollama_runtime_environment, parse_ollama_model_allowlist
+from .ollama_runtime import (
+    build_ollama_runtime_environment, cache_only_ollama_runtime_version, parse_ollama_model_allowlist,
+)
 from .registered_ollama import RegisteredOllamaLifecycle
 from .registered_ollama_admission import REGISTERED_CAPABILITIES, REGISTERED_PROVIDER_NAME, RegisteredQuotePolicy
 from .registered_ollama_journal import RegisteredActivation, RegisteredActivationState, RegisteredInferenceTerms, RegisteredOllamaJournal
@@ -245,6 +247,7 @@ class RegisteredInferenceLeaseProvider:
                             snapshot = verify_registered_runtime(
                                 evidence.json(), tags.json(), telemetry_binding_sha256=intent.admission_sha256,
                                 expected_model=intent.terms.model, model_digest=self._model_digest,
+                                expected_runtime_version=cache_only_ollama_runtime_version(lifecycle.endpoint.baseline.image),
                                 first_worker=worker, last_worker=confirmed,
                             )
                             if snapshot.model_load_ms is None:

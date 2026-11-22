@@ -191,10 +191,7 @@ def test_container_contract_is_pinned_nonroot_and_secret_free() -> None:
     assert "libssl3t64=3.0.13-0ubuntu3.16 openssl=3.0.13-0ubuntu3.16" in dockerfile
     assert (RUNTIME / "go.mod").read_text().endswith("go 1.26.11\n")
     assert "USER 0:0" in dockerfile
-    assert (
-        "prepareRuntimeFilesystem(config.ModelStoragePath)"
-        in (RUNTIME / "main.go").read_text()
-    )
+    assert "prepareRuntimeFilesystem(config)" in (RUNTIME / "main.go").read_text()
     assert 'VOLUME ["/models"]' in dockerfile
     assert "EXPOSE 11434" in dockerfile
     assert "RUNPOD_API_KEY=" not in dockerfile
@@ -258,13 +255,19 @@ def test_image_security_tools_share_runner_owned_scratch() -> None:
     assert all(step.get("env", {}).get("TMPDIR") == expected for step in tools.values())
 
 
-def test_fresh_volume_runtime_smoke_supplies_every_required_environment_value() -> None:
+@pytest.mark.parametrize("step_name", [
+    "Verify fresh-volume initialization drops all runtime privilege",
+    "Start the packaged server on a read-only cache without CHOWN",
+])
+def test_runtime_smoke_supplies_every_required_environment_value(step_name: str) -> None:
     contract = json.loads((RUNTIME / "runpod-template.json").read_text())
-    workflow = (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
-    smoke = workflow.split(
-        "- name: Verify fresh-volume initialization drops all runtime privilege",
-        maxsplit=1,
-    )[1].split("- name: Generate SPDX SBOM", maxsplit=1)[0]
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "ollama-runtime.yml").read_text()
+    )
+    smoke, = [
+        step["run"] for step in workflow["jobs"]["image-security"]["steps"]
+        if step.get("name") == step_name
+    ]
 
     invalid_counts = {
         name: smoke.count(f'--env "{name}=')
