@@ -16,6 +16,7 @@ from .billing import billing_amounts, exact_decimal_sum
 from .clients import (
     RunpodControlPlaneClient,
     RunpodServerlessClient,
+    endpoint_worker_population_is_empty,
     is_exact_runpod_not_found,
 )
 from .effect_custody import await_owned_effect
@@ -84,9 +85,6 @@ _BILLING_METADATA_KEYS = frozenset(
 _BILLING_QUERY_KEYS = frozenset({"startTime", "endTime", "bucketSize", "serverlessId"})
 _BILLING_TOTAL_KEYS = frozenset(
     {"totalAmount", "gpuAmount", "cpuAmount", "diskAmount", "feeAmount"}
-)
-_WORKER_SUMMARY_KEYS = frozenset(
-    {"running", "idle", "initializing", "throttled", "unhealthy", "total"}
 )
 _AVAILABILITY_RANK = {
     Availability.NONE.value: 0,
@@ -706,32 +704,17 @@ class RunpodServerlessCapacityProvider:
         worker_page = await asyncio.to_thread(
             self.control_client.list_endpoint_workers, activation.endpoint_id
         )
-        workers = worker_page.get("workers")
-        summary = worker_page.get("summary")
-        if not isinstance(workers, list) or not isinstance(summary, Mapping):
+        try:
+            workers_are_zero = endpoint_worker_population_is_empty(worker_page)
+        except RunPodManagerError as exc:
+            if is_execution_control_error(exc):
+                raise
             raise ServerlessEndpointCleanupError(
                 "Serverless worker inventory is invalid before cleanup",
                 endpoint_name=activation.endpoint_name,
                 endpoint_id=activation.endpoint_id,
-            )
-        if set(summary) != _WORKER_SUMMARY_KEYS:
-            raise ServerlessEndpointCleanupError(
-                "Serverless worker summary is invalid before cleanup",
-                endpoint_name=activation.endpoint_name,
-                endpoint_id=activation.endpoint_id,
-            )
-        try:
-            workers_are_zero = all(
-                _integer(summary.get(key), f"workers summary.{key}") == 0
-                for key in _WORKER_SUMMARY_KEYS
-            )
-        except RunPodManagerError as exc:
-            raise ServerlessEndpointCleanupError(
-                "Serverless worker summary is invalid before cleanup",
-                endpoint_name=activation.endpoint_name,
-                endpoint_id=activation.endpoint_id,
             ) from exc
-        if workers or not workers_are_zero:
+        if not workers_are_zero:
             raise ServerlessEndpointCleanupError(
                 "Serverless endpoint still has active workers before cleanup",
                 endpoint_name=activation.endpoint_name,
