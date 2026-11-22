@@ -338,6 +338,31 @@ component does not, by itself, enable a provider-neutral lease route or
 start a reconciler. Do not mix older create-only writers on the same
 journal when deploying a registered activation.
 
+The opt-in `runpod_registered` provider and the one-shot
+`kestrel-runpod-reconcile-registered-ollama` command use the same absolute
+`RUNPOD_REGISTERED_OLLAMA_CONFIG` and `RUNPOD_OLLAMA_LEASE_DB`. Keep the
+reaper outside the requester process while a trial is admitted. Only the
+requester receives the separate `RUNPOD_REGISTERED_OLLAMA_KEY`, scoped to that
+endpoint; the reaper uses only the management credential. Runtime
+configuration carries a write-only Runpod secret reference, never the
+management credential. Record the SHA-256 of the credential enrolled with the
+exact endpoint-only scope as `invocation_key_sha256`, not its plaintext.
+Fresh admission also requires authenticated endpoint health and management
+denial. Quote acceptance binds one exact model digest and one US data center,
+and the journal revokes the route before verifying teardown. Requests
+and status during restart never wake a new worker from an old offer.
+
+The config contains `[endpoint]` with the original ID, name and creation
+time (`endpoint_id`, `endpoint_name`, `created_at`), plus `image`, `gpu_pool`,
+`region`, `cache_id`, `registry_id`, `min_cuda`, `disk_gb`,
+`worker_idle_seconds`, and `execution_timeout_ms`. Give `[inference]`
+the exact `model_pin` (`model:tag@sha256:...`), `secret_name`,
+`gpu_id`, `cache_size_gb`, `model_storage_path`, quote and readiness
+bounds (`quote_ttl_seconds`, `estimated_ready_seconds`,
+`max_readiness_seconds`, `max_session_seconds`), and
+`non_compute_cost_bound_usd`. Do not point the provider at a definition
+that is currently serving outside the same journal.
+
 Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload IDs, the exact model, placement constraints, expected warm utilization, an idle timeout, hard deadline, and maximum spend. The service compares current Pod and Serverless catalog offers. Bursty traffic can use native load-balanced Serverless; sustained sessions can use a dedicated Pod. Queue Serverless is not selected for interactive streaming. `lease.public_route_url` remains `None` until both Runpod health and Ollama `/api/tags` prove the requested model is ready. An external scheduler must run `RunPodManager.reconcile_ollama_leases()` periodically so expiry and teardown retries survive requester crashes. The `kestrel-runpod-reconcile-ollama` command performs one fail-fast pass and is suitable for a timer or job runner.
 
 Kestrel normally reaches that lifecycle through
