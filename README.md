@@ -326,6 +326,18 @@ automatic operator loss, or fabricated job is substituted for observed spend.
 
 Create calls are never retried automatically. If a connection failure or 5xx makes a Pod, endpoint, or queue-job creation result ambiguous, the client raises `RunPodAmbiguousResultError` with `reconcile_required = True`. Ollama leases persist the request fingerprint and deterministic resource name before creation, then recover by listing before any replacement could be authorized.
 
+Registered Serverless activation custody (`registered_ollama`) is a
+control-plane component, not a live route. It keeps one original
+activation per registered endpoint and per cache in the existing SQLite
+journal. An ambiguous activation cannot be replayed; an expired original
+can be parked only after exact provider readback. An uncertain park can
+be rescued after the hard deadline, but the endpoint and cache stay
+fenced against future leases so a delayed PATCH cannot affect a new one.
+Only control-plane readback proves the worker population is zero. This
+component does not, by itself, enable a provider-neutral lease route or
+start a reconciler. Do not mix older create-only writers on the same
+journal when deploying a registered activation.
+
 Private Ollama callers submit a stable `OllamaLeaseRequest` with owner/workload IDs, the exact model, placement constraints, expected warm utilization, an idle timeout, hard deadline, and maximum spend. The service compares current Pod and Serverless catalog offers. Bursty traffic can use native load-balanced Serverless; sustained sessions can use a dedicated Pod. Queue Serverless is not selected for interactive streaming. `lease.public_route_url` remains `None` until both Runpod health and Ollama `/api/tags` prove the requested model is ready. An external scheduler must run `RunPodManager.reconcile_ollama_leases()` periodically so expiry and teardown retries survive requester crashes. The `kestrel-runpod-reconcile-ollama` command performs one fail-fast pass and is suitable for a timer or job runner.
 
 Kestrel normally reaches that lifecycle through

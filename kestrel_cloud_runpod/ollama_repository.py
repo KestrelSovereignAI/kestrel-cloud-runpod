@@ -55,6 +55,7 @@ from .ollama_contracts import (
     resource_from_lease,
     runtime_telemetry_binding_for_intent,
 )
+from .registered_ollama_journal import require_unreserved_registered_cache
 from .sqlite_store import lease_database_connection
 
 _CURRENT_WRITER_CONTRACT_VERSION = OLLAMA_WRITER_CONTRACT_VERSION
@@ -2104,6 +2105,7 @@ class SQLiteOllamaLeaseRepository:
             if proposed.requires_cached_model:
                 raise OllamaLeaseConflictError("Cache-only provisioning has no original network volume")
             return
+        require_unreserved_registered_cache(connection, volume_ids)
         rows = connection.execute(
             """SELECT provisioning_intent_json FROM ollama_leases
                  WHERE lease_id != ? AND provisioning_intent_json IS NOT NULL
