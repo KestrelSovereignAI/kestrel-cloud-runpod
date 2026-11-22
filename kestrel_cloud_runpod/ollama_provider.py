@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 from kestrel_sovereign.execution_custody import (
@@ -29,6 +29,7 @@ from .models import (
     ComputeProduct,
     EndpointCreateRequest,
     EndpointResource,
+    EndpointResourceVersion,
     FlashBoot,
     GPUProfile,
     NetworkVolume,
@@ -1157,9 +1158,7 @@ class _ProvisioningAssessment:
     """Collect every independent readback fact before choosing the outcome."""
 
     observed: EndpointResource | PodResource
-    intent: OllamaProvisioningIntent
-    provider_resource_id: str
-    observed_at: datetime
+    reject_mismatch: Callable[[OllamaProvisioningMismatchReason, str], NoReturn]
     missing_common: list[str] = field(default_factory=list)
     missing_policy: list[str] = field(default_factory=list)
     missing_placement: list[str] = field(default_factory=list)
@@ -1215,14 +1214,7 @@ class _ProvisioningAssessment:
         if not self.mismatches:
             return
         reason, detail = self.mismatches[0]
-        _raise_mismatch(
-            self.observed,
-            self.intent,
-            provider_resource_id=self.provider_resource_id,
-            observed_at=self.observed_at,
-            reason=reason,
-            detail=detail,
-        )
+        self.reject_mismatch(reason, detail)
 
     def finish_endpoint(self) -> None:
         self.raise_mismatch_if_any()
@@ -1270,12 +1262,18 @@ def _validate_common_provisioning(
     observed_at: datetime,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any], _ProvisioningAssessment]:
     expected = _intent_request(intent)
-    assessment = _ProvisioningAssessment(
-        observed=observed,
-        intent=intent,
-        provider_resource_id=provider_resource_id,
-        observed_at=observed_at,
-    )
+
+    def reject(reason: OllamaProvisioningMismatchReason, detail: str) -> NoReturn:
+        _raise_mismatch(
+            observed,
+            intent,
+            provider_resource_id=provider_resource_id,
+            observed_at=observed_at,
+            reason=reason,
+            detail=detail,
+        )
+
+    assessment = _ProvisioningAssessment(observed, reject)
     if observed.name != intent.resource_name:
         assessment.mismatch(
             OllamaProvisioningMismatchReason.RESOURCE_IDENTITY,
@@ -1297,6 +1295,18 @@ def _validate_common_provisioning(
         raise OllamaProvisioningEvidenceError(
             "Stored Ollama image or environment intent is invalid"
         )
+    _assess_ollama_runtime_identity(
+        assessment, expected_image=expected.get("image"),
+        expected_environment_sha256=intent.environment_sha256,
+    )
+    return expected, observed.raw, assessment
+
+
+def _assess_ollama_runtime_identity(
+    assessment: _ProvisioningAssessment, *,
+    expected_image: object, expected_environment_sha256: str,
+) -> None:
+    observed = assessment.observed
     assessment.record_resource_field("common", "createdAt")
     assessment.record_resource_field("common", "image")
     assessment.record_resource_field("common", "env")
@@ -1317,16 +1327,74 @@ def _validate_common_provisioning(
         assessment.missing("common", "env")
     if (
         observed.field_evidence.state("image") is ResourceFieldState.PRESENT
-        and observed.image != expected.get("image")
+        and observed.image != expected_image
     ) or (
         observed.field_evidence.state("env") is ResourceFieldState.PRESENT
-        and observed.environment_sha256 != intent.environment_sha256
+        and observed.environment_sha256 != expected_environment_sha256
     ):
         assessment.mismatch(
             OllamaProvisioningMismatchReason.IMAGE_OR_ENVIRONMENT,
             "Ollama provider readback image or environment does not match intent",
         )
-    return expected, observed.raw, assessment
+
+
+def validate_registered_ollama_endpoint(
+    endpoint: EndpointResource,
+    *,
+    endpoint_id: str,
+    original_created_at: datetime,
+    expected: EndpointCreateRequest,
+) -> None:
+    """Check an operator-registered definition, not a lease or create receipt.
+
+    The caller must already hold the approved ID, creation time and policy.
+    Worker population, volume colocation, key custody and spend authority
+    require their own evidence; this function never grants a provider effect.
+    """
+    if (
+        not isinstance(endpoint_id, str)
+        or not endpoint_id
+        or not isinstance(original_created_at, datetime)
+        or original_created_at.utcoffset() is None
+        or expected.resource_schema_version is not EndpointResourceVersion.GA
+        or expected.endpoint_type != "LOAD_BALANCER"
+        or expected.workers_min != 0
+        or type(expected.workers_min) is not int
+        or type(expected.workers_max) is not int
+        or expected.workers_max not in (0, 1)
+        or type(expected.gpu_count) is not int
+        or expected.gpu_count != 1
+        or len(expected.gpu_pools) != 1
+        or len(expected.data_center_ids) != 1
+        or len(expected.network_volume_ids) != 1
+        or not all((*expected.gpu_pools, *expected.data_center_ids, *expected.network_volume_ids))
+        or type(expected.scaling.get("requestCount")) is not int
+        or expected.scaling["requestCount"] != 1
+        or expected.flashboot is not FlashBoot.OFF
+        or type(expected.idle_timeout_seconds) is not int
+        or not 0 < expected.idle_timeout_seconds <= RUNPOD_SERVERLESS_MAX_IDLE_TIMEOUT_SECONDS
+        or expected.min_cuda_version is None
+        or not expected.registry_id
+    ):
+        raise OllamaProvisioningEvidenceError("Invalid registered Ollama endpoint policy")
+    require_cache_only_ollama_image(expected.image)
+    if (
+        endpoint.id != endpoint_id
+        or endpoint.name != expected.name
+        or endpoint.created_at != original_created_at
+    ):
+        raise OllamaProvisioningEvidenceError("Registered Ollama endpoint identity changed")
+
+    def reject(_reason: OllamaProvisioningMismatchReason, detail: str) -> NoReturn:
+        raise OllamaProvisioningEvidenceError(detail)
+
+    assessment = _ProvisioningAssessment(endpoint, reject)
+    _assess_ollama_runtime_identity(
+        assessment, expected_image=expected.image,
+        expected_environment_sha256=environment_values_sha256(expected.env),
+    )
+    _assess_endpoint_policy(endpoint, expected.to_payload(), assessment)
+    assessment.finish_endpoint()
 
 
 def _validate_endpoint_provisioning(
@@ -1336,12 +1404,29 @@ def _validate_endpoint_provisioning(
     provider_resource_id: str,
     observed_at: datetime,
 ) -> dict[str, Any]:
-    expected, raw, assessment = _validate_common_provisioning(
+    expected, _raw, assessment = _validate_common_provisioning(
         endpoint,
         intent,
         provider_resource_id=provider_resource_id,
         observed_at=observed_at,
     )
+    _assess_endpoint_policy(endpoint, expected, assessment)
+    assessment.finish_endpoint()
+    return {
+        "provider_resource_id": endpoint.id,
+        "provider_created_at": (
+            iso_datetime(endpoint.created_at) if endpoint.created_at else None
+        ),
+        "provider_request": expected,
+    }
+
+
+def _assess_endpoint_policy(
+    endpoint: EndpointResource,
+    expected: Mapping[str, Any],
+    assessment: _ProvisioningAssessment,
+) -> None:
+    raw = endpoint.raw
     assessment.record_resource_field("runtime", "requestUrls", required=False)
     assessment.record_resource_field("policy", "type")
     if (
@@ -1474,7 +1559,12 @@ def _validate_endpoint_provisioning(
                     OllamaProvisioningMismatchReason.ENDPOINT_POLICY,
                     "Ollama Endpoint placement policy does not match intent",
                 )
-        if set(value).difference(accepted_mapping):
+        extra = set(value).difference(accepted_mapping)
+        if field_name == "workers" and value.get("initTimeout") is None:
+            # Current v2 returns null for an unset initialization override.
+            # A populated override still changes the accepted worker policy.
+            extra.discard("initTimeout")
+        if extra:
             assessment.mismatch(
                 OllamaProvisioningMismatchReason.ENDPOINT_POLICY,
                 "Ollama Endpoint placement policy does not match intent",
@@ -1510,14 +1600,6 @@ def _validate_endpoint_provisioning(
         assessment.missing("policy", f"mounts.{kind}")
     for kind in mount_assessment.invalid_kinds:
         assessment.invalid("policy", f"mounts.{kind}")
-    assessment.finish_endpoint()
-    return {
-        "provider_resource_id": endpoint.id,
-        "provider_created_at": (
-            iso_datetime(endpoint.created_at) if endpoint.created_at else None
-        ),
-        "provider_request": expected,
-    }
 
 
 def _validate_pod_provisioning(
@@ -1790,7 +1872,7 @@ def _raise_mismatch(
     observed_at: datetime,
     reason: OllamaProvisioningMismatchReason,
     detail: str,
-) -> None:
+) -> NoReturn:
     safe_readback = {
         "provider_resource_id": provider_resource_id,
         "observed_resource_id": observed.id,
