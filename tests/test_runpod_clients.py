@@ -84,6 +84,27 @@ def test_serverless_endpoint_worker_inventory_refuses_invalid_or_inconsistent_co
         endpoint_worker_population_is_empty({"workers": [], "summary": summary})
 
 
+def test_disabled_endpoint_can_stage_a_redacted_immutable_environment():
+    environment = {"PORT": "11434", "WORKLOAD_TOKEN": "test-credential-not-for-display"}
+    staged = EndpointUpdateRequest(workers_min=0, workers_max=0, env=environment)
+    environment["PORT"] = "80"
+    assert staged.to_payload() == {
+        "workers": {"min": 0, "max": 0},
+        "env": {"PORT": "11434", "WORKLOAD_TOKEN": "test-credential-not-for-display"},
+    }
+    assert "test-credential-not-for-display" not in repr(staged)
+    staged.to_payload()["env"]["PORT"] = "80"
+    assert staged.to_payload()["env"]["PORT"] == "11434"
+    assert EndpointUpdateRequest(env={}).to_payload() == {"env": {}}
+    assert EndpointUpdateRequest(workers_min=0).to_payload() == {"workers": {"min": 0}}
+
+
+@pytest.mark.parametrize("environment", [{"PORT": 11434}, ["PORT=11434"]])
+def test_endpoint_update_refuses_nonstring_environment(environment):
+    with pytest.raises(RunPodManagerError):
+        EndpointUpdateRequest(env=environment)
+
+
 def _page(key, items, next_cursor=None):
     return {
         key: items,
