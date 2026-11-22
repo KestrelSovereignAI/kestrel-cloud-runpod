@@ -296,6 +296,7 @@ def test_typed_create_and_update_payloads_validate_against_pin():
             workers_min=0,
             workers_max=0,
             env={"PORT": "11434"},
+            network_volume_ids=("cache-123",),
         ).to_payload(),
     )
 

@@ -105,6 +105,31 @@ def test_endpoint_update_refuses_nonstring_environment(environment):
         EndpointUpdateRequest(env=environment)
 
 
+def test_disabled_endpoint_patch_mounts_network_volume_without_changing_global_mounts():
+    volumes = ["cache-123"]
+    request = EndpointUpdateRequest(
+        workers_min=0, workers_max=0, network_volume_ids=volumes,
+    )
+    volumes.append("foreign-volume")
+    payload = request.to_payload()
+    assert payload == {
+        "workers": {"min": 0, "max": 0},
+        "mounts": {"network": [{"volumeId": "cache-123"}]},
+    }
+    payload["mounts"]["network"].clear()
+    assert request.to_payload()["mounts"]["network"] == [{"volumeId": "cache-123"}]
+    assert EndpointUpdateRequest(network_volume_ids=()).to_payload() == {
+        "mounts": {"network": []},
+    }
+    assert "mounts" not in EndpointUpdateRequest(workers_max=0).to_payload()
+
+
+@pytest.mark.parametrize("volumes", ["cache", ("",), ("../cache",), ("abc", "abc"), (42,)])
+def test_endpoint_patch_rejects_invalid_network_volume_ids(volumes):
+    with pytest.raises(ValueError, match="distinct network volume IDs"):
+        EndpointUpdateRequest(network_volume_ids=volumes)
+
+
 def _page(key, items, next_cursor=None):
     return {
         key: items,

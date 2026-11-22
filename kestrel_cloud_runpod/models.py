@@ -248,6 +248,10 @@ def _assess_mounts(
     return EndpointMountAssessment(tuple(missing), tuple(invalid), tuple(mismatched))
 
 
+def _endpoint_network_mounts(volume_ids: Sequence[str]) -> list[dict[str, str]]:
+    return [{"volumeId": volume_id} for volume_id in volume_ids]
+
+
 def assess_endpoint_mounts(
     raw: Mapping[str, Any], expected_network_volume_ids: Sequence[str]
 ) -> EndpointMountAssessment:
@@ -256,9 +260,7 @@ def assess_endpoint_mounts(
     return _assess_mounts(
         raw,
         expected={
-            "network": [
-                {"volumeId": volume_id} for volume_id in expected_network_volume_ids
-            ],
+            "network": _endpoint_network_mounts(expected_network_volume_ids),
             "global": [],
         },
         parsers={
@@ -785,7 +787,7 @@ class EndpointCreateRequest:
 
 @dataclass(frozen=True)
 class EndpointUpdateRequest:
-    """Typed v2 PATCH fields; an explicit env replaces the existing map."""
+    """Typed v2 PATCH; explicit env and network mounts replace their own fields."""
 
     name: Optional[str] = None
     image: Optional[str] = None
@@ -807,6 +809,18 @@ class EndpointUpdateRequest:
         if self.env is not None:
             environment = _string_mapping(self.env, "Endpoint update env")
             object.__setattr__(self, "env", _freeze_json_value(environment))
+        if self.network_volume_ids is not None:
+            volumes = self.network_volume_ids
+            if (
+                not isinstance(volumes, (tuple, list))
+                or any(
+                    not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", item)
+                    for item in volumes
+                )
+                or len(set(volumes)) != len(volumes)
+            ):
+                raise ValueError("Endpoint update requires distinct network volume IDs")
+            object.__setattr__(self, "network_volume_ids", tuple(volumes))
 
     def to_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
@@ -836,7 +850,7 @@ class EndpointUpdateRequest:
         if self.data_center_ids is not None:
             payload["dataCenterIds"] = list(self.data_center_ids)
         if self.network_volume_ids is not None:
-            payload["networkVolumes"] = list(self.network_volume_ids)
+            payload["mounts"] = {"network": _endpoint_network_mounts(self.network_volume_ids)}
         if self.execution_timeout_ms is not None:
             payload["timeout"] = self.execution_timeout_ms
         if self.flashboot is not None:
