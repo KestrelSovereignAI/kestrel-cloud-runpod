@@ -18,6 +18,9 @@ _CACHE_ONLY_RUNTIME_VERSIONS = MappingProxyType(
         # 1.1.5: main a8caa52f07a00d6073aa22ebcfb57bf32e5ea2d8,
         # publish 44931259242. Add releases after checking provenance and SBOM.
         "sha256:c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3": "1.1.5",
+        # 1.1.6: main 2c94d5723153e13170a985b57042ef014ad3594d,
+        # publish 45070697667; verified SLSA and SPDX attestations.
+        "sha256:10b4194c09b715f1b2def2461122d0fd9d93649243ae77927660b8961207cec0": "1.1.6",
     }
 )
 OLLAMA_RUNTIME_IMAGE_REPOSITORY = (

@@ -17,12 +17,28 @@ from kestrel_cloud_runpod.ollama_runtime import (
     OLLAMA_RUNTIME_PORT,
     OLLAMA_RUNTIME_VERSION,
     build_ollama_runtime_environment,
+    cache_only_ollama_runtime_version,
+    require_cache_only_ollama_image,
     require_immutable_ollama_image,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime" / "ollama-runtime"
 MODEL_DIGEST = "sha256:" + "a" * 64
+
+
+@pytest.mark.parametrize(("digest", "runtime_version"), [
+    ("c316c4e8a71cc801844b0651b4b174d79c75a7ca6725eb75b00138862c8d5cd3", "1.1.5"),
+    ("10b4194c09b715f1b2def2461122d0fd9d93649243ae77927660b8961207cec0", "1.1.6"),
+])
+def test_cache_only_runtime_version_is_bound_to_the_enrolled_digest(digest, runtime_version):
+    image = f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@sha256:{digest}"
+    assert require_cache_only_ollama_image(image) == image
+    assert cache_only_ollama_runtime_version(image) == runtime_version
+    with pytest.raises(RunPodManagerError):
+        cache_only_ollama_runtime_version(f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}:{runtime_version}")
+    with pytest.raises(RunPodManagerError):
+        cache_only_ollama_runtime_version(f"registry.example/other/runtime@sha256:{digest}")
 IMAGE = f"{OLLAMA_RUNTIME_IMAGE_REPOSITORY}@{MODEL_DIGEST}"
 TOKEN = "workload-" + "s" * 32
 
