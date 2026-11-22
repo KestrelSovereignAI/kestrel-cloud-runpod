@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -1344,6 +1345,7 @@ def validate_registered_ollama_endpoint(
     endpoint_id: str,
     original_created_at: datetime,
     expected: EndpointCreateRequest,
+    expected_environment_sha256: str | None = None,
 ) -> None:
     """Check an operator-registered definition, not a lease or create receipt.
 
@@ -1389,9 +1391,13 @@ def validate_registered_ollama_endpoint(
         raise OllamaProvisioningEvidenceError(detail)
 
     assessment = _ProvisioningAssessment(endpoint, reject)
+    if expected_environment_sha256 is None:
+        expected_environment_sha256 = environment_values_sha256(expected.env)
+    if re.fullmatch(r"[a-f0-9]{64}", expected_environment_sha256) is None:
+        raise OllamaProvisioningEvidenceError("Invalid registered endpoint environment fingerprint")
     _assess_ollama_runtime_identity(
         assessment, expected_image=expected.image,
-        expected_environment_sha256=environment_values_sha256(expected.env),
+        expected_environment_sha256=expected_environment_sha256,
     )
     _assess_endpoint_policy(endpoint, expected.to_payload(), assessment)
     assessment.finish_endpoint()
