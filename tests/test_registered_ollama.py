@@ -10,14 +10,14 @@ from threading import Thread
 
 import pytest
 from kestrel_sdk.llm import (
-    InferenceLeaseOwnershipError, InferenceLeaseProviderUnavailableError,
+    InferenceLeaseConstraintError, InferenceLeaseOwnershipError, InferenceLeaseProviderUnavailableError,
     InferenceLeaseRequest, InferenceLeaseState,
 )
 from ollama_test_support import OwnedLoopbackHTTPServer, runtime_telemetry_payload
 from pydantic import SecretStr
 
 from kestrel_cloud_runpod.clients import RunpodControlPlaneClient
-from kestrel_cloud_runpod.models import EndpointCreateRequest, FlashBoot, RunPodAPIError
+from kestrel_cloud_runpod.models import EndpointCreateRequest, EndpointUpdateRequest, FlashBoot, RunPodAPIError
 from kestrel_cloud_runpod.ollama_contracts import OLLAMA_REQUIRE_CACHED_MODEL_ENV, OllamaLeaseConflictError
 from kestrel_cloud_runpod.ollama_repository import SQLiteOllamaLeaseRepository
 from kestrel_cloud_runpod.registered_ollama import RegisteredOllamaEndpoint, RegisteredOllamaLifecycle
@@ -115,13 +115,13 @@ def home(tmp_path):
                     timestamp = state["env"]["KESTREL_OLLAMA_PROVISION_REQUESTED_AT"]
                     busy[:] = [{
                         "id": "worker-" + str(len(applied)), "status": "IDLE", "version": 1,
-                        "isStale": False, "gpuCount": 1, "image": endpoint.baseline.image,
+                        "isStale": False, "gpuCount": 1, "image": state["image"],
                         "startedAt": timestamp, "gpuTypeId": "NVIDIA GeForce RTX 4090",
                         "dataCenterId": "US-NC-1",
                     }]
                     self.send_json({
                         **runtime_telemetry_payload(state["env"]["KESTREL_OLLAMA_TELEMETRY_BINDING_SHA256"], timestamp),
-                        "runtime_version": cache_only_ollama_runtime_version(endpoint.baseline.image),
+                        "runtime_version": cache_only_ollama_runtime_version(state["image"]),
                     })
                 else:
                     if state.get("_replace_during_observation"):
@@ -138,7 +138,9 @@ def home(tmp_path):
             patch = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             applied.append(patch)
             state["workers"].update(patch["workers"])
-            state["env"] = patch["env"]
+            for key in ("env", "image"):
+                if key in patch:
+                    state[key] = patch[key]
             if len(applied) in drop:
                 self.close_connection = True
                 return
@@ -148,10 +150,10 @@ def home(tmp_path):
     SQLiteOllamaLeaseRepository(db)
     ticks = [start]
 
-    def controller(client):
+    def controller(client, enrollment=endpoint):
         clock = lambda: ticks[0]
         journal = RegisteredOllamaJournal(db, clock=clock)
-        return RegisteredOllamaLifecycle(client=client, endpoint=endpoint, journal=journal, clock=clock)
+        return RegisteredOllamaLifecycle(client=client, endpoint=enrollment, journal=journal, clock=clock)
 
     def activate(client, name="first"):
         now = ticks[0]
@@ -176,12 +178,12 @@ def home(tmp_path):
             max_safe_retries=0,
         ),
     ) as client:
-        def provider():
-            lifecycle = controller(client)
+        def provider(enrollment=endpoint):
+            lifecycle = controller(client, enrollment)
             implementation = RegisteredInferenceLeaseProvider()
             implementation._lifecycle = lifecycle
             implementation._policy = RegisteredQuotePolicy(
-                endpoint.digest, SQLiteOllamaLeaseRepository(db).journal_identity(),
+                enrollment.digest, SQLiteOllamaLeaseRepository(db).journal_identity(),
                 "US-NC-1", model, "sha256:" + manifest, 20, 30, 5, 120, 150, Decimal("0.01"),
             )
             implementation._base_url = client.transport.base_url.removesuffix("/v2")
@@ -281,6 +283,7 @@ def sdk_request(now):
 
 
 READINESS_READS = ["/kestrel/telemetry", "/kestrel/telemetry", "/api/tags"]
+ROTATED_IMAGE = OLLAMA_RUNTIME_IMAGE_REPOSITORY + "@sha256:10b4194c09b715f1b2def2461122d0fd9d93649243ae77927660b8961207cec0"
 
 
 @pytest.mark.asyncio
@@ -311,6 +314,90 @@ async def test_sdk_lease_two_cycles_use_same_endpoint_and_independent_restart_re
     assert second.state is InferenceLeaseState.READY
     assert second.metadata["worker_id"] == "worker-3"
     assert [patch["workers"]["max"] for patch in applied] == [1, 0, 1]
+    assert data_reads == READINESS_READS * 2
+
+
+@pytest.mark.asyncio
+async def test_rotated_image_can_only_read_the_original_parked_receipt(home):
+    client, controller, _activate, ticks, applied, _drop, busy, _state, provider, data_reads = home
+    request = sdk_request(ticks[0])
+    original = provider()
+    first = await asyncio.wait_for(original.acquire(request, await original.quote(request)), 5)
+    previous = original._runtime()[0].endpoint
+    endpoint = replace(previous, baseline=replace(previous.baseline, image=ROTATED_IMAGE))
+    rotated = provider(endpoint)
+    assert endpoint.digest != previous.digest
+    with pytest.raises(InferenceLeaseConstraintError, match="original endpoint changed"):
+        await rotated.status(request.owner_id, first.lease_id)
+
+    ticks[0] += timedelta(seconds=11)
+    assert controller(client).reap_due()[0].state is RegisteredActivationState.PARKING
+    busy.clear()
+    assert controller(client).reap_due()[0].state is RegisteredActivationState.PARKED
+    released = await original.status(request.owner_id, first.lease_id)
+    assert released.state is InferenceLeaseState.RELEASED and released.route is None
+
+    # The historical read must still work with the real HTTP client closed.
+    # The original exact durable record and readiness evidence are unchanged.
+    client.close()
+    assert await rotated.status(request.owner_id, first.lease_id) == released
+    with pytest.raises(InferenceLeaseOwnershipError):
+        await rotated.status("foreign-owner", first.lease_id)
+    for effect in (rotated.touch, rotated.release):
+        with pytest.raises(InferenceLeaseConstraintError, match="original endpoint changed"):
+            await effect(request.owner_id, first.lease_id)
+    for foreign in (
+        replace(endpoint, endpoint_id="different-endpoint"),
+        replace(endpoint, baseline=replace(endpoint.baseline, network_volume_ids=("other-cache",))),
+        replace(endpoint, baseline=replace(endpoint.baseline, data_center_ids=("US-OTHER",))),
+    ):
+        with pytest.raises(InferenceLeaseConstraintError, match="original endpoint changed"):
+            await provider(foreign).status(request.owner_id, first.lease_id)
+    assert [patch["workers"]["max"] for patch in applied] == [1, 0]
+    assert data_reads == READINESS_READS
+
+
+@pytest.mark.asyncio
+async def test_image_only_rotation_reuses_exact_parked_predecessor_for_a_new_lease(home):
+    client, controller, _activate, ticks, applied, _drop, busy, state, provider, data_reads = home
+    original = provider()
+    first_request = sdk_request(ticks[0])
+    first = await asyncio.wait_for(original.acquire(first_request, await original.quote(first_request)), 5)
+    old_endpoint = original._runtime()[0].endpoint
+    rotated_endpoint = replace(old_endpoint, baseline=replace(old_endpoint.baseline, image=ROTATED_IMAGE))
+    with pytest.raises(OllamaLeaseConflictError, match="already reserved"):
+        active_row = controller(client).journal.get(first.lease_id)
+        controller(client).journal.reserve(replace(
+            active_row.intent, lease_id="too-soon", registration_sha256=rotated_endpoint.digest,
+        ))
+    ticks[0] += timedelta(seconds=11)
+    assert controller(client).reap_due()[0].state is RegisteredActivationState.PARKING
+    busy.clear()
+    parked = controller(client).reap_due()[0]
+    assert parked.state is RegisteredActivationState.PARKED
+    client.update_endpoint(old_endpoint.endpoint_id, EndpointUpdateRequest(
+        image=ROTATED_IMAGE, workers_min=0, workers_max=0,
+    ))
+    second_request = replace(first_request, request_id="second", requested_at=ticks[0])
+    mismatched = replace(rotated_endpoint, baseline=replace(rotated_endpoint.baseline, idle_timeout_seconds=6))
+    with pytest.raises(OllamaLeaseConflictError, match="predecessor changed"):
+        unauthorized = provider(mismatched)
+        await unauthorized.acquire(second_request, await unauthorized.quote(second_request))
+    assert state["workers"]["max"] == 0 and not busy
+
+    rotated = provider(rotated_endpoint)
+    end = await rotated.status(first_request.owner_id, first.lease_id)
+    assert end.state is InferenceLeaseState.RELEASED and end.route is None
+    second = await asyncio.wait_for(rotated.acquire(second_request, await rotated.quote(second_request)), 5)
+    assert second.state is InferenceLeaseState.READY and second.metadata["cache_hit"]
+    assert second.metadata["worker_id"] != first.metadata["worker_id"]
+    assert await rotated.status(first_request.owner_id, first.lease_id) == end
+    assert controller(client).journal.get(first.lease_id) == parked
+    ticks[0] += timedelta(seconds=11)
+    assert controller(client, rotated_endpoint).reap_due()[0].state is RegisteredActivationState.PARKING
+    busy.clear()
+    assert controller(client, rotated_endpoint).reap_due()[0].state is RegisteredActivationState.PARKED
+    assert [patch["workers"]["max"] for patch in applied] == [1, 0, 0, 1, 0]
     assert data_reads == READINESS_READS * 2
 
 

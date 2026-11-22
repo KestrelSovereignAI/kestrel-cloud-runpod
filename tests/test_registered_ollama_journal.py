@@ -140,3 +140,26 @@ def test_elapsed_offer_cannot_create_a_row(authority):
     with pytest.raises(OllamaLeaseConflictError, match="window has elapsed"):
         journal.reserve(intent)
     assert journal.get(intent.lease_id) is None
+
+
+def test_rotated_admission_requires_the_exact_latest_parked_predecessor(authority):
+    path, clock, _advance, intent = authority
+    journal = RegisteredOllamaJournal(path, clock=clock)
+    journal.reserve(intent)
+    journal.record_active(intent)
+    journal.claim_park(intent)
+    journal.record_parked(intent)
+    candidate = replace(
+        intent, lease_id="new-image", registration_sha256="f" * 64,
+        prior_environment_sha256=intent.parked_environment_sha256, parked_environment_sha256="e" * 64,
+    )
+    for expected, attempted in (
+        (None, candidate),
+        (replace(intent, owner_id="another-owner"), candidate),
+        (intent, replace(candidate, cache_id="another-cache")),
+        (intent, replace(candidate, prior_environment_sha256="a" * 64)),
+    ):
+        with pytest.raises(OllamaLeaseConflictError, match="predecessor changed"):
+            journal.reserve(attempted, expected_parked_predecessor=expected)
+        assert journal.get(candidate.lease_id) is None
+    assert journal.reserve(candidate, expected_parked_predecessor=intent)[1]

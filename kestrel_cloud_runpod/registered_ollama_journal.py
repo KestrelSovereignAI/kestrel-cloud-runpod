@@ -236,8 +236,11 @@ class RegisteredOllamaJournal:
             row = self._get(db, lease_id)
             return _row_activation(row) if row is not None else None
 
-    def reserve(self, intent: RegisteredActivationIntent) -> tuple[RegisteredActivation, bool]:
-        """Only inserted=True grants the current caller a single first PATCH."""
+    def reserve(
+        self, intent: RegisteredActivationIntent, *,
+        expected_parked_predecessor: RegisteredActivationIntent | None = None,
+    ) -> tuple[RegisteredActivation, bool]:
+        """Grant a single first PATCH, comparing any validated predecessor in the transaction."""
         with lease_database_connection(self._path) as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._get(db, intent.lease_id)
@@ -256,9 +259,18 @@ class RegisteredOllamaJournal:
             ).fetchone() is not None:
                 raise OllamaLeaseConflictError("Registered endpoint or cache is already reserved")
             last = self._last_parked(db, intent.endpoint_id)
-            if last is not None and (
-                last.intent.parked_environment_sha256 != intent.prior_environment_sha256
-                or last.intent.registration_sha256 != intent.registration_sha256
+            if (
+                (expected_parked_predecessor is not None and (
+                    last is None or last.intent != expected_parked_predecessor
+                ))
+                or (last is not None and (
+                    last.intent.parked_environment_sha256 != intent.prior_environment_sha256
+                    or last.intent.cache_id != intent.cache_id
+                    or (
+                        expected_parked_predecessor is None
+                        and last.intent.registration_sha256 != intent.registration_sha256
+                    )
+                ))
             ):
                 raise OllamaLeaseConflictError("Registered endpoint predecessor changed before admission")
             for old in db.execute(
